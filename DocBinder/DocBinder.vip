@@ -1,0 +1,1699 @@
+/*
+ г===========================================================================┐
+ │                                  ЭП - Аудит                               │
+ │ Система       : ГАЛАКТИКА                                                 │
+ │ Проект        :                                                           │
+ │ Версия        : x.xx                                                      │
+ │ Назначение    :                                                           │
+ │ Ответственный : v.balandin                                               │
+ │ Параметры     : есть                                                      │
+ L===========================================================================-
+*/
+#include DocBinder.vih
+#include DocBinder.def
+#include CommonObjIfc.vih
+#include OperPlanCustomizer.vih
+#include MnPlanDef.vpp
+#include SystemHelper.vih
+#include MsgDlg.vih
+#include Query.vih
+#include ObjIntPl.vin
+
+#include ExtAttr.vih
+
+Interface DocBinder;
+
+#include OperPlanCustomizer.inc
+#include DocBinderSql.vpp
+
+var
+ traParams   : TRecAcc;
+
+table struct TmpDebug
+(
+   typeOwn : word
+  ,cOwner  : comp
+  ,typeObj : word
+  ,cObject : comp
+)
+;
+
+Exception #EXDSQL;
+
+const
+   BATCH_SIZE : word = 1000;
+end
+
+
+Create view
+
+as select
+ TmpDebug.*
+from
+ TmpDebug
+,SpSloj
+,Pick
+,Pick PickToCalcRemains
+,tmpSaldo1
+where
+((
+        MnPlan.cSloj      == SpSloj.cMain
+   and  cgKau_FpPeriod    == SpSloj.kodGrKau
+
+   and cgPick_MC          == PickToCalcRemains.wList
+
+))
+;
+
+// вызывать только после updateTmpSpObjAcc() в котором проставляются недостающие ссылки на позиции документов
+function calcExpDateFor(objTDoc: ObjTypeDoc): integer;
+Var
+  s_posDoc : string;
+{
+
+  #_new_objS_
+
+  s_posDoc  := if(objTDoc.getDirect() = DEMAND, 'TmpSpObjAcc.cPos', 'TmpSpObjAcc.cObject')
+
+  objS
+    .append('Update TmpSpObjAcc ')
+    .append('  Set TmpSpObjAcc.expDate = ' + objTDoc.getDSQLExpDateFormula() )
+    .append('From ')
+    .append('  TmpSpObjAcc ')
+
+
+
+  if (#__warnIfFalse(objTDoc.expDateJoinTables(objS, s_posDoc),'Ошибка подготовки запроса для расчета сроков годности!',#__LINE__))
+    {
+    FreeVipInterface(objS);
+    exit;
+    }
+
+  objS
+    .append('Where')
+    .append('  TmpSpObjAcc.cTypeDoc = #_COMP(objTDoc.getNrec())')
+
+
+  #_execDirect_objS_
+
+}
+
+
+function calcExpDateTmpSpObjAcc(): integer;
+Var
+  oi_docList  : ObjListTypeDoc;
+  objTDoc     : ObjTypeDoc;
+{
+
+  result := tsOk;
+
+  // для связей документа остатков
+  objTDoc := oi_customizer.newRemains();
+  if (not #__warnIfTrue(objTDoc = nullRef,'Ошибка получения объекта с остатками, срок годности рассчитан не будет!',#__LINE__))
+    result := calcExpDateFor(objTDoc);
+
+
+  oi_docList := ObjListTypeDoc(oi_customizer);
+  oi_docList.reset();
+
+  // для связей плановых документов спроса
+  while (oi_docList.hasMore())
+    {
+
+    objTDoc := oi_docList.next();
+
+    if (objTDoc.getDirect() != DEMAND)
+      continue;
+
+    if ( objTDoc.getTypeObj != coMnPlan )
+      continue;
+
+    if (result = tsOk)
+      result := calcExpDateFor(objTDoc);
+
+    }
+
+}
+
+function setMaxExpDateTmpSpObjAcc_WhereItNull: integer;
+{
+
+  #_new_objS_
+
+  objS
+    .append('Update TmpSpObjAcc                                ')
+    .append('  Set TmpSpObjAcc.expDate = #_DATE(MAX_EXPDATE)   ')
+    .append('From                                              ')
+    .append('  TmpSpObjAcc                                     ')
+    .append('Where                                             ')
+    .append('      TmpSpObjAcc.expDate = #_DATE(date(0,0,0))   ')
+
+  #_execDirect_objS_
+
+}
+
+function getNameField(p_Num: word): string;
+{
+   result := #__GetFldNameByNum(p_Num);
+
+}
+
+function setCustomizer(p_customizer: ObjOperPlanCustomizer): boolean;
+{
+   result := Inherited::setCustomizer(p_customizer);
+
+   traParams := oi_customizer.getParams();
+   result := false;
+
+   if (MsgDlg::WarnIfFalse((vi_curView = 1)
+             ,'На данный момент запуск алгоритма возможен только из представления "Период"')
+        )
+       Exit;
+
+   if (MsgDlg::WarnIfNotOk((getFirst FastFirstRow MnPlan)
+             ,'Документ не найден! (Nrec = ' + string(traParams.cMnPlan,0,0) +')')
+        )
+       Exit;
+
+   if (MsgDlg::WarnIfNotOk((getFirst FastFirstRow SpSloj)
+            ,'В слое аналитик не найдена роль "Период планирования"! (Nrec = ' + string(MnPlan.cSloj,0,0) + ')')
+        )
+       Exit;
+
+   sqlSetMacro('BatchSize'    , ' TOP #_WORD(BATCH_SIZE)');
+//   sqlSetMacro('PlanSnab_Type', ' #_WORD(MnPlan.TypePlan)');
+//   sqlSetMacro('PlanSnab_Nrec', ' #_COMP(MnPlan.Nrec)');
+
+   result := true;
+}
+
+function createTmpObjAccT: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('TABLE TmpObjAccT')
+    .append('(')
+    .append('   id       : longint')
+    .append('  ,typeOwn  : word')
+    .append('  ,cOwner   : comp')
+    .append('  ,typeObj  : word')
+    .append('  ,cObject  : comp')
+    .append('  ,cTypeDoc : comp') // временное поле, ссылка на настройку типа документа (имеется ввиду настройка алгоритма)
+    .append('  ,hDate    : longint') // дата из документа (если не будет даты в позиции , надо брать ее)
+    .append(')')
+    .append('WITH INDEX')
+    .append('(')
+    .append('  I0 = id(autoinc)')
+    .append(' ,I1 = cTypeDoc')
+    .append(' ,I2 = typeOwn + cOwner + typeObj + cObject')
+    .append(');');
+
+   #_safeCreateTmpTbl_objS_('TmpObjAccT')
+}
+
+function createTmpSpObjAcc: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('TABLE TmpSpObjAcc')
+    .append('(')
+    .append('   id        : longint')
+    .append('  ,idOat     : longint')
+    .append('  ,cObjAccT  : comp')
+    .append('  ,cSpObjAcc : comp')
+    .append('  ,typePos   : word')
+    .append('  ,cPos      : comp')
+    .append('  ,typeObj   : word')
+    .append('  ,cObject   : comp')
+    .append('  ,cOtpEd    : comp')
+    .append('  ,typeHier  : word')
+    .append('  ,typeNorm  : word')
+    .append('  ,kolcPos   : double')
+    .append('  ,startDate : longint')
+    .append('  ,cProduct  : comp') // временное поле, ссылка на продукт (МЦ, услуга)
+    .append('  ,tProduct  : word') // временное поле, тип продукта
+    .append('  ,cPeriod   : comp') // временное поле, ссылка на период
+    .append('  ,cTypeDoc  : comp') // временное поле, ссылка на настройку типа документа (имеется ввиду настройка алгоритма)
+
+    .append('  ,m_typeOwn   : word') // копия из TmpObjAccT
+    .append('  ,m_typeObj   : word') // копия из TmpObjAccT
+    .append('  ,m_cOwner    : comp') // копия из TmpObjAccT
+    .append('  ,m_cObject   : comp') // копия из TmpObjAccT
+    .append('  ,newRec    : integer') // 1 если новая запись , 0, если не новая (не требует вставки)
+    .append('  ,direct    : integer') // DEMAND - входящие, SUPPLY - исходящие
+    .append('  ,expDate   : date')    // срок годности (expDate)
+    .append(')')
+    .append('WITH INDEX')
+    .append('(')
+    .append('  I0 = id(autoinc)')
+    .append(' ,I1 = cTypeDoc')
+    .append(' ,I2 = typeHier + newRec')
+    .append(' ,I3 = idOat')
+    .append(');');
+
+   #_safeCreateTmpTbl_objS_('TmpSpObjAcc')
+}
+
+function createTmpSpMnPlan: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('TABLE TmpSpMnPlan')
+    .append('(')
+    .append('   id       : longint')
+    .append('  ,cIzd     : comp')
+    .append('  ,typeIzd  : word')
+    .append(')')
+    .append('WITH INDEX')
+    .append('(')
+    .append('  I0 = id(autoinc)')
+    .append(' ,I1 = typeIzd + cIzd')
+    .append(');');
+
+   #_safeCreateTmpTbl_objS_('TmpSpMnPlan')
+}
+
+function createTmpSpMnPl: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('TABLE TmpSpMnPl')
+    .append('(')
+    .append('   cIzd      : comp')
+    .append('  ,typeIzd   : word')
+    .append('  ,startDate : longint')
+    .append('  ,endDate   : longint')
+    .append('  ,cRoleAn4  : comp')
+    .append('  ,wKodGr4   : word')
+    .append('  ,cAnVal4   : comp')
+    .append('  ,cMnAnal   : comp')
+    .append('  ,cSpMnPlan : comp')
+    .append(')')
+    .append('WITH INDEX')
+    .append('(')
+    .append('  I1 = typeIzd + cIzd + cAnVal4')
+    .append(');');
+
+   #_safeCreateTmpTbl_objS_('TmpSpMnPl')
+}
+
+function createAllTmpTables: boolean;
+{
+   #DSQL_VARDECLARE
+
+   result := false;
+
+   _try
+    {
+       #__begin_tran
+       #__execCRUDFunc(createTmpObjAccT(),#__LINE__);
+       #__execCRUDFunc(createTmpSpObjAcc(),#__LINE__);
+       #__execCRUDFunc(createTmpSpMnPlan(),#__LINE__);
+       #__execCRUDFunc(createTmpSpMnPl(),#__LINE__);
+       #__commit(#__LINE__)
+    }
+   _except
+   on #ExDSQL :
+    {
+       #__rollback('Ошибка создания временной таблицы')
+    }
+}
+
+function dropAllTmpTables: void;
+{
+   sqlDropTmpTable('TmpObjAccT');
+   sqlDropTmpTable('TmpSpObjAcc');
+   sqlDropTmpTable('TmpSpMnPlan');
+   sqlDropTmpTable('TmpSpMnPl');
+}
+
+
+function insertTmpObjAccT(objTDoc : ObjTypeDoc): integer;
+var
+ s_cOwn
+,s_cObj
+,s_wOwn
+,s_wObj : string;
+{
+   #_new_objS_
+
+   if (objTDoc = nullRef)
+      Exit;
+
+   s_cOwn := if(objTDoc.getDirect() = DEMAND, '#_COMP(MnPlan.Nrec)'  , objTDoc.getField(FLD_HEAD_NREC))
+   s_wOwn := if(objTDoc.getDirect() = DEMAND, string(MnPlan.typePlan), objTDoc.getField(FLD_HEAD_TDOC));
+
+   s_cObj := if(objTDoc.getDirect() = SUPPLY, '#_COMP(MnPlan.Nrec)'  , objTDoc.getField(FLD_HEAD_NREC))
+   s_wObj := if(objTDoc.getDirect() = SUPPLY, string(MnPlan.typePlan), objTDoc.getField(FLD_HEAD_TDOC));
+
+
+
+   objS
+    .append('INSERT INTO TmpObjAccT')
+    .append('(')
+    .append('   typeOwn')
+    .append('  ,cOwner ')
+    .append('  ,typeObj')
+    .append('  ,cObject')
+    .append('  ,cTypeDoc')
+    .append('  ,hDate')
+    .append(')')
+    .append('SELECT')
+    .append('  ' + s_wOwn)
+    .append(', ' + s_cOwn)
+    .append(', ' + s_wObj)
+    .append(', ' + s_cObj)
+    .append(', #_COMP(objTDoc.getNrec())')
+    .append(', ' + objTDoc.getField(FLD_HEAD_DATE))
+    .append('FROM')
+    .append(objTDoc.getHeadTable())
+    .append('WHERE')
+    .append(' NOT EXISTS')
+    .append('  (')
+    .append('    SELECT')
+    .append('      1')
+    .append('    FROM')
+    .append('      TmpObjAccT a')
+    .append('    WHERE')
+    .append('        a.typeOwn = ' + s_wOwn)
+    .append('    AND a.cOwner  = ' + s_cOwn)
+    .append('    AND a.typeObj = ' + s_wObj)
+    .append('    AND a.cObject = ' + s_cObj)
+    .append('  )')
+
+   objTDoc.addHeadCondition(objS);
+
+   #_execDirect_objS_
+
+}
+
+function insertTmpSpObjAcc_InHier0_OutHier1(objTDoc : ObjTypeDoc): integer;
+var
+ s_cPos
+,s_wPos
+,s_cObj
+,s_wObj : string;
+ w_Fld
+,w_Hier : word;
+{
+   #_new_objS_
+
+   // тип и ссылка на входящую позицию
+   s_cPos := if(objTDoc.getDirect() = DEMAND, objTDoc.getField(FLD_SPEC_NREC)    , '#COMP(0)');
+   s_wPos := if(objTDoc.getDirect() = DEMAND, 'mpGetTypeSpec(TmpObjAccT.typeObj)', 'mpGetTypeSpec(#MNPLANTYPE)');
+
+   // тип и ссылка на исходящую позицию
+   s_cObj := if(objTDoc.getDirect() = SUPPLY, objTDoc.getField(FLD_SPEC_NREC)    , '#COMP(0)');
+   s_wObj := if(objTDoc.getDirect() = SUPPLY, 'mpGetTypeSpec(TmpObjAccT.typeOwn)', '0');
+
+   // номер поля с количеством берем из настройки типа документа,
+   w_Fld  := objTDoc.getNumQtyField();
+   // для входящих typeHier = 0, для исходящих  typeHier = 1
+   w_Hier := if(objTDoc.getDirect() = DEMAND, 0, 1);
+
+   objS
+    .append('INSERT INTO TmpSpObjAcc')
+    .append('(')
+    .append('   typePos')
+    .append('  ,cPos')
+    .append('  ,typeObj')
+    .append('  ,cObject')
+    .append('  ,typeHier')
+    .append('  ,typeNorm')
+    .append('  ,cOtpEd')    // пока ноль
+    .append('  ,kolcPos')
+    .append('  ,startDate')
+    .append('  ,cProduct') // временное поле, ссылка на изделие
+    .append('  ,tProduct') // временное поле, тип изделия
+    .append('  ,cPeriod') // временное поле, ссылка на период
+    .append('  ,cTypeDoc') // временное поле, ссылка на настройку типа документа (имеется ввиду в настройке алгоритма)
+
+    .append('  ,m_typeOwn') // копия из TmpObjAccT
+    .append('  ,m_typeObj') // копия из TmpObjAccT
+    .append('  ,m_cOwner')  // копия из TmpObjAccT
+    .append('  ,m_cObject') // копия из TmpObjAccT
+    .append('  ,newRec')   // копия из TmpObjAccT
+    .append('  ,direct')   // направление
+    .append('  ,idOat')   //ccылка на TmpObjAccT
+
+    .append(')')
+    .append('SELECT')
+    .append('  ' + s_wPos)
+    .append(', ' + s_cPos)
+    .append(', ' + s_wObj)
+    .append(', ' + s_cObj)
+    .append(', #_WORD(w_Hier)')
+    .append(', #_WORD(w_Fld)')
+    .append(', #COMP(0)')  // пока ноль
+    .append(', ' + objTDoc.getField(FLD_SPEC_QTY))
+    .append(',(CASE ')
+    .append('     WHEN ' + objTDoc.getField(FLD_SPEC_DATE) + ' > 0 THEN ' )
+    .append('        '+ objTDoc.getField(FLD_SPEC_DATE))
+    .append('     ELSE')
+    .append('        TmpObjAccT.hDate')
+    .append('   END')
+    .append('  ) ')
+    .append(', ' + objTDoc.getField(FLD_SPEC_CIZD))
+    .append(', ' + objTDoc.getField(FLD_SPEC_TIZD))
+    .append(', FpPeriod.Nrec')
+    .append(', #_COMP(objTDoc.getNrec())')
+    .append(', TmpObjAccT.typeOwn')
+    .append(', TmpObjAccT.typeObj')
+    .append(', TmpObjAccT.cOwner')
+    .append(', TmpObjAccT.cObject')
+    .append(', 1')
+    .append(', #_WORD(objTDoc.getDirect())')
+    .append(', TmpObjAccT.id')
+    .append('FROM')
+    .append('  TmpObjAccT')
+
+   objTDoc.joinSpec(objS, 'TmpObjAccT.' + if(objTDoc.getDirect() = DEMAND, 'cObject', 'cOwner'));
+
+   objS
+    .append('JOIN FpPeriod ON')
+    .append('(')
+    .append(' (CASE ')
+    .append('     WHEN ' + objTDoc.getField(FLD_SPEC_DATE) + ' > 0 THEN ' )
+    .append('        mpGetPeriod(#_COMP(oi_customizer.getTypePeriod()), '+ objTDoc.getField(FLD_SPEC_DATE)+')')
+    .append('     ELSE')
+    .append('        mpGetPeriod(#_COMP(oi_customizer.getTypePeriod()), TmpObjAccT.hDate)')
+    .append('   END')
+    .append('  )  = FpPeriod.Nrec')
+    .append(')')
+
+   objS
+    .append('WHERE')
+    .append('  TmpObjAccT.cTypeDoc = #_COMP(objTDoc.getNrec())')
+
+   objTDoc.addSpecCondition(objS);
+
+   #_execDirect_objS_
+
+}
+
+function insertTmpSpObjAcc_InHier1_OutHier0(objTDoc : ObjTypeDoc): integer;
+var
+ s_cPos
+,s_wPos
+,s_cObj
+,s_wObj : string;
+ w_Fld
+,w_Hier : word;
+{
+   #_new_objS_
+
+   // тип и ссылка на входящую позицию
+   s_cPos := if(objTDoc.getDirect() = DEMAND, 'T1.cPos'    , '#COMP(0)');
+   s_wPos := 'T1.typePos';
+
+   // тип и ссылка на исходящую позицию (везде нуль, так как для входящих документов - это ссылка на текущую позицию, а для
+   // исходящих typeHier = 0, в этом случае ссылка на исходящую позицию не задается)
+   s_cObj := '#COMP(0)';
+   s_wObj := if(objTDoc.getDirect() = DEMAND, 'mpGetTypeSpec(#MNPLANTYPE)', '0');
+
+   // номер поля с количеством берем из настройки типа документа,
+   w_Fld  := if(objTDoc.getDirect() = DEMAND, oi_customizer.getNumDemandFld(), oi_customizer.getNumSupplyFld());
+   // для входящих typeHier = 1, для исходящих  typeHier = 0
+   w_Hier := if(objTDoc.getDirect() = DEMAND, 1, 0);
+
+
+   objS
+    .append('INSERT INTO TmpSpObjAcc')
+    .append('(')
+    .append('   typePos')
+    .append('  ,cPos')
+    .append('  ,typeObj')
+    .append('  ,cObject')
+    .append('  ,typeHier')
+    .append('  ,typeNorm')
+    .append('  ,cOtpEd')
+    .append('  ,kolcPos')
+    .append('  ,startDate')
+    .append('  ,cProduct') // временное поле, ссылка на МЦ
+    .append('  ,tProduct') // временное поле, тип МЦ
+    .append('  ,cPeriod') // временное поле, ссылка на период
+    .append('  ,cTypeDoc') // временное поле, ссылка на настройку типа документа (имеется ввиду настройка алгоритма)
+    .append('  ,m_typeOwn') // копия из TmpObjAccT
+    .append('  ,m_typeObj') // копия из TmpObjAccT
+    .append('  ,m_cOwner')  // копия из TmpObjAccT
+    .append('  ,m_cObject') // копия из TmpObjAccT
+    .append('  ,newRec')   // копия из TmpObjAccT
+    .append('  ,direct') // направление
+    .append('  ,idOat') // cсылка на TmpObjAccT
+    .append(')')
+    .append('SELECT')
+    .append('  ' + s_wPos)
+    .append(', ' + s_cPos)
+    .append(', ' + s_wObj)
+    .append(', ' + s_cObj)
+    .append(', #_WORD(w_Hier)')
+    .append(', #_WORD(w_Fld)')
+    .append(', #COMP(0)')
+    .append(', SUM(T1.kolcPos)')
+    .append(', FpPeriod.dBeg')
+    .append(', T1.cProduct')
+    .append(', T1.tProduct')
+    .append(', T1.cPeriod')
+    .append(', T1.cTypeDoc')
+    .append(', T1.m_typeOwn')
+    .append(', T1.m_typeObj')
+    .append(', T1.m_cOwner')
+    .append(', T1.m_cObject')
+    .append(', 1')
+    .append(', #_WORD(objTDoc.getDirect())')
+    .append(', T1.idOat')
+    .append('FROM')
+    .append('  TmpSpObjAcc T1')
+    .append('JOIN FpPeriod ON')
+    .append('(')
+    .append('   T1.cPeriod = FpPeriod.Nrec')
+    .append(')')
+    .append('WHERE')
+    .append('  T1.cTypeDoc = #_COMP(objTDoc.getNrec())')
+    .append('GROUP BY')
+    .append('  ' + s_wPos)
+
+  if(objTDoc.getDirect() = DEMAND)
+    objS.append(', ' + s_cPos)
+
+  objS
+    .append(', FpPeriod.dBeg')
+    .append(', T1.cProduct')
+    .append(', T1.tProduct')
+    .append(', T1.cPeriod')
+    .append(', T1.cTypeDoc')
+    .append(', T1.m_typeOwn')
+    .append(', T1.m_typeObj')
+    .append(', T1.m_cOwner')
+    .append(', T1.m_cObject')
+    .append(', T1.idOat')
+
+   #_execDirect_objS_
+}
+
+function deleteTmpObjAccT_WithoutSpec: integer;
+{
+   #_new_objS_
+
+   objS
+     .append('DELETE TmpObjAccT')
+     .append('WHERE')
+     .append(' NOT EXISTS')
+     .append('    (')
+     .append('       SELECT')
+     .append('         1 ')
+     .append('       FROM')
+     .append('         TmpSpObjAcc')
+     .append('       WHERE')
+     .append('         TmpObjAccT.id = TmpSpObjAcc.idOat')
+     .append('    )')
+
+   #_execDirect_objS_
+
+}
+// Обязательно вызывать только после сохранения ObjAccT и SpMnPl !
+function updateTmpSpObjAcc(): integer;
+{
+   #_new_objS_
+
+   objS
+    .append('UPDATE TmpSpObjAcc')
+    .append('  SET TmpSpObjAcc.cObjAccT = ObjAccT.Nrec')
+    .append('FROM')
+    .append('  TmpSpObjAcc')
+    .append('JOIN ObjAccT ON')
+    .append('(')
+    .append('  TmpSpObjAcc.m_typeOwn = ObjAccT.typeOwn AND')
+    .append('  TmpSpObjAcc.m_cOwner  = ObjAccT.cOwner  AND')
+    .append('  1                     = ObjAccT.kindRec AND')
+    .append('  TmpSpObjAcc.m_typeObj = ObjAccT.typeObj AND')
+    .append('  TmpSpObjAcc.m_cObject = ObjAccT.cObject')
+    .append(')')
+
+   result := sqlExecDirect(objS.pointer)
+
+   if (result != tsOk)
+      Exit;
+
+   // обновляем  среднюю и нижнюю панель
+   objS
+    .append('UPDATE TmpSpObjAcc')
+    .append('  SET TmpSpObjAcc.cPos    = (CASE TmpSpObjAcc.direct')
+    .append('                                WHEN #DEMAND THEN TmpSpObjAcc.cPos')
+    .append('                                ELSE SpMnPl.Nrec')
+    .append('                             END)')
+    .append('     ,TmpSpObjAcc.cObject = (CASE TmpSpObjAcc.typeHier WHEN 0 THEN #COMP(0) ELSE')
+    .append('                              (CASE TmpSpObjAcc.direct')
+    .append('                                WHEN #SUPPLY THEN TmpSpObjAcc.cObject')
+    .append('                                ELSE SpMnPl.Nrec')
+    .append('                               END)')
+    .append('                              END)')
+    .append('FROM ')
+    .append('  TmpSpObjAcc')
+    .append('JOIN SpMnPlan ON')
+    .append('(')
+    .append('  #MNPLANNREC = SpMnPlan.cMnPlan AND')
+    .append('  TmpSpObjAcc.tProduct = SpMnPlan.typeIzd AND')
+    .append('  TmpSpObjAcc.cProduct = SpMnPlan.cIzd')
+    .append(')')
+    .append('JOIN SpMnPl ON')
+    .append('(')
+    .append('  SpMnPlan.Nrec = SpMnPl.cSpMnPlan AND')
+    .append('  #WKOLAN = SpMnPl.wKolAn AND')
+    .append('  #WKODGR4 = SpMnPl.wKodGr4 AND')
+    .append('  TmpSpObjAcc.cPeriod = SpMnPl.cAnVal4')
+    .append(')')
+
+
+   #_execDirect_objS_
+}
+
+// Обязательно вызывать только после сохранения SpObjAcc с typeHier = 0 до вставки SpObjAcc с typeHier = 1!
+function updateSpObjAccLink: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('UPDATE TmpSpObjAcc')
+    .append('  SET TmpSpObjAcc.cSpObjAcc = SpObjAcc.Nrec')
+    .append('FROM')
+    .append('  SpObjAcc')
+    .append('WHERE')
+    .append('(')
+    .append('  TmpSpObjAcc.typePos = SpObjAcc.typePos AND')
+    .append('  TmpSpObjAcc.cPos = SpObjAcc.cPos AND')
+    .append('  TmpSpObjAcc.cObjAccT = SpObjAcc.cObjAccT AND')
+    .append('  0 = SpObjAcc.typeHier')
+    .append(')')
+
+   #_execDirect_objS_
+
+}
+
+function insertTmpSpObjAcc(objTDoc : ObjTypeDoc): integer;
+{
+   if (objTDoc = nullRef)
+      Exit;
+
+   // для входящих документов создаем позиции средней панели, для исходящих - позиции нижней панели
+   result := insertTmpSpObjAcc_InHier0_OutHier1(objTDoc);
+
+   if (result != tsOk)
+      Exit;
+
+   // для входящих документов создаем позиции нижней панели, для исходящих - позиции средней панели
+   result := insertTmpSpObjAcc_InHier1_OutHier0(objTDoc);
+
+}
+
+function insertTmpSpMnPlan: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('INSERT INTO TmpSpMnPlan')
+    .append('(')
+    .append('  cIzd')
+    .append(' ,TypeIzd')
+    .append(')')
+    .append('SELECT DISTINCT')
+    .append('  TmpSpObjAcc.cProduct')
+    .append(' ,TmpSpObjAcc.tProduct')
+    .append('FROM')
+    .append('  TmpSpObjAcc');
+
+   #_execDirect_objS_
+}
+
+function insertTmpSpMnPl: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('INSERT INTO TmpSpMnPl')
+    .append('(')
+    .append('   cIzd')
+    .append('  ,TypeIzd')
+    .append('  ,StartDate')
+    .append('  ,EndDate')
+    .append('  ,cRoleAn4')
+    .append('  ,wKodGr4')
+    .append('  ,cAnVal4')
+    .append(')')
+    .append('SELECT DISTINCT')
+    .append('  TmpSpMnPlan.cIzd')
+    .append(' ,TmpSpMnPlan.typeIzd')
+    .append(' ,FpPeriod.dBeg')
+    .append(' ,FpPeriod.dEnd')
+    .append(' ,#CROLEAN4)
+    .append(' ,#WKODGR4')
+    .append(' ,TmpSpObjAcc.cPeriod')
+    .append('FROM')
+    .append('  TmpSpObjAcc')
+    .append('JOIN TmpSpMnPlan ON')
+    .append('(')
+    .append('  TmpSpObjAcc.tProduct = TmpSpMnPlan.typeIzd AND')
+    .append('  TmpSpObjAcc.cProduct = TmpSpMnPlan.cIzd')
+    .append(')')
+    .append('JOIN FpPeriod ON')
+    .append('(')
+    .append('  TmpSpObjAcc.cPeriod = FpPeriod.Nrec')
+    .append(')')
+
+   #_execDirect_objS_
+}
+
+// Обязательно вызывать после сохранения позиций SpMnPlan!
+function updateTmpSpMnPl: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('UPDATE TmpSpMnPl')
+    .append('SET TmpSpMnPl.cSpMnPlan = SpMnPlan.Nrec')
+    .append('FROM')
+    .append('  SpMnPlan')
+    .append('WHERE')
+    .append('  #MNPLANNREC = SpMnPlan.cMnPlan AND')
+    .append('  TmpSpMnPl.typeIzd = SpMnPlan.typeIzd AND')
+    .append('  TmpSpMnPl.cIzd    = SpMnPlan.cIzd')
+
+   #_execDirect_objS_
+}
+
+function flushObjAccT: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('INSERT INTO ObjAccT')
+    .append('(')
+    .append('   typeOwn')
+    .append('  ,cOwner ')
+    .append('  ,typeObj')
+    .append('  ,cObject')
+    .append('  ,kindRec')
+    .append('  ,numSort')
+    .append('  ,condRec')
+    .append('  ,cOwnerDop') // ссылка на настройку типа документа из алгоритма
+    .append('  ,Atl_Branch') // филиал
+    .append(')')
+    .append('SELECT')
+    .append('   TmpObjAccT.typeOwn')
+    .append('  ,TmpObjAccT.cOwner ')
+    .append('  ,TmpObjAccT.typeObj')
+    .append('  ,TmpObjAccT.cObject')
+    .append('  ,1')
+    .append('  ,#COMP(100000)')
+    .append('  ,1')
+    .append('  ,cTypeDoc')
+    .append('  ,#_COMP(GetCurrentBranch)')
+    .append('FROM')
+    .append('  TmpObjAccT');
+
+    #_execDirect_objS_
+}
+
+function flushMnAnal: integer;
+{
+   #_new_objS_
+
+   var i: integer;
+
+   objS
+    .append('INSERT INTO MnAnal')
+    .append('(')
+    .append('  cSloj')
+    .append(' ,cBlock')
+    .append(' ,atl_Branch')
+    .append(' ,fldAn1')
+    .append(' ,fldAn2')
+    .append(' ,fldAn3')
+    .append(' ,fldAn4')
+    .append(' ,fldAn5')
+    .append(' ,fldAn6')
+    .append(' ,fldAn7')
+    .append(' ,fldAn8')
+    .append(' ,fldAn9')
+    .append(' ,fldAn10')
+    .append(')')
+    .append('SELECT DISTINCT ')
+    .append('  #CSLOJ')
+    .append(' ,#COMP(0)')
+    .append(' ,#_COMP(GetCurrentBranch)')
+    for (i := 1; i <= 10; i++)
+     {
+        objS.append(if (i = SpSloj.Npp, ',TmpSpObjAcc.cPeriod', ',#COMP(0)'))
+     }
+   objS
+    .append('FROM')
+    .append('  TmpSpObjAcc')
+    .append('WHERE')
+    .append('  NOT EXISTS')
+    .append('   (')
+    .append('     SELECT')
+    .append('       MnAnal.Nrec')
+    .append('     FROM')
+    .append('       MnAnal')
+    .append('     WHERE')
+    .append('       MnAnal.cSloj = #CSLOJ AND')
+    .append('       MnAnal.cBlock = #COMP(0) AND')
+    for (i := 1; i <= 10; i++)
+     {
+        objS.append('       MnAnal.fldAn' + i + ' = ' + if (i = SpSloj.Npp, 'TmpSpObjAcc.cPeriod', '#COMP(0)') +
+                    if (i = 10, '', ' AND')
+                    )
+     }
+   objS
+    .append('   )')
+
+   #_execDirect_objS_
+
+}
+
+function flushSpMnPlan: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('INSERT INTO SpMnPlan')
+    .append('(')
+    .append('   lastTime')
+    .append('  ,lastDate')
+    .append('  ,lastUser')
+    .append('  ,atl_Branch')
+    .append('  ,cMnPlan')
+    .append('  ,cIzd')
+    .append('  ,typeIzd')
+    .append('  ,number')
+    .append('  ,cStatus')
+    .append('  ,cRoleAn1')
+    .append('  ,cRoleAn2')
+    .append('  ,cRoleAn3')
+    .append('  ,wKodGr1')
+    .append('  ,wKodGr2')
+    .append('  ,wKodGr3')
+    .append('  ,cSloj')
+    .append('  ,edTime')
+    .append('  ,cRoleIzd')
+    .append('  ,startDate')
+    .append('  ,endDate')
+    .append('  ,numSort')
+    .append('  ,cOtpEd')
+    .append(')')
+    .append('SELECT')
+    .append('   CURTIME')
+    .append('  ,CURDATE')
+    .append('  ,#USERNAME')
+    .append('  ,#_COMP(GetCurrentBranch)')
+    .append('  ,#MNPLANNREC')
+    .append('  ,TmpSpMnPlan.cIzd')
+    .append('  ,TmpSpMnPlan.TypeIzd')
+    .append('  ,SUBSTRING(''00000'' + (CAST(TmpSpMnPlan.id AS STRING)), LENGTH(''00000'' + (CAST(TmpSpMnPlan.id AS STRING))) - 4, 5)')
+    .append('  ,#_COMP(pi_SetPl.getKatNotesNRecSpMnplan())')
+    .append('  ,#_COMP(pi_SetPl.getKatRoleNRecSp(1))')
+    .append('  ,#_COMP(pi_SetPl.getKatRoleNRecSp(2))')
+    .append('  ,#_COMP(pi_SetPl.getKatRoleNRecSp(3))')
+    .append('  ,#_WORD(pi_setPl.getLinkTblSp(1))')
+    .append('  ,#_WORD(pi_setPl.getLinkTblSp(2))')
+    .append('  ,#_WORD(pi_setPl.getLinkTblSp(3))')
+    .append('  ,#CSLOJ')
+    .append('  ,#_WORD(xHour)')
+    .append('  ,#_COMP(pi_SetPl.GetKatRoleNRecObj(word(1)))')
+    .append('  ,#_DATE(MnPlan.StartDate)')
+    .append('  ,#_DATE(MnPlan.EndDate)')
+    .append('  ,COMP(TmpSpMnPlan.Id)')
+    .append('  ,COALESCE(KatOtpEd.Nrec, #COMP(0))')
+    .append('FROM')
+    .append('  TmpSpMnPlan')
+    .append('LEFT JOIN KatOtpEd ON')
+    .append('(')
+    .append('  TmpSpMnPlan.typeIzd = KatOtpEd.PrMc AND')
+    .append('  TmpSpMnPlan.cIzd    = KatOtpEd.cMcUsl AND')
+    .append('  1 = KatOtpEd.Akt')
+    .append(')')
+
+    #_execDirect_objS_
+}
+
+function flushSpMnPl: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('INSERT INTO SpMnPl')
+    .append('(')
+    .append('   lastTime')
+    .append('  ,lastDate')
+    .append('  ,lastUser')
+    .append('  ,atl_Branch')
+    .append('  ,cMnPlan')
+    .append('  ,cIzd')
+    .append('  ,typeIzd')
+    .append('  ,number')
+    .append('  ,cRoleAn1')
+    .append('  ,cRoleAn2')
+    .append('  ,cRoleAn3')
+    .append('  ,wKodGr1')
+    .append('  ,wKodGr2')
+    .append('  ,wKodGr3')
+    .append('  ,cSloj')
+    .append('  ,cStatus')
+    .append('  ,cOtpEd')
+    .append('  ,edTime')
+    .append('  ,numSort')
+    .append('  ,cSpMnPlan')
+    .append('  ,typeEd')
+    .append('  ,cRoleIzd')
+
+    .append('  ,cRoleAn4')
+    .append('  ,wKodGr4')
+    .append('  ,cAnVal4')
+    .append('  ,startDate')
+    .append('  ,endDate')
+    .append('  ,cMnAnal')
+    .append('  ,wKolAn')
+
+    .append(')')
+    .append('SELECT')
+    .append('   CURTIME')
+    .append('  ,CURDATE')
+    .append('  ,#USERNAME')
+    .append('  ,#_COMP(GetCurrentBranch)')
+    .append('  ,SpMnPlan.cMnPlan')
+    .append('  ,SpMnPlan.cIzd')
+    .append('  ,SpMnPlan.typeIzd')
+    .append('  ,SpMnPlan.number')
+    .append('  ,SpMnPlan.cRoleAn1')
+    .append('  ,SpMnPlan.cRoleAn2')
+    .append('  ,SpMnPlan.cRoleAn3')
+    .append('  ,SpMnPlan.wKodGr1')
+    .append('  ,SpMnPlan.wKodGr2')
+    .append('  ,SpMnPlan.wKodGr3')
+    .append('  ,SpMnPlan.cSloj')
+    .append('  ,SpMnPlan.cStatus')
+    .append('  ,SpMnPlan.cOtpEd')
+    .append('  ,SpMnPlan.edTime')
+    .append('  ,SpMnPlan.numSort')
+    .append('  ,SpMnPlan.nrec')
+    .append('  ,SpMnPlan.typeEd')
+    .append('  ,SpMnPlan.cRoleIzd')
+    .append('  ,TmpSpMnPl.cRoleAn4')
+    .append('  ,TmpSpMnPl.wKodGr4')
+    .append('  ,TmpSpMnPl.cAnVal4')
+    .append('  ,TmpSpMnPl.startDate')
+    .append('  ,TmpSpMnPl.endDate')
+    .append('  ,MnAnal.Nrec')
+    .append('  ,#WKOLAN')
+    .append('FROM')
+    .append('  TmpSpMnPl')
+    .append('JOIN SpMnPlan ON')
+    .append('(')
+    .append('   TmpSpMnPl.cSpMnPlan = SpMnPlan.Nrec')
+    .append(')')
+    .append('JOIN MnAnal ON')
+    .append('(')
+    .append('   SpMnPlan.cSloj = MnAnal.cSloj AND')
+    .append('   #COMP(0) = MnAnal.cBlock AND')
+
+    var i : integer;
+    for (i := 1; i <= 10; i++)
+     {
+        objS.append(if (i = SpSloj.Npp, '   TmpSpMnPl.cAnVal4', '   #COMP(0)') +
+                    ' = MnAnal.fldAn' + i + if (i = 10, '', ' AND')
+                    )
+     }
+
+   objS
+    .append(')')
+
+   #_execDirect_objS_
+}
+
+// вызывать обязательно в последнюю очередь!
+function flushValSpMnP: integer;
+{
+   #_new_objS_
+
+   objS
+    .append('INSERT INTO ValSpMnP')
+    .append('(')
+    .append('   lastTime')
+    .append('  ,lastDate')
+    .append('  ,lastUser')
+    .append('  ,atl_Branch')
+    .append('  ,cSpMnPl')
+    .append('  ,num')
+    .append('  ,cOtpEd')
+    .append('  ,edTime')
+    .append('  ,#DEMANDFLD')
+    .append('  ,#SUPPLYFLD')
+    .append('  ,#DEMANDTYPEFLD')
+    .append('  ,#SUPPLYTYPEFLD')
+    .append(')')
+    .append('SELECT')
+    .append('   CURTIME')
+    .append('  ,CURDATE')
+    .append('  ,#USERNAME')
+    .append('  ,#_COMP(GetCurrentBranch)')
+    .append('  ,SpMnPl.Nrec')
+    .append('  ,1')
+    .append('  ,SpMnPl.cOtpEd')
+    .append('  ,SpMnPl.edTime')
+    .append('  ,COALESCE(InPos.kol, 0)')
+    .append('  ,COALESCE(OutPos.kol, 0)')
+    .append('  ,#_WORD(pi_SetPl.getTypeFieldVidWayAccou(oi_customizer.getNumDemandFld()))')
+    .append('  ,#_WORD(pi_SetPl.getTypeFieldVidWayAccou(oi_customizer.getNumSupplyFld()))')
+    .append('FROM')
+    .append('  TmpSpMnPl')
+    .append('JOIN SpMnPl ON')
+    .append('(')
+    .append('   TmpSpMnPl.cSpMnPlan = SpMnPl.cSpMnPlan AND')
+    .append('   #WKOLAN             = SpMnPl.wKolAn AND')
+    .append('   TmpSpMnPl.wKodGr4   = SpMnPl.wKodGr4 AND')
+    .append('   TmpSpMnPl.cAnVal4   = SpMnPl.cAnVal4')
+    .append(')')
+    .append('LEFT JOIN')
+    .append('   (SELECT')
+    .append('      SpObjAcc.cObject AS nrec ')
+    .append('     ,SUM(SpObjAcc.kolcPos) AS kol')
+    .append('    FROM')
+    .append('      SpObjAcc')
+    .append('     ,SpMnPl')
+    .append('    WHERE')
+    .append('      mpGetTypeSpec(#MNPLANTYPE) = SpObjAcc.typeObj AND')
+    .append('      SpMnPl.Nrec = SpObjAcc.cObject AND')
+    .append('      1 = SpObjAcc.typeHier')
+    .append('    GROUP BY SpObjAcc.cObject')
+    .append('    ) AS InPos ON')
+    .append('(')
+    .append('   SpMnPl.Nrec = InPos.nrec ')
+    .append(')')
+    .append('LEFT JOIN')
+    .append('   (SELECT')
+    .append('      SpObjAcc.cPos AS nrec ')
+    .append('     ,SUM(SpObjAcc.kolcPos) AS kol')
+    .append('    FROM')
+    .append('      SpObjAcc')
+    .append('     ,SpMnPl ')
+    .append('    WHERE')
+    .append('      mpGetTypeSpec(#MNPLANTYPE) = SpObjAcc.typePos AND')
+    .append('      SpMnPl.Nrec = SpObjAcc.cPos AND')
+    .append('      1 = SpObjAcc.typeHier')
+    .append('    GROUP BY SpObjAcc.cPos')
+    .append('    ) AS OutPos ON')
+    .append('(')
+    .append('   SpMnPl.Nrec = OutPos.nrec ')
+    .append(')')
+
+   #_execDirect_objS_
+
+}
+
+function flushSpObjAccOnHier(p_wHier: word): integer;
+{
+   #_new_objS_
+
+   objS
+    .append('INSERT INTO SpObjAcc')
+    .append('(')
+    .append('   atl_Branch')
+    .append('  ,typePos')
+    .append('  ,typeObj')
+    .append('  ,cPos')
+    .append('  ,cObject')
+    .append('  ,typeHier')
+    .append('  ,typeNorm')
+    .append('  ,cOtpEd')
+    .append('  ,kolcPos')
+    .append('  ,startDate')
+    .append('  ,cObjAccT')
+    .append('  ,cSpObjAcc')
+    .append('  ,kindRec')
+    .append('  ,dOpr')
+    .append('  ,NumSort')
+    .append(')')
+    .append('SELECT')
+    .append('  #_COMP(GetCurrentBranch)')
+    .append(' ,TmpSpObjAcc.typePos ')
+    .append(' ,TmpSpObjAcc.typeObj ')
+    .append(' ,TmpSpObjAcc.cPos')
+    .append(' ,TmpSpObjAcc.cObject')
+    .append(' ,TmpSpObjAcc.typeHier')
+    .append(' ,TmpSpObjAcc.typeNorm')
+    .append(' ,COALESCE(KatOtpEd.Nrec, #COMP(0))')
+    .append(' ,TmpSpObjAcc.kolcPos')
+    .append(' ,TmpSpObjAcc.startDate')
+    .append(' ,TmpSpObjAcc.cObjAccT')
+    .append(' ,TmpSpObjAcc.cSpObjAcc')
+    .append(' ,1')
+    .append(' ,TmpSpObjAcc.expDate')
+    .append(' ,#COMP(100000)')
+    .append('FROM')
+    .append('  TmpSpObjAcc')
+    .append('LEFT JOIN KatOtpEd ON')
+    .append('(')
+    .append('  TmpSpObjAcc.tProduct = KatOtpEd.PrMc AND')
+    .append('  TmpSpObjAcc.cProduct = KatOtpEd.cmcUsl AND')
+    .append('  1 = KatOtpEd.Akt')
+    .append(')')
+    .append('WHERE')
+    .append('  TmpSpObjAcc.TypeHier = #_WORD(p_wHier) AND')
+    .append('  TmpSpObjAcc.NewRec = 1 ')
+    //.append('AND  TmpSpObjAcc.cPeriod <> #COMP(0)')
+
+   #_execDirect_objS_
+}
+
+function deleteObjAccT(_cMnPlan: comp; _wTypePlan: word; p_wDirect: word): integer;
+{
+   #_new_objS_
+
+   objS
+    .append('DELETE ObjAccT')
+    .append('WHERE')
+   if (p_wDirect = INPUT_DOC)
+    {
+      objS
+        .append('  ObjAccT.typeOwn = #_WORD(_wTypePlan) AND')
+        .append('  ObjAccT.cOwner  = #_COMP(_cMnPlan) AND')
+        .append('  ObjAccT.kindRec = 1 ')
+    }
+   else
+    {
+      objS
+        .append('  ObjAccT.typeObj = #_WORD(_wTypePlan) AND')
+        .append('  ObjAccT.cObject = #_COMP(_cMnPlan) AND')
+        .append('  ObjAccT.kindRec = 1 ')
+    }
+
+   #_execDirect_objS_
+}
+
+function executeBatch(p_query: IQuery): integer;
+{
+  var vRowCount : longint;
+
+  do
+  {
+     vRowCount := p_query.execute().RowCount;
+
+     if ((result := p_query.ErrorCode) != tsOk)
+        Exit;
+
+  }
+  while ( vRowCount > 0 )
+
+  result := tsOk;
+
+}
+
+function batchDeleteSpObjAcc(_cMnPlan: comp; _wTypePlan: word; p_wDirect: word) : integer;
+{
+  var oi_query : IQuery;
+
+  oi_query := queryManager.createQuery(qrDelete_SpObjAcc)
+                              .setMacro('cMnPlanNrec',' #_COMP(_cMnPlan)')
+                              .setMacro('wTypePlan',' #_WORD(_wTypePlan)');
+
+  if (p_wDirect = INPUT_DOC)
+   {
+      oi_query
+       .setMacro('FldOwnerType','TypeOwn')
+       .setMacro('FldOwnerNrec','cOwner')
+   }
+  else
+   {
+      oi_query
+       .setMacro('FldOwnerType','TypeObj')
+       .setMacro('FldOwnerNrec','cObject')
+   }
+
+  result := executeBatch(oi_query);
+}
+
+function batchDeleteValSpMnP(_cMnPlan: comp; p_wKolAn: word = 0) : integer;
+{
+  var oi_query : IQuery;
+  oi_query := queryManager.createQuery(qrDelete_ValSpMnP).setMacro('cMnPlanNrec',' #_COMP(_cMnPlan)');
+
+  if (p_wKolAn != 0)
+    oi_query.setMacro('DocView_Condition',' AND #_WORD(vi_curView) = SpMnPl.wKolAn');
+  else
+    oi_query.setMacro('DocView_Condition','');
+
+  result := executeBatch(oi_query);
+}
+
+function batchDeletePropSpMn(_cMnPlan: comp; p_wKolAn: word = 0) : integer;
+{
+  var oi_query : IQuery;
+  oi_query := queryManager.createQuery(qrDelete_PropSpMn).setMacro('cMnPlanNrec',' #_COMP(_cMnPlan)');
+
+  if (p_wKolAn != 0)
+    oi_query.setMacro('DocView_Condition',' AND #_WORD(vi_curView) = SpMnPl.wKolAn');
+  else
+    oi_query.setMacro('DocView_Condition','');
+
+  result := executeBatch(oi_query);
+}
+
+function batchDeleteSpMnPl(_cMnPlan: comp; p_wKolAn: word = 0) : integer;
+{
+  var oi_query : IQuery;
+  oi_query := queryManager.createQuery(qrDelete_SpMnPl).setMacro('cMnPlanNrec',' #_COMP(_cMnPlan)');
+
+  if (p_wKolAn != 0)
+    oi_query.setMacro('DocView_Condition',' AND #_WORD(vi_curView) = SpMnPl.wKolAn');
+  else
+    oi_query.setMacro('DocView_Condition','');
+
+  result := executeBatch(oi_query);
+}
+
+function batchDeleteSpMnPlan(_cMnPlan: comp) : integer;
+{
+  var oi_query : IQuery;
+  oi_query := queryManager.createQuery(qrDelete_SpMnPlan).setMacro('cMnPlanNrec',' #_COMP(_cMnPlan)');
+  result := executeBatch(oi_query);
+}
+
+function flushAll: boolean;
+#DSQL_VARDECLARE
+{
+   result := false;
+
+   _try
+    {
+       #__begin_tran
+       #__execCRUDFunc(flushObjAccT(),#__LINE__);
+       #__execCRUDFunc(flushSpMnPlan(),#__LINE__);
+       #__execCRUDFunc(flushMnAnal(),#__LINE__);
+       #__execCRUDFunc(updateTmpSpMnPl(),#__LINE__);
+       #__execCRUDFunc(flushSpMnPl(),#__LINE__);
+       #__execCRUDFunc(updateTmpSpObjAcc(),#__LINE__);
+       #__execCRUDFunc(calcExpDateTmpSpObjAcc,#__LINE__);
+       #__execCRUDFunc(setMaxExpDateTmpSpObjAcc_WhereItNull,#__LINE__);
+       #__execCRUDFunc(flushSpObjAccOnHier(0),#__LINE__);
+       #__execCRUDFunc(updateSpObjAccLink(),#__LINE__);
+       #__execCRUDFunc(flushSpObjAccOnHier(1),#__LINE__);
+       #__execCRUDFunc(flushValSpMnP(),#__LINE__);
+       #__commit(#__LINE__)
+    }
+   _except on
+    #ExDSQL:
+     {
+        #__rollback('Ошибка при сохранении данных')
+     }
+
+
+}
+
+function unBind(_cMnPlan: comp; _wTypePlan: word; p_flagInOut: word; p_bTranEnabled: boolean = true): boolean;
+#DSQL_VARDECLARE
+{
+   result := false;
+
+   _try
+    {
+       if (p_bTranEnabled)
+          #__begin_tran
+
+       if ((p_flagInOut & INPUT_DOC) != 0)
+        {
+           #__execCRUDFunc(batchDeleteSpObjAcc(_cMnPlan,_wTypePlan,INPUT_DOC),#__LINE__);
+           #__execCRUDFunc(deleteObjAccT(_cMnPlan,_wTypePlan,INPUT_DOC),#__LINE__);
+        }
+
+       if ((p_flagInOut & OUTPUT_DOC) != 0)
+        {
+           #__execCRUDFunc(batchDeleteSpObjAcc(_cMnPlan,_wTypePlan,OUTPUT_DOC),#__LINE__);
+           #__execCRUDFunc(deleteObjAccT(_cMnPlan,_wTypePlan,OUTPUT_DOC),#__LINE__);
+        }
+
+       if (p_bTranEnabled)
+          #__commit(#__LINE__)
+       else
+          result := true;
+    }
+   _except on
+    #ExDSQL:
+     {
+        if (p_bTranEnabled)
+         {
+            #__rollback('Ошибка при удалении связей')
+         }
+        else
+         {
+            #EXDSQL_MESSAGE('Ошибка при удалении связей');
+            Exit;
+         }
+     }
+    _finally
+     {
+        delete Pick where ((cPickSpMnPlanInterf == Pick.wList));
+     }
+}
+
+function processUnbindAllAndDeleteSpec(_cMnPlan: comp; _wTypePlan: word): boolean;
+#DSQL_VARDECLARE
+{
+   #__begin_tran
+   result := unBind(_cMnPlan, _wTypePlan, INPUT_DOC | OUTPUT_DOC, false);
+
+   if (not result)
+    {
+       #__rollback('Ошибка при удалении позиций');
+       Exit;
+    }
+   else
+    {
+       result := false;
+      _try
+       {
+          #__execCRUDFunc(batchDeleteValSpMnP(_cMnPlan),#__LINE__);
+          #__execCRUDFunc(batchDeletePropSpMn(_cMnPlan),#__LINE__);
+          #__execCRUDFunc(batchDeleteSpMnPl(_cMnPlan),#__LINE__);
+          #__execCRUDFunc(batchDeleteSpMnPlan(_cMnPlan),#__LINE__);
+          #__commit(#__LINE__)
+       }
+      _except on
+       #ExDSQL:
+        {
+           #__rollback('Ошибка при удалении позиций');
+        }
+    }
+}
+
+function unBindAllAndDeleteSpec(): boolean;
+{
+  result := processUnbindAllAndDeleteSpec(MnPlan.Nrec, MnPlan.TypePlan);
+}
+
+function appendRemainsDocSpec(remDoc: TMnPlan; i_remains: TypeDocRemains): boolean;
+Var
+  oi_insTbl      : InsertTblMnpl;
+  oi_gldt        : GlobData;
+  stSpMnPlan : TSpMnPlan;
+  stSpMnPl       : TSpMnPl;
+  stValSpMnP     : TValSpMnP;
+{
+
+  result := false;
+
+  if (#__errorIfObjNotGet(oi_gldt, 'GlobDataSource'))
+      Exit;
+
+  oi_insTbl  := oi_gldt.getInsertTblMnpl();
+
+  _loop tmpSaldo1
+    {
+
+    ClearAdvRecord(stSpMnPlan);
+    oi_insTbl.setDefStSpMnPlan(0, stSpMnPlan);
+
+    stSpMnPlan.cSloj    := remDoc.cSloj;
+    stSpMnPlan.Number   := NextNumStr(oi_insTbl.getLastNumSpMnPlan(remDoc.Nrec));
+    stSpMnPlan.cMnPlan  := remDoc.Nrec;
+    stSpMnPlan.TypeIzd  := toMc;
+    stSpMnPlan.cIzd     := tmpSaldo1.cMc;
+    stSpMnPlan.wKodGr1  := i_remains.getKodAn(1);
+    stSpMnPlan.wKodGr2  := i_remains.getKodAn(2);
+    stSpMnPlan.wKodGr3  := i_remains.getKodAn(3);
+    stSpMnPlan.cRoleAn1 := i_remains.getRoleAn(1);
+    stSpMnPlan.cRoleAn2 := i_remains.getRoleAn(2);
+    stSpMnPlan.cRoleAn3 := i_remains.getRoleAn(3);
+    stSpMnPlan.cAnVal1  := case(stSpMnPlan.wKodGr1;
+                                cgKau_KatPodr : tmpSaldo1.cPodr
+                               ,cgKau_KatMOL  : tmpSaldo1.cMol
+                               ,cgKau_KatParty: tmpSaldo1.cParty;
+                               0h
+                               );
+    stSpMnPlan.cAnVal2  := case(stSpMnPlan.wKodGr2;
+                                cgKau_KatPodr : tmpSaldo1.cPodr
+                               ,cgKau_KatMOL  : tmpSaldo1.cMol
+                               ,cgKau_KatParty: tmpSaldo1.cParty;
+                               0h
+                               );
+    stSpMnPlan.cAnVal3  := case(stSpMnPlan.wKodGr3;
+                                cgKau_KatPodr : tmpSaldo1.cPodr
+                               ,cgKau_KatMOL  : tmpSaldo1.cMol
+                               ,cgKau_KatParty: tmpSaldo1.cParty;
+                               0h
+                               );
+
+    if (MsgDlg::warnIfFalse(oi_insTbl.insertSpMnPlan(stSpMnPlan), 'Ошибка создания документа с остатками. SpMnPlan insert FAIL!'))
+      Exit;
+
+    //-------------------------------------------------------------------------------------------------//
+
+    ClearAdvRecord(stSpMnPl);
+    oi_insTbl.setDefStSpMnPl(0, stSpMnPl);
+
+    pi_insTbl.synchroSpMnPlBufSpMnPlan(stSpMnPlan, stSpMnPl);
+    stSpMnPl.wKolAn      :=  i_remains.getDocView();
+    pi_insTbl.pumpRoleKodGrForSpMnPl(stSpMnPl);
+    stSpMnPl.cAnVal4     :=  remDoc.Nrec;
+
+    if (MsgDlg::warnIfFalse(oi_insTbl.insertSpMnPl(stSpMnPl), 'Ошибка создания документа с остатками. SpMnPl insert FAIL!'))
+      Exit;
+
+    //--------------------------------------------------------------------------------------------------//
+
+    ClearAdvRecord(stValSpMnP);
+    oi_insTbl.setDefStValSpMnP(0, stValSpMnP);
+
+    stValSpMnP.cSpMnPl      := stSpMnPl.Nrec;
+    stValSpMnP.Num          := word(1);
+    stValSpMnP.EdTime       := xHour
+    stValSpMnp.typeField[ObjTypeDoc(i_remains).getNumQtyField()] := 1;  // всегда кол-во
+
+    #_SetFldByNum(stValSpMnP,ObjTypeDoc(i_remains).getNumQtyField(),tmpSaldo1.Kol)
+
+    if (MsgDlg::warnIfFalse(oi_insTbl.insertValSpMnP(stValSpMnP), 'Ошибка создания документа с остатками. ValSpMnP insert FAIL!'))
+      Exit;
+
+    }
+
+  result := true;
+
+}
+
+
+function createRemainsDocument(i_remains: TypeDocRemains): boolean;
+Var
+  oi_rSet        : IResultSet;
+  oi_insTbl      : InsertTblMnpl;
+  oi_gldt        : GlobData;
+  remDoc         : TMnPlan;
+  podrFilterMode : comp;
+  MOLFilterMode  : comp;
+   notGroupPodr
+  ,notGroupMOL
+  ,notGroupParty : boolean;
+{
+
+  result := false;
+
+  if (#__errorIfObjNotGet(oi_gldt, 'GlobDataSource'))
+      Exit;
+
+  oi_insTbl  := oi_gldt.getInsertTblMnpl();
+
+  oi_insTbl.GetBufMnPlan(i_remains.getRemainsDocNrec(), remDoc);
+  if (remDoc.Nrec = 0h)
+    exit;
+
+  // удалить связи и спецификацию документа с остатками
+  processUnbindAllAndDeleteSpec(remDoc.Nrec, remDoc.typePlan);
+  remDoc.startDate := MnPlan.startDate;
+
+  if (MsgDlg::warnIfFalse(oi_insTbl.UpDateMnPlan(remDoc), 'Ошибка создания документа с остатками. MnPlan update FAIL!'))
+    Exit;
+
+  // получаем будущую специю документа с остатками и записываем в Pick
+  oi_rSet := queryManager.createQuery(qrGetFutureSpecPlanSnab).setParam('typeIzd', toMc).getResultSet();
+
+  if (#__warnIfNullRef(oi_rSet,#__LINE__))
+    Exit;
+
+  if (oi_rSet.getFirst != tsOK)
+    Exit;
+
+  Delete all PickToCalcRemains;
+  do
+    {
+
+    Insert PickToCalcRemains set
+                PickToCalcRemains.wList := cgPick_MC
+               ,PickToCalcRemains.cRec  := comp(oi_rSet.row.val('cIzd'));
+
+    } While (oi_rSet.getNext = tsOk)
+
+  FreeVipInterface(oi_rSet);
+
+  podrFilterMode := MOLFilterMode := 0; // без фильтра
+
+  if (i_remains.getPodrFilter() != nullRef)
+    if (i_remains.getPodrFilter().getCount() != 0)
+      {
+      podrFilterMode := -2; // по записям из PICK
+      i_remains.getPodrFilter().insertToPick();
+      }
+
+  if (i_remains.getMOLFilter() != nullRef)
+    if (i_remains.getMOLFilter().getCount() != 0)
+      {
+      MOLFilterMode := -2; // по записям из PICK
+      i_remains.getMOLFilter().insertToPick();
+      }
+
+  // если заданы аналитики в документе с остатками, то не группируем остатки. Т.к. эти аналитики нужно заполнить
+  // false - группируем, true - нет
+  notGroupPodr  := case(cgKau_KatPodr;
+                             i_remains.getKodAn(1)
+                            ,i_remains.getKodAn(2)
+                            ,i_remains.getKodAn(3): true
+                            ;false);
+  notGroupMOL   := case(cgKau_KatMOL;
+                             i_remains.getKodAn(1)
+                            ,i_remains.getKodAn(2)
+                            ,i_remains.getKodAn(3): true
+                            ;false);
+  notGroupParty := case(cgKau_KatParty;
+                             i_remains.getKodAn(1)
+                            ,i_remains.getKodAn(2)
+                            ,i_remains.getKodAn(3): true
+                            ;false);
+
+  if (MsgDlg::warnIfFalse(Store_Init, 'Не удалось инициализировать функционал для расчета остатков!'))
+    Exit;
+
+  _try
+    {
+
+    if (i_remains.useManufRemains())
+      {
+
+      Delete all tmpSaldo1;
+      Store_TypeOstatki(false);    // исходящие остатки
+      Store_SkladProizv(1);        // пр-во
+
+      Store_Run(remDoc.startDate
+               ,comp(-2)
+               ,podrFilterMode
+               ,MOLFilterMode
+               ,comp(0)
+               ,notGroupPodr
+               ,notGroupMOL
+               ,notGroupParty
+              );
+
+      if (not appendRemainsDocSpec(remDoc, i_remains))
+        exit;
+
+      }
+
+    if (i_remains.useSkladRemains())
+      {
+
+      Delete all tmpSaldo1;
+      Store_TypeOstatki(false);    // исходящие остатки
+      Store_SkladProizv(0);        // склад
+      Store_Run(remDoc.startDate
+               ,comp(-2)
+               ,podrFilterMode
+               ,MOLFilterMode
+               ,comp(0)
+               ,notGroupPodr
+               ,notGroupMOL
+               ,notGroupParty
+              );
+
+      if (not appendRemainsDocSpec(remDoc, i_remains))
+        exit;
+
+      }
+
+    result := true;
+
+    }
+  _finally
+    {
+    Store_Done;
+    }
+
+}
+
+function createSpecAndBind(p_flagInOut: word; p_list: ObjListTypeDoc = nullRef): boolean;
+var
+  objTDoc : ObjTypeDoc;
+  #DSQL_VARDECLARE
+{
+
+  result := false;
+
+  if (not createAllTmpTables())
+     Exit;
+
+  if (p_list = nullRef)
+     p_list := ObjListTypeDoc(oi_customizer);
+
+  p_list.reset();
+
+  result := true;
+  _try
+    {
+
+    while (p_list.hasMore())
+      {
+
+      objTDoc := p_list.next();
+
+      if (objTDoc.getDirect() = DEMAND)
+        if ((p_flagInOut & INPUT_DOC) = 0)
+          continue;
+
+      if (objTDoc.getDirect() = SUPPLY)
+        if ((p_flagInOut & OUTPUT_DOC) = 0)
+          continue;
+
+      #__execCRUDFunc(insertTmpObjAccT(objTDoc),#__LINE__);
+      #__execCRUDFunc(insertTmpSpObjAcc(objTDoc),#__LINE__);
+
+      }
+
+    var oi_remains : ObjTypeDoc;
+    oi_remains := oi_customizer.newRemains();
+    if (oi_remains != nullRef)
+      {
+      StartNewVisual( vtRotateVisual, vfTimer, 'Расчет документа с остатками...', 1);
+      // создать спецификацию документа с остатками на основе данных в TmpSpObjAcc
+      if (createRemainsDocument( TypeDocRemains(oi_remains) ))
+        {
+        #__execCRUDFunc(insertTmpObjAccT(oi_remains),#__LINE__);
+        #__execCRUDFunc(insertTmpSpObjAcc(oi_remains),#__LINE__);
+        }
+
+      StopVisual( '', 0 );
+      }
+
+    #__execCRUDFunc(deleteTmpObjAccT_WithoutSpec,#__LINE__);
+    #__execCRUDFunc(insertTmpSpMnPlan,#__LINE__);
+    #__execCRUDFunc(insertTmpSpMnPl,#__LINE__);
+
+    result := flushAll();
+
+    }
+  _except on
+     #ExDSQL: #EXDSQL_MESSAGE('Ошибка при выполнении инструкции DSQL')
+  _finally
+     dropAllTmpTables();
+
+}
+
+End.
