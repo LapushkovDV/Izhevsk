@@ -1,6 +1,4 @@
-USE [Russia]
-GO
-/****** Object:  StoredProcedure [dbo].[S$BUFSPPLAM]    Script Date: 09.05.2024 5:20:17 ******/
+/****** Object:  StoredProcedure [dbo].[S$BUFSPPLAM]    Script Date: 18.05.2024 9:10:34 ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -26,7 +24,9 @@ WHILE @@FETCH_STATUS = 0
 BEGIN
                 INSERT INTO V$BUFSPPLAM (f$sRas, f$cDoc, f$tPlan, f$vidProd, f$Model, f$TPOTR, f$CPOTR, f$TIZG, f$CIZG, f$cMC, f$KIND, f$PRMAT, f$cOtpEd, f$dt, f$Kol)
                 Select bufSpPlam.*
-                FROM [dbo].[fn_bufSpPlamDay](@cMmPlam,@DataT,@sGUID) as bufSpPlam;
+                FROM [dbo].[fn_bufSpPlamDay](@cMmPlam,@DataT,@sGUID) as bufSpPlam
+--                where bufSpPlam.kol >0
+                ;
 
 FETCH NEXT FROM cur INTO @DataT;
 END;
@@ -34,4 +34,3 @@ END;
 CLOSE cur;
 DEALLOCATE cur;
 END;
-

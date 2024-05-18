@@ -1,0 +1,38 @@
+/****** Object:  UserDefinedFunction [dbo].[fn_razuzlMK]    Script Date: 14.05.2024 19:49:29 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER FUNCTION [dbo].[fn_razuzlMK]
+        (
+          @MKnrec binary(8)
+        , @dtPlan int
+        )
+RETURNS TABLE
+AS
+  RETURN
+WITH MK (ID, kindID, kodMK, CMC, Norm,CDEP,TDEP)
+AS
+(
+SELECT
+ KATMARSH.F$NREC as ID, NORMAS.F$CDOC as kindID, KATMARSH.F$SHIFR as kodMK, NORMAS.F$CRESOURCE as CMC, NORMAS.F$RASX*NORMAS.F$DNORMED AS Norm,MK_SP.F$CDEP as CDEP,MK_SP.F$TDEP as TDEP
+ FROM  T$NORMAS as NORMAS
+ join T$MARSH_SP as MK_SP  on (NORMAS.F$CMASTER = MK_SP.F$NREC)
+ join T$KATMARSH as KATMARSH  on (  MK_SP.F$CMARSH = KATMARSH.F$NREC)
+ where (NORMAS.F$TMASTER=11005   and NORMAS.F$TRESOURCE = 4 and NORMAS.F$TDOC = 24  and NORMAS.F$CDOC>0
+ AND ((NORMAS.F$DTBEG<=@dtPlan OR NORMAS.F$DTBEG IS NULL) AND (NORMAS.F$DTEND>=@dtPlan OR NORMAS.F$DTEND IS NULL)))
+ ),
+recMK (ID, kindID, kodMK, CMC, Norm,CDEP,TDEP)
+AS
+(
+SELECT ID, kindID, kodMK ,CMC, Norm,CDEP,TDEP
+ FROM  MK
+ where (MK.ID = @MKnrec)
+ UNION ALL
+SELECT MK.ID, MK.kindID, MK.kodMK, MK.CMC, MK.Norm,MK.CDEP,MK.TDEP
+ FROM MK
+ JOIN recMK ON (recMK.kindID = MK.ID)
+)
+SELECT *
+FROM  recMK
+
