@@ -1,4 +1,6 @@
-/****** Object:  StoredProcedure [dbo].[S$BUFSPPLAM2]    Script Date: 18.05.2024 8:54:28 ******/
+USE [Russia2]
+GO
+/****** Object:  StoredProcedure [dbo].[S$BUFSPPLAM2]    Script Date: 19.05.2024 20:50:33 ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -34,7 +36,7 @@ select
  , spmnplan.F$COTPED as cOtpEd
  , kated.F$NAME  as edName
  , case when kated.f$name  = 'шт' then 1 else kated.f$diskret end as diskret
- , coalesce(spsloj.F$CROLE,0x800000000000000)  as roleModel
+ , coalesce(spsloj.F$CROLE,0x8000000000000000)  as roleModel
  , coalesce(spsloj.F$KODGRKAU,0) as kodkaumodel
  , case coalesce(spsloj.F$NPP,0) when 1 then hashan.F$CANALIT#1#
                                  when 2 then hashan.F$CANALIT#2#
@@ -46,7 +48,7 @@ select
                                  when 8 then hashan.F$CANALIT#8#
                                  when 9 then hashan.F$CANALIT#9#
                                  when 10 then hashan.F$CANALIT#10#
-        else 0x800000000000000 end as сmodel
+        else 0x8000000000000000 end as сmodel
  , sum(valspmnp.F$KOL) as FullKol
  , case when spmnpl.F$RECOMDATE <= @DateBeg_endraspr and mnplan.F$CANVAL1 != @CVIDPROD_not_need_raspr -- по этому виду продукции на недо распределять по дням
                 then [dbo].[ymd2date]([dbo].[dtYEAR]([dbo].[ToAtlDateTime2](spmnpl.F$RECOMDATE,0)),[dbo].[dtMONTH]([dbo].[ToAtlDateTime2](spmnpl.F$RECOMDATE,0)),1)
@@ -81,7 +83,7 @@ group by
  , spmnplan.F$COTPED
  , kated.F$NAME
  , case when kated.f$name  = 'шт' then 1 else kated.f$diskret end
- , coalesce(spsloj.F$CROLE,0x800000000000000)
+ , coalesce(spsloj.F$CROLE,0x8000000000000000)
  , coalesce(spsloj.F$KODGRKAU,0)
  , case coalesce(spsloj.F$NPP,0) when 1 then hashan.F$CANALIT#1#
                                  when 2 then hashan.F$CANALIT#2#
@@ -93,7 +95,7 @@ group by
                                  when 8 then hashan.F$CANALIT#8#
                                  when 9 then hashan.F$CANALIT#9#
                                  when 10 then hashan.F$CANALIT#10#
-        else 0x800000000000000
+        else 0x8000000000000000
   end
  , case when spmnpl.F$RECOMDATE <= @DateBeg_endraspr and mnplan.F$CANVAL1 != @CVIDPROD_not_need_raspr -- по этому виду продукции на недо распределять по дням
                 then [dbo].[ymd2date]([dbo].[dtYEAR]([dbo].[ToAtlDateTime2](spmnpl.F$RECOMDATE,0)),[dbo].[dtMONTH]([dbo].[ToAtlDateTime2](spmnpl.F$RECOMDATE,0)),1)
