@@ -11,6 +11,7 @@
 const
 end;
 #include Query.vih
+#include ProtPlan_CF.vih
 #include objintpl.vin
 #include runalg_sql_createPlanProizv.vih
 
@@ -26,13 +27,15 @@ Interface runalg_sql_createPlanProizv 'Создание плана производства на основе пла
 create view
 var _logFile : string = '';
     _cMnPlan : comp;
-
+    _formPL : comp;
     _startDateRaspred
   , _EndDateRaspred : date;
 
     _STATUS_PLAN
   , _cGRAFIK
   , _CVIDPROD_not_need_raspr : comp;
+   WorkLog : oiEvnLog;
+   iprot   : oProtPlan_CF;
 
 as select
  mnplan.nrec
@@ -48,9 +51,11 @@ from
  , KatNotes
  , Grafik
  , katparty
+ , formPL
 
  where ((
                       _cMnPlan == MnPlan.nrec
+               and _formPL == formpl.nrec
               and _STATUS_PLAN == KatNotes.Nrec
                   and _cGRAFIK == GRAFIK.nrec
   and _CVIDPROD_not_need_raspr == katparty.nrec
@@ -58,9 +63,68 @@ from
 
 ;
 
+Procedure DoneInter;
+{
+ if (Not NullVipRef(WorkLog))
+  FreeVipInterface(WorkLog);
+ if (Not NullVipRef(iProt))
+  FreeVipInterface(iProt);
+}
+Procedure RunProtocol;
+{
+  Var vr_ProtPlan: type$ProtPlan;
+  Var i : longint;
+  Var stItem : rELItem;
+
+  if (WorkLog.fGetFirst <> tsOK)
+    Exit;
+
+  vr_ProtPlan.TypeOwn := Mnplan.TypePlan;
+  vr_ProtPlan.cOwner  := Mnplan.Nrec;
+  vr_ProtPlan.cFormPl := FormPl.Nrec;
+  if (iProt.ProtPlan_Ins(vr_ProtPlan) <> tsOk)
+  {
+    Message('Ошибка создания протокола расчета', Error);
+    exit;
+  }
+
+  vr_ProtPlan.StartDate := Cur_date;
+  vr_ProtPlan.StartTime := Cur_time;
+  iProt.ProtPlan_Upd(vr_ProtPlan);
+
+  iProt.ProtPlan_AddStr(vr_ProtPlan.nRec, '');
+  iProt.ProtPlan_AddStr(vr_ProtPlan.nRec, '                              ПРОТОКОЛ РАСЧЕТА');
+  iProt.ProtPlan_AddStr(vr_ProtPlan.nRec, '');
+  if (WorkLog.fGetFirst = tsOK)
+  {
+    StartNewVisual(vtRotateVisual, vfTimer + vfConfirm + vfBreak, 'Формирование протокола расчета',1);
+    Do
+    {
+      if (not NextVisual)
+        break;
+
+      stItem := WorkLog.Item();
+      for (i := 1 ; WorkLog.ItemLinesCount >= i ; i := i+1)
+      {
+       iProt.ProtPlan_AddStr(vr_ProtPlan.nRec, '  ' + WorkLog.ReadLine(i));
+      }
+    }  While (WorkLog.fGetNext = tsOK);
+    StopVisual('',0);
+
+    RunInterface('iProtPlan_RB', vr_ProtPlan.nRec, 0, '', 0, 0, 0, 0);
+  }
+}
+
+Procedure writeProtocol(txt : string);
+{
+  WorkLog.itemInsert(1, etWarrning, 1);
+  WorkLog.WriteLine(WorkLog.LineNom, txt);
+}
+
 procedure MyLog(_log : string); {
   if _logFile = '' then _logFile := GetStringParameter('Files', 'OutputFilesDirectory', 0) + 'runalg_sql_createPlanProizv_'+DateToStr(Cur_date, 'YYYYMMDD') + '_' + timetostr(Cur_time, 'HH.MM.SS') + '_' + UserName + '.log';
   logstrtofile(_logFile,DateToStr(Cur_date, 'YYYYMMDD') + '_' + timetostr(Cur_time, 'HH.MM.SS') +'| ' +_log);
+  writeProtocol(DateToStr(Cur_date, 'YYYYMMDD') + '_' + timetostr(Cur_time, 'HH.MM.SS') +'| ' +_log);
 }
 
 procedure filltddate(_guid : string); {
@@ -205,12 +269,34 @@ windowevent winSetParams;
  }
 end;
 
+Procedure StopDone; {
+  if VisualizationActive then stopvisual;
+  DoneInter;
+}
+
 function Run_real(__cMnPlan : comp) : boolean; {
   result := False;
   set _cMnPlan := __cMnPlan;
   set _logFile := '';
 
- MyLog('Старт алгоритма');
+  if (Not LoadVipRef (WorkLog, 'iEvnLog'))
+  {
+    Message('Системная ошибка! Не загружен интерфейс <iEvnLog>', Error);
+    StopDone;
+    exit;
+  }
+  WorkLog.ClearLog;
+
+  if (Not LoadVipRef (iProt, 'iProtPlan_CF'))
+  {
+    Message('Системная ошибка! Не загружен интерфейс <iProtPlan_CF>', Error);
+    StopDone;
+    exit;
+  }
+
+
+
+
  if getfirst mnplan <> tsOK then {
    mylog('if getfirst mnplan <> tsOK. exit');
    exit;
@@ -224,6 +310,7 @@ function Run_real(__cMnPlan : comp) : boolean; {
    exit;
   }
 
+ MyLog('Старт');
  set _EndDateRaspred := add_day(add_months(_startDateRaspred,4),-1);
 
 
@@ -306,18 +393,19 @@ function Run_real(__cMnPlan : comp) : boolean; {
   sqlFreeStmt(stmt);
   stmt := 0;
 /*начало BUFSPPLAM2.tPlan = 1*/
-  SetVisualheader('Вставка SPMNPLAN/ BUFSPPLAM2.sRas = '''+_guid+''' ');
+  SetVisualheader('Вставка SPMNPLAN | BUFSPPLAM2.sRas = '''+_guid+''' ');
 
   MysqlAddStr(stmt, 'insert into SPMNPLAN (CMNPLAN, STARTDATE, EDTIME, TYPEIZD, CIZD, CROLEIZD');
   MysqlAddStr(stmt, '                     ,CROLEAN1, WKODGR1,CANVAL1');
   MysqlAddStr(stmt, '                     ,CROLEAN2, WKODGR2,CANVAL2');
   MysqlAddStr(stmt, '                     ,CROLEAN3, WKODGR3,CANVAL3');
-  MysqlAddStr(stmt, '                     )                         ');
+  MysqlAddStr(stmt, '                     , cSloj)                         ');
   MysqlAddStr(stmt, 'select  distinct                               ');
   MysqlAddStr(stmt, '        MNPLAN.NREC, MNPLAN.STARTDATE, 1, BUFSPPLAM2.typeizd, BUFSPPLAM2.cIzd, #comp(400020974FA419FEh)   ');
   MysqlAddStr(stmt, '      , BUFSPPLAM2.roleVidpROD  , BUFSPPLAM2.KODKAUVidProd  , BUFSPPLAM2.cVidprod           ');
   MysqlAddStr(stmt, '      , BUFSPPLAM2.rolemodel    , BUFSPPLAM2.kodkaumodel    , BUFSPPLAM2.cmodel              ');
   MysqlAddStr(stmt, '      , BUFSPPLAM2.roleTechMarsh, BUFSPPLAM2.kodkauTechMarsh, BUFSPPLAM2.cTechMarch         ');
+  MysqlAddStr(stmt, '      , MnPlan.cSloj  ');
   MysqlAddStr(stmt, 'from BUFSPPLAM2');
   MysqlAddStr(stmt, 'JOIN MNPLAN ON MNPLAN.NREC = #comp('+string(mnplan.nrec)+')');
   MysqlAddStr(stmt, 'where BUFSPPLAM2.sRas = '''+_guid+ ''' ');
@@ -334,24 +422,27 @@ function Run_real(__cMnPlan : comp) : boolean; {
   stmt := 0;
 
   var _cDefaultGrafik : comp =  cogettune('DEFAULTGRAFIKPLAN');
-
+  SetVisualheader('Вставка SPMNPL | BUFSPPLAM2.sRas = '''+_guid+''' ');
   MysqlAddStr(stmt, 'insert into SPMNPL (    CMNPLAN, CSPMNPLAN, STARTDATE, ENDDATE,EDTIME,WKOLAN');
   MysqlAddStr(stmt, '                       ,typeizd, cizd, cotped, cRoleIzd                     ');
   MysqlAddStr(stmt, '                       ,RECOMDATE, cMnAnal                                  ');
-  MysqlAddStr(stmt, '                       ,CROLEAN1, WKODGR1,CANVAL1                           ');
-  MysqlAddStr(stmt, '                       ,CROLEAN2, WKODGR2,CANVAL2                           ');
-  MysqlAddStr(stmt, '                       ,CROLEAN3, WKODGR3,CANVAL3                           ');
+  MysqlAddStr(stmt, '                       ,CROLEAN1, WKODGR1, CANVAL1                           ');
+  MysqlAddStr(stmt, '                       ,CROLEAN2, WKODGR2, CANVAL2                           ');
+  MysqlAddStr(stmt, '                       ,CROLEAN3, WKODGR3, CANVAL3                           ');
+  MysqlAddStr(stmt, '                       ,CROLEAN4, WKODGR4, CANVAL4                           ');
   MysqlAddStr(stmt, '                       ,CROLEAN8, WKODGR8,CANVAL8                           ');
   MysqlAddStr(stmt, '                       ,CROLEAN9, WKODGR9,CANVAL9                           ');
-  MysqlAddStr(stmt, '                     )                                                      ');
-  MysqlAddStr(stmt, 'select	 MNPLAN.NREC, SPMNPLAN.NREC, BUFSPPLAM2.plandate, BUFSPPLAM2.plandate, SPMNPLAN.EDTIME,52');
+  MysqlAddStr(stmt, '                       ,cSloj)                                                      ');
+  MysqlAddStr(stmt, 'select	distinct MNPLAN.NREC, SPMNPLAN.NREC, BUFSPPLAM2.plandate, BUFSPPLAM2.plandate, SPMNPLAN.EDTIME,52');
   MysqlAddStr(stmt, '        ,SPMNPLAN.TYPEIZD , SPMNPLAN.CIZD   , BUFSPPLAM2.cOtpEd, SPMNPLAN.cRoleIzd');
   MysqlAddStr(stmt, '        ,BUFSPPLAM2.plandate, MnAnal.Nrec                             ');
   MysqlAddStr(stmt, '        ,SPMNPLAN.CROLEAN1, SPMNPLAN.WKODGR1, SPMNPLAN.CANVAL1                                                              ');
   MysqlAddStr(stmt, '        ,SPMNPLAN.CROLEAN2, SPMNPLAN.WKODGR2, SPMNPLAN.CANVAL2                                                              ');
   MysqlAddStr(stmt, '        ,SPMNPLAN.CROLEAN3, SPMNPLAN.WKODGR3, SPMNPLAN.CANVAL3                                                              ');
+  MysqlAddStr(stmt, '        ,#comp(400054F07BE14D49h), 27, SpGraf.nrec                                                                          ');
   MysqlAddStr(stmt, '        ,SPMNPLAN.CROLEAN4, SPMNPLAN.WKODGR4, SPMNPLAN.CANVAL4                                                              ');
   MysqlAddStr(stmt, '        ,SPMNPLAN.CROLEAN5, SPMNPLAN.WKODGR5, SPMNPLAN.CANVAL5                                                              ');
+  MysqlAddStr(stmt, '      , MnPlan.cSloj  ');
   MysqlAddStr(stmt, 'from MNPLAN                                                                                                             ');
   MysqlAddStr(stmt, 'join SPMNPLAN on SPMNPLAN.CMNPLAN = MNPLAN.NREC                                                                             ');
   MysqlAddStr(stmt, 'join BUFSPPLAM2 on  ');
@@ -386,7 +477,7 @@ function Run_real(__cMnPlan : comp) : boolean; {
   sqlFreeStmt(stmt);
   stmt := 0;
 
-
+  SetVisualheader('Вставка VALSPMNP | BUFSPPLAM2.sRas = '''+_guid+''' ');
   MysqlAddStr(stmt, 'Insert into valspmnp (CSPMNPL, num, EDTIME, KOL, TYPEFIELD[1], TYPEFIELD[2], TYPEFIELD[3], TYPEFIELD[4], TYPEFIELD[5]');
   MysqlAddStr(stmt, '                      , TYPEFIELD[6],TYPEFIELD[7], TYPEFIELD[8], TYPEFIELD[9], TYPEFIELD[10], TYPEFIELD[11], TYPEFIELD[12]');
   MysqlAddStr(stmt, '                      , TYPEFIELD[13], TYPEFIELD[14],COTPED)');
@@ -399,6 +490,7 @@ function Run_real(__cMnPlan : comp) : boolean; {
   MysqlAddStr(stmt, '    and SPMNPLAN.CANVAL1 = BUFSPPLAM2.cVidprod');
   MysqlAddStr(stmt, '    and SPMNPLAN.CANVAL2 = BUFSPPLAM2.cmodel      ');
   MysqlAddStr(stmt, '    and SPMNPLAN.CANVAL3 = BUFSPPLAM2.cTechMarch');
+  MysqlAddStr(stmt, '    and spmnpl.startdate = BUFSPPLAM2.plandate');
   MysqlAddStr(stmt, 'where MNPLAN.NREC = #comp('+String(mnplan.nrec)+') ');
   MysqlAddStr(stmt, '       and BUFSPPLAM2.sRas = '''+_guid+ ''' ');
 
@@ -432,7 +524,7 @@ function Run_real(__cMnPlan : comp) : boolean; {
   SetVisualheader('Очищение временных данных');
   MyLog('Старт. Очищение временных данных');
   stmt := sqlAllocStmt;
-  sql_str := 'delete from BUFSPPLAM2 where sRas = '''+_guid+ ''' ';
+//  sql_str := 'delete from BUFSPPLAM2 where sRas = '''+_guid+ ''' ';
 //  message(sql_str);
   MyLog('выполнение запроса '+sql_str);
   sqlPrepare(stmt, sql_str);
@@ -447,11 +539,14 @@ function Run_real(__cMnPlan : comp) : boolean; {
   stmt := 0;
 
   MyLog('Окончание. Очищение временных данных');
+  MyLog('Конец. Успешно!');
   if VisualizationActive then stopvisual;
   result := true;
 }
-procedure Run(__cMnPlan : comp); {
+procedure Run(__cMnPlan : comp; __formPL : comp); {
 
+  set _formPL := __formPL;
+  if getfirst formpl <> tsOK {exit;}
   if run_real(__cMnPlan) {
       if VisualizationActive then stopvisual;
     Message('Выполнение алгоритма успешно');
@@ -461,7 +556,9 @@ procedure Run(__cMnPlan : comp); {
     Message('При выполнении алгоритма возникли ошибки',error);
   }
   if VisualizationActive then stopvisual;
-  ProcessText(_logFile, vfEscable or vfNewTitle or vfMacroSize, 'Протокол');
+  //ProcessText(_logFile, vfEscable or vfNewTitle or vfMacroSize, 'Протокол');
+  RunProtocol;
+  DoneInter;
 }
 handleevent
 cmpick: {
