@@ -23,10 +23,27 @@ table struct tMcOrgPodrClaim (
   , ZakazNumber  : string
   , zakazDate    : date
   , KolZakaz     : double
-  , KolZakazAvto : double
+  , KolZakazOst  : double
+  , ZakazNumberAvto : string
 )
 with index (
- ind0 = cmc + corg + ZakazNumber
+  ind0 = cmc + corg + ZakazNumberAvto
+ ,ind1 = cmc + corg + zakazDate
+)
+;
+table struct tMcOrgPodrClaimDistr (
+    cmc          : comp
+  , corg         : comp
+  , cpodr        : comp
+  , ZakazNumber  : string
+  , ZakazNumberAvto : string
+  , PlanDate     : date
+  , ZakazDate    : date
+  , Kol          : double
+)
+with index (
+  ind0 = cmc + corg + ZakazNumber
+ ,ind1 = cmc + corg + PlanDate
 )
 ;
 table struct tColumn (
@@ -91,6 +108,32 @@ table struct tMcOrgPodrPlanKol (
 with index (
  ind0 = cmc + corg
 );
+table struct tMcOrgPodrPlanKolAll (
+    cmc      : comp
+  , corg     : comp
+  , cpodr    : comp
+  , planDate : date
+  , Plankol  : double
+  , DistrKol : double
+)
+with index (
+   ind0 = cmc + corg + planDate
+ , ind1 = planDate
+);
+
+
+table struct tTree (
+     ID       : comp
+   , UPPER_ID : comp
+   , vString  : string
+   , vDate    : date
+   , vDouble  : double
+)
+with index
+( ind0 = ID(unique, autoinc)
+, ind1 = UPPER_ID
+);
+
 //function getplankol(_cmc, _corg, _cpodr : comp; _date : date) : double; forward;
 create view
  var
@@ -127,21 +170,10 @@ create view
 */
 from
    MnPlan
- , SpMnPlan
- , SpMnPl
  , KatMC
- , ValSpMnP
- , spkau Model
  , KatOrg
- , KatParty
  , KatPodr
  , KatPodr KatPodr_cllaim
- , attrnam AN_MC
- , attrval AV_MC
- , spkau KodPlanPostavk
- , normas
- , Marsh_SP
- , Marsh_SP Marsh_SP_Next
 
 
  , tMcOrgPodr
@@ -152,7 +184,12 @@ from
  , tMcOrgPodrClaimAvto tMcOrgPodrClaimAvto_1
  , tMcOrgPodrPlanKol
  , tMcOrgPodrPlanKol tMcOrgPodrPlanKol_1
- , tMcOrgPodrPlanKol tMcOrgPodrPlanKol_2
+ , tTree
+ , tTree insttTree_1
+ , tMcOrgPodrPlanKolAll
+ , tMcOrgPodrPlanKolAll tMcOrgPodrPlanKolAll_1
+ , tMcOrgPodrClaimDistr
+ , tMcOrgPodrClaimDistr tMcOrgPodrClaimDistr_1
 
 
 where ((         tMcOrgPodr.cMc   == KatMc.Nrec
@@ -166,7 +203,7 @@ where ((         tMcOrgPodr.cMc   == KatMc.Nrec
 
            and tMcOrgPodrClaimAvto.cmc         == tMcOrgPodrClaim.cmc
            and tMcOrgPodrClaimAvto.corg        == tMcOrgPodrClaim.corg
-           and tMcOrgPodrClaimAvto.ZakazNumber == tMcOrgPodrClaim.ZakazNumber
+           and tMcOrgPodrClaimAvto.ZakazNumberAvto == tMcOrgPodrClaim.ZakazNumberAvto
 
            and tMcOrgPodrClaim.cpodr == KatPodr_cllaim.nrec
 
@@ -191,6 +228,9 @@ bounds byPodr      tMcOrgPodr.cpodr == tMcOrgPodrClaimAvto.cpodr (noindex)
 */
 procedure filltmpTable; {
   if _dBeg = 0 then _dBeg := to_date(01,01,2024);
+ var _filelog : string = GetStringParameter('Files','TmpFilesDirectory',0)+'Interactiverecord_'+UserName + '_'+datetostr(cur_date, 'YYYYMMDD') + TimeToStr(Cur_Time,'HHMMSS')+'.log';
+   logstrtofile(_filelog,shortstrtowin('_dBeg = ' + _dBeg));
+
  StartNewVisual(vtRotateVisual, vfBreak+vfTimer,'Он сказал поехали и махнул рукой' , 1);
  setvisualheader('Очистка временных таблиц');
  if getfirst tMcOrgPodr_1 <> tsOK {
@@ -213,25 +253,27 @@ procedure filltmpTable; {
       }
  }
  //delete all tMcOrgPodr_1;
- delete all tMcOrgPodrClaim_1;
- delete all tMcOrgPodrClaimAvto_1;
+// delete all tMcOrgPodrClaim_1;
+// delete all tMcOrgPodrClaimAvto_1;
  delete all tMcOrgPodrPlanKol_1;
  var dateBeg : date = _dBeg;
  var dateEnd : date = add_day(_dBeg,20);
-
+   logstrtofile(_filelog,shortstrtowin('dateEnd = ' + dateEnd));
 
   setvisualheader('Заполнение tMcOrgPodrClaim');
+  if getfirst tMcOrgPodrClaim_1 <> tsOK {
       _Try
       {
         sql
-        select
+        select distinct
             tspmnplan.cMc  as cmc
           , tspmnplan.corg as corg
           , tspmnplan.cPodr as cpodr
           , claim.name     as ZakazNumber
           , indent.dPlan   as zakazDate
-          , sum(claim.kol) as KolZakaz
-          , sum(SpObjAcc.kolcpos) as KolZakazAvto
+          , claim.kol      as KolZakaz
+          , claim.kol      as KolZakazOst
+          , KatZak.NomZak   as ZakazNumberAvto
         from (
          select distinct
                       SpMnPlan.cIzd    as cMC
@@ -240,9 +282,10 @@ procedure filltmpTable; {
                      ,SpMnPl.STARTDATE as startdate
                    From spmnplan
                      join spmnpl on spmnpl.cspmnplan = SpMnPlan.nrec
-                                and SpMnPl.STARTDATE >= :(dateBeg)
-                                and SpMnPl.STARTDATE <= :(dateEnd)
-
+/*
+                                    and SpMnPl.STARTDATE >= :(dateBeg)
+                                    and SpMnPl.STARTDATE <= :(dateEnd)
+*/
                   where SpMnPlan.cMnPlan = :(_cMnPlan)
         ) tspmnplan
         join katmc on katmc.nrec = tspmnplan.cmc
@@ -250,7 +293,7 @@ procedure filltmpTable; {
                 and Indent.iam = 0
                 and Indent.cOrder = tspmnplan.cPodr
                 and Indent.cPerform = tspmnplan.corg
-                and Indent.dPlan = tspmnplan.startdate
+              //  and Indent.dPlan <= tspmnplan.startdate
         join claim on Claim.cIndent = Indent.nrec
                 and Claim.prmc = 1
                 and Claim.cmcusl = tspmnplan.cmc
@@ -261,72 +304,92 @@ procedure filltmpTable; {
                          and ObjAcct.TypeOwn = 112
         left join KatZak on KatZak.nrec = ObjAcct.cowner
 
-        group by tspmnplan.cmc, indent.dPlan, claim.name, tspmnplan.corg, tspmnplan.cPodr
+//        group by tspmnplan.cmc, indent.dPlan, claim.name, tspmnplan.corg, tspmnplan.cPodr
         into tMcOrgPodrClaim_1;
       }
       _Except
       else{
       }
+    }
      setvisualheader('Заполнение tMcOrgPodrClaimAvto');
+   logstrtofile(_filelog,shortstrtowin('Заполнение tMcOrgPodrClaimAvto'));
+     if getfirst tMcOrgPodrClaimAvto_1 <> tsOK {
       _Try
       {
-          sql
-          select
-              tspmnplan.cMc   as cmc
-            , tspmnplan.corg  as corg
-            , tspmnplan.cPodr as cpodr
-            , indent.dPlan    as zakazDate
-            , claim.name      as ZakazNumber
-            , KatZak.NomZak   as ZakazNumberAvto
-            , sum(SpObjAcc.kolcpos) as KolZakazAvto
-          from (
-           select distinct
-                        SpMnPlan.cIzd    as cMC
-                       ,SpMnPlan.CANVAL2 as cOrg
-                       ,SpMnPlan.CANVAL3 as cPodr
-                       ,SpMnPl.STARTDATE as startdate
-                     From spmnplan
-                     join spmnpl on spmnpl.cspmnplan = SpMnPlan.nrec
-                             and SpMnPl.STARTDATE >= :(dateBeg)
-                             and SpMnPl.STARTDATE <= :(dateEnd)
-                  where SpMnPlan.cMnPlan = :(_cMnPlan)
-          ) tspmnplan
-          join katmc on katmc.nrec = tspmnplan.cmc
-          join Indent on Indent.itis = 1
-                  and Indent.iam = 0
-                  and Indent.cOrder = tspmnplan.cPodr
-                  and Indent.cPerform = tspmnplan.corg
-                and Indent.dPlan = tspmnplan.startdate
-          join claim on Claim.cIndent = Indent.nrec
-                  and Claim.prmc = 1
-                  and Claim.cmcusl = tspmnplan.cmc
-          join SpObjAcc on SpObjAcc.typepos = 13
-                            and SpObjAcc.typeHier = 0
-                            and SpObjAcc.cPos = claim.nrec
-          join ObjAcct on ObjAcct.nrec = SpObjAcc.cObjAcct
-                           and ObjAcct.TypeOwn = 112
-          join KatZak on KatZak.nrec = ObjAcct.cowner
-          group by tspmnplan.cmc, indent.dPlan, claim.name, tspmnplan.corg, tspmnplan.cPodr,KatZak.NomZak
+         sql
+           select
+               t.cMc
+             , t.corg
+             , t.cPodr
+             , t.zakazDate
+             , '' as ZakazNumber
+             , t.ZakazNumberAvto
+             , sum(SpObjAcc.kolcpos) as KolZakazAvto
+           from
+            (
+                      select distinct
+                          tspmnplan.cMc   as cmc
+                        , tspmnplan.corg  as corg
+                        , tspmnplan.cPodr as cpodr
+                        , indent.dPlan    as zakazDate
+                        , claim.nrec      as claimnrec
+                        , KatZak.NomZak   as ZakazNumberAvto
+                        , SpObjAcc.nrec   as SpObjAccNrec
+                        //, sum(SpObjAcc.kolcpos) as KolZakazAvto
+                      from (
+                       select distinct
+                                    SpMnPlan.cIzd    as cMC
+                                   ,SpMnPlan.CANVAL2 as cOrg
+                                   ,SpMnPlan.CANVAL3 as cPodr
+                                   ,SpMnPl.STARTDATE as startdate
+                                 From spmnplan
+                                 join spmnpl on spmnpl.cspmnplan = SpMnPlan.nrec
+/*
+                                    and SpMnPl.STARTDATE >= :(dateBeg)
+                                    and SpMnPl.STARTDATE <= :(dateEnd)
+*/
+                        where SpMnPlan.cMnPlan = :(_cMnPlan)
+                      ) tspmnplan
+                      join katmc on katmc.nrec = tspmnplan.cmc
+                      join Indent on Indent.itis = 1
+                              and Indent.iam = 0
+                              and Indent.cOrder = tspmnplan.cPodr
+                              and Indent.cPerform = tspmnplan.corg
+                         //   and Indent.dPlan <= tspmnplan.startdate
+                      join claim on Claim.cIndent = Indent.nrec
+                              and Claim.prmc = 1
+                              and Claim.cmcusl = tspmnplan.cmc
+                      join SpObjAcc on SpObjAcc.typepos = 13
+                                        and SpObjAcc.typeHier = 0
+                                        and SpObjAcc.cPos = claim.nrec
+                      join ObjAcct on ObjAcct.nrec = SpObjAcc.cObjAcct
+                                       and ObjAcct.TypeOwn = 112
+                      join KatZak on KatZak.nrec = ObjAcct.cowner
+//                      where katmc.barkod = '8450054103'
+            //          and KatZak.NomZak = 'A0000003666'
+            ) t
+            join SpObjAcc on SpObjAcc.nrec = t.SpObjAccNrec
+            group by t.cMc, t.corg, t.cPodr, t.zakazDate, t.ZakazNumberAvto
         into tMcOrgPodrClaimAvto_1;
       }
       _Except
       else{
       }
-
+     }
   setvisualheader('Заполнение tMcOrgPodrPlanKol');
-
+   logstrtofile(_filelog,shortstrtowin('Заполнение tMcOrgPodrPlanKol'));
   var dateBeg1 : date = add_day(dateBeg,1);
 #declare setprop(npp)
 cfsSetProp('c_BRPLANVALUE_TMCORGPODRPLANKOL.VALUE#npp_Поле_#npp',cfpTitle,datetostr(dateBeg#npp,'DD.MM.YYYY'));
 #end
-  var dateBeg2 : date = add_day(dateBeg,2);
-  var dateBeg3 : date = add_day(dateBeg,3);
-  var dateBeg4 : date = add_day(dateBeg,4);
-  var dateBeg5 : date = add_day(dateBeg,5);
-  var dateBeg6 : date = add_day(dateBeg,6);
-  var dateBeg7 : date = add_day(dateBeg,7);
-  var dateBeg8 : date = add_day(dateBeg,8);
-  var dateBeg9 : date = add_day(dateBeg,9);
+  var dateBeg2  : date = add_day(dateBeg,2);
+  var dateBeg3  : date = add_day(dateBeg,3);
+  var dateBeg4  : date = add_day(dateBeg,4);
+  var dateBeg5  : date = add_day(dateBeg,5);
+  var dateBeg6  : date = add_day(dateBeg,6);
+  var dateBeg7  : date = add_day(dateBeg,7);
+  var dateBeg8  : date = add_day(dateBeg,8);
+  var dateBeg9  : date = add_day(dateBeg,9);
   var dateBeg10 : date = add_day(dateBeg,10);
   var dateBeg11 : date = add_day(dateBeg,11);
   var dateBeg12 : date = add_day(dateBeg,12);
@@ -417,16 +480,16 @@ cfsSetProp('c_BRPLANVALUE_TMCORGPODRPLANKOL.VALUE#npp_Поле_#npp',cfpTitle,dateto
               SpMnPlan.cIzd    as cmc
             , SpMnPlan.CANVAL2 as corg
             , SpMnPlan.CANVAL3 as cpodr
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg) then valspmnp.kol else 0 end) as Value0
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg1) then valspmnp.kol else 0 end) as Value1
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg2) then valspmnp.kol else 0 end) as Value2
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg3) then valspmnp.kol else 0 end) as Value3
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg4) then valspmnp.kol else 0 end) as Value4
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg5) then valspmnp.kol else 0 end) as Value5
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg6) then valspmnp.kol else 0 end) as Value6
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg7) then valspmnp.kol else 0 end) as Value7
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg8) then valspmnp.kol else 0 end) as Value8
-            , sum(case when SpMnPl.STARTDATE =:(dateBeg9) then valspmnp.kol else 0 end) as Value9
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg)   then valspmnp.kol else 0 end) as Value0
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg1)  then valspmnp.kol else 0 end) as Value1
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg2)  then valspmnp.kol else 0 end) as Value2
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg3)  then valspmnp.kol else 0 end) as Value3
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg4)  then valspmnp.kol else 0 end) as Value4
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg5)  then valspmnp.kol else 0 end) as Value5
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg6)  then valspmnp.kol else 0 end) as Value6
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg7)  then valspmnp.kol else 0 end) as Value7
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg8)  then valspmnp.kol else 0 end) as Value8
+            , sum(case when SpMnPl.STARTDATE =:(dateBeg9)  then valspmnp.kol else 0 end) as Value9
             , sum(case when SpMnPl.STARTDATE =:(dateBeg10) then valspmnp.kol else 0 end) as Value10
             , sum(case when SpMnPl.STARTDATE =:(dateBeg11) then valspmnp.kol else 0 end) as Value11
             , sum(case when SpMnPl.STARTDATE =:(dateBeg12) then valspmnp.kol else 0 end) as Value12
@@ -452,8 +515,8 @@ cfsSetProp('c_BRPLANVALUE_TMCORGPODRPLANKOL.VALUE#npp_Поле_#npp',cfpTitle,dateto
 */
             From spmnplan
              join spmnpl on spmnpl.cspmnplan = SpMnPlan.nrec
-                             and SpMnPl.STARTDATE >= :(dateBeg)
-                             and SpMnPl.STARTDATE <= :(dateEnd)
+                                    and SpMnPl.STARTDATE >= :(dateBeg)
+                                    and SpMnPl.STARTDATE <= :(dateEnd)
              join valspmnp on valspmnp.cspmnpl = spmnpl.nrec
            where SpMnPlan.cMnPlan = :(_cMnPlan)
           group by SpMnPlan.cIzd
@@ -463,37 +526,173 @@ cfsSetProp('c_BRPLANVALUE_TMCORGPODRPLANKOL.VALUE#npp_Поле_#npp',cfpTitle,dateto
       _Except
       else{
       }
+  setvisualheader('Заполнение tMcOrgPodrPlanKolAll');
+   logstrtofile(_filelog,shortstrtowin('Заполнение tMcOrgPodrPlanKolAll'));
+   if getfirst tMcOrgPodrPlanKolAll_1 <> tsOK {
+      _Try
+      {
+         sql
 
+          select
+              SpMnPlan.cIzd    as cmc
+            , SpMnPlan.CANVAL2 as corg
+            , SpMnPlan.CANVAL3 as cpodr
+            , SpMnPl.STARTDATE as planDate
+            , sum(valspmnp.kol) as Plankol
+            , 0 as Distrkol
+            From spmnplan
+             join spmnpl on spmnpl.cspmnplan = SpMnPlan.nrec
+             join valspmnp on valspmnp.cspmnpl = spmnpl.nrec
+          where SpMnPlan.cMnPlan = :(_cMnPlan)
+          group by SpMnPlan.cIzd
+            , SpMnPlan.CANVAL2, SpMnPlan.CANVAL3, SpMnPl.STARTDATE
+       into tMcOrgPodrPlanKolAll_1;
+       }
+          _Except
+          else{
+          }
+     }
+
+  setvisualheader('Заполнение распределения по заказам');
+   logstrtofile(_filelog,shortstrtowin('Заполнение распределения по заказам'));
+   var _i : longint = 0;
+  if getfirst tMcOrgPodrClaimDistr_1 <> tsOK {
+    logstrtofile(_filelog,shortstrtowin('if getfirst tMcOrgPodrClaimDistr_1 <> tsOK'));
+      _loop tMcOrgPodrPlanKolAll_1 ordered by tMcOrgPodrPlanKolAll_1.planDate {
+        _i++;
+        if _i mod 7137 = 0 then setvisualheader('Заполнение распределения по заказам ' + string(_i));
+
+//       logstrtofile(_filelog,shortstrtowin('_loop tMcOrgPodrPlanKolAll_1 ordered by tMcOrgPodrPlanKolAll_1.planDate {'));
+        var _needToDistribute : double = tMcOrgPodrPlanKolAll_1.Plankol;
+//       logstrtofile(_filelog,shortstrtowin('_loop tMcOrgPodrPlanKolAll_1 _needToDistribute = ' + string(_needToDistribute)));
+         if _needToDistribute <> 0
+         _loop tMcOrgPodrClaim_1 where ((tMcOrgPodrPlanKolAll_1.cmc == tMcOrgPodrClaim_1.cmc
+                                           and tMcOrgPodrPlanKolAll_1.corg == tMcOrgPodrClaim_1.corg
+                                           and tMcOrgPodrPlanKolAll_1.planDate >>= tMcOrgPodrClaim_1.zakazDate)) {
+            if _needToDistribute = 0 then continue;
+            if tMcOrgPodrClaim_1.KolZakazOst = 0 then continue;
+            if _needToDistribute <= tMcOrgPodrClaim_1.KolZakaz {
+                insert tMcOrgPodrClaimDistr_1 set
+                     tMcOrgPodrClaimDistr_1.cmc         := tMcOrgPodrPlanKolAll_1.cmc
+                   , tMcOrgPodrClaimDistr_1.corg        := tMcOrgPodrPlanKolAll_1.corg
+                   , tMcOrgPodrClaimDistr_1.planDate    := tMcOrgPodrPlanKolAll_1.planDate
+                   , tMcOrgPodrClaimDistr_1.ZakazDate   := tMcOrgPodrClaim_1.ZakazDate
+                   , tMcOrgPodrClaimDistr_1.ZakazNumber := tMcOrgPodrClaim_1.ZakazNumber
+                   , tMcOrgPodrClaimDistr_1.ZakazNumberAvto := tMcOrgPodrClaim_1.ZakazNumberAvto
+                   , tMcOrgPodrClaimDistr_1.kol         := _needToDistribute
+                 ;
+                 update current tMcOrgPodrClaim_1 set tMcOrgPodrClaim_1.KolZakazOst := tMcOrgPodrClaim_1.KolZakazOst - _needToDistribute;
+                 update current tMcOrgPodrPlanKolAll_1 set tMcOrgPodrPlanKolAll_1.Distrkol := _needToDistribute;
+                _needToDistribute := 0;
+            } else {
+                insert tMcOrgPodrClaimDistr_1 set
+                     tMcOrgPodrClaimDistr_1.cmc         := tMcOrgPodrPlanKolAll_1.cmc
+                   , tMcOrgPodrClaimDistr_1.corg        := tMcOrgPodrPlanKolAll_1.corg
+                   , tMcOrgPodrClaimDistr_1.planDate    := tMcOrgPodrPlanKolAll_1.planDate
+                   , tMcOrgPodrClaimDistr_1.ZakazDate   := tMcOrgPodrClaim_1.ZakazDate
+                   , tMcOrgPodrClaimDistr_1.ZakazNumber := tMcOrgPodrClaim_1.ZakazNumber
+                   , tMcOrgPodrClaimDistr_1.ZakazNumberAvto := tMcOrgPodrClaim_1.ZakazNumberAvto
+                   , tMcOrgPodrClaimDistr_1.kol         := tMcOrgPodrClaim_1.KolZakaz
+                 ;
+                 update current tMcOrgPodrClaim_1 set tMcOrgPodrClaim_1.KolZakazOst := 0;
+                 update current tMcOrgPodrPlanKolAll_1 set tMcOrgPodrPlanKolAll_1.Distrkol := tMcOrgPodrClaim_1.KolZakaz;
+                _needToDistribute := _needToDistribute - tMcOrgPodrClaim_1.KolZakazOst;
+            }
+        }
+      }
+  }
  if VisualizationActive then stopvisual;
-
- message('McOrgPodrClaim_1 ' +recordsintable(tntMcOrgPodrClaim_1)+ '| tMcOrgPodrClaimAvto_1 ' + recordsintable(tntMcOrgPodrClaimAvto_1)+ '| tMcOrgPodrPlanKol_1 '+recordsintable(tntMcOrgPodrPlanKol_1));
+// message('McOrgPodrClaim_1 ' +recordsintable(tntMcOrgPodrClaim_1)+ '| tMcOrgPodrClaimAvto_1 ' + recordsintable(tntMcOrgPodrClaimAvto_1)+ '| tMcOrgPodrPlanKol_1 '+recordsintable(tntMcOrgPodrPlanKol_1));
+}
+function insttTree(_vstring: string; _vdate : date; _vDouble : double; _upper_id : comp) : comp; {
+  insert insttTree_1 set
+      insttTree_1.vstring  := _vstring
+    , insttTree_1.vdate    := _vdate
+    , insttTree_1.vDouble  := _vDouble
+    , insttTree_1.upper_id := _upper_id
+   ;
+  result := insttTree_1.id
 }
 
-window winInteractiveReport 'Параметры отчета';
+function vehicleIcon: string;{
+    result := 'M_MnPlan::bmpVehicle'
+}
+
+window wintTree 'Заказы', cyan;
+ tree trtTree;
+  table tTree (tTree.UPPER_ID) ;
+
+//    closeNodeImage = vehicleIcon;
+//    listNodeImage = L;
+//    openNodeImage = vehicleIcon;
+
+  fields
+   tTree.vString  'Заказ': [10], PROTECT, nopickbutton;
+   tTree.vDate    'дата': [5], PROTECT, nopickbutton;
+   tTree.vDouble  'Количество': [5,2], PROTECT, nopickbutton;
+ end;
+end;
+windowevent wintTree ;
+cminit:{
+
+  if TreeGetFirstEx(trtTree)
+        do
+          TreeOpenNode(trtTree);
+        while TreeGetNextEx(trtTree);
+      TreeGetFirstEx(trtTree);
+  rereadrecord;
+}
+end;
+procedure filltTree;{
+  delete all insttTree_1;
+  _loop tMcOrgPodrClaimAvto {
+    var _upper_id : comp = insttTree(tMcOrgPodrClaimAvto.ZakazNumberAvto, tMcOrgPodrClaimAvto.zakazDate, tMcOrgPodrClaimAvto.KolZakazAvto, 0h);
+    _loop tMcOrgPodrClaim {
+      var _null_id : comp = insttTree(tMcOrgPodrClaim.ZakazNumber, tMcOrgPodrClaim.zakazDate, tMcOrgPodrClaim.KolZakaz, _upper_id);
+    }
+   }
+  setwindowtitle(wintTree,'Все заказы для МЦ ' + Katmc.name);
+}
+procedure Fillttreebydate(_date: date); {
+  delete all insttTree_1;
+  _loop tMcOrgPodrClaimDistr_1 where (( tMcOrgPodrPlanKol.cmc == tMcOrgPodrClaimDistr_1.cmc
+                                   and tMcOrgPodrPlanKol.corg == tMcOrgPodrClaimDistr_1.corg
+                                                    and _date == tMcOrgPodrClaimDistr_1.planDate)) {
+      var _upper_id : comp = insttTree(tMcOrgPodrClaimDistr_1.ZakazNumberAvto, tMcOrgPodrClaimDistr_1.ZakazDate, tMcOrgPodrClaimDistr_1.kol, 0h);
+      var _null_id  : comp = insttTree(tMcOrgPodrClaimDistr_1.ZakazNumber    , tMcOrgPodrClaimDistr_1.ZakazDate, tMcOrgPodrClaimDistr_1.kol, _upper_id);
+    }
+   setwindowtitle(wintTree,'Заказы, закрывающие потребность на '+datetostr(_date,'DD.MM.YYYY') + 'для МЦ ' + Katmc.name);
+}
+
+
+window winInteractiveReport 'работа с планом снабжения';
 Screen scrInteractiveReport;
-  show at (,,, 3);
+  show at (,,, 1);
+ NoTableNavigation;
   Fields
-    _needPodr : NoProtect;
+//    _needPodr : NoProtect;
     _dBeg    : NoProtect, {Font={BackColor=if(_dBeg = date(0,0,0),ColorNeed,0)}};
-    add_day(_dBeg,30) : skip;
+    add_day(_dBeg,20) : skip;
 <<'Внешняя потребность на основании плана снабжения'
-  [.] -в разрезе подразделений`
+!  [.] -в разрезе подразделений`
   Период с .@@@@@@@@@@ по .@@@@@@@@@@
 >>
 end;
 browse brtHead ('',,sci1Esc);
- show at(,4,30,10);
+// show at(,2,30,10);
+ show at(,2,30,);
 table tMcOrgPodr;
 fields
+{Font = {color = if( not isvalidall(tntMcOrgPodrClaimAvto), ColorError,0);}};
   Katmc.barkod  'МЦ баркод' headerAlign = centered:protect,[4];
   Katmc.name    'МЦ наименование' headerAlign = centered:protect,[4];
   KatOrg.name   'Изготовитель'    headerAlign = centered:protect,[4];
-  KatPodr.name  'Потребитель'     headerAlign = centered:protect,[4];
+//  KatPodr.name  'Потребитель'     headerAlign = centered:protect,[4];
 //  Model.name       'Модель'          headerAlign = centered:protect,[4];
 end;
 
 Browse brPlanValue ('',,sci1Esc);
-Show at (31,4,,10);//  alwaysShowhScroll ;//excelColumns, ,manualHScroll
+Show at (31,2,,);//  alwaysShowhScroll ;//excelColumns, ,manualHScroll
 Table tMcOrgPodr;
 Fields
   tMcOrgPodrPlanKol.value0 'Поле 0' :[8,2],Protect;  //,noAutoSize
@@ -530,7 +729,7 @@ Fields
 */
 end;// Browse brPremR#(wNum)
 
-
+/*
 browse brtMcOrgPodrClaimAvto ('',,sci1Esc);
  show at(,11,30,);
 table tMcOrgPodrClaimAvto;
@@ -549,11 +748,46 @@ fields
   tMcOrgPodrClaim.KolZakaz    'Заказ','кол-во'     headerAlign = centered:protect,[4];
   KatPodr_cllaim.name         'Потребитель'     headerAlign = centered:protect,[4];
 end;
-
+*/
 end;
 windowevent winInteractiveReport ;
 cminit:{
   filltmpTable;
+}
+cmdefault: {
+  case curtable of
+    #tMcOrgPodr: {
+       case curfield of
+          #Katmc.barkod
+        , #Katmc.name
+        , #KatOrg.name: {
+             filltTree;
+          }
+          #tMcOrgPodrPlanKol.value0  : Fillttreebydate(_dBeg)
+          #tMcOrgPodrPlanKol.value1  : Fillttreebydate(add_day(_dBeg,1))
+          #tMcOrgPodrPlanKol.value2  : Fillttreebydate(add_day(_dBeg,2))
+          #tMcOrgPodrPlanKol.value3  : Fillttreebydate(add_day(_dBeg,3))
+          #tMcOrgPodrPlanKol.value4  : Fillttreebydate(add_day(_dBeg,4))
+          #tMcOrgPodrPlanKol.value5  : Fillttreebydate(add_day(_dBeg,5))
+          #tMcOrgPodrPlanKol.value6  : Fillttreebydate(add_day(_dBeg,6))
+          #tMcOrgPodrPlanKol.value7  : Fillttreebydate(add_day(_dBeg,7))
+          #tMcOrgPodrPlanKol.value8  : Fillttreebydate(add_day(_dBeg,8))
+          #tMcOrgPodrPlanKol.value9  : Fillttreebydate(add_day(_dBeg,9))
+          #tMcOrgPodrPlanKol.value10 : Fillttreebydate(add_day(_dBeg,10))
+          #tMcOrgPodrPlanKol.value11 : Fillttreebydate(add_day(_dBeg,11))
+          #tMcOrgPodrPlanKol.value12 : Fillttreebydate(add_day(_dBeg,12))
+          #tMcOrgPodrPlanKol.value13 : Fillttreebydate(add_day(_dBeg,13))
+          #tMcOrgPodrPlanKol.value14 : Fillttreebydate(add_day(_dBeg,14))
+          #tMcOrgPodrPlanKol.value15 : Fillttreebydate(add_day(_dBeg,15))
+          #tMcOrgPodrPlanKol.value16 : Fillttreebydate(add_day(_dBeg,16))
+          #tMcOrgPodrPlanKol.value17 : Fillttreebydate(add_day(_dBeg,17))
+          #tMcOrgPodrPlanKol.value18 : Fillttreebydate(add_day(_dBeg,18))
+          #tMcOrgPodrPlanKol.value19 : Fillttreebydate(add_day(_dBeg,19))
+          #tMcOrgPodrPlanKol.value20 : Fillttreebydate(add_day(_dBeg,20))
+        end;
+        runwindowmodal(wintTree);
+      }
+  end;
 }
 end;
 /*
