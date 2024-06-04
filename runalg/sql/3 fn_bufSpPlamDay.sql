@@ -2,18 +2,16 @@ ALTER FUNCTION [dbo].[fn_bufSpPlamDay]
         (
           @cMmPlam binary(8)
         , @dtPlan int
-        , @sGUID varchar(40)
+                , @sGUID varchar(40)
         )
 RETURNS TABLE
 AS
   RETURN
-WITH SPPLAN as(
+WITH SPPLAN as
+(
 SELECT
 T$SpMnPl.F$CIZD,coalesce(T$KATMARSH.F$NREC , MK.F$NREC, NULL) as MKnrec, T$VALSPMNP.F$KOL, T$SpMnPl.F$NREC as SPnrec, T$SpMnPl.F$ENDDATE as dtEndPl
---,T$SpMnPl.F$CANVAL1 as vidProd,T$SpMnPl.F$CANVAL2 as Model
---,T$SpMnPl.F$CSPMNPLAN as vidProd, 0 as Model
-,T$SpMnPl.F$NREC as vidProd
-, 0x8000000000000000 as Model
+,T$SpMnPl.F$CANVAL1 as vidProd,T$SpMnPl.F$CANVAL2 as Model
 FROM
 T$MnPlan
 JOIN T$SpMnPl on (T$SpMnPl.F$cMnPlan = T$MnPlan.F$NREC
@@ -25,7 +23,7 @@ LEFT JOIN T$KATMARSH MK on (MK.F$COBJECT  = T$SpMnPl.F$CIZD and MK.F$ACTIVE = 1
 and (MK.F$DTBEG<=@dtPlan OR MK.F$DTBEG = 0 OR MK.F$DTBEG IS NULL) AND (MK.F$DTEND>=@dtPlan OR MK.F$DTEND=0 OR MK.F$DTEND IS NULL))
 WHERE
  T$MnPlan.f$Nrec = @cMmPlam
---T$SpMnPl.f$Nrec = 0x80010000054A3385
+
 )
 ,MK_MC as(
 SELECT
@@ -63,8 +61,7 @@ SELECT
 --?? пробить изготовителя в МК для быстродействия ??        left JOIN T$KATMARSH
         outer apply (select top 1 M_izg.F$NUM, M_izg.F$TDEP,M_izg.F$CDEP from t$Marsh_Sp as M_izg where (N.F$CDOC = M_izg.F$CMARSH ) order by M_izg.F$NUM DESC) M_i
 )
-,SP_MK as(
-SELECT
+,SP_MK as(SELECT
 t.SPnrec,fMK.kindID as MKnrec,fMK.TDEP,fMK.CDEP,fMK.Norm
 FROM SPPLAN AS t
 CROSS APPLY [dbo].[fn_razuzlMK](t.MKnrec,t.dtEndPl) AS fMK
@@ -88,7 +85,6 @@ left join SP_MK on (t.SPnrec = SP_MK.SPnrec )
 left join MK_MC on (SP_MK.MKnrec = MK_MC.MKnrec )
 
 )
-
 ,GR_SP as(
 SELECT
 N_SP.vidProd, N_SP.Model,N_SP.dtEndPl,
@@ -100,7 +96,6 @@ GROUP BY N_SP.vidProd, N_SP.Model,N_SP.dtEndPl,N_SP.KIND , N_SP.PRMAT,
 N_SP.TPOTR, N_SP.CPOTR
 ,N_SP.MCnrec,N_SP.cEd, N_SP.TIZG,N_SP.CIZG
 )
-
 SELECT
  @sGUID as sRas,
  @cMmPlam as cDoc,
