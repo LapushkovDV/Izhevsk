@@ -1,0 +1,272 @@
+#include KatMarshStruct_report.vih
+#component "M_MnPlan"
+Interface KatMarshStruct_report 'отчет о внешней потребности на основании плана снабжения';
+
+table struct tKatMarshStruct (
+    cKM   : comp
+  , tDoc  : word
+  , cDoc  : comp
+  , cNorma : comp
+  , Shifr : string
+  , CMARSH_SP : COMP
+  , cMc   : comp
+  , mcKOd : string
+  , mcName  : string
+  , KolNorm : double
+  , KolAll  : double
+  , level : word
+)
+with index (
+   ind0 = cDoc
+ , ind1 = cKM + cMc
+ , ind2 = cKM + cDoc
+)
+;
+create view
+var
+  _dismissFantom : boolean;
+  Nrow0, Nrow, column, nrowreal,column0 : longint = 0;
+  __log : string = '';
+ as select tKatMarshStruct.cKM
+from
+    tKatMarshStruct
+  ,  KATMARSH
+  , MARSH_SP
+  , NORMAS
+  , katmc
+;
+Function GenerateNewFile: string; {
+ result := GetStringParameter('Files','OutputFilesDirectory',0)+ '\kmstruct_'+DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS-SSS');
+ result := replace(result,'\\','\');
+}
+function getFileLog : string; {
+  if __log = '' then __log  := GenerateNewFile+'.log';
+  result := __log;
+}
+procedure mylog(_str : string); {
+  //exit;
+  //logstrtofile(getFileLog,_str);
+}
+
+procedure fill_tKatMarshStruct(_cDoc : comp; _date : date; _kol : double;  _level : word); {
+
+   if getfirst KATMARSH where ((_cDoc == KATMARSH.nrec)) <> tsOK then exit;
+
+
+   setvisualheader('Сбор данных ' + KATMARSH.SHIFR);
+    _loop MARSH_SP where ((_cDoc == MARSH_SP.CMARSH)) {
+      _loop NORMAS WHERE ((   11005 == NORMAS.TMASTER
+               and MARSH_SP.NREC == NORMAS.CMASTER
+                   ))
+               AND (NORMAS.DTBEG <= _date   or NORMAS.DTBEG = 0)
+               AND (NORMAS.DTEND >= _date or NORMAS.DTBEG = 0)
+               AND NORMAS.TRESOURCE = 4
+               AND NORMAS.RASX > 0
+               AND NORMAS.DNORMED > 0 {
+
+                  if getfirst katmc where ((NORMAS.CRESOURCE == katmc.nrec)) = tsOK {
+                    var _needInsert : boolean = true;
+                    if _dismissFantom and katmc.kind = 3 {
+                      _needInsert := false;
+                    }
+                    if _needInsert {
+                         if getfirst tKatMarshStruct where ((KATMARSH.NREC == tKatMarshStruct.cKM
+                                                      and NORMAS.CRESOURCE == tKatMarshStruct.cMc)) <> tsOK {
+                           Insert tKatMarshStruct set
+                              tKatMarshStruct.cKM   := KATMARSH.NREC
+                            , tKatMarshStruct.tDoc  := normas.tdoc
+                            , tKatMarshStruct.cDoc  := NORMAS.CDOC
+                            , tKatMarshStruct.ShIfr := KATMARSH.SHIFR
+                            , tKatMarshStruct.cMc   := NORMAS.CRESOURCE
+                            , tKatMarshStruct.mcKOd := katmc.barkod
+                            , tKatMarshStruct.mcName  := katmc.name
+                            , tKatMarshStruct.level := _level
+                            , tKatMarshStruct.cNorma := NORMAS.nrec
+                            , tKatMarshStruct.CMARSH_SP := MARSH_SP.NREC
+                         ;
+                         }
+                         update current tKatMarshStruct set
+                             tKatMarshStruct.KolNorm  := NORMAS.RASX*NORMAS.DNORMED
+                           , tKatMarshStruct.KolAll   := NORMAS.RASX*NORMAS.DNORMED*_kol
+                          ;
+                       pushpos(tnKATMARSH);
+                       pushpos(tnMARSH_SP);
+                       pushpos(tnNORMAS  );
+                       fill_tKatMarshStruct(tKatMarshStruct.cDoc, _date, tKatMarshStruct.KolAll, _level + 1);
+                       poppos(tnNORMAS  );
+                       poppos(tnMARSH_SP);
+                       poppos(tnKATMARSH);
+                     }
+                 }
+               }
+    }
+
+
+}
+window windismissFantom;
+show at (,,10,4);
+screen scrdismissFantom;
+ fields
+ _dismissFantom : Noprotect;
+  buttons
+    cmOK,,,;
+    cmCancel,,,;
+
+<<'Параметры отчета'
+
+  [.] - Пропускать фантомы`
+
+  <. Продолжить .>   <. Отмена .>
+>>
+end;
+end;
+windowevent windismissFantom ;
+ cmOk: {
+   closewindowex(windismissFantom, cmDefault)
+ }
+end;
+
+function CreateExcel (FExcelName : string) : boolean;
+{
+  setvisualheader('Инициализация EXCEL');
+    result := true;
+
+    DeleteFile(FExcelName);
+
+    if (not xlCreateExcel(FExcelName, true))
+    {
+      message('ОШИБКА! Не удалось инициализировать сессию Excel', Error);
+      xlKillExcel;
+      result := false;
+      exit;
+    }
+
+    if (not xlIsExcelValid)
+    {
+      message('ОШИБКА! Не удалось инициализировать сессию Excel', Error);
+      xlKillExcel;
+      result := false;
+      exit
+    }
+  var xlCount : word;
+  xlCount := 0;
+   Do
+   {
+    xlGetSheetsCount(xlCount);
+    xlDeleteSheet(xlCount);
+   } while xlCount > 1
+
+    xlSetActiveSheet(1);
+    xlSetSheetName(1, 'Потребность вненей поставки_'+UserName);
+
+}
+Procedure MyPrintMatrixToExcel;
+{
+ if nrow = 500 then
+  {
+   SetVisualheader('Формирование отчета'+
+            ''#13'' + 'Выгружено строк ' + string(nrowReal));
+   xlWritematrixToExcel(nrowReal,1);
+   xlclearMatrix;
+   nrowReal := nrowReal + nrow-1;
+   nrow := 1;
+  }
+}
+procedure printtoexcel(_cParent : comp); {
+  mylog('procedure printtoexcel _cParent = ' + string(_cParent));
+ _loop tKatMarshStruct where ((_cParent == tKatMarshStruct.cKM)) ordered by tKatMarshStruct.cdoc {
+     mylog('_loop tKatMarshStruct mcName = ' + tKatMarshStruct.mcName);
+    column := 1;
+   MyPrintMatrixToExcel;
+   Nrow++;
+   xlDoWriteToMatrix(nrow, 1, tKatMarshStruct.level);
+   var _i : byte = 0;
+   var _probel : string = '';
+   for(_i:=1; _i<= tKatMarshStruct.level; _i++) {
+    _probel := _probel + '  ';
+   }
+   xlStWriteToMatrix(nrow, 2, chr(39) + _probel+ tKatMarshStruct.mcName);
+   xlStWriteToMatrix(nrow, 3, chr(39) + tKatMarshStruct.mcKOd);
+   xlDoWriteToMatrix(nrow, 4, tKatMarshStruct.KolNorm);
+   xlDoWriteToMatrix(nrow, 5, tKatMarshStruct.KolAll );
+   if tKatMarshStruct.cdoc <> 0h {
+     pushpos(tntKatMarshStruct);
+      printtoexcel(tKatMarshStruct.cdoc);
+     poppos(tntKatMarshStruct);
+   }
+ }
+}
+procedure printreport(__cKatmarsh : comp; __date : date); {
+   if getfirst KATMARSH where ((__cKatmarsh == KATMARSH.nrec)) <> tsOK then exit;
+
+
+
+       if getfirst katmc where ((KATMARSH.cObject == katmc.nrec)) <> tsOK then exit;
+            Insert tKatMarshStruct set
+                        tKatMarshStruct.cKM   := __cKatmarsh
+                      , tKatMarshStruct.tDoc  := 0
+                      , tKatMarshStruct.cDoc  := 0
+                      , tKatMarshStruct.ShIfr := KATMARSH.SHIFR
+                      , tKatMarshStruct.cMc   := KATMARSH.cObject
+                      , tKatMarshStruct.mcKOd := katmc.barkod
+                      , tKatMarshStruct.mcName  := katmc.name
+                      , tKatMarshStruct.KolNorm  := 0
+                      , tKatMarshStruct.KolAll   := 1
+                      , tKatMarshStruct.level := 0
+                      , tKatMarshStruct.cNorma := 0h
+                   ;
+ StartNewVisual(vtRotateVisual, vfBreak+vfTimer,'Формирование отчета' , 1);
+  fill_tKatMarshStruct(__cKatmarsh,  __date, 1,  1);
+  putTableToDBF(#tKatMarshStruct, GenerateNewFile+'_tKatMarshStruct.dbf', ptfFullTable);
+ if not createexcel(GenerateNewFile + '.xlsx') then exit;
+  xlCreateMatrix(500,10);
+  nrowreal := 1;
+ Nrow := column := 1;
+   if getfirst KATMARSH where ((__cKatmarsh == KATMARSH.nrec)) <> tsOK then exit;
+   xlStWriteToMatrix(nrow, 1, 'МК: ' +KATMARSH.shifr);
+   nrow++;
+   xlStWriteToMatrix(nrow, 1, 'На дату: ' + datetostr(__date,'DD.MM.YYYY'));
+
+   nrow++;
+   xlsetcolumnwidth(8,1,1,1,1);
+   xlStWriteToMatrix(nrow, 1, 'Уровень');
+   xlsetcolumnwidth(100,1,2,1,2);
+   xlStWriteToMatrix(nrow, 2, 'Наименование');
+   xlsetcolumnwidth(15,1,3,1,3);
+   xlStWriteToMatrix(nrow, 3, 'Обозначение');
+   xlStWriteToMatrix(nrow, 4, 'Количество в узле');
+   xlStWriteToMatrix(nrow, 5, 'Количество в изделии');
+
+ mylog('0 printtoexcel' + string(__cKatmarsh,0,0));
+ printtoexcel(__cKatmarsh);
+ xlWritematrixToExcel(nrowReal,1);
+ xlKillExcel;
+if VisualizationActive then stopvisual;
+}
+procedure printreportFromFRM(__shifr, __strdate : string); {
+
+    __shifr := trim(replace(__shifr,'Обозначение маршрутной карты :','')); // Обозначение маршрутной карты : 219020Y005C7B1_20000_9900|
+    __strdate := replace(__strdate,'(состояние на дату',''); //(состояние на дату 21.06.2024)
+    __strdate := replace(__strdate,')','');
+    __strdate := trim(__strdate);
+
+   if getfirst KATMARSH where ((__shifr == KATMARSH.shifr)) <> tsOK then exit;
+
+   if runwindowmodal(windismissFantom) <> cmDefault then exit;
+   var __date : date = strtodate(__strdate,'DD.MM.YYYY');
+/*
+   message('__shifr = "'+__shifr +'"'+
+           +''#13''+'__strdate = "'+__strdate+'"'+
+          +''#13''+'__date=' + datetostr(__date,'DD.MM.YYYY'));
+*/
+   printreport(KATMARSH.nrec,__date);
+
+}
+handleevent
+cminit: {
+
+  printreport(56986,to_date(01,01,2024));
+  closeinterface(-1);
+}
+end;
+end.
