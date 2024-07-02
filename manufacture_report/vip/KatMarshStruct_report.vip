@@ -1,3 +1,5 @@
+#include oiPotrGt.vih
+
 #include KatMarshStruct_report.vih
 #component "M_MnPlan"
 Interface KatMarshStruct_report 'отчет о внешней потребности на основании плана снабжения';
@@ -14,26 +16,52 @@ table struct tKatMarshStruct (
   , mcName  : string
   , KolNorm : double
   , KolAll  : double
+  , kolpostavka : double
+  , sEd : string
   , level : word
 )
 with index (
    ind0 = cDoc
  , ind1 = cKM + cMc
  , ind2 = cKM + cDoc
+ , ind3 = cKM + level + mcKOd
 )
 ;
+table struct tFantomWas (
+    cDoc   : comp
+)
+with index (
+ ind0 = cDoc
+)
+;
+
 create view
 var
+  iKAUInfo : GetNKau;
+    iTMPotr  : oiPotrGt;
   _dismissFantom : boolean;
   Nrow0, Nrow, column, nrowreal,column0 : longint = 0;
   __log : string = '';
+  _serviceLog, _LongStringLog : tptr;
+  _DateReport : date;
+  _CMK       : comp;
+  CurDSE      : comp;  // Изделие, для которого считаем потребность
+  mdRes_Out   : comp;
  as select tKatMarshStruct.cKM
 from
     tKatMarshStruct
-  ,  KATMARSH
+  , tFantomWas
+  , KATMARSH
   , MARSH_SP
   , NORMAS
   , katmc
+  , kated
+  , katotped
+  , KatMC snKatMC
+
+ where ((
+    curDse == snKatMC.nRec
+       ))
 ;
 Function GenerateNewFile: string; {
  result := GetStringParameter('Files','OutputFilesDirectory',0)+ '\kmstruct_'+DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS-SSS');
@@ -43,12 +71,31 @@ function getFileLog : string; {
   if __log = '' then __log  := GenerateNewFile+'.log';
   result := __log;
 }
+procedure disableLog; {
+  HttpConnect_DestroyLongString(_serviceLog, _LongStringLog);
+  HttpConnect_Free(_serviceLog);
+}
+procedure enableLog; {
+   disableLog;
+  _serviceLog    := HttpConnect_CreateEx('http://ya.ru', '', '', true);
+  _LongStringLog := HttpConnect_CreateLongString(_serviceLog);
+}
+
+function GetLogFile : string; {
+
+  var _log_OUT : string = GenerateNewFile+'.log';
+  HttpConnect_SaveToFileEx(_serviceLog, _LongStringLog, _log_OUT, cpUTF8, false);
+  result := _log_OUT;
+}
+
 procedure mylog(_str : string); {
   //exit;
   //logstrtofile(getFileLog,_str);
+//  _str := DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS') + ': '+_str + ''#13'';
+  HttpConnect_AddValueToLongString(_serviceLog, _str, _LongStringLog);
 }
 
-procedure fill_tKatMarshStruct(_cDoc : comp; _date : date; _kol : double;  _level : word); {
+procedure fill_tKatMarshStruct(_cDoc, _cDocUp : comp; _date : date; _kol : double;  _level : word; _FromFantom : boolean); {
 
    if getfirst KATMARSH where ((_cDoc == KATMARSH.nrec)) <> tsOK then exit;
 
@@ -58,22 +105,25 @@ procedure fill_tKatMarshStruct(_cDoc : comp; _date : date; _kol : double;  _leve
       _loop NORMAS WHERE ((   11005 == NORMAS.TMASTER
                and MARSH_SP.NREC == NORMAS.CMASTER
                    ))
-               AND (NORMAS.DTBEG <= _date   or NORMAS.DTBEG = 0)
-               AND (NORMAS.DTEND >= _date or NORMAS.DTBEG = 0)
                AND NORMAS.TRESOURCE = 4
                AND NORMAS.RASX > 0
                AND NORMAS.DNORMED > 0 {
+
+               IF  NORMAS.DTBEG > _date then continue;
+               if  NORMAS.DTEND < _date then
+                 if NORMAS.DTEND <> to_date(0,0,0) then continue;
 
                   if getfirst katmc where ((NORMAS.CRESOURCE == katmc.nrec)) = tsOK {
                     var _needInsert : boolean = true;
                     if _dismissFantom and katmc.kind = 3 {
                       _needInsert := false;
                     }
+                    mylog('KATMARSH.SHIFR='+KATMARSH.SHIFR+'| katmc.barkod = ' + katmc.barkod + '|_date='+_date+'| NORMAS.DTBEG=' + NORMAS.DTBEG +'| NORMAS.DTEND='+ NORMAS.DTEND+ '| NORMAS.RASX='+NORMAS.RASX +'| NORMAS.DNORMED='+NORMAS.DNORMED +'| _kol=' + _kol + '| _fromFantom='+_fromFantom);
                     if _needInsert {
-                         if getfirst tKatMarshStruct where ((KATMARSH.NREC == tKatMarshStruct.cKM
+                         if getfirst tKatMarshStruct where ((_cDocUp == tKatMarshStruct.cKM
                                                       and NORMAS.CRESOURCE == tKatMarshStruct.cMc)) <> tsOK {
                            Insert tKatMarshStruct set
-                              tKatMarshStruct.cKM   := KATMARSH.NREC
+                              tKatMarshStruct.cKM   := _cDocUp
                             , tKatMarshStruct.tDoc  := normas.tdoc
                             , tKatMarshStruct.cDoc  := NORMAS.CDOC
                             , tKatMarshStruct.ShIfr := KATMARSH.SHIFR
@@ -83,20 +133,43 @@ procedure fill_tKatMarshStruct(_cDoc : comp; _date : date; _kol : double;  _leve
                             , tKatMarshStruct.level := _level
                             , tKatMarshStruct.cNorma := NORMAS.nrec
                             , tKatMarshStruct.CMARSH_SP := MARSH_SP.NREC
+                            , tKatMarshStruct.sEd :=  if( getfirst KatOtpEd where ((Normas.cEd == KatOtpEd.nRec)) = tsOK // to do уччеть коэфф пересчета единиц
+                                                         , katotped.abbr
+                                                         , if(getfirst kated where ((KatMC.cEd == kated.nrec)) = tsOK
+                                                              , kated.abbr
+                                                              ,'???'
+                                                             )
+                                                        )
                          ;
                          }
+
+                         var  _KolNorm, _KolAll : double = 0;
+                         if getfirst tFantomWas where ((_cDoc == tFantomWas.cDoc)) <> tsOK{
+                          _KolNorm := tKatMarshStruct.KolNorm;
+                          _KolAll  := tKatMarshStruct.KolAll;
+                          insert tFantomWas set tFantomWas.cDoc := _cDoc;
+                         }
+
                          update current tKatMarshStruct set
-                             tKatMarshStruct.KolNorm  := NORMAS.RASX*NORMAS.DNORMED
-                           , tKatMarshStruct.KolAll   := NORMAS.RASX*NORMAS.DNORMED*_kol
+                             tKatMarshStruct.KolNorm     :=   if(_FromFantom, _KolNorm + _kol, tKatMarshStruct.KolNorm + NORMAS.RASX*NORMAS.DNORMED)
+                           , tKatMarshStruct.KolAll      :=   if(_FromFantom, _KolAll  + _kol, tKatMarshStruct.KolAll  +   NORMAS.RASX*NORMAS.DNORMED*_kol)
+                           , tKatMarshStruct.kolPostavka := tKatMarshStruct.kolPostavka + if(_FromFantom, NORMAS.RASX*NORMAS.DNORMED,0)
                           ;
+                      }
                        pushpos(tnKATMARSH);
                        pushpos(tnMARSH_SP);
                        pushpos(tnNORMAS  );
-                       fill_tKatMarshStruct(tKatMarshStruct.cDoc, _date, tKatMarshStruct.KolAll, _level + 1);
+                       fill_tKatMarshStruct(  NORMAS.CDOC
+                                            , if(_needInsert , NORMAS.CDOC, _cDocUp) // фантомы если пропускаем, то на их уровень поднимаем все, что под ними
+                                            , _date
+                                            , if(_needInsert , tKatMarshStruct.KolAll, NORMAS.RASX*NORMAS.DNORMED)
+                                            , if(_needInsert ,_level + 1, _level)
+                                            , if(_needInsert , false, true)
+                                           );
                        poppos(tnNORMAS  );
                        poppos(tnMARSH_SP);
                        poppos(tnKATMARSH);
-                     }
+
                  }
                }
     }
@@ -107,12 +180,24 @@ window windismissFantom;
 show at (,,10,4);
 screen scrdismissFantom;
  fields
+  [FldDSE] if (CurDSE <> 0, trim(iKAUInfo.GetNKAUKod(cgKAU_KatMC, CurDSE)), '')
+          ('Выбор изделия')                               : protect, pickbutton;
+  [FldObz] if (CurDSE <> 0, snKatMC.Obozn, '')
+          ('Конструкторское обозначение')                 : protect, pickbutton;
+  [FldTM] if (_CMK <> 0, trim(iKAUInfo.GetNKAUKod(cgKAU_KatMarsh, _CMK)), '')
+          ('Название маршрутной карты')                   : protect, pickbutton;
+  _DateReport : NoProtect;
  _dismissFantom : Noprotect;
   buttons
     cmOK,,,;
     cmCancel,,,;
 
 <<'Параметры отчета'
+    `Наименование`     .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Обозначение`      .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Маршрутная карта` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  `Формировать на дату`.@@@@@@@@@@@
 
   [.] - Пропускать фантомы`
 
@@ -121,7 +206,14 @@ screen scrdismissFantom;
 end;
 end;
 windowevent windismissFantom ;
+cminit: {
+  _dismissFantom := true;
+}
  cmOk: {
+   SaveMyDSK(_CMK, #__InterfaceName__ + '_CMK');
+   SaveMyDSK(curDse, #__InterfaceName__ + '_curDse');
+   SaveMyDSK(_DateReport, #__InterfaceName__ + '_DateReport');
+
    closewindowex(windismissFantom, cmDefault)
  }
 end;
@@ -169,13 +261,13 @@ Procedure MyPrintMatrixToExcel;
    xlWritematrixToExcel(nrowReal,1);
    xlclearMatrix;
    nrowReal := nrowReal + nrow-1;
-   nrow := 1;
+   nrow := 0;
   }
 }
 procedure printtoexcel(_cParent : comp); {
-  mylog('procedure printtoexcel _cParent = ' + string(_cParent));
- _loop tKatMarshStruct where ((_cParent == tKatMarshStruct.cKM)) ordered by tKatMarshStruct.cdoc {
-     mylog('_loop tKatMarshStruct mcName = ' + tKatMarshStruct.mcName);
+//  mylog('procedure printtoexcel _cParent = ' + string(_cParent));
+ _loop tKatMarshStruct where ((_cParent == tKatMarshStruct.cKM)) ordered by tKatMarshStruct.level, tKatMarshStruct.mcKOd {
+//     mylog('_loop tKatMarshStruct mcName = ' + tKatMarshStruct.mcName);
     column := 1;
    MyPrintMatrixToExcel;
    Nrow++;
@@ -185,10 +277,14 @@ procedure printtoexcel(_cParent : comp); {
    for(_i:=1; _i<= tKatMarshStruct.level; _i++) {
     _probel := _probel + '  ';
    }
-   xlStWriteToMatrix(nrow, 2, chr(39) + _probel+ tKatMarshStruct.mcName);
-   xlStWriteToMatrix(nrow, 3, chr(39) + tKatMarshStruct.mcKOd);
+
+   xlStWriteToMatrix(nrow, 2, chr(39) + tKatMarshStruct.mcKOd);
+   xlStWriteToMatrix(nrow, 3, chr(39) + _probel+ tKatMarshStruct.mcName);
    xlDoWriteToMatrix(nrow, 4, tKatMarshStruct.KolNorm);
    xlDoWriteToMatrix(nrow, 5, tKatMarshStruct.KolAll );
+   xlDoWriteToMatrix(nrow, 6, tKatMarshStruct.kolPostavka);
+   xlStWriteToMatrix(nrow, 7, chr(39) +tKatMarshStruct.sEd);
+
    if tKatMarshStruct.cdoc <> 0h {
      pushpos(tntKatMarshStruct);
       printtoexcel(tKatMarshStruct.cdoc);
@@ -197,6 +293,7 @@ procedure printtoexcel(_cParent : comp); {
  }
 }
 procedure printreport(__cKatmarsh : comp; __date : date); {
+  enableLog;
    if getfirst KATMARSH where ((__cKatmarsh == KATMARSH.nrec)) <> tsOK then exit;
 
 
@@ -216,31 +313,57 @@ procedure printreport(__cKatmarsh : comp; __date : date); {
                       , tKatMarshStruct.cNorma := 0h
                    ;
  StartNewVisual(vtRotateVisual, vfBreak+vfTimer,'Формирование отчета' , 1);
-  fill_tKatMarshStruct(__cKatmarsh,  __date, 1,  1);
+ delete all tKatMarshStruct;
+ delete all tFantomWas;
+  fill_tKatMarshStruct(__cKatmarsh, __cKatmarsh, __date, 1, 1, false);
   putTableToDBF(#tKatMarshStruct, GenerateNewFile+'_tKatMarshStruct.dbf', ptfFullTable);
  if not createexcel(GenerateNewFile + '.xlsx') then exit;
   xlCreateMatrix(500,10);
   nrowreal := 1;
  Nrow := column := 1;
    if getfirst KATMARSH where ((__cKatmarsh == KATMARSH.nrec)) <> tsOK then exit;
-   xlStWriteToMatrix(nrow, 1, 'МК: ' +KATMARSH.shifr);
-   nrow++;
-   xlStWriteToMatrix(nrow, 1, 'На дату: ' + datetostr(__date,'DD.MM.YYYY'));
 
+   xlStWriteToMatrix(nrow, 1, 'СТРУКТУРА СБОРОЧНОЙ ЕДИНИЦЫ');
+   xlmergecells(nrow,1,nrow,7);
    nrow++;
+   xlStWriteToMatrix(nrow, 1, '(состояние на дату '+datetostr(__date,'DD.MM.YYYY')+')');
+   xlmergecells(nrow,1,nrow,7);
+   nrow++;
+   xlStWriteToMatrix(nrow, 1, 'Название маршрутной карты    :'+ KATMARSH.name           );
+   xlmergecells(nrow,1,nrow,7);
+   nrow++;
+   xlStWriteToMatrix(nrow, 1, 'Обозначение маршрутной карты :'+ KATMARSH.shifr          );
+   xlmergecells(nrow,1,nrow,7);
+   nrow++;
+
    xlsetcolumnwidth(8,1,1,1,1);
    xlStWriteToMatrix(nrow, 1, 'Уровень');
-   xlsetcolumnwidth(100,1,2,1,2);
-   xlStWriteToMatrix(nrow, 2, 'Наименование');
-   xlsetcolumnwidth(15,1,3,1,3);
-   xlStWriteToMatrix(nrow, 3, 'Обозначение');
+   xlsetcolumnwidth(15,1,2,1,2);
+   xlStWriteToMatrix(nrow, 2, 'Обозначение');
+   xlsetcolumnwidth(100,1,3,1,3);
+   xlStWriteToMatrix(nrow, 3, 'Наименование');
    xlStWriteToMatrix(nrow, 4, 'Количество в узле');
    xlStWriteToMatrix(nrow, 5, 'Количество в изделии');
+   xlStWriteToMatrix(nrow, 6, 'Количество в МК на поставку');
+   xlStWriteToMatrix(nrow, 7, 'ед.изм');
 
- mylog('0 printtoexcel' + string(__cKatmarsh,0,0));
+// mylog('0 printtoexcel' + string(__cKatmarsh,0,0));
  printtoexcel(__cKatmarsh);
  xlWritematrixToExcel(nrowReal,1);
+  setvisualheader('"Разлиновка" отчета');
+  xlFrameCells(63, 2, 1, 1, 5, 1, nrow+nrowreal-1, 7);
+
+ var _filemacros : string = GetStringParameter('Files','TmpFilesDirectory',0)+'MK_Macros_'+UserName + '_'+datetostr(cur_date, 'YYYYMMDD') +'_'+TimeToStr(Cur_Time,'HHMMSS')+'.bas';
+
+   logstrtofile(_filemacros,'Sub SetFilters()');
+   logstrtofile(_filemacros,'    Rows("5:5").Select');
+   logstrtofile(_filemacros,'    Selection.AutoFilter');
+   logstrtofile(_filemacros,' End Sub');
+   xlImportModule(_filemacros);
+   xlRunMacro('SetFilters');
+
  xlKillExcel;
+ GetLogFile;
 if VisualizationActive then stopvisual;
 }
 procedure printreportFromFRM(__shifr, __strdate : string); {
@@ -252,21 +375,64 @@ procedure printreportFromFRM(__shifr, __strdate : string); {
 
    if getfirst KATMARSH where ((__shifr == KATMARSH.shifr)) <> tsOK then exit;
 
-   if runwindowmodal(windismissFantom) <> cmDefault then exit;
    var __date : date = strtodate(__strdate,'DD.MM.YYYY');
+
+   set _CMK   := KATMARSH.nrec;
+   set curDse := KatMarsh.cObject;
+   set _DateReport := __date;
+
+   if runwindowmodal(windismissFantom) <> cmDefault then exit;
+
 /*
    message('__shifr = "'+__shifr +'"'+
            +''#13''+'__strdate = "'+__strdate+'"'+
           +''#13''+'__date=' + datetostr(__date,'DD.MM.YYYY'));
 */
-   printreport(KATMARSH.nrec,__date);
+   printreport(_CMK,_DateReport);
 
 }
 handleevent
 cminit: {
 
-  printreport(56986,to_date(01,01,2024));
+   ReadMyDSK(_CMK, #__InterfaceName__ + '_CMK', true);
+   ReadMyDSK(curDse, #__InterfaceName__ + '_curDse', true);
+   ReadMyDSK(_DateReport, #__InterfaceName__ + '_DateReport', true);
+
+
+  set _CMK        := _CMK;
+  set curDse      := curDse;
+  set _DateReport := _DateReport;
+  if runwindowmodal(windismissFantom) <> cmDefault then {stop; abort; exit;}
+
+   printreport(_CMK,_DateReport);
   closeinterface(-1);
+}
+cmpick: {
+   case curfield of
+      #FldDSE, #FldObz: {
+       if (RunInterface(GetMC, CurDSE) <> cmDefault)
+        exit;
+         set _CMK   := 0;
+         set _CMK:= iTMPotr.GetActiveDoc(cgKAU_KatMarsh, cgKAU_KatMC, CurDSE, mdRes_Out);
+      }
+    #FldTM:
+      {
+      if (CurDSE <> 0)
+        {
+        if (RunInterface(iTPM, _CMK, 1, 1, cgKAU_KatMC, CurDSE, 0, 1) <> cmDefault)
+          exit;
+        }
+      else
+        {
+        if (RunInterface(iTPM, _CMK, 1, 4, cgKAU_KatMC, CurDSE, 0, 1) <> cmDefault)
+          exit;
+        if (KatMarsh.tObject <> cgKAU_KatMC or KatMarsh.cObject = 0)
+          exit;
+        set CurDSE:= KatMarsh.cObject;
+        }
+      }
+      end;
+      rereadrecord;
 }
 end;
 end.
