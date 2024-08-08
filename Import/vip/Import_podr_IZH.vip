@@ -1,0 +1,389 @@
+/*************************************************************************************************\
+* Наименование: Ижевск. Импорт подразделений (НЕ складов)                                         *
+* Контур/Модуль:                                                                                  *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+
+\*************************************************************************************************/
+
+const
+end;
+#component "GP"
+Interface Import_podr_IZH 'Импорт подразделений (НЕ СКЛАДОВ). Ижевск';
+
+#include VarsTypes.var
+
+Table Struct tRows (
+    nrow          : longint
+  , podrKod       : string
+  , PTZpodrKod    : string // код ПТЗ
+  , podrName      : String
+  , cpodr         : comp
+  , podrUpKod     : String
+  , cpodrup       : comp
+  , isActive      : boolean
+  , FlagErr       : byte
+  , Descr         : string
+)
+with index (
+   Index1 = nrow
+ , Index2 = podrKod
+ , Index3 = podrUpKod
+)
+;
+
+
+procedure MyLog(_log : string); forward;
+
+create view
+var
+
+  ListName    : string = '';
+  ListName0   : string = 'СправочникПодразделения';
+  ListNamePTZ : string = 'СоответствиеПодразделенийПТЗ';
+  _CreateOnlyActive : byte = 1;
+    File_input
+  , _strResult
+  , _logFile   : string= '';
+  typeTable  : word = 0;
+  _dateArch  : date = to_date(01,01,2024);
+
+from
+    KatPodr
+  , KatPodr KatPodr_BR
+  , tRows
+  , tRows tRows_check
+  , tRows tRows_BR
+where ((
+        tRows_BR.cpodr == KatPodr_br.nrec
+      ))
+;
+
+PROCEdURE ClearAll;
+{
+ delete all tRows;
+ rereadrecord;
+} // PROCEdURE ClearAll;
+
+PROCEdURE fillrecArrayByTypeTable;
+{
+    var _npp: byte = 1;
+    SetLimit(_recArray, 0);
+    SetLimit(_recArray, 1);
+    case typeTable of
+     0 : {
+       _recArray[_npp].def := 'Подразделение'        ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+       _recArray[_npp].def := 'ГоловноеПодразделение'; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+       _recArray[_npp].def := 'Описание'             ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+       _recArray[_npp].def := 'Активный'             ;
+     }
+     1 : {
+       _recArray[_npp].def := 'Подразделение'      ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+       _recArray[_npp].def := 'КодПодразделенияПТЗ';
+     }
+    end;
+}
+
+Function getColor(_FlagErr: byte) : word;
+{
+  case _FlagErr of
+   0 : Result := 0
+   1 : Result := ColorNeed
+   2 : Result := ColorError
+  else
+  {
+   Result := 0;
+  }
+  end;
+}
+
+
+#declare seterror(_str)
+  tRows.FlagErr := 2 ;
+  tRows.Descr   := tRows.Descr + #_str;
+//  mylog(#_str);
+#end
+
+#declare setwarning(_str)
+  tRows.FlagErr := if(tRows.FlagErr > 1, tRows.FlagErr , 1) ;
+  tRows.Descr   := tRows.Descr + #_str;
+//  mylog(#_str);
+#end
+
+function getPodr(_kod : string) : comp;
+{
+  result := 0h;
+   if getfirst katpodr where ((_kod == katpodr.kod)) = tsOK then {
+     result := katpodr.nrec;
+    }
+}
+
+Procedure CheckErrors_tRows;
+{
+   setvisualheader('определение ошибок -_- ');
+  update tRows set tRows.FlagErr := 0, tRows.Descr := '';
+  StartNewVisual(vtIndicatorVisual , vfTimer, 'определение ошибок',recordsintable(tntRows));
+
+  _loop tRows {
+       if  (tRows.podrKod = tRows.podrUpKod) // почему то в выгрузке одинаковые
+        or (tRows.podrUpKod = '') { // считаем , что под 101 входит
+         if tRows.podrKod <> '101' then update current tRows set tRows.podrUpKod := '101' //  всех под ООО "ЛАДА ИЖЕВСК"
+        }
+
+       update current tRows set tRows.cPodr := getPodr(tRows.podrKod);
+       update current tRows set tRows.cPodrUp := getPodr(tRows.podrUpKod);
+
+      if tRows.cPodr = 0h {
+         #setwarning('|подразделение будет создано')
+      }
+
+       if tRows.cPodrUp = 0h  and tRows.podrKod <> '101' {
+        if getfirst tRows_check where ((tRows.podrUpKod == tRows_check.podrKod)) <> tsOK {
+         #seterror('|не найдено вышестоящее подразделение ни в БД ни в EXCEL (среди активных)')
+        }
+       }
+    update current tRows;
+   }
+}
+
+
+#include OpenFileExcelSearchCells.vpp
+
+
+procedure MyLog(_log : string); {
+  if _logFile = '' then _logFile := GetStringParameter('Files', 'OutputFilesDirectory', 0) + 'Import_podr_IZH_'+DateToStr(Cur_date, 'YYYYMMDD') + '_' + timetostr(Cur_time, 'HH.MM.SS') + '_' + UserName + '.log';
+//  logstrtofile(_logFile,ShortStrToWin(_log));
+  logstrtofile(_logFile,_log);
+}
+
+PROCEdURE FillInsertTables(_nrow : longint; _file : string); {
+ var _i: byte;
+ var _podrKod, _PTZpodrKod : string = '';
+  clearBuffer(tntRows);
+  tRows.nrow := _nrow;
+
+    for(_i := 1; _I <= getLimit(_recArray); _i++) {
+     case typeTable of
+      0: {
+         case upcase(_recArray[_i].def) of
+          Upcase( 'Подразделение'        ) : tRows.podrKod   := Trim(_recArray[_i].value);
+          Upcase( 'ГоловноеПодразделение') : tRows.podrUpKod := Trim(_recArray[_i].value);
+          Upcase( 'Описание'             ) : tRows.podrName  := Trim(_recArray[_i].value);
+          Upcase( 'Активный'             ) : tRows.isActive  := if(upcase(Trim(_recArray[_i].value)) = 'ДА', True, False);
+         end;
+      }
+      1: {
+        case upcase(_recArray[_i].def) of
+         Upcase( 'Подразделение'        ) : _podrKod    := Trim(_recArray[_i].value);
+         Upcase( 'КодПодразделенияПТЗ'  ) : _PTZpodrKod := Trim(_recArray[_i].value);
+        end;
+      }
+    end;
+  }
+   case typeTable of
+      0: {
+          if tRows.isActive = True or _CreateOnlyActive = 0 then insert current tRows;
+       }
+      1 : {
+        if getfirst tRows where ((_podrKod == tRows.podrKod)) = tsOK {
+          update current tRows set tRows.PTZpodrKod := _PTZpodrKod;
+        }
+      }
+   end;
+} // PROCEdURE FillInsertTableeNaklSFO(_log: string);
+
+procedure Insert_Podr; {
+  Setvisualheader('Создание/обновление подразделений');
+  _loop tRows {
+       if tRows.cPodr = 0h {
+             insert katpodr set
+               katpodr.kod  := tRows.podrkod
+             , katpodr.name := tRows.podrname
+             , katpodr.LASTDATE := if(tRows.isActive, to_date(0,0,0), _dateArch)
+            ;
+         update current tRows set tRows.cPodr := katpodr.nrec;
+         mylog('Добавлено подразделение ' + tRows.podrkod + ' ' + tRows.podrname);
+         _loop tRows_check where ((tRows.podrkod == tRows_check.podrUpKod)) {
+           update current tRows_check set tRows_check.cpodrup := tRows.cpodr;
+         }
+        } else {
+          if getfirst katpodr where ((tRows.cPodr == katpodr.nrec)) = tsOK {
+            if katpodr.name <> tRows.podrname {
+              update current katpodr set katpodr.name := tRows.podrname;
+              mylog('Обновлено название подразделения ' + tRows.podrkod + ' ' + tRows.podrname);
+            }
+            if katpodr.LASTDATE = to_date(0,0,0) and tRows.isActive = false {
+              update current katpodr set katpodr.LASTDATE := _dateArch;
+              mylog('Обновлено "В архиве с" на '+datetostr(_dateArch,'DD/MM/YYYY')+' у подразделения ' + tRows.podrkod + ' ' + tRows.podrname);
+            }
+            if katpodr.LASTDATE <> to_date(0,0,0) and tRows.isActive = true {
+              update current katpodr set katpodr.LASTDATE := to_date(0,0,0);
+              mylog('Обновлено "В архиве с" на пустое у подразделения ' + tRows.podrkod + ' ' + tRows.podrname);
+            }
+          }
+        }
+    ssetattr(coKatPodr, tRows.cPodr, 'Код ПТЗ', tRows.PTZpodrKod );
+  }
+
+  Setvisualheader('Обновление вышестоящих подразделений');
+  _loop tRows {
+    if getfirst katpodr where ((tRows.cPodr == katpodr.nrec)) = tsOK {
+      if katpodr.cpodr <> tRows.cpodrup {
+        update current katpodr set katpodr.cpodr := tRows.cpodrup;
+        mylog('Обновлено вышестоящее подразделение у ' + tRows.podrkod + ' ' + tRows.podrname);
+      }
+    }
+  }
+}
+
+Screen scrImportPodr;
+  show at (,,, 7);
+  Fields
+    ListName0   : NoProtect,{Font = {backcolor = if(ListName0 = '', colorneed,0);}};
+    ListNamePTZ   : NoProtect,{Font = {backcolor = if(ListNamePTZ = '', colorneed,0);}};
+    File_input :  Protect, PickButton,{Font = {backcolor = if(File_input = '', colorneed,0);}};
+    _CreateOnlyActive : [list 0 'Нет', 1 'Да'], protect;
+    _dateArch : NoProtect, {Font = {backcolor = if(_dateArch = to_date(0,0,0), colorneed,0);}};
+    _strResult : skip, {Font = {backcolor = if(ListName0 = '', colorneed,0);}};
+  buttons
+    cmOK,,,;
+    cmCreateDocs,,,;
+    cmCancel,,,;
+<<'Импорт подразделений из EXCEL'
+`ВНИМАНИЕ! В системе должно существовать подразделение с кодом 101 (ООО "ЛАДА ИЖЕВСК")`
+`После загрузки ОБЯЗАТЕЛЬНО ВЫПОЛНИТЕ ПРОВЕРКУ КАТАЛОГА ПОДРАЗДЕЛЕНИЙ`
+`         Наименование листа с подразделениями`.@@@@@@@@@@@@@@@@
+`Наименование листа с кодами ПТЗ подразделений`.@@@@@@@@@@@@@@@@
+EXCEL Файл.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Обрабатывать только активные подразделения`.@@@@@`для неактивных установить"В архиве с"`.@@@@@@@@@@
+.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  <.Загрузить файл.>           <.Создать/обновить подразделения.>            <. Отмена .>
+>>
+end;
+browse brtRows_br('',,sci1Esc);
+ show at(,8,,);
+table tRows_br;
+fields
+ {Font = {backcolor = getColor(tRows_br.FlagErr);}};
+  tRows_br.nrow       'Строка','в файле' headerAlign = centered:protect,[2];
+  tRows_br.podrKod    'Код'              headerAlign = centered:protect,[2];
+  tRows_br.PTZpodrKod 'ПТЗ код'          headerAlign = centered:protect,[2];
+  tRows_br.podrName   'Наименование'     headerAlign = centered:protect,[4];
+  tRows_br.podrUpKod  'Код','вышестоящего' headerAlign = centered:protect,[2];
+  if(tRows_br.isActive, 'ДА', 'НЕТ') 'Активный' headerAlign = centered:protect,[1];
+  tRows_br.Descr      'Описание'         headerAlign = centered:protect,[8];
+end;
+
+handleevent
+cminit:{
+  set _CreateOnlyActive := 1;
+  if getfirst katpodr where (('101' == katpodr.kod)) <> tsOK {
+    message('Не найдено подразделение с кодом "101"'+
+       +''#13'' + 'дальнейшая работа невозможна', error);
+    stop; abort; exit;
+  }
+ rereadrecord;
+}
+cmpick:{
+  case curfield of
+   #File_input: {
+      File_input := GetFileName('*.xlsx;*.xls', 'Выбор файла с подразделениями для загрузки');
+      ClearAll;
+    }
+  end;
+rereadrecord;
+}
+cmOK: {
+    if File_input = '' {
+     message('не выбран файл шаблона',error) ;
+     stop;abort;exit;
+    }
+    if ListName0 = '' {
+     message('не указан EXCEL лист для подразделений',error);
+     stop;abort;exit;
+    }
+
+    if ListNamePTZ = '' {
+     message('не указан EXCEL лист для подразделений с кодом ПТЗ',error);
+     stop;abort;exit;
+    }
+
+
+//    var _srvFileName : string = GetStringParameter('Files', 'OutputFilesDirectory', 0) + OleGenerateGUID+'.xlsx';
+    MyLog('File_input ' + File_input);
+//    CopyMoveFile(File_input,_srvFileName,false, ecmfClientFrom + ecmfServerTo );
+    GetFileFromClient(File_input, true);
+    File_input := ConvertClientPathToSrv(File_input);
+    MyLog('on server File_input ' + File_input);
+
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Он сказал поехали и махнул рукой', 1);
+    ClearAll;
+    typeTable := 0;
+    ListName := ListName0;
+    fillrecArrayByTypeTable;
+
+    var _isError : boolean = false;
+    MyLog( '***********************************************************************');
+    _isError := not CheckFileFillValues(File_input);
+    if _isError then {
+      ProcessText(_logFile, vfEscable or vfNewTitle or vfMacroSize, 'Протокол обработки файлов и загрузки данных');
+     if visualizationactive  StopVisual('The End',vfTimer);
+     if visualizationactive  StopVisual('The End',vfTimer);
+
+      stop; abort; exit;
+    }
+
+    typeTable := 1;
+    ListName := ListNamePTZ;
+    fillrecArrayByTypeTable;
+    MyLog( '***********************************************************************');
+    _isError := not CheckFileFillValues(File_input);
+
+    if _isError then {
+      ProcessText(_logFile, vfEscable or vfNewTitle or vfMacroSize, 'Протокол обработки файлов и загрузки данных');
+      putfiletoclient(_logFile, false);
+      if visualizationactive  StopVisual('The End',vfTimer);
+      if visualizationactive  StopVisual('The End',vfTimer);
+      stop; abort; exit;
+    }
+
+  CheckErrors_tRows;
+   if(getfirst tRows where tRows.FlagErr = 2 )= tsOK {
+    set _strResult := 'В файле есть ошибки. Загрузка невозможна';
+    stop; abort; exit;
+  }
+ putfiletoclient(_logFile, false);
+ if visualizationactive  StopVisual('The End',vfTimer);
+ if visualizationactive  StopVisual('The End',vfTimer);
+
+
+  rereadrecord(tntRows_br);
+} // cmOK
+cmCreateDocs: {
+  if getfirst tRows <> tsOK {
+    Message('Сначала загрузите файл',error);
+    stop; abort; exit;
+  }
+  if(getfirst tRows where tRows.FlagErr = 2 )= tsOK {
+    Message('В файле есть ошибки. Загрузка невозможна',error);
+    stop; abort; exit;
+  }
+
+  if _dateArch = to_date(0,0,0) and _CreateOnlyActive = 0 {
+    Message('Установлена загрузка неактивных подразделений' +
+     + ''#13'' +'Установите дату "В архиве с"',error);
+    stop; abort; exit;
+  }
+
+  var _isError : boolean = false;
+   StartNewVisual(vtRotateVisual, vfTimer, 'Он сказал поехали и махнул рукой', 1);
+    Insert_Podr;
+   if visualizationactive  StopVisual('The End',vfTimer);
+   ProcessText(_logFile, vfEscable or vfNewTitle or vfMacroSize, 'Протокол работы');
+   rereadrecord(tntRows_br);
+}
+end;
+end.
