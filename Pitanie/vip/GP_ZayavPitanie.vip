@@ -21,6 +21,8 @@
 Interface GP_ZayavPitanie '' (,,sci17EnEsc), EscClose;
 //************************************************************
 Show At (,,120,30)
+procedure AgreeZayavka; forward;
+function GetStatusName(_status : word): forward;
 //----------------------------------------
 #Include ShowKau.Vpp
 //----------------------------------------
@@ -60,7 +62,6 @@ with index
 */
 Create View
 var
-   iGP_Odecl:GP_ODecl;
     iOdecl:declension;
    _ee: EmpElements;
    cRec
@@ -75,39 +76,40 @@ var
   _typeZayav : word;
     boVisibleRun:boolean; //тип запуска - false как объект
   boDataProtector : boolean;
-  UserAccessService   : GP_UserAccessService NoAuto;//cgiSingleEdit
-  StatusChange        : GP_StatusChange NoAuto;
-  Status              : GP_Status NoAuto;
-    DataProtector       : IGP_Protector2;//защита полей от модификации
-   pStatus_GetDefault  : comp; // статус по умолчанию
-  _Kau_IIKOLIMIT : word;
+   pStatus_GetDefault  : word; // статус по умолчанию
+
+    _Kau_IIKOLIMIT
+  , _Kau_system : word;
 as select
-  Zayavka.Nrec
- ,If(Zayavka.CGP_SCUD_PERS  = 0h, '--выберите сотрудника--', #ShowKau(cgKau_Persons,Pers.nrec)) (Fieldname = PersonsFio, FieldTitle='ФИО сорудника')
- ,If(Zayavka.CLIMITCATEGORY = 0h, '--выберите категорию лимита питания--', #ShowKau(_Kau_IIKOLIMIT,Zayavka.CLIMITCATEGORY)) (Fieldname=limitcategory, FieldTitle='Лимит категория питания')
+   Zayavka.Nrec
+ , If(Zayavka.cPersons    = 0h, '--выберите сотрудника--', #ShowKau(cgKau_Persons,Pers.nrec)) (Fieldname = PersonsFio, FieldTitle='ФИО сорудника')
+ , If(Zayavka.CLIMITCATEGORY = 0h, '--выберите категорию лимита питания--', #ShowKau(_Kau_IIKOLIMIT,Zayavka.CLIMITCATEGORY)) (Fieldname=limitcategory, FieldTitle='Лимит категория питания')
+ , If(Zayavka.cSystem = 0h, '--выберите систему питания--', #ShowKau(_Kau_system,Zayavka.cSystem)) (Fieldname=SystemPitanie, FieldTitle='Система питания')
+   zayavka.Status   ('статус документа '):[list 0 'Оформляемый', 1 'Утвержден', 2 'Передан'], protect, skip;
+ , GetStatusName(zayavka.Status) (Fieldname=StatusName, FieldTitle='Статус заявки на питание')
 // ,if(isValid(tneMail), eMail.eMail,' -у сотрудника нет почты- ')  (fieldname = PERSEMAIL)
 From
   persons ScudPers
 , GP_ZAYAVKA_PITANIE zayavka
-, KatPOdr Podr
+, catalogs Podr
 , x$users UserInput
 , x$users UserApprove
 , Persons Pers
 , KatOrg
-, GP_StatusChangeLog
+
 , COMMUNICATIONS eMail
+, spkau KauSystem
 , tmp_Limitpitanie
 //, ZAR_USER ZU
 //, tPodr
 
 where
-((             _typeZayav == zayavka.wTypeDoc
-and _datetime(0,0,0,0,0,0,0) <<= zayavka.INPUT_DATE (noindex)
-and zayavka.CGP_SCUD_PERS == ScudPers.nrec
-and ScudPers.CPERSONS     == Pers.nrec
+((
+   _datetime(0,0,0,0,0,0,0) <<= zayavka.INPUT_DATE (noindex)
+and       zayavka.cSystem == KauSystem.nrec
+ and zayavka.cPersons     == Pers.nrec
 and  zayavka.cPodr        == podr.nrec
 and  zayavka.CUSERINPUT   == Userinput.Atl_nrec
-and  zayavka.STATUS       == Gp_Status.nrec
 and  zayavka.CUSERAPPROVE == UserApprove.atl_nrec
 and             Pers.nrec == eMail.PERSON
 and                     3 == eMail.OBJTYPE
@@ -130,21 +132,18 @@ bounds
 */
 
 ;
-Parameters _typeZayav
-          ,cRec ;
 
-Create view FindTypeDocs
-var _typeZayav1 : word;
-as select Gp_TypeDocs_Find.nrec
-From
-  Gp_TypeDocs Gp_TypeDocs_Find
-, GP_StatusChangeLog
-//, ZAR_USER ZU
-where ((
-                _typeZayav1 == Gp_TypeDocs_Find.wType(noindex)
-//---------------
-))
-;
+function GetStatusName(_status : word): cacheable; {
+ result := '--не известно--'
+  case _status of
+   0 : result := 'Оформляемый'
+   1 : result := 'Утвержденный'
+   2 : result := 'В очереди'
+   3 : result := 'Передан'
+   4 : result := 'Ошибка передачи'
+  end;
+}
+
 //---------------------------
 //
 //---------------------------
@@ -152,17 +151,6 @@ where ((
 //******************************************************************************
 // Функции
 //******************************************************************************
-Procedure LoadProtector;
-{  if boDataProtector then exit;
-   boDataProtector:=true;
-   LoadVipRef(DataProtector, 'GP_Protector');
-   DataProtector.LinkToExt(cfsGetCurrentContainerSelf, '', true);
-   DataProtector.ProtectedStatusCtx := sci1EscIns;
-   DataProtector.AutoPalette := true;
-   if (UserAccessService.CanIns(_typeZayav))
-   { DataProtector.ProtectedStatusCtx := sci17EnIns;
-   }
-}
 Procedure EnableDisableDelete(_Enable:boolean);
 { if _Enable
   { EnableCommand(cmDelete);
@@ -175,20 +163,17 @@ Procedure EnableDisableDelete(_Enable:boolean);
 } //Function EnableDisableDelete(_Enable:boolean);
 
 Function SetDocFieldsState: boolean;
-{ Result:=true;
-  var _StatusDoc:comp = Zayavka.status;
-  if  _StatusDoc=0 then exit;
-  var _FieldStatus:longint=#GP_Status.Name;
-  if  _FieldStatus=0 then Exit;
+{
+  Result:=true;
   var _CanDel   :boolean=true;
   var _CanChange:boolean=true;
 
 
-  _CanDel:=False;
-  _CanDel:=UserAccessService.CanDel(_StatusDoc);
+  _CanDel := False;
+  _CanDel := True;
   EnableDisableDelete(_CanDel);
-  _CanChange := StatusChange.CanChangeStatus(_StatusDoc);
-  if(zayavka.TRANSTOIIKO_DATE <> _datetime(0,0,0, 0,0,0,0))
+  _CanChange := True;
+  if(zayavka.output_DATE <> _datetime(0,0,0, 0,0,0,0))
    {
     cfsSetProp('i_SCREDIT_GP_STATUS.NAME','SKIP',TRUE);
     _CanChange := false;
@@ -220,23 +205,19 @@ Function SetDocFieldsState: boolean;
 
 procedure SetEditMode(Value: boolean);
 {
-  //timelog(GetInterfaceName+'->SetEditMode:Value='+string(Value));
-  if (isProtect=(not Value)) and isProtect_Set
-  { SetDocFieldsState;
-    exit; // не будем повторно ставить
-  }
-  if boVisibleRun
-  { LoadProtector;
-    DataProtector.SetProtected(not Value);
-  }
-  else
-  { ProtectRecord(CurTable,Not Value);
-  }
   if Value
     cfsSetProp(cfsGetCurrentContainerSelf, cfpPalette, wpBlueWindow);
   else
     cfsSetProp(cfsGetCurrentContainerSelf, cfpPalette, wpCyanWindow);
-  isProtect:=not Value;
+
+    cfsSetProp('i_SCREDIT_ZAYAVKA.DOCDATE', 'Skip', (not Value));
+    cfsSetProp('i_SCREDIT_ZAYAVKA.NODOC'  , 'Skip', (not Value));
+    cfsSetProp('i_SCREDIT_PERSONSFIO'     , 'Skip', (not Value));
+    cfsSetProp('i_SCREDIT_SYSTEMPITANIE'  , 'Skip', (not Value));
+    cfsSetProp('i_SCREDIT_LIMITCATEGORY'  , 'Skip', (not Value));
+    cfsSetProp('i_SCREDIT_ZAYAVKA.PHONE'  , 'Skip', (not Value));
+    cfsSetProp('i_SCREDIT_ZAYAVKA.EMAIL'  , 'Skip', (not Value));
+  isProtect:= not Value;
   isProtect_Set:=true;
   SetDocFieldsState;
   //timelog(GetInterfaceName+'->SetEditMode finish=');
@@ -244,25 +225,14 @@ procedure SetEditMode(Value: boolean);
 
 Function CanEditTbl:boolean;
 {
-  result:=UserAccessService.CanEdit(Zayavka.status);
-  if not Result exit;
+  result:=false; //CanEdit(Zayavka.status);
+  if zayavka.status = 0 then result:=true;
+
 } //Function CanEditTbl:boolean;
 
 Function Status_Init:boolean;
-{ Result:=False;
-  if _typeZayav=0 then exit;
-  if FindTypeDocs._typeZayav1 <>_typeZayav
-  or (Status=NullRef)
-  { FindTypeDocs._typeZayav1 :=_typeZayav;
-    if FindTypeDocs.getfirst Gp_TypeDocs_Find <>tsok then
-    { Message('Не нашли запись в справочнике документов для типа '+string(_typeZayav)
-       +chr(13)+'Зайдите в  Управление персоналом - Столовая - Настройки - Настройки доступа к документам' );
-      exit;
-    }
-    //if (Status=NullRef)
-    Status:=New(GP_Status,InitForTypeDoc(FindTypeDocs.GP_TypeDocs_Find.Name));
-  }
-  else Result:=True;
+{
+  Result:=True;
 } //Function Status_Init(_wType:word):boolean;
 
   //-----------------------------------------------------
@@ -281,7 +251,7 @@ Function Status_Init:boolean;
       select max(GP_ZAYAVKA_PITANIE.NoDOC)
       from GP_ZAYAVKA_PITANIE
     where(:(_DTBeg)<=GP_ZAYAVKA_PITANIE.DocDate
-      and GP_ZAYAVKA_PITANIE.wTypeDoc=:(_wTypeDoc))
+      )
     into (result);
 
     if (Trim(result)='')
@@ -294,8 +264,8 @@ Function Status_Init:boolean;
   //============================================
   // Получить статус по умолчанию
   //============================================
-  Function GetStatus_Default:comp;
-  { Result:=Status.GetDefault;
+  Function GetStatus_Default:word;
+  { Result := 0;
   } //Function GetStatus_Default:comp;
 
 
@@ -333,18 +303,10 @@ Procedure MakeBufferZayavka;
   { ClearBuffer(#Zayavka);
     Zayavka.Nrec       := GetNextNrec(#Zayavka,0) ;
     Zayavka.INPUT_DATE := _CurDateTime;
-    Zayavka.wTypeDoc   := _typeZayav;
     Zayavka.noDoc      := GetNextDocNumber(year(Cur_Date));
     Zayavka.CUSERINPUT := UserID(); //UserAccessService.UserPersonsNRec;
     Zayavka.DocDate    := Cur_date;
     Zayavka.Status     := pStatus_GetDefault;
-
-    IF _typeZayav = coWdocType_ZayavDel{
-      ZAYAVKA.climitcategory := 000A000000000142h; // Запрет питания
-    }
-    if _typeZayav = coWdocType_ZayavZarList{
-     ZAYAVKA.ADDWORD[1] := 3;
-    }
   } //Procedure MakeBufferGP_SCUD_Doc;
 
 //========================================================
@@ -365,31 +327,34 @@ Table zayavka;
 Fields
   zayavka.DocDate  ('Дата документа ',,sci138Esc): [12] ,NoProtect;
   zayavka.NoDoc    ('Номер документа')           : [10] ,NoProtect;
-  GP_Status.Name   ('статус документа ',,sci138Esc):[10] ,Protect,PickButton;
+  StatusName       ('статус документа '):[list 0 'Оформляемый', 1 'Утвержден', 2 'Передан'], protect, skip;
   Userinput.XU$FULLNAME  ('Автор документа - кто занес в систему') : Protect, Skip;
   zayavka.INPUT_DATE ('Дата внесения в систему' ,,sci138Esc): [12] ,Protect, NoPickButton, Skip;
   UserApprove.XU$FULLNAME ('Утвердивший документа - кто утвердил') : Protect, Skip;
   zayavka.APPROVE_DATE ('Дата утверждения документа' ,,sci138Esc): [12] ,Protect, NoPickButton, Skip, {Font={Color=if(zayavka.APPROVE_DATE = _datetime(0,0,0,0,0,0,0), 0, 13)}};
-  zayavka.TRANSTOIIKO_DATE ('Дата передачи в IIKO' ,,sci138Esc): [12] ,Protect, NoPickButton, Skip, {Font={Color=if(Zayavka.TRANSTOIIKO_DATE = _datetime(0,0,0,0,0,0,0),0,14)}};
-  PersonsFio         ('Сотрудник',,sci138Esc):Protect,PickButton,NoDel, {Font={BackColor=if(Zayavka.CGP_SCUD_PERS<> 0h,0,ColorNeed)}};
-  podr.Kod           ('Подразделение код') : Protect;
-  podr.name          ('Подразделение наименование') : Protect;
+  zayavka.output_DATE ('Дата передачи в IIKO' ,,sci138Esc): [12] ,Protect, NoPickButton, Skip, {Font={Color=if(Zayavka.output_DATE = _datetime(0,0,0,0,0,0,0),0,14)}};
+  PersonsFio         ('Сотрудник',,sci138Esc):Protect,PickButton,NoDel, {Font={BackColor=if(Zayavka.cPersons<> 0h,0,ColorNeed)}};
+  podr.code           ('Подразделение код') : skip;
+  podr.name          ('Подразделение наименование') : skip;
+  SystemPitanie      ('Система  питания',,sci138Esc):Protect,PickButton,NoDel, {Font={BackColor=if(Zayavka.cSystem <> 0h,0,ColorNeed)}};
   limitcategory      ('Категория лимита питания',,sci138Esc):Protect,PickButton,NoDel, {Font={BackColor=if(Zayavka.CLIMITCATEGORY<>0h,0,ColorNeed)}};
-  zayavka.ADDWORD[1] : NoProtect;
-  zayavka.ADDSTR[1]  : NoProtect, { inputmask = '"+7"(999)999"-"9999' }, {Font={BackColor=if(trim(zayavka.ADDSTR[1]) <> '',0,ColorNeed)}};
-  zayavka.ADDSTR[2]  : NoProtect, {Font={BackColor=if(trim(zayavka.ADDSTR[2]) <> '',0,ColorNeed)}};
+  zayavka.phone  : NoProtect, { inputmask = '"+7"(999)999"-"9999' }, {Font={BackColor=if(trim(zayavka.phone) <> '',0,ColorNeed)}};
+  zayavka.email  : NoProtect, {Font={BackColor=if(trim(zayavka.email) <> '',0,ColorNeed)}};
+buttons
+  cmValue1 , , ,'Утвердить',,sci1Esc;
 <<
-  `Дата документа`  .@@@@@@@@@@@ `Номер` .@@@@@@@@@ `Статус`  .@@@@@@@@@@@@@@@@@@@
-   `Автор `   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ `Дата создания   ` .@@@@@@@@@@@@@@@
-   `Утвердил` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ `Дата утверждения` .@@@@@@@@@@@@@@@
-                                            `Дата передачи в IIKO` .@@@@@@@@@@@@@@@
+  `Дата документа`  .@@@@@@@@@@@ `Номер` .@@@@@@@@@ `Статус`  .@@@@@@@@@@@@@@@@@@@   <.Утвердить.>
+   `Автор `   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ `Дата создания    `.@@@@@@@@@@@@@@@
+   `Утвердил` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ `Дата утверждения `.@@@@@@@@@@@@@@@
+                                  `Дата передачи во внеш. систему`.@@@@@@@@@@@@@@@
 
   `Сотрудник    `   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
   `Подразделение`   .@@@@@@@@@@@ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Система лимита  `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
   `Категория лимита`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-   Уведомить по:
-    [.] - телефон ` .@@@@@@@@@@@@@@@@@@  (Для получения через портал)
-    [.] - E-Mail  ` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ (Для получения на E-MAIL)
+
+            телефон .@@@@@@@@@@@@@@@@@@
+            E-Mail  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 
 >>
 end;
@@ -397,6 +362,10 @@ Handleevent
   cmPrintDoc: {
         processcommand(cmPrintDoc);
       }
+  cmvalue1: {
+    AgreeZayavka;
+  }
+
 end;
 end;
 //------------------------------------------------------
@@ -456,32 +425,34 @@ Procedure EnableDisableInsert(_Enable:boolean);
 //------------------------------------
 
 Procedure SetDocStateStart;
-{ EnableDisableInsert(UserAccessService.CanIns(_typeZayav));
+{ EnableDisableInsert(true);
 }
 
 Procedure LoadInterface;
 {  //-----------------------------
 boVisibleRun := TRUE;
-var RoleGroupName : string;
-  RoleGroupName:=if(coWdocType_ZayavZarList <> _typeZayav,'IIKO','Мотивация персонала');
+
+
+
 
   _Kau_IIKOLIMIT := 0;
   _Kau_IIKOLIMIT := wgettune('GP_OWN.GP_OWN.PITANIE.KAULIMIT');
 
-  if _Kau_IIKOLIMIT = 0
-   {
+  _Kau_system    := 0
+  _Kau_system := wgettune('GP_OWN.GP_OWN.PITANIE.SYSTEM');
+
+  if _Kau_IIKOLIMIT = 0 {
      message('В настройке не указана аналитика лимитов питания',error)
    }
-  UserAccessService:=New(GP_UserAccessService,InitForRoleGroup(RoleGroupName));
+  if _Kau_system = 0 {
+     message('В настройке не указана система питания',error)
+   }
+
   //timelog(GetInterfaceName+'->LoadInterface:003 ');
-  if (UserAccessService=NullRef) {
-        abort;
-        exit;
-  }
   //------------------------------
   boDataProtector:=false;
   if boVisibleRun
-  { LoadProtector;
+  {
   }
   Status_Init;
   if not NullVipRef(Status)
@@ -489,7 +460,6 @@ var RoleGroupName : string;
   //------------------
   //timelog(GetInterfaceName+'->LoadInterface:006');
   //-----------------------------
-  StatusChange:=New(GP_StatusChange,InitForRoleGroup(UserAccessService.RoleGroup));
   //-----------------------------
   //-------------------------
   fCurMainFormatEdit:=GetCurrentFormat;
@@ -514,40 +484,11 @@ var RoleGroupName : string;
     addbounds(tbbuZarPodr);
    }
    */
-  CASE _typeZayav of
-    coWdocType_ZayavIns :
-                     {
                        sTitle_InterFace := 'Ввод заявлений на питание';
                        sTitle_Window  := 'Редактирование заявления на питание';
                        cfsSetProp('T_SCREDIT_(Для_получения_через_портал)','VISIBLE',false)
                        cfsSetProp('T_SCREDIT_(Для_получения_на_E-MAIL)','VISIBLE',false)
-                     }
-    coWdocType_ZayavDel :
-                     {
-                      sTitle_InterFace := 'Ввод заявлений на прекращение питания';
-                      sTitle_Window := 'Редактирование заявления на прекращение питания';
-                      cfsSetProp('c_BRDOC_LIMITCATEGORY_Лимит_питания','SKIP',TRUE);
-                      //cfsSetProp('i_SCREDIT_LIMITCATEGORY','Visible',false);
-                     }
-    coWdocType_ZayavZarList:
-                     {
-                      sTitle_InterFace := 'Ввод заявлений на пересылку расчетного листка на почту';
-                      sTitle_Window := 'Редактирование заявления на пересылку расчетного листка на почту';
-                      cfsSetProp('c_BRDOC_LIMITCATEGORY_Лимит_питания','Visible',false);
-                      cfsSetProp('i_SCREDIT_LIMITCATEGORY','Visible',false);
-                      cfsSetProp('L_SCREDIT_Дата_передачи_в_IIKO','Visible',false);
-                      cfsSetProp('i_SCREDIT_ZAYAVKA.TRANSTOIIKO_DATE','Visible',false);
-                      //cfsSetProp('i_SCREDIT_ZAYAVKA.ADDSTR[2]','Protect',false);
-//                      cfsSetProp('i_SCREDIT_ZAYAVKA.ADDSTR[2]','SKIP',false);
-                      cfsSetProp('T_SCREDIT_Уведомить_по:','Title','Контакты');
-//                      cfsSetProp('ci_SCREDIT_ZAYAVKA.ADDWORD[1]_-_телефон','SKIP',true);
-//                      cfsSetProp('ci_SCREDIT_ZAYAVKA.ADDWORD[1]_-_E-Mail','SKIP' ,true);
-                      cfsSetProp('c_BRDOC_ZAYAVKA.TRANSTOIIKO_DATE_Дата_передачи_в_IIKO','Visible' ,false);
-                      cfsSetProp('L_SCREDIT_Категория_лимита','VISIBLE' ,false);
-                      //ZAYAVKA.ADDWORD[1] := 3
-                     }
-   else sTitle_InterFace := '"!!!!!!!!!!!!!!!! неизвестный тип '
-  end;
+
   if boVisibleRun
   {
     if(cfsSetCurrentContainer(cfsGetCurrentContainerSelf) <> cfOk)
@@ -582,156 +523,45 @@ var RoleGroupName : string;
   //timelog(GetInterfaceName+'->LoadInterface:Final');
 } //Procedure LoadInterface(_wVisibleRun:boolean);
 
-Function Check_Status_Change_Before(_pStatus:comp):boolean;
-{ Result:=true;
-  _pStatus:=_pStatus;
-} //Function Check_Status_Change_Before:boolean;
 
-//--------- выполнить проверку после изменения статуса
-Function Check_Status_Change_After(_pStatus:comp;_pStatusTo:comp):boolean;
-{ Result:=True;
-  _pStatus:=_pStatus;
-} //Function Check_Status_Change_After:boolean;
+procedure AgreeZayavka; {
+    if zayavka.STATUS <> pStatus_GetDefault exit;// 'ОФОРМЛЯЕМЫЙ'
 
-function ChangeStatus(pDoc:comp;StatusChangeLog:type$GP_StatusChangeLog):comp;
-var Rez:integer;
-{
-  result:=0;
-  if not Check_Status_Change_Before(StatusChangeLog.cStatusFrom)
-  {
-    exit;
-  }
-  Status_Init;
-  //Начало транзакции
-  Rez:=BeginConcurrentTransaction(trNoLock);
-  if (Rez<>tsok)
-    message('Ошибка открытия транзакции - '+string(Rez),error);
-  else {
-    GP_StatusChangeLog.buffer   := StatusChangeLog;
-    GP_StatusChangeLog.NRec     := 0;
-    GP_StatusChangeLog.wTbl     := co_ZAYAVKA_PITANIE;
-    GP_StatusChangeLog.cDoc     := pDoc;
-    GP_StatusChangeLog.DateOper := _CurDateTime;
-    GP_StatusChangeLog.cUser    := UserId;
-    Rez:=insert current GP_StatusChangeLog;
-    if (Rez<>tsok)
-      message('Ошибка вставки записи в таблицу GP_StatusChangeLog - '+string(Rez),error);
-
-    if (Rez=tsok) {
-      Result:=StatusChangeLog.cStatusTo;
-      if (Rez<>tsok)
-        message('Ошибка модификации записи в таблице '+string(Rez),error);
-    }
-
-    if (Rez=tsok) {//Запись в БД
-      Rez:=EndTransaction;
-      if (Rez<>tsOK)
-      {  message('Ошибка завершения транзакции - '+string(Rez),error);
-         result:=0;
-      }
-    } else {//Откат
-      Rez:=AbortTransaction;
-      if (Rez<>tsOK)
-      { message('Ошибка отката транзакции - '+string(Rez),error);
-        Result:=0
-      }
-    }
-  }
-  if Result<>0
-  { //Check_Status_Change_After(Result); - будем проверять только если переведен с дефалта
-    Check_Status_Change_After(StatusChangeLog.cStatusFrom,Result);
-
-  }
-} //function ChangeStatus(pDoc:comp;StatusChangeLog:type$GP_StatusChangeLog):comp;
-
-function MyPickStatus: boolean;
-{
-  var _sStatus_Prev:string;
-  var _Status_Prev : comp;
-  var  StatusChangeLog:type$GP_StatusChangeLog;
-  {
-    if zayavka.STATUS =  pStatus_GetDefault // 'ОФОРМЛЯЕМЫЙ'
-     {
-      if _typeZayav = coWdocType_ZayavIns
-      if Zayavka.CLIMITCATEGORY = 0
-       {
+      if Zayavka.CLIMITCATEGORY = 0 {
          Message('Не выбран лимит питания',error);
          exit;
        }
-      if Zayavka.CGP_SCUD_PERS = 0
-       {
+      if Zayavka.cPersons = 0 {
          Message('Не выбран сотрудник',error);
          exit;
        }
-      if _typeZayav = coWdocType_ZayavZarList
-       {
-        if zayavka.ADDWORD[1] = 0
-        {
-         Message('Не выбран ни телефон ни EMAIL',error);
-         exit;
-        }
 
-        if trim(zayavka.ADDSTR[1]) = '' and (zayavka.ADDWORD[1] = 3 or zayavka.ADDWORD[1] = 1)
-         {
-           Message('Не указан телефон',error);
-           exit;
-         }
-        if trim(zayavka.ADDSTR[2]) = '' and (zayavka.ADDWORD[1] = 3 or zayavka.ADDWORD[1] = 2)
-         {
-           Message('Не указан e-Mail',error);
-           exit;
-         }
-       }
-     }
-    _sStatus_Prev:='';
-    Result:=false;
-     ClearAdvRecord(StatusChangeLog);
-     _Status_Prev  := Zayavka.Status;
-     _sStatus_Prev := GP_Status.Name;
-
-//     oGP_Log.Init('IIKO_ZayavkaPitanie.log', true, true, true);
-
-      StatusChangeLog.cStatusFrom := Zayavka.Status;
-
-
-         if (StatusChange.PickStatus(Zayavka.Status))
-          {
-            var pTmp : comp;
-            pTmp:=ChangeStatus(Zayavka.NRec,StatusChange.StatusChangeLog);
-            if PTmp<>0
-            { set Zayavka.Status:=StatusChange.StatusChangeLog.cStatusTo;
-
-               if _Status_Prev <> Zayavka.Status
-               {
-                 if upcase(GP_Status.Name) = 'УТВЕРЖДЕН'
-                 {
-                  set zayavka.CUSERAPPROVE := userID;
-                  set zayavka.APPROVE_DATE := _CurDateTime;
-                 }
-                 if upcase(_sStatus_Prev) = 'УТВЕРЖДЕН'
-                 {
-                  set zayavka.CUSERAPPROVE := 0h;
-                  set zayavka.APPROVE_DATE := _datetime(0,0,0, 0,0,0,0);
-                 }
-               }
-              update current Zayavka;
-              SetEditMode(CanEditTbl);
-              Result:=true;
-            }
-          }
-      ReReadRecord(#Zayavka);
-//    oGP_Log.Done(true);
-  }// MyPickStatus
-}
-Procedure PrintDoc;
-{
-  if zayavka.wTypeDoc = coWdocType_ZayavZarList then
-   if upcase(GP_Status.Name) = upcase('На утверждении')
-     then {RunFReport(ZayavZarList_DTS, '', False);}
-     else
-      {
-        Message('Печать возможна только в статусе "На утверждении"',error)
+      if trim(zayavka.phone) = '' {
+        Message('Не указан телефон',error);
+        exit;
       }
+
+      if trim(zayavka.email) = '' {
+         Message('Не указан e-Mail',error);
+         exit;
+       }
+
+      set zayavka.STATUS       := 1;
+      set zayavka.CUSERAPPROVE := userID;
+      set zayavka.APPROVE_DATE := _CurDateTime;
+     update current Zayavka;
+     SetEditMode(CanEditTbl);
+    ReReadRecord(#Zayavka);
+//    oGP_Log.Done(true);
+}
+
+Procedure PrintDoc; {
+  if zayavka.status = pStatus_GetDefault {
+        Message('Печать возможна только в статусе "На утверждении"',error)
+        exit;
+    }
+
+  RunFReport(ZayavZarList_DTS, '', False);
 }
 
 
@@ -741,21 +571,21 @@ Procedure PrintDoc;
 Browse brDoc '' (,,sci1478Esc)
 //show at (,,,15);
 Table Zayavka;
-Fields {Font={Color=if(Zayavka.TRANSTOIIKO_DATE = _datetime(0,0,0,0,0,0,0)
+Fields {Font={Color=if(Zayavka.output_DATE = _datetime(0,0,0,0,0,0,0)
                        ,if(zayavka.APPROVE_DATE = _datetime(0,0,0,0,0,0,0)
                           , 0
                           , 13
                           )
                        ,3)}};
-  zayavka.DocDate     'Дата'  ('Дата документа')  : [12] ,Protect,NoDel;
-  zayavka.NoDoc       'Номер' ('номер документа') : [10] ,Protect,NoDel;
-  GP_Status.Name      'Статус' ('статус документа ',,sci13Esc): [10],Protect,NoDel;
+  zayavka.DocDate      'Дата'  ('Дата документа')  : [12] ,Protect,NoDel;
+  zayavka.NoDoc        'Номер' ('номер документа') : [10] ,Protect,NoDel;
+  StatusName          'Статус' ('статус документа ',,sci13Esc): [10],Protect,NoDel;
   zayavka.INPUT_DATE   'Дата ввода'  ('Дата ввода документа')  : [12] ,Protect,NoDel;
   zayavka.APPROVE_DATE 'Дата утверждения'  ('Дата утверждения документа')  : [12] ,Protect,NoDel;
-  zayavka.TRANSTOIIKO_DATE 'Дата передачи в IIKO'  ('Дата передачи в IIKO')  : [12] ,Protect,NoDel;
+  zayavka.output_DATE 'Дата передачи в IIKO'  ('Дата передачи в IIKO')  : [12] ,Protect,NoDel;
   PersonsFio           'ФИО'  ('ФИО сотрудника')  : [12] ,Protect,NoDel;
   Pers.sex             'Пол'  ('Пол сотрудника')  : [2] ,Protect,NoDel;
-  podr.Kod             'Подр.' ('Код подразделения') : [10] ,Protect,NoDel;
+  podr.code             'Подр.' ('Код подразделения') : [10] ,Protect,NoDel;
   limitcategory        'Лимит питания' ('Категория лимита питания') : [10] ,Protect,NoDel;
 
 end;//Browse
@@ -834,17 +664,13 @@ end;//Window wnGetReason
 //******************************************************************************
   HandleEvent
     //-----------------------------
-    cmInit:
-    {
+    cmInit: {
       LoadInterFace;
       ClearFuncCache;
       //--------------------------
-      if UserAccessService.OnlyUserDoc(_typeZayav)
-      { AddBounds(tbByUserID);
-      }
 
-      //--------------------------
-      if getfirst Zayavka where (( cRec == Zayavka.nrec ))=tsok {}
+     //--------------------------
+
       if cRec>0
       { if getfirst Zayavka where (( cRec == Zayavka.nrec ))=tsok {}
       }
@@ -877,53 +703,56 @@ end;//Window wnGetReason
     cmPick:
     {
       case curField of
-      #GP_Status.Name:
-      {
-
-        MyPickStatus;
-      }
       #PersonsFio:
       {
-       if RunInterface(GP_STAFF::GP_SCUD_PersVib,cgiPick,Zayavka.CGP_SCUD_PERS,0,0)<>cmCancel
+       if //RunInterface(GP_STAFF::GP_SCUD_PersVib,cgiPick,Zayavka.CGP_SCUD_PERS,0,0)<>cmCancel
+       iGetKau.GetCodeKau(cgiPick,cgKau_Persons,Zayavka.cpersons)<>cmCancel
         {
-          Set Zayavka.CGP_SCUD_PERS := Zayavka.CGP_SCUD_PERS;
-          set zayavka.cPodr := ScudPers.cKatPodr
-          set zayavka.ADDSTR[2]  :=if(isValid(tneMail), eMail.eMail,'');
+          Set Zayavka.cpersons := Zayavka.cpersons;
+          if getfirst Pers = tsOK then set zayavka.cPodr := pers.department;
+          set zayavka.email  :=if(isValid(tneMail), eMail.eMail,'');
           SetModified(true);
           UpdateTable;// ломает базу;
         }
       }
-      #limitcategory:
-       {
-         if _Kau_IIKOLIMIT = 0
-         {
+      #limitcategory: {
+         if _Kau_IIKOLIMIT = 0 {
            message('В настройке не указана аналитика лимитов питания',error)
          }
          else
          {
-           IF _typeZayav = coWdocType_ZayavDel
-           {
-            message('В запрете питания выбор категории запрещен',error)
-           }
-           else
-           {
+
+             /*
              if RunWindowModal(wnGetLimitpitanie)=cmDefault
               {
                 set Zayavka.CLIMITCATEGORY := tmp_Limitpitanie.nrec
                 SetModified(true);
                 UpdateTable;// ломает базу;
               }
-             /*
+             */
              if iGetKau.GetCodeKau(cgiPick,_Kau_IIKOLIMIT,Zayavka.CLIMITCATEGORY)<>cmCancel
              {
               set Zayavka.CLIMITCATEGORY := Zayavka.CLIMITCATEGORY
               SetModified(true);
               UpdateTable;// ломает базу;
-             }
-             */
            }
          }
        }
+       #SystemPitanie: {
+         if _Kau_system = 0 {
+           message('В настройке не указана система питания',error)
+         }
+         else
+         {
+             if iGetKau.GetCodeKau(cgiPick,_Kau_system,Zayavka.cSystem)<>cmCancel
+             {
+              set Zayavka.cSystem := Zayavka.cSystem
+              SetModified(true);
+              UpdateTable;// ломает базу;
+           }
+         }
+       }
+
       end;
     }
 
@@ -956,8 +785,7 @@ end;//Window wnGetReason
     cmHotKeys:
     {
       case CurTable of
-      #Zayavka:
-      {
+      #Zayavka: {
         ProcessCommand(RunMenu('GP_IIKO_ZAYAVKA_Main_HotKey_Adm'));
        /*
         if pr_CurUserAdmin
@@ -970,8 +798,7 @@ end;//Window wnGetReason
       }
       end;
     }
-    cmdelonprotect:
-    {
+    cmdelonprotect: {
       stop;abort;exit;
 
     }
