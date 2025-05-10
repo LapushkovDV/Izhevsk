@@ -10,6 +10,9 @@
 #include odecl.vih             // Функции склонения ФИО
 #include GetKau.vih
 #include QUE_BASE.vih
+#include QUE_View_QUE_OUT.vih
+
+
 #component "EM_IIKO"
 #doc
 Заявления на отказ питания
@@ -25,7 +28,13 @@ function GetStatusName(_status : word): string; forward;
 #Include ShowKau.Vpp
 
 #include GetKau.Var
-
+table struct tTmp (
+  cRec : comp
+)
+with index (
+ ind0 = cRec
+)
+;
 Create View
 var
     iOdecl:declension;
@@ -43,9 +52,10 @@ var
    boVisibleRun:boolean; //тип запуска - false как объект
    boDataProtector : boolean;
    pStatus_GetDefault  : word; // статус по умолчанию
-
+    iQUE_BASE : QUE_BASE;
 as select
    Zayavka.Nrec
+ , iQUE_BASE.GetNameStatusQueue(QUE_OUT.status) (FieldName = StatusNameQueue)
  , If(Zayavka.cPersons    = 0h, '--выберите сотрудника--', Pers.Fio) (Fieldname = PersonsFio, FieldTitle='ФИО сорудника')
 // , zayavka.Status   ('статус документа '):[list 0 'Оформляемый', 1 'Утвержден', 2 'Передан'], protect, skip;
  , GetStatusName(zayavka.Status) (Fieldname=StatusName, FieldTitle='Статус заявки на питание')
@@ -57,7 +67,7 @@ From
 , x$users UserApprove
 , Persons Pers
 , KatOrg
-
+, tTmp
 where
 ((
    _datetime(0,0,0,0,0,0,0) <<= zayavka.INPUT_DATE (noindex)
@@ -66,6 +76,7 @@ where
 and  zayavka.cPodr        == podr.nrec
 and  zayavka.CUSERINPUT   == Userinput.Atl_nrec
 and  zayavka.CUSERAPPROVE == UserApprove.atl_nrec
+     and zayavka.cQUE_OUT  == QUE_OUT.nrec
 ))
 Bounds byNrec      pGP_IIKO_Doc == Zayavka.Nrec(noindex) ordered by TableOrder
 ;
@@ -81,6 +92,28 @@ function GetStatusName(_status : word): string; cacheable; {
   end;
 }
 
+
+Function generateFileToemefsi : string; {
+    result := '';
+    if getfirst Zayavka where ((1 == Zayavka.status)) <> tsOK exit;
+      delete all tTmp;
+
+
+      var _outFile : string = GetStringParameter('Files', 'OutputFilesDirectory', 0) + 'Pitanie_cancel_outfile_'+DateToStr(Cur_date, 'YYYYMMDD') + '_' + timetostr(Cur_time, 'HH.MM.SS') + '_' + UserName + '.csv';
+//В каждой строке <постоянный номер>, <код RFID чипа пропуска>, <табельный номер>, <код вида питания>, <инициалы сотрудника>, <номер столовой>
+      _loop Zayavka where ((1 == Zayavka.status)) {
+        var _outStr : string = '';
+        _outStr := string(pers.nrec,0,0);
+        _outStr := _outStr + ';' + pers.PASSNMB;
+        _outStr := _outStr + ';' + if(wgettune('FORMATCLOCKNUMBER') = 1,pers.strtabn,string(pers.tabnmb));
+        _outStr := _outStr + ';' + SubStr(pers.fio,1,1) + ' ' + SubStr(extractdelimitedword(pers.fio,2,' '),1,1)  +  ' ' + SubStr(extractdelimitedword(pers.fio,3,' '),1,1);
+        _outStr := _outStr + ';' +'***';
+        _outStr := shortstrtowin(_outStr);
+        logstrtofile(_outFile,_outStr)
+        insert tTmp set cRec := Zayavka.nrec;
+      }
+   result := _outFile;
+}
 //---------------------------
 //
 //---------------------------
@@ -614,6 +647,10 @@ end;//Window wnGetReason
     {
       case CurTable of
       #Zayavka: {
+        if zayavka.cQUE_OUT = 0h
+         then disablecommand(cmValue4)
+         else enablecommand(cmValue4);
+
         ProcessCommand(RunMenu('GP_IIKO_ZAYAVKA_Main_HotKey_Adm'));
        /*
         if pr_CurUserAdmin
@@ -635,23 +672,42 @@ end;//Window wnGetReason
         message('нет заявок в статусе "'+ GetStatusName(1)+'"', error);
         stop;abort;exit
       }
-      var _outFile : string = GetStringParameter('Files', 'OutputFilesDirectory', 0) + 'Pitanie_cancel_outfile_'+DateToStr(Cur_date, 'YYYYMMDD') + '_' + timetostr(Cur_time, 'HH.MM.SS') + '_' + UserName + '.csv';
-//В каждой строке <постоянный номер>, <код RFID чипа пропуска>, <табельный номер>, <код вида питания>, <инициалы сотрудника>, <номер столовой>
-      _loop Zayavka where ((1 == Zayavka.status)) {
-        var _outStr : string = '';
-        _outStr := string(pers.nrec,0,0);
-        _outStr := _outStr + ';' + pers.PASSNMB;
-        _outStr := _outStr + ';' + if(wgettune('FORMATCLOCKNUMBER') = 1,pers.strtabn,string(pers.tabnmb));
-        _outStr := _outStr + ';' + SubStr(pers.fio,1,1) + ' ' + SubStr(extractdelimitedword(pers.fio,2,' '),1,1)  +  ' ' + SubStr(extractdelimitedword(pers.fio,3,' '),1,1);
-        _outStr := _outStr + ';' +'***';
-        _outStr := shortstrtowin(_outStr);
-        logstrtofile(_outFile,_outStr)
+
+       var _outFile : string = generateFileToemefsi;
+      if _outFile <> '' {
+        ProcessText(_outFile, vfEscable or vfNewTitle or vfMacroSize, 'Экспорт данных для эМэФСи');
+        putfiletoclient(_outFile, false);
       }
-
-      ProcessText(_outFile, vfEscable or vfNewTitle or vfMacroSize, 'Экспорт данных для эМэФСи');
-
-      putfiletoclient(_outFile, false);
     }
+   cmValue3 : {
+      var _filetoQue : string = generateFileToemefsi;
+      if _filetoQue <> '' {
+
+        var httpCon: TPtr = HttpConnect_CreateEx('ya.ru', '', '', True);
+        var _MessLong : tptr = HttpConnect_CreateLongString(httpCon);
+          _MessLong := HttpConnect_LoadFromFile(httpCon, _filetoQue,866);
+
+        var _cQue : comp;
+        if iQUE_BASE.InsertMessageDirectToQueue(_MessLong, 'pitanie_cancel_emefsi', 0, _cQue) {
+          _loop tTmp {
+            if getfirst zayavka where ((tTmp.cRec == zayavka.nrec)) = tsOK {
+             update current zayavka set
+                zayavka.output_DATE := _CurDateTime
+               ,zayavka.cQUE_OUT := _cQue
+               ,zayavka.status   := 3
+              ;
+            }
+           }
+         HttpConnect_Free(httpCon);
+        }
+      }
+      rereadrecord;
+    }
+   cmValue4 : {
+     var iQUE_View_QUE_OUT : QUE_View_QUE_OUT;
+     if zayavka.cQUE_OUT <> 0h then iQUE_View_QUE_OUT.showwinQUE_OUT_BR(zayavka.cQUE_OUT);
+   }
+
   end;
 
 end.
@@ -661,4 +717,7 @@ GP_IIKO_ZAYAVKA_Main_HotKey_Adm Menu
 - 'Внешняя классификация', cmPickClass, 'Внешняя классификация', hcGkatalM1ExtClass, 'Alt+C', kbAltC, sci1Esc;
 - 'Внешние атрибуты'     , cmPickAttr , 'Заполнение внешних атрибутов по данной позиции', hcGkatalM1Attr, 'Alt+A', kbAltA, sci1Esc;
 - 'Экспортировать данные для эМэФСи'     , cmValue2 , 'Экспортировать данные для эМэФСи',     ,'',,sci1Esc;
+----------;
+- 'Передать данные в очередь для эМэФСи'     , cmValue3 , 'Передать данные в очередь для эМэФСи',     ,'',,sci1Esc;
+- 'Просмотр сообщения в очереди'     , cmValue4 , 'Просмотр сообщения в очереди',     ,'',,sci1Esc;
 }
