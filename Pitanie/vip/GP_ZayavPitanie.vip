@@ -10,7 +10,7 @@
 #include GetKau.vih
 #include GP_ZayavPitanie.vih
 #include odecl.vih             // Функции склонения ФИО
-
+#include QUE_BASE.vih
 
 #component "EM_IIKO"
 #doc
@@ -21,6 +21,13 @@
 Interface GP_ZayavPitanie '' (,,sci17EnEsc), EscClose;
 //************************************************************
 Show At (,,120,30);
+table struct tTmp (
+  cRec : comp
+)
+with index (
+ ind0 = cRec
+)
+;
 procedure AgreeZayavka; forward;
 function GetStatusName(_status : word): string; forward;
 //----------------------------------------
@@ -82,8 +89,10 @@ var
 
     _Kau_IIKOLIMIT
   , _Kau_system : word;
+    iQUE_BASE : QUE_BASE;
 as select
    Zayavka.Nrec
+ , iQUE_BASE.GetNameStatusQueue(QUE_OUT.status) (FieldName = StatusNameQueue)
  , If(Zayavka.cPersons    = 0h, '--выберите сотрудника--', Pers.fio) (Fieldname = PersonsFio, FieldTitle='ФИО сорудника')
  , If(Zayavka.CLIMITCATEGORY = 0h, '--выберите категорию лимита питания--', Limitpitanie.name) (Fieldname=limitcategory, FieldTitle='Лимит категория питания')
  , If(Zayavka.cSystem = 0h, '--выберите систему питания--', KauSystem.name) (Fieldname=SystemPitanie, FieldTitle='Система питания')
@@ -97,13 +106,14 @@ From
 , x$users UserApprove
 , Persons Pers
 , KatOrg
+, QUE_OUT
 
 , COMMUNICATIONS eMail
 , spkau KauSystem
 , spkau Limitpitanie
 //, ZAR_USER ZU
 //, tPodr
-
+, tTmp
 where
 ((
    _datetime(0,0,0,0,0,0,0) <<= zayavka.INPUT_DATE (noindex)
@@ -113,6 +123,7 @@ and  zayavka.cPodr        == podr.nrec
 and  zayavka.CUSERINPUT   == Userinput.Atl_nrec
 and  zayavka.CUSERAPPROVE == UserApprove.atl_nrec
 and Zayavka.CLIMITCATEGORY == Limitpitanie.nrec
+     and zayavka.cQUE_OUT  == QUE_OUT.nrec
 and             Pers.nrec == eMail.PERSON
 and                     3 == eMail.OBJTYPE
 and     000A00000003995Dh == eMail.COMTYPE (noindex)// eMail
@@ -336,7 +347,8 @@ Fields
   zayavka.INPUT_DATE ('Дата внесения в систему' ,,sci138Esc): [12] ,Protect, NoPickButton, Skip;
   UserApprove.XU$FULLNAME ('Утвердивший документа - кто утвердил') : Protect, Skip;
   zayavka.APPROVE_DATE ('Дата утверждения документа' ,,sci138Esc): [12] ,Protect, NoPickButton, Skip, {Font={Color=if(zayavka.APPROVE_DATE = _datetime(0,0,0,0,0,0,0), 0, 13)}};
-  zayavka.output_DATE ('Дата передачи в IIKO' ,,sci138Esc): [12] ,Protect, NoPickButton, Skip, {Font={Color=if(Zayavka.output_DATE = _datetime(0,0,0,0,0,0,0),0,14)}};
+  zayavka.output_DATE ('Дата передачи в очередь' ,,sci138Esc): [12] ,Protect, NoPickButton, Skip, {Font={Color=if(Zayavka.output_DATE = _datetime(0,0,0,0,0,0,0),0,14)}};
+  StatusNameQueue     : skip;
   PersonsFio         ('Сотрудник',,sci138Esc):Protect,PickButton,NoDel, {Font={BackColor=if(Zayavka.cPersons<> 0h,0,ColorNeed)}};
   podr.code           ('Подразделение код') : skip;
   podr.name          ('Подразделение наименование') : skip;
@@ -350,8 +362,8 @@ buttons
   `Дата документа`  .@@@@@@@@@@@ `Номер` .@@@@@@@@@ `Статус`  .@@@@@@@@@@@@@@@@@@@   <.Утвердить.>
    `Автор `   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ `Дата создания    `.@@@@@@@@@@@@@@@
    `Утвердил` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ `Дата утверждения `.@@@@@@@@@@@@@@@
-                                  `Дата передачи во внеш. систему`.@@@@@@@@@@@@@@@
-
+                                         `Дата передачи в очередь`.@@@@@@@@@@@@@@@
+                                      `Статус сообщения в очереди`.@@@@@@@@@@@@@@@@@@@@@
   `Сотрудник    `   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
   `Подразделение`   .@@@@@@@@@@@ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
   `Система лимита  `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -531,7 +543,7 @@ boVisibleRun := TRUE;
 Function generateFileToemefsi : string; {
     result := '';
     if getfirst Zayavka where ((1 == Zayavka.status)) <> tsOK exit;
-
+      delete all tTmp;
       var _outFile : string = GetStringParameter('Files', 'OutputFilesDirectory', 0) + 'Pitanie_outfile_'+DateToStr(Cur_date, 'YYYYMMDD') + '_' + timetostr(Cur_time, 'HH.MM.SS') + '_' + UserName + '.csv';
 //В каждой строке <постоянный номер>, <код RFID чипа пропуска>, <табельный номер>, <код вида питания>, <инициалы сотрудника>, <номер столовой>
       _loop Zayavka where ((1 == Zayavka.status)) {
@@ -544,6 +556,7 @@ Function generateFileToemefsi : string; {
         _outStr := _outStr + ';' +'***';
         _outStr := shortstrtowin(_outStr);
         logstrtofile(_outFile,_outStr)
+        insert tTmp set cRec := Zayavka.nrec;
       }
    result := _outFile;
 }
@@ -605,7 +618,8 @@ Fields {Font={Color=if(Zayavka.output_DATE = _datetime(0,0,0,0,0,0,0)
   StatusName          'Статус' ('статус документа ',,sci13Esc): [10],Protect,NoDel;
   zayavka.INPUT_DATE   'Дата ввода'  ('Дата ввода документа')  : [12] ,Protect,NoDel;
   zayavka.APPROVE_DATE 'Дата утверждения'  ('Дата утверждения документа')  : [12] ,Protect,NoDel;
-  zayavka.output_DATE 'Дата передачи в IIKO'  ('Дата передачи в IIKO')  : [12] ,Protect,NoDel;
+  zayavka.output_DATE  'Дата передачи в очередь'  ('Дата передачи в очередь')  : [12] ,Protect,NoDel;
+  StatusNameQueue       'Статус в очереди'   ('Статус сообщения в очереди')   : [12] ,Protect,NoDel;
   PersonsFio           'ФИО'  ('ФИО сотрудника')  : [12] ,Protect,NoDel;
   Pers.sex             'Пол'  ('Пол сотрудника')  : [2] ,Protect,NoDel;
   podr.code             'Подр.' ('Код подразделения') : [10] ,Protect,NoDel;
@@ -836,7 +850,31 @@ end;//Window wnGetReason
        putfiletoclient(_outFile, false);
       }
     }
+   cmValue3 : {
+      var _filetoQue : string = generateFileToemefsi;
+      if _filetoQue <> '' {
+
+        var httpCon: TPtr = HttpConnect_CreateEx('ya.ru', '', '', True);
+        var _MessLong : tptr = HttpConnect_CreateLongString(httpCon);
+          _MessLong := HttpConnect_LoadFromFile(httpCon, _filetoQue,866);
+
+        var _cQue : comp;
+        if iQUE_BASE.InsertMessageDirectToQueue(_MessLong, 'pitanie_emefsi', 0, _cQue) {
+          _loop tTmp {
+            if getfirst zayavka where ((tTmp.cRec == zayavka.nrec)) = tsOK {
+             update current zayavka set
+                zayavka.output_DATE := _CurDateTime
+               ,zayavka.cQUE_OUT := _cQue
+              ;
+            }
+           }
+         HttpConnect_Free(httpCon);
+        }
+      }
+      rereadrecord;
+   }
   end;
+
 
 end.
 GP_IIKO_ZAYAVKA_Main_HotKey_Adm Menu
@@ -844,5 +882,6 @@ GP_IIKO_ZAYAVKA_Main_HotKey_Adm Menu
 // - 'Фильтр на данные'     , cmFilterSave, 'Фильтр на данные', hcProc_NagrKaf, 'Alt+B',kbAltB, scMenuCtx;
 - 'Внешняя классификация', cmPickClass, 'Внешняя классификация', hcGkatalM1ExtClass, 'Alt+C', kbAltC, sci1Esc;
 - 'Внешние атрибуты'     , cmPickAttr , 'Заполнение внешних атрибутов по данной позиции', hcGkatalM1Attr, 'Alt+A', kbAltA, sci1Esc;
-- 'Экспортировать данные для эМэФСи'     , cmValue2 , 'Экспортировать данные для эМэФСи',     ,'',,sci1Esc;
+- 'Экспортировать данные для эМэФСи. Просмотр файла'     , cmValue2 , 'Экспортировать данные для эМэФСи',     ,'',,sci1Esc;
+- 'Передать данные в очередь для эМэФСи'     , cmValue3 , 'Передать данные в очередь для эМэФСи',     ,'',,sci1Esc;
 }
