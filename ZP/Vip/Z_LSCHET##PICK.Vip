@@ -1,0 +1,230 @@
+/*************************************************************************************************\
+* Наименование:  Выбор работников                                                                 *
+*                Выплаты в межпериод                                                              *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Добавить колонку "Код подразделения"                                             *
+* 1812 = быстродействие                                                                           *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1811         |03/02/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#1812         |03/02/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#define PICK_CURLSCH
+//****************************
+#include MARKS.VIH
+#include DEPTREE.VIH
+#include CONTEXTS.VIH
+#include CLSFUNCS.VIH
+#include DefaultPaValidators.obj
+#include XRefs.vih
+
+#component "Z_LSCHET"
+#doc
+ Выбор работников
+#end
+//****************************
+Alter Interface PICK ;
+//****************************
+OverLoad
+  function RecordMayBeMarked: boolean;
+  function IsAccountVisible: boolean;
+  function ProcessAccounts(List: IIteratableGroupList; Operation: byte; _AdditionalValidator: ICompoundPersonalAccountValidator = NullRef): boolean;
+
+end;
+#IFDEF PICK_CURLSCH
+var CLSF        : CurLSFunctions;
+#ENDIF
+var Validator_I: IPersonalAccountValidator;
+var Validator_N:boolean;
+var Validator_F:boolean;
+
+
+//------------------------------------------------------------------------------
+  create view PickView
+  from CurLschet
+  ;
+//------------------------------------------------------------------------------
+//1812
+function RecordMayBeMarked: boolean;
+{ if not UserFilterSet then
+   { RecordMayBeMarked:=True;
+     Exit
+   }
+  // только групповая пометка должна учитывать настройку "помечать уволенных"
+#IFDEF _GP_
+  if Validator_N //not NullVipRef(Validator)
+  { RecordMayBeMarked := Validator_I.Valid(LSCHET.BUFFER);
+  }
+#ELSE
+  var Validator: IPersonalAccountValidator;
+  Validator := Options.GetMarkValidator;
+  if not NullVipRef(Validator)
+    RecordMayBeMarked := Validator.Valid(LSCHET.BUFFER);
+#ENDIF
+}
+
+//------------------------------------------------------------------------------
+//1812
+Function RecordMayBeMarked_GP(_pLschet:comp):boolean;
+{ if not UserFilterSet then
+   { Result:=True;
+     Exit
+   }
+   if getfirst Lschet where (( _pLschet == Lschet.Nrec )) =tsok
+   { Result:=RecordMayBeMarked;
+   }
+   else Result:=false;
+
+} //Function RecordMayBeMarked_GP(_pLschet:comp):boolean;
+
+
+//------------------------------------------------------------------------------
+//1812
+function IsAccountVisible: boolean;
+{
+   if not UserFilterSet then
+   { IsAccountVisible:=True;
+     Exit;
+   }
+#IFDEF _GP_
+    if Validator_N //not NullVipRef(Validator)
+      IsAccountVisible := Validator_I.Valid(LSCHET.BUFFER);
+#ELSE
+    var Validator: IPersonalAccountValidator;
+    Validator := Options.GetVisibilityValidator;
+    if not NullVipRef(Validator)
+      IsAccountVisible := Validator.Valid(LSCHET.BUFFER);
+#ENDIF
+} //function IsAccountVisible: boolean;
+
+
+//------------------------------------------------------------------------------
+// Обработать лицевые счета групп из списка List
+// operation: 0 - пересканирование; 1 - пометка;
+//------------------------------------------------------------------------------
+//1812
+  function ProcessAccounts(List: IIteratableGroupList; Operation: byte; _AdditionalValidator: ICompoundPersonalAccountValidator = NullRef): boolean;
+  {
+    //ED
+    timelog('Pick->ProcessAccounts:START');
+    Validator_I := Options.GetVisibilityValidator;
+    Validator_N :=not NullVipRef(Validator_I);
+#IFDEF PICK_CURLSCH
+    //Все подразделения
+    if RootGroup=SGROUP.NREC and Code=coLSCHET
+    and CurPeriod
+    { TimeLog('PICK Все по текущему периоду '+RecordsInTable(#CurLSCHET));
+          case Operation of
+      0: // пересканирование
+      {
+        StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Просмотр лицевых счетов', 1);
+        delete all SACCOUNT;
+      }
+
+      1: // пометка
+      {
+        StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Пометка лицевых счетов', 1);
+        PushPos(#SACCOUNT);
+      }
+
+      2: // инвертирование пометок
+      {
+        StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Обращение пометок лицевых счетов', 1);
+        PushPos(#SACCOUNT);
+      }
+
+      else
+        exit;
+      end; //case
+
+      if RecordsInTable(#CurLSCHET)=0
+      { CLSF.ReScan;
+      }
+      if Operation=0 // вставка
+      { insert into SACCOUNT
+          (TABN, STRTABN,FIO,SOURCE,GROUP,CLSCHET,MAYBEMARKED)
+          select
+             CURLSCHET.TABN
+           , CURLSCHET.STRTABN
+           , CURLSCHET.FIO
+           , CURLSCHET.clschet // уникальность индекса не позволит добавить дважды
+           , CurLSCHET.Cex
+           , CurLSCHET.clschet
+           , True //RecordMayBeMarked(CurLSCHET.clschet)
+           from CURLSCHET(CURLSCHET02) where RecordMayBeMarked_GP(CurLSCHET.clschet)
+           ;
+           Result:=true;
+      }
+      else
+      {
+         _loop fullcache CurLschet novisual
+         { if not NextVisual then break;
+                  // ED
+           //if CurLschet.strtabn='4100482' timelog('Нашли 4100482')
+           if UserFilterSet and Validator_N then
+           { if getfirst fastfirstrow lschet where (( curlschet.clschet == lschet.nrec ))=0 {}
+             if not IsAccountVisible    continue;
+           }
+                  // ED
+           //if CurLschet.strtabn='4100482' timelog('Добавили 4100482')
+           SACCOUNT.TABN := CURLSCHET.TABN;
+           SACCOUNT.STRTABN := CURLSCHET.STRTABN;
+           SACCOUNT.FIO := CURLSCHET.FIO;
+           SACCOUNT.SOURCE := CURLSCHET.clschet; // уникальность индекса не позволит добавить дважды
+           SACCOUNT.GROUP := CurLSCHET.cex;
+           SACCOUNT.CLSCHET := CurLSCHET.clschet;
+           SACCOUNT.MAYBEMARKED := True; //RecordMayBeMarked(CurLSCHET.clschet);
+           DoOperation(Operation, _AdditionalValidator);
+         }
+      } //if Operation=0 // вставка
+      StopVisual('',0);
+      TimeLog('отобрали '+RecordsInTable(#SACCOUNT));
+      case Operation of
+        0: if getfirst SACCOUNT <> tsOk {}
+        1,2: PopPos(#SACCOUNT);
+      end; //case
+      OnIdleTimerEnabled := false;
+      case Operation of
+        0: if getfirst SACCOUNT <> tsOk {}
+        1,2: PopPos(#SACCOUNT);
+      end; //case
+      OnIdleTimerEnabled := false;
+
+      Exit;
+
+    } //-------------------
+
+#endif
+    Result:=Inherited::ProcessAccounts(List, Operation
+              , _AdditionalValidator//: ICompoundPersonalAccountValidator = NullRef
+              );
+    //end ed
+    timelog('Pick->ProcessAccounts:START');
+
+  } //function ProcessAccounts(List: IIteratableGroupList; Operation: byte; _AdditionalValidator: ICompoundPersonalAccountValidator = NullRef): boolean;
+
+//******************************************************************************
+// Форматы
+//******************************************************************************
+ExtendFormats DepartmentAccountsBrowse;
+
+  browse DepartmentAccountsBrowse (,, sci147EnIns);
+  show (,11,,);
+  table SACCOUNT;
+    fields
+      {font = {color = if (IsValid(#OBJMARKS), ColorMark, if(not SACCOUNT.MAYBEMARKED, ColorSysGray, 0))}};
+   KATPODR.Kod 'Код подр.': protect, [7], noautosize;
+ end;
+
+HandleEvent
+cmInit:
+{
+   case inherited :: handleEvent (cmInit) of
+   heAbort:{abort;exit;}
+   heStop:{stop;exit;}
+   end;
+   SetupAccountSorting(#SACCOUNT.FIO);
+}
+end;
+
+end.

@@ -1,0 +1,544 @@
+/**************************************************************************************************\
+* Наименование: Библиотека для установки нестандартных фильтров в отчётах                         *
+* Контур/Модуль: *                                                                                *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#829          |24/04/18|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_Filter.vih
+
+interface GP_Filter;
+
+  const
+    FMT_BROWSE         =   0; // Тип формата - Browse
+    FMT_TREE           =   1; // Тип формата - Tree
+    EXT_ATTR_PROD_TYPE = 'Вид производства'; // Внеший атрибут "Вид производства" к каталогу подразделений
+  end;
+
+  table Struct SKatPodr
+  (
+    NRec: tNRec,
+    cPodr: tNRec,
+    Kod: String[21],
+    Name: String[151],
+    cProdType: tNRec,
+    Selectable: Boolean
+  )
+  With index
+  (
+    SKatPodr01 = NRec,
+    SKatPodr02 = cPodr + Name,
+    SKatPodr03 = Name
+  );
+
+  function GetSelKeyValue(_pFilterType: Word): tNRec; forward;
+
+  create view
+    var
+      pFilterType: Word;
+      pSettings: Word;
+      pMarkerName: String;
+      pTitle: String;
+      SelMarker: LongInt;
+      SaveFilterState: Boolean;
+      CurWin: Integer;
+      CurNode: Comp;
+      UpperNode: Comp;
+      CurFormatType: Byte;
+      CurTreeFormat: LongInt;
+    as select
+      GetSelKeyValue(pFilterType) (FieldName = SelKeyValue),
+      if(FoundMarker(SelMarker, SelKeyValue), '√', '') (FieldName = SelMarkerStr)
+    from
+      KatPodr,
+      UserRights,
+      SKatPodr(SKatPodr02),
+      synonym SpKau SpKauP
+    where
+    ((
+          UserName           == Zar_User.OwnName
+      // Фильтр по подразделениям
+      and CurNode            == SKatPodr.cPodr
+      and SKatPodr.cProdType == SpKauP.NRec
+      and coKAtPodr          == AttrNam.WTable
+      and EXT_ATTR_PROD_TYPE == AttrNam.Name
+      and AttrNam.WTable     == AttrVal.WTable
+      and KatPodr.NRec       == AttrVal.cRec
+      and AttrNam.NRec       == AttrVal.cAttrNam
+      and AttrVal.vComp      == SpKau.NRec
+    ))
+  ;
+
+  function GetSelKeyValue(_pFilterType: Word): tNRec;
+  begin
+    result := 0;
+    case _pFilterType of
+      GP_FLT_KAT_PODR: result := SKatPodr.NRec;
+    end;
+  end;
+
+  // Возвращает true, если текущая запись может быть выбрана
+  function CanBeSelected: Boolean;
+  begin
+    result := true;
+    case pFilterType of
+      GP_FLT_KAT_PODR: // Фильтр по подразделениям
+        if not SKatPodr.Selectable then
+        begin
+          result := false;
+          exit;
+        end;
+    end;
+  end;
+
+  #declare mcrWindowHandle(NameTable, NumTable)
+    cmInit:
+      UpdateTitle;
+    cmDefault: // Закончить выбор
+      begin
+        if not IsValid(CurTable) then
+          abort
+        else
+          // Если ничего не помечено
+          if GetMarkerCount(SelMarker) = 0 then
+            if CanBeSelected then
+            begin
+              UpdateTitle;
+              // помечаем текущюю запись
+              InsertMarker(SelMarker, #NameTable.NRec);
+            end else
+            begin
+              Message('Эта запись не может быть выбрана');
+              abort;
+            end;
+      end;
+    cmMarkUnMark:  // Пометка текущей записи
+      begin
+        if CurFormatType = FMT_TREE then
+        begin
+          var CurLevel: Integer;
+          var OldLevel: Integer;
+          var SelCnt: Integer = 0;
+
+          // Помечаем запись, на которой стоит курсор
+          if CanBeSelected then
+          begin
+            InvertMarker(SelMarker, #NameTable.NRec);
+            SelCnt++;
+          end;
+          OldLevel := TreeLevel(CurTreeFormat);
+          if not TreeNodeIsOpen(CurTreeFormat) then
+            TreeOpenNode(CurTreeFormat);
+          // Помечаем все подчиненные записи, попутно открывая закрытые узлы
+          while TreeGetNext(CurTreeFormat) do
+          begin
+            CurLevel := TreeLevel(CurTreeFormat);
+            if CurLevel <= OldLevel then
+              break;
+            if CanBeSelected then
+            begin
+              InvertMarker(SelMarker, #NameTable.NRec);
+              SelCnt++;
+            end;
+            if not TreeNodeIsOpen(CurTreeFormat) then
+              TreeOpenNode(CurTreeFormat);
+          end;
+          if SelCnt = 0 then
+            Message('Эта запись не может быть выбрана');
+        end else
+        begin
+          if CanBeSelected then
+          begin
+            InvertMarker(SelMarker, #NameTable.NRec);
+            if getNext #NameTable = tsOk then
+            begin
+              // Если это не последняя запись, переходим на следующюю
+            end;
+          end else
+            Message('Эта запись не может быть выбрана');
+        end;
+        UpdateTitle;
+        ReScanPanel(#NumTable);
+      end;
+    cmSelectAll:   // Пометка всех записей
+      begin
+        if CurFormatType = FMT_TREE then
+          ResetBounds(#NumTable);
+        PushPos(#NumTable);
+        _loop #NameTable
+        begin
+          if CanBeSelected then
+            InsertMarker(SelMarker, #NameTable.NRec);
+        end;
+        PopPos(#NumTable);
+        if CurFormatType = FMT_TREE then
+          SetBounds(#NumTable);
+        UpdateTitle;
+        RescanPanel(#NumTable);
+      end;
+    cmUnSelectAll: // Снять все пометки
+      begin
+        if CurFormatType = FMT_TREE then
+          ResetBounds(#NumTable);
+        ClearMarker(SelMarker);
+        if CurFormatType = FMT_TREE then
+          SetBounds(#NumTable);
+        UpdateTitle;
+        RescanPanel(#NumTable);
+      end;
+  #end
+
+  #declare mcrGetFilterState(NameTable, NumTable, NameField)
+    begin
+      PushPos(#NumTable);
+      if getFirst #NameTable where((Key == #NameTable.NRec)) = tsOk then
+        GetState := #NameTable.#NameField;
+      PopPos(#NumTable);
+    end;
+  #end
+
+  procedure UpdateTitle;
+  begin
+    SetWindowTitle(CurWin, pTitle + ' (Выбрано записей: ' + To_Char(GetMarkerCount(SelMarker)) + ')');
+  end;
+
+  window winKatPodr 'Выбор подразделений' doAccept, escClose, cyan;
+    show at (,, 75, 17);
+
+    tree 1 trSKatPodr (,, sci1EnInsTree); // 1 - номер колонки для отображения структуры дерева
+      table SKatPodr;
+    fields {font = {color = if(SelMarkerStr <> '', ColorMark, 0)}};
+      SelMarkerStr '' ('"√" - запись помечена'): [1], noAutoSize, protect;
+      SKatPodr.Name 'Название подразделения' ('Название подразделения'): [50], protect;
+      SKatPodr.Kod 'Код' ('Код подразделения'): [10], noAutoSize, protect;
+      SpKauP.Code 'Вид пр-ва' ('Вид производства'): [10], noAutoSize, protect;
+      // if(SKatPodr.Selectable, '+', '-') ('Может ли быть помечена запись'): [1], noAutoSize, protect;
+    end;
+
+    browse brSKatPodr (,, sci1InsPM);
+      table SKatPodr;
+    fields {Font = {Color = if(SelMarkerStr <> '', ColorMark, 0)}};
+      SelMarkerStr '' ('"√" - запись помечена'): [1], noAutoSize, protect;
+      SKatPodr.Kod 'Код' ('Код подразделения'): [10], noAutoSize, protect;
+      SKatPodr.Name 'Название подразделения' ('Название подразделения'): [50], protect;
+      SpKauP.Code 'Вид пр-ва' ('Вид производства'): [10], noAutoSize, protect;
+      // if(SKatPodr.Selectable, '+', '-') ('Может ли быть помечена запись'): [1], noAutoSize, protect;
+    end;
+
+    handleEvent
+      #mcrWindowHandle(SKatPodr, #SKatPodr)
+      cmAccording:
+        if CurFormatType = FMT_TREE then
+        begin
+          ResetBounds(#SKatPodr);
+          CurFormatType := FMT_BROWSE;
+          SetFormat(brSKatPodr);
+          CurTreeFormat := 0;
+        end else
+        begin
+          //CurNode := SKatPodr.cPodr;
+          var _cSKatPodr: tNRec;
+          _cSKatPodr := SKatPodr.NRec;
+          SetBounds(#SKatPodr);
+          CurFormatType := FMT_TREE;
+          SetFormat(trSKatPodr);
+          CurTreeFormat := trSKatPodr;
+          //RescanPanel(#SKatPodr);
+          TreeJumpToRecord(trSKatPodr, _cSKatPodr);
+          RescanPanel(#SKatPodr);
+        end;
+    end;
+  end;
+
+  // Проверка подразделения на доступность в соответствии с разграничением прав доступа к подразделениям 
+  private function IsDepAccessible(_cKatPodr: tNRec): Boolean;
+  begin
+    result := true;
+    if Zar_User.PodrShare != '+' then
+      exit;
+    // Проверяем, есть ли это подразделение в списке подразделений, доступных пользователю
+    if getFirst UserRights where ((
+          Zar_User.OwnName == UserRights.OwnName
+      and _cKatPodr        == UserRights.cRecDS
+    )) != tsOk then
+      result := false;
+  end;
+
+  private procedure AddPodrToSKatPodr(_cKatPodr: tNRec; _CheckFilter: Boolean);
+  begin
+    if getFirst KatPodr where ((_cKatPodr == KatPodr.NRec)) = tsOk then
+      if getFirst SKatPodr where ((_cKatPodr == SKatPodr.NRec)) != tsOk then
+      begin
+        var _Selectable: Boolean = true;
+        // Если установлен фильтр по подразделениям с внешнеим атрибутом "Вид производства" со значениями "НИК" или "КБ"
+        if (pSettings and GP_FLT_ST_NIK_OR_KB) != 0 then
+        begin
+          if not IsValid(tnSpKau) then
+            _Selectable := false
+          else
+          begin
+            var ProdTypeCode: String = UpCase(SpKau.Code);
+            if not (ProdTypeCode = 'НИК' or ProdTypeCode = 'КБ') then
+              _Selectable := false;
+          end;
+          if _CheckFilter then
+            if not _Selectable then
+              exit;
+        end;
+        ClearBuffer(#SKatPodr);
+        SKatPodr.NRec := _cKatPodr;
+        SKatPodr.cPodr := KatPodr.cPodr;
+        SKatPodr.Kod := KatPodr.Kod;
+        SKatPodr.Name := KatPodr.Name;
+        SKatPodr.cProdType := AttrVal.vComp;
+        SKatPodr.Selectable := _Selectable;
+        insert current SKatPodr;
+        if KatPodr.cPodr != 0 then
+          AddPodrToSKatPodr(KatPodr.cPodr, false);
+      end;
+  end;
+
+  private procedure FillSKatPodr;
+  begin
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm,
+     ''#3'Построение списка подразделений...'#13, RecordsInTable(#KatPodr));
+    _loop KatPodr
+    begin
+      if not NextVisual then
+        break;
+      if not IsDepAccessible(KatPodr.NRec) then
+        continue;
+      PushPos(#KatPodr);
+      AddPodrToSKatPodr(KatPodr.NRec, true);
+      PopPos(#KatPodr);
+    end;
+    StopVisual('',0);
+  end;
+
+  // Раскрывает все узлы указанного дерева
+  procedure OpenAllNodes(TreeCode: LongInt);
+  begin
+    if TreeGetFirst(TreeCode) then
+    begin
+      do begin
+        if not TreeNodeIsOpen(TreeCode) then
+          TreeOpenNode(TreeCode);
+      end while TreeGetNext(TreeCode);
+      TreeGetFirst(TreeCode);
+    end;
+    RereadRecord;
+  end;
+
+  //=[ Экспортируемые функции ]=========================================
+
+  // Инициализация фильтра
+  public function Init(_pFilterType: Word; _pMarkerName: String; _pTitle: String; _pSettings: Word): Boolean;
+  begin
+    result := true;
+    SaveFilterState := false;
+
+    CurNode := 0;
+    UpperNode := 0;
+
+    pFilterType := _pFilterType;
+    pSettings := _pSettings;
+    pMarkerName := _pMarkerName;
+    pTitle := _pTitle;
+
+    case pFilterType of
+      GP_FLT_KAT_PODR: // Фильтр по подразделениям
+        begin
+          CurWin := winKatPodr;
+          if pTitle = '' then
+            pTitle := 'Выбор подразделений';
+          FillSKatPodr;
+        end;
+    else
+      exit;
+    end;
+
+    SelMarker := InitMarker(pMarkerName, 8, 10, 10);
+  end;
+
+  // Деинициализация фильтра
+  public procedure Done;
+  begin
+    if pFilterType != 0 then
+    begin
+      pFilterType := 0;
+      DoneMarker(SelMarker, if((pSettings and GP_FLT_ST_NO_AUTO_SAVE) != 0, '', pMarkerName));
+    end;
+  end;
+
+  // Сохранение состояния фильтра в DSK-файле
+  public procedure Save;
+  begin
+    if pFilterType != 0 then
+    begin
+      DoneMarker(SelMarker, pMarkerName);
+      SelMarker := InitMarker(pMarkerName, 8, 10, 10);
+    end;
+  end;
+
+  // Снять все пометки
+  public procedure Reset;
+  begin
+    if pFilterType != 0 then
+      ClearMarker(SelMarker);
+  end;
+
+  // Вызывает окно выбора элементов
+  public function Pick: Boolean;
+  var
+    SaveMarker: LongInt;
+    I: LongInt;
+    Key: Comp;
+  begin
+    result := false;
+    if pFilterType = 0 then
+      exit;
+
+    // Сохраняем пометки на случай отмены выбора
+    SaveMarker := InitMarker('GP_FilterSave', 8, 10, 10);
+    for (I := 0; I < GetMarkerCount(SelMarker); I++)
+    begin
+      if GetMarker(SelMarker, I, Key) then
+        InsertMarker(SaveMarker, Key);
+    end;
+
+    CurFormatType := FMT_BROWSE;
+    CurTreeFormat := 0;
+    case pFilterType of
+      GP_FLT_KAT_PODR:
+        begin
+          CurFormatType := FMT_TREE;
+          CurTreeFormat := trSKatPodr;
+          if CurFormatType = FMT_TREE then
+            OpenAllNodes(CurTreeFormat);
+          result := RunWindowModal(winKatPodr) = cmDefault;
+        end;
+    end;
+
+    // В случае отмены выбора восстанавливаем пометки
+    if not result then
+    begin
+      ClearMarker(SelMarker);
+      for (I := 0; I < GetMarkerCount(SaveMarker); I++)
+      begin
+        if GetMarker(SaveMarker, I, Key) then
+          InsertMarker(SelMarker, Key);
+      end;
+    end;
+    DoneMarker(SaveMarker, '');
+  end;
+
+  // Возвращает кол-во выделенных элементов
+  public function SelCount: LongInt;
+  begin
+    if pFilterType != 0 then
+      result := GetMarkerCount(SelMarker)
+    else
+      result := 0;
+  end;
+
+  // Возвращает NRec выбранной записи элемента с индексом _IndexNo (нумерация начинается с нуля)
+  public function GetSelected(_IndexNo: LongInt): Comp;
+  var
+    Key: Comp;
+  begin
+    result := 0;
+    if pFilterType != 0 then
+      if GetMarker(SelMarker, _IndexNo, Key) then
+        result := Key;
+  end;
+
+  // Проверяет, выделена ли запись с указанным NRec-ом
+  public function IsSelected(_Key: Comp): Boolean;
+  var
+    IndexNo: LongInt;
+  begin
+    if pFilterType != 0 then
+      IsSelected := SearchMarker(SelMarker, _Key, IndexNo)
+    else
+      IsSelected := false;
+  end;
+
+  // Возвращает строку, характеризующюю текущее состояние фильтра
+  public function GetState: String;
+  var
+    SelCnt: LongInt;
+    S: String;
+    C: Char;
+    Key: Comp;
+  begin
+    GetState := '<не определен>';
+    if pFilterType != 0 then
+    begin
+      SelCnt := GetMarkerCount(SelMarker);
+      if SelCnt = 0 then
+        exit;
+      if SelCnt = 1 then
+      begin
+        if not GetMarker(SelMarker, 0, Key) then
+          exit;
+        case pFilterType of
+          GP_FLT_KAT_PODR:
+            #mcrGetFilterState(SKatPodr, #SKatPodr, Name)
+        end;
+      end else
+      begin
+        S := String(SelCnt);
+        C := SubStr(S, Length(S), 1);
+        case C of
+          '1': GetState := 'Выбран ' + S + ' элемент';
+          '2', '3', '4': GetState := 'Выбрано ' + S + ' элемента';
+        else
+          GetState := 'Выбрано ' + S + ' элементов';
+        end;
+      end;
+    end;
+  end;
+
+  // Возвращает маркер со списком выделенных элементов
+  public function GetSelMarker: LongInt;
+  begin
+    result := SelMarker;
+  end;
+
+  handleEvent
+    cmOnVipLoad:
+      pFilterType := 0;
+    cmOnVipUnload:
+      Done;
+    cmTreeTop:
+      CurNode := UpperNode;
+    cmTreeUp:
+      case CurTable of
+        #SKatPodr:
+          CurNode := SKatPodr.cPodr;
+      end;
+    cmTreeDown:
+      case CurTable of
+        #SKatPodr:
+          CurNode := SKatPodr.NRec;
+      end;
+    cmTreeNodeType:
+      case CurTable of
+        #SKatPodr:
+          if TreeIsTerminal(trSKatPodr) then
+            TreeSetNodeType(trSKatPodr, ntfText);
+      end;
+    cmTreeNeedOwner:
+      case CurTable of
+        #SKatPodr:
+          if SKatPodr.cPodr != UpperNode then
+            TreeJumpToRecord(trSKatPodr, SKatPodr.cPodr)
+          else
+            TreeJumpToRecord(trSKatPodr, 0);
+      end;
+  end;
+
+end.

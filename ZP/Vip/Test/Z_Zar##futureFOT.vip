@@ -1,0 +1,831 @@
+//------------------------------------------------------------------------------
+//                                                      (c) Корпорация Галактика
+// Галактика 8.10 - интерфейс заполнения "виртуального" буфера справочников
+// "Размер социальных налогов"
+//------------------------------------------------------------------------------
+
+#include futureFOT.vih
+#include TaxRanges.vih
+#include NeoblSumForm.VIH//Функции формирования необлагаемых сумм матпомощи
+#include PaXrefs.vih
+
+#component "Z_Zar"
+#doc
+Интерфейс заполнения "виртуального" буфера справочников
+"Размер социальных налогов"
+#end
+
+Alter interface FillFotFut;
+OverLoad
+  Procedure pNakNb(VidPer: word);
+  Procedure FillLgot(_LSNrec: comp);
+  Procedure FillSumm(LsNrec: comp; Vidper: word);
+  procedure InsSumsInTmp(LschNrec: comp);
+  procedure FillSumulSocBuf(LsNrec: comp; Vidper: word; dDate: date);
+  Function IFillFotFut.GetSumulsocBuf(_cLsNrec: comp; _wVidper: word; var _Buff: tSumUlSoc): boolean;
+  function IFillFotFut.GetSumUpSocBuf(LsNrec: comp; VidPer: word; var _Buff: tSumUpSoc): boolean;
+end;
+
+
+
+//create view vfillbuf
+//------------------------------------------------------------------------------
+//суммирование налоговой базы для СВ с учетом совместительства
+//------------------------------------------------------------------------------
+Procedure pNakNb(VidPer: word);
+{ timelog('FillFotFut->pNakNb:VidPer='+string(VidPer));
+  var Tek_NB: double;    //налоговая база одного работника с учетом совм-ва по одному налогу
+  var Y_Prev_NB: double; //НБ за год (до текущего м-ца) одного работника с учетом совм-ва по одному налогу
+  var Y_Tek_NB: double;  //НБ за год (по текущий м-ц) одного работника с учетом совм-ва по одному налогу
+  var OgrTek_NB: double; //ограниченная НБ одного работника с учетом совм-ва по одному налогу
+  var Curr_NB: double;   //рабочая пер-ная для подсуммирования перераспределенной НБ
+  var UnderPrev_S: double; //годовая налоговая база "до превышения" для "Л" с учетом совм-ва
+  var UnderPrevTek_S: double; //налоговая база за месяц "до превышения" для "Л" с учетом совм-ва
+  var Tek_Nal: double;   //налог одного работника с учетом совм-ва
+  var Tek_FullNal: double; //налог без учета льгот одного работника с учетом совм-ва
+  var Nal_UP_Pro:  double; //начисленный ранее налог "до превышения" для "Л" с учетом совм-ва
+  var Nal_UP_Tec : double; //налог "до превышения" для "Л", подлежащий начислению в расч.м-це с учетом совм-ва
+  var Max_NB: double;    //max налоговая база из ограничений
+  var FlagOgr,
+      FlOgrFFOMC,
+      FlOgrPF: boolean;  //флаг применения ограничений
+  var monrab: word;
+  var SumPreV: double;
+  var TR:    TaxRanges;
+  var sum9: double;
+  var sum11: double;      //для заполнения summa11[..] - доля налога на годовую базу "до прев." по всем л/с
+  var NeedRound: boolean;
+
+  if GetFirst tmp_PERECH where ((VidPer == tmp_PERECH.VidPer)) <> tsOk
+    exit;
+  FlagOgr := false;
+  Max_NB := 0;
+  if OgrFot[MonFut] > 0
+  {
+    Max_NB  := OgrFot[MonFut];
+    FlagOgr := true;
+  }
+  Tek_NB    := 0;
+  Y_Tek_NB  := 0;
+  Y_Prev_NB := 0;
+  Curr_NB   := 0;
+  UnderPrev_S := 0;    //база "до превышения" для обложения за год с учетом совм-ва
+  UnderPrevTek_S := 0; //база "до превышения" за месяц с учетом совм-ва
+  Tek_Nal   := 0;
+  Tek_FullNal := 0;
+  SumPreV    := 0;
+  Nal_UP_Pro := 0;
+  FlOgrFFOMC := true;
+  FlOgrPF := true;
+
+  if YeaFut < 2015
+  {
+    if tmp_PERECH.param = 'Л'
+      FlOgrPF := false;
+  }
+  else
+    if (tmp_PERECH.Param = '+') and (tmp_PERECH.NomGraf = 3)
+      FlOgrFFOMC := false;
+
+  sum9 := 0;
+  NeedRound := false;
+  if ExistTune('UP.ZAR.FOT.ROUNDMES') //есть настройка - Округлять сумму за месяц до копеек
+    NeedRound := boGetTune('UP.ZAR.FOT.ROUNDMES');
+
+  _loop TAB_SOVM //и пройдемся по всем - дополнительным и основному
+  {
+    if getfirst fastfirstrow LSCHET where ((TAB_SOVM.ADJACENT == LSCHET.NREC)) = tsok
+    {
+      //подсуммируем налоговую базу (или налог) по всем доп. таб.номерам
+      if (getfirst fastfirstrow tp_SumUlSoc = tsOK)
+      {
+        Tek_NB := Tek_NB + tp_SumUlSoc.Summa10[MonFut];
+        Tek_Nal := Tek_Nal + tp_SumUlSoc.SNal[MonFut];
+        Tek_FullNal := Tek_FullNal + tp_SumUlSoc.Summa4[MonFut];
+        for (monrab := 1; monrab <= MonFut ; monrab := monrab + 1)
+        {
+          Y_Tek_NB  := Y_Tek_NB + tp_SumUlSoc.Summa10[monrab] + tp_SumUlSoc.Summa6[monrab];  //ПО текущий
+          Y_Prev_NB := Y_Prev_NB + tp_SumUlSoc.Summa6[monrab];   //пред.филиал
+          if monrab < MonFut then
+          {                                                         //ДО текущего
+            Y_Prev_NB  := Y_Prev_NB + tp_SumUlSoc.Summa10[monrab];
+            UnderPrev_S := UnderPrev_S + tp_SumUlSoc.SumV[monrab];
+            Nal_UP_Pro := Nal_UP_Pro + tp_SumUlSoc.Summa9[monrab];
+          }
+        }
+      }
+    } //if (getFirst Lschet where ...
+  } // loop TAB_SOVM
+  //обработаем данные, суммарные по всем л/счетам
+  if FlOgrPF and (tmp_PERECH.Param = 'Л') then
+  {
+    TR.InitTaxRangesForORG(AM_Firstdate(MonFut, YeaFut), tmp_PERECH.vidper);
+    if  TR.Last <> tsOK
+    {
+      Message('Не загрузилось ограничение по налогу', Error);
+    }
+    SumPreV := TR.GetPreviousDiapason(Y_Tek_NB);
+    if Tek_NB < 0
+      SumPreV := TR.GetPreviousDiapason(Y_Prev_NB);
+  }
+  OgrTek_NB := Tek_NB;
+  if FlOgrPF and (tmp_PERECH.Param = 'Л') then
+  {
+    if SumPreV > 0.001 then   //если превышение достигнуто
+    {
+      if Y_Tek_NB > SumPreV then   //итого за год превышено
+        Y_Tek_NB := SumPreV;       //вместо НБ за год - ограничение
+      if Y_Prev_NB > SumPreV then  //уже было превышено
+        OgrTek_NB := Y_Tek_NB - SumPreV
+      else
+        OgrTek_NB := Y_Tek_NB - Y_Prev_NB;
+      UnderPrevTek_S := OgrTek_NB;
+      //если общая база за месяц "до превышения" ненулевая
+      if abs(UnderPrevTek_S) > 0.001           //"до превышения"
+      {
+          //за год:
+          sum11 := Get_NalogSV(tmp_PERECH.VidPer, abs(UnderPrev_S + UnderPrevTek_S), AD_Date(1,MonFut,YeaFut),
+                               Stavka, NomScale);
+          if NeedRound then
+            sum11 := Round(sum11, 2);
+          if UnderPrev_S + UnderPrevTek_S < 0
+            sum11 := - sum11;
+          //теперь нужно сформировать за месяц MonFut по всем л/с
+          Nal_UP_Tec := sum11 - Nal_UP_Pro; 
+      }
+      else    //если общая база за месяц "до превышения" нулевая - то и общий налог на неё нулевой
+        Nal_UP_Tec := 0;
+    }
+    else  //превышение не достигнуто, весь налог пойдёт в колонку "до превышения"
+      Nal_UP_Tec := Tek_Nal;
+  }
+  else
+  {
+    if FlagOgr and FlOgrFFOMC and (tmp_PERECH.Param <> 'Л') then  //ограничим НБ за тек.месяц исходя из общей величины НБ и годового ограничения
+    {
+      if Y_Tek_NB > Max_NB        //итого за год превышено
+        Y_Tek_NB := Max_NB;       //вместо НБ за год - ограничение
+      if Y_Prev_NB > Max_NB       //уже было превышено
+        OgrTek_NB := Y_Tek_NB - Max_NB
+      else
+        OgrTek_NB := Y_Tek_NB - Y_Prev_NB;
+    }
+  }
+
+  //занесем накопленную НБ (кроме инд.ограниченной) и налог - во все места работы
+  _loop TAB_SOVM    //по всем - дополнительным и основному
+  {
+    if getfirst fastfirstrow LSCHET where ((TAB_SOVM.ADJACENT == LSCHET.NREC)) = tsok
+    {
+      RecAbatementTax := fRecordAbatementTax(LSCHET.NREC, tmp_PERECH.VidPer, AD_Date(1,MonFut,YeaFut));
+      if (RecAbatementTax.Owner <> comp(0)) and (RecAbatementTax.Nomscale <> 0) //есть льготная шкала
+        NomScale := RecAbatementTax.Nomscale;
+      if (getfirst tp_SumUlSoc = tsOK) //суммы по основному месту работы после расчета з/пл
+      {
+        tp_SumUlSoc.SumVS[MonFut] := OgrTek_NB;
+        if (tmp_PERECH.Param = 'Л') and FlOgrPF
+        {
+          if (abs(Tek_NB - tp_SumUlSoc.SumVS[MonFut]) > 0.001)
+            tp_SumUlSoc.SUMMA5[MonFut] := Tek_NB - tp_SumUlSoc.SumVS[MonFut]
+          else
+            tp_SumUlSoc.SUMMA5[MonFut] := 0;
+          tp_SumUlSoc.SUMMA11[MonFut] := Nal_UP_Tec;
+        }
+        //уменьшим локальные пропорц-но их доле в общей сумме месяца
+        if ((tmp_PERECH.Param <> 'Л') or (FlOgrPF)) and FlagOgr and FlOgrFFOMC
+        {
+          if TAB_SOVM.LMain = false          //НБ - только по дополнит.
+          {
+            if (abs(tp_SumUlSoc.SumVS[MonFut]) > 0.001) or (abs(tp_SumUlSoc.SumV[MonFut]) > 0.001)
+            {
+              if abs(Tek_NB) > 0.001    //чтобы исключить деление на 0
+              {
+                tp_SumUlSoc.SumV[MonFut] := tp_SumUlSoc.SumV[MonFut] * OgrTek_NB / Tek_NB;
+                tp_SumUlSoc.SumV[MonFut] := round(tp_SumUlSoc.SumV[MonFut],2);
+                if (tmp_PERECH.Param = 'Л') and FlOgrPF
+                {
+                  if (abs(tp_SumUlSoc.SUMMA10[MonFut] - tp_SumUlSoc.SumV[MonFut]) > 0.001) then
+                    tp_SumUlSoc.SUMMA4[MonFut] := tp_SumUlSoc.SUMMA10[MonFut] - tp_SumUlSoc.SumV[MonFut]
+                  else
+                    tp_SumUlSoc.SUMMA4[MonFut] := 0;
+                  if (abs(tp_SumUlSoc.SNal[MonFut]) > 0) // если налог посчитан
+                    if abs(tp_SumUlSoc.SumV[MonFut]) > 0.001 and abs(tp_SumUlSoc.SumVS[MonFut]) > 0.001
+                    {  //личный
+                      tp_SumUlSoc.Summa9[MonFut] := Nal_UP_Tec *
+                                           tp_SumUlSoc.SumV[MonFut] / tp_SumUlSoc.SumVS[MonFut];
+                    }
+                }
+                Curr_NB := Curr_NB + tp_SumUlSoc.SumV[MonFut];
+              }
+            }
+          }   //if TAB_SOVM.LMain = false
+        }
+
+        if (tmp_PERECH.Param = 'Л')
+          tp_SumUlSoc.SNalS[MonFut] := Tek_Nal;
+        else
+        {
+          if tmp_PERECH.Param = '+'
+            tp_SumUlSoc.SNalS[MonFut] := Tek_Nal;
+          tp_SumUlSoc.Summa5[MonFut] := Tek_FullNal;     //можем заполнить и сумму налога без льготы
+        }
+        update current tp_SumUlSoc;
+      } //if (getfirst tp_SumUlSoc
+    } //if (GetFirst Lschet where ...
+  } // loop TAB_SOVM
+  if FlagOgr       //остались незаполнены локальные НБ осн.л/счета
+  {
+    _loop TAB_SOVM //НБ - основной
+    {
+      if TAB_SOVM.LMain = true
+      {
+        if getfirst LSCHET where ((TAB_SOVM.ADJACENT == LSCHET.NREC)) = tsok
+        {
+          RecAbatementTax := fRecordAbatementTax(LSCHET.NREC, tmp_PERECH.VidPer, AD_Date(1,MonFut,YeaFut));
+          if (RecAbatementTax.Owner <> comp(0)) and (RecAbatementTax.Nomscale <> 0) //есть льготная шкала
+            NomScale := RecAbatementTax.Nomscale;
+          if GetFirst tp_SumUlSoc = tsOK //суммы по основному месту работы после расчета з/пл
+          {
+            if (tmp_PERECH.Param = 'Л') and FlOgrPF
+            {
+              if (abs(Tek_NB - tp_SumUlSoc.SumVS[MonFut]) > 0.001)
+                tp_SumUlSoc.SUMMA5[MonFut] := Tek_NB - tp_SumUlSoc.SumVS[MonFut]
+              else
+                tp_SumUlSoc.SUMMA5[MonFut] := 0;
+            }
+            if ((tmp_PERECH.Param <> 'Л') or (FlOgrPF)) and FlagOgr and FlOgrFFOMC  //уменьшим локальную как разность общей и локальных
+            {
+              tp_SumUlSoc.SumV[MonFut] := OgrTek_NB - Curr_NB;
+              tp_SumUlSoc.SumV[MonFut] := round(tp_SumUlSoc.SumV[MonFut],2);
+            }
+            if (tmp_PERECH.Param = 'Л') and FlOgrPF
+            {
+              if (abs(tp_SumUlSoc.SUMMA10[MonFut] - tp_SumUlSoc.SumV[MonFut]) > 0.001)
+                tp_SumUlSoc.SUMMA4[MonFut] := tp_SumUlSoc.SUMMA10[MonFut] - tp_SumUlSoc.SumV[MonFut]
+              else
+                tp_SumUlSoc.SUMMA4[MonFut] := 0;
+              if (abs(tp_SumUlSoc.SNal[MonFut]) > 0) // если налог посчитан
+                if abs(tp_SumUlSoc.SumV[MonFut]) > 0.001 and abs(tp_SumUlSoc.SumVS[MonFut]) > 0.001
+                {  //личный
+                  tp_SumUlSoc.Summa9[MonFut] := Nal_UP_Tec *
+                                       tp_SumUlSoc.SumV[MonFut] / tp_SumUlSoc.SumVS[MonFut];
+                }
+            }
+            update current tp_SumUlSoc;
+          } //if (getfirst tp_SumUlSoc
+        } //if (GetFirst Lschet where ...
+      }  //if main
+    } // loop TAB_SOVM
+  }  //if FlagOgr
+  //} // конец цикла по классификатору налогов
+  timelog('FillFotFut->pNakNb:Finish VidPer='+string(VidPer));
+
+} //Procedure pNakNb
+//-------------------------------------------------------------------------------------------
+// заполнение временной таблицы со льготами
+//-------------------------------------------------------------------------------------------
+Procedure FillLgot(_LSNrec: comp);
+{
+  timelog('FillFotFut->FillLgot:');
+  // заполним табличку с льготами
+  _loop LgNalLsz where ((_LSNrec == LgNalLsz.cLschet))
+  {
+    clearbuffer(#tmp_LgNalLsz);
+    tmp_LgNalLsz.cLschet := _LSNrec;
+    tmp_LgNalLsz.Vidper := LgNalLsz.Vidper;
+    tmp_LgNalLsz.Vidper1 := LgNalLsz.Vidper1;
+    tmp_LgNalLsz.Mes := LgNalLsz.Mes;
+    tmp_LgNalLsz.Year := LgNalLsz.Year;
+    tmp_LgNalLsz.Proc := LgNalLsz.Proc;
+    tmp_LgNalLsz.Priznak  := LgNalLsz.Priznak;
+    tmp_LgNalLsz.Nomscale := LgNalLsz.Nomscale;
+    tmp_LgNalLsz.KolMes := fGetKolMonth(LgNalLsz.Mes, LgNalLsz.Year);
+    if substr(LgNalLsZ.LastUser,1,1) = '1'
+      tmp_LgNalLsz.Reason := 1;
+    else
+      if substr(LgNalLsZ.LastUser,1,1) = '2'
+        tmp_LgNalLsz.Reason := 2;
+      else
+        if substr(LgNalLsZ.LastUser,1,1) = '3'
+          tmp_LgNalLsz.Reason := 3;
+        else
+          if substr(LgNalLsZ.LastUser,1,1) = '4'
+            tmp_LgNalLsz.Reason := 4;
+          else
+            tmp_LgNalLsz.Reason := 0;
+    insert current tmp_LgNalLsz;
+  }
+}
+//-------------------------------------------------------------------------------------------
+// заполнение сумм и налога за месяц MonFut и год YeaFut для LsNrec
+//-------------------------------------------------------------------------------------------
+Procedure FillSumm(LsNrec: comp; Vidper: word);
+var SummaG,
+    SummaM,
+    SummaN: double;
+    Lgot_Mon: double;
+    ProcUpl: double;
+    MinSumma,
+    NeoblSumMon,
+    TekSumma,
+    OblSumma: double;
+    fllgot: boolean;
+{
+   timelog('FillFotFut->FillSumm:VidPer='+string(VidPer));
+   if GetFirst Lschet where ((LsNrec == Lschet.Nrec)) <> tsOk
+    exit;
+
+  SummaG := 0;
+  SummaM := 0;
+  SummaN := 0;
+
+  Lgot_Mon := StavMinHF;
+  Procupl := 100;
+  fllgot := false;
+  RecAbatementTax := fRecordAbatementTax(LsNrec, VidPer, AD_Date(1,MonFut,YeaFut));
+  if (RecAbatementTax.Owner <> comp(0))
+  {
+    fllgot := true;
+    if (RecAbatementTax.Reason = 0) and (RecAbatementTax.Percent = 0) and (RecAbatementTax.NomScale = 0)
+      ProcUpl := 0; // НБ д.б.= 0
+  }
+  _LOOP tmp_Nachisl where ((YeaFut == tmp_Nachisl.YEARN and MonFut == tmp_Nachisl.MesN))
+  {
+    if ((tmp_Nachisl.CexOZ <> 0) or (Lschet.Char13 <> '+'))
+    { //не нужно отсекать из-за перевода м/филиалами
+      set Pvidopl := tmp_Nachisl.Vidopls;
+
+      if ((klvidopl.VHVOE[32] = '+') and (ProcUpl <> 0))
+        if (GetFirst KlVxod <> tsok) //данный вид оплаты не входит в годовые льготы - они зачтутся позже
+          if (GetFirst KlPerOpl = tsOk)
+          {
+            if ((tmp_Nachisl.VidOpls >= 150) and (tmp_Nachisl.VidOpls <= 155))
+                 or (klvidopl.VhVoE[19] = 'М')               //матпомощь
+            {
+              SummaM := SummaM + tmp_Nachisl.Summa;  //накапливаем сумму мат.помощи
+              if (SummaM > Lgot_Mon) and (Lgot_Mon > 0)  //выплачено матпомощи больше, чем льгота за этот месяц
+                SummaG := SummaG + (SummaM - Lgot_Mon) * ProcUpl / 100
+              else
+                SummaG := SummaG + tmp_Nachisl.Summa * ProcUpl / 100;
+            }
+            else
+              SummaG := SummaG + tmp_Nachisl.Summa * ProcUpl / 100;
+          }
+    }     // if (MySetDefParam <> ccRus) or ...
+  }
+  _loop KlShLgN
+  {
+    MinSumma := 0;
+    if (GetFirst HelpTabN where ((KlShLgN.Nrec == HelpTabN.cKlShLg  and
+                                  Prmonth.Nrec == HelpTabN.cPrMonth and                 //ищем на начало месяца Nextmon
+                                             0 == HelpTabN.FilialNo (noindex))) = tsok) //по страховым взносам в целом
+    {
+      TekSumma := HelpTabN.MonFOT;              //сумма мат.пом.за месяц
+      OblSumma := HelpTabN.MoFOT;               //обл. сумма льгот по мат.пом. за год
+      if GetFirst tmp_KlShLg where ((HelpTabN.cKlShLg == tmp_KlShLg.Nrec(noindex))) = tsok
+        MinSumma := tmp_KlShLg.Summa[MonFut];        //сумма ограничения по мат.пом. за месяц mon
+      if TekSumma <> 0
+      {
+        NeoblSumMon := vNeoblSumForm.NeoblSum(MinSumma, HelpTabN.MFOT, TekSumma, OblSumma); //необлагаемая сумма за месяц
+        SummaG := SummaG + (HelpTabN.MonFOT - NeoblSumMon);    //облагаемая за месяц = всего - необлагаемая
+      }   //if TekSumma <> 0
+    }  //if GetFirst HelpTabN...
+  }
+
+  //собираем налог для каждого Фонда
+  _LOOP tmp_PerevodTek where ((VidPer == tmp_PerevodTek.VidPer))
+  {
+    if ((tmp_PerevodTek.CexOZ <> 0) or (Lschet.Char13 <> '+'))
+      //не нужно отсекать из-за перевода м/филиалами
+      if (tmp_PerevodTek.Year = YeaFut) and (tmp_PerevodTek.Month = MonFut)
+        SummaN := SummaN + tmp_PerevodTek.SumPer;
+  }
+
+  if GetFirst tp_SumUlSoc = tsOk
+  {
+    if (fllgot) and
+       (not (RecAbatementTax.Percent = 100) and (RecAbatementTax.NomScale = 0)) //не отмена льгот
+    {
+      tp_SumUlSoc.Summa3[MonFut] := RecAbatementTax.Percent;
+      tp_SumUlSoc.Summa2[MonFut] := RecAbatementTax.Reason + 1;
+    }
+    tp_SumUlSoc.SUMV[MonFut] := round(SummaG,2);    //Выплаты, обл. налогом
+    tp_SumUlSoc.Summa10[MonFut] := round(SummaG,2); //Выплаты, обл. налогом без ограничения
+    tp_SumUlSoc.SUMVS[MonFut] := 0;                 //с учетом совм-ва, они заполнятся позже
+    tp_SumUlSoc.Summa1[MonFut] := SummaM;           //Мат.помощь - всего
+    tp_SumUlSoc.SNalS[MonFut] := 0;    //с учетом совм-ва, они заполнятся позже
+    if (tmp_PERECH.Param <> 'Л') //or (tmp_PERECH.Param = 'Л' and YearFut <= 2014)
+      tp_SumUlSoc.Summa5[MonFut] := 0; //налог без льготы с учетом совм-ва
+    set tp_SumUlSoc.SNal[MonFut] := SummaN; // налог
+    update current tp_SumUlSoc;
+  }
+}//FillSumm
+
+procedure InsSumsInTmp(LschNrec: comp);
+{
+  timelog('FillFotFut->InsSumsInTmp');
+  delete all tmp_PerevodTek;
+  delete all tmp_Nachisl;
+
+  insert into tmp_PerevodTek (VidPer, Month, Year, Sumper, CexOz, cNach, Otkuda)
+  select PerevodTek.Vidper,
+   if (PerevodTek.cPodr = 0, PerevodTek.MesN, PerevodTek.cPodr),
+     if (PerevodTek.cPodrOZ = 0, PerevodTek.YEARN, PerevodTek.cPodrOZ),
+       PerevodTek.Sumper,PerevodTek.CexOz, PerevodTek.cNach, if (PerevodTek.Otkuda = '0', 0, 1)
+  from PerevodTek(PEREVTEK01), tmp_Perech where ((LschNrec /== PerevodTek.cLsch
+   and PerevodTek.vidper /== tmp_Perech.vidper
+   and ((((PerevodTek.cPodr <> 0) and (PerevodTek.cPodrOZ <> 0)) and
+        (vfillbuf.MonFut = PerevodTek.cPodr and vfillbuf.YeaFut = PerevodTek.cPodrOZ)) or
+        (((PerevodTek.cPodr = 0) or (PerevodTek.cPodrOZ = 0)) and
+        (vfillbuf.MonFut = PerevodTek.MesN and vfillbuf.YeaFut = PerevodTek.YEARN)))));
+
+  insert into tmp_Nachisl (Vidopls, Vidopl, MesN, YearN, Summa, CexOz, Summa28, Otkuda)
+  select Nachisl.Vidopls, Nachisl.Vidopl, Nachisl.MesN, Nachisl.YearN, Nachisl.Summa, Nachisl.CexOz, Nachisl.Summa28, 0
+  from Nachisl where ((LschNrec /== Nachisl.cLsch
+   and (vfillbuf.MonFut = Nachisl.MesN and vfillbuf.YeaFut = Nachisl.YearN)));
+
+  insert into tmp_Nachisl (Vidopls, Vidopl, MesN, YearN, Summa, CexOz, Summa28, Otkuda)
+  select Nenach.Vidopls, Nenach.Vidopl, Nenach.MesN, Nenach.YearN, Nenach.Summa, Nenach.CexOz, Nenach.Summa28, 1
+  from Nenach where ((LschNrec /== Nenach.cLsch
+   and (vfillbuf.MonFut = Nenach.MesN and vfillbuf.YeaFut = Nenach.YearN)));
+}  //InsSumsInTmp
+//-------------------------------------------------------------------------------------------
+//непосредственно заполнение буфера SumUlSoc за месяц MonFut и год YeaFut
+//-------------------------------------------------------------------------------------------
+procedure FillSumulSocBuf(LsNrec: comp; Vidper: word; dDate: date);
+var LsNrec1: comp;
+{
+  timelog('FillFotFut->FillSumulSocBuf:Vidper='+string(Vidper));
+  if GetFirst LSchet where ((LsNrec == LSchet.Nrec)) <> tsOk
+    exit;
+  if Day(dDate) = 0
+  {
+    DateRep := dGetTune('UP.DATOTCH');
+    YeaRep := Ad_Year(DateRep);
+    MonRep := Ad_Month(DateRep);
+    DateFut := Add_Months(dGetTune('UP.DATOTCH'), 1);
+    YeaFut := Ad_Year(DateFut);
+    MonFut := Ad_Month(DateFut);
+  }
+  else
+  {
+    YeaFut := Ad_Year(dDate);
+    MonFut := Ad_Month(dDate);
+  }
+  if MonFut = 12
+  {
+    NextMon := 1;
+    NextYe  := YeaFut + 1;
+  }
+  else
+  {
+    NextMon := MonFut + 1;
+    NextYe  := YeaFut;
+  }
+  timelog('FillFotFut->FillSumulSocBuf:001');
+#IFDEF _GP_
+  timelog('FillFotFut->FillSumulSocBuf:001.001');
+#ELSE
+  // реализация "итератор по дополнительным лицевым счетам"
+  LoadVipRef(APAI, 'AdditionalPersonalAccountsIterator');
+  // реализация "итератор по основным лицевым счетам"
+  LoadVipRef(MPAI, 'MainPersonalAccountsIterator');
+
+  //необлагаемые суммы по м/п
+  timelog('FillFotFut->FillSumulSocBuf:002');
+  LoadVipRef(vNeoblSumForm, 'NeoblSumForm');
+#ENDIF
+  timelog('FillFotFut->FillSumulSocBuf:002.001');
+  delete all tp_SumUlSocDel;
+#IFDEF _GP_
+  timelog('FillFotFut->FillSumulSocBuf:002.002');
+  delete all tmp_LgNalLsz;
+#ELSE
+  delete all tmp_Perech;
+  delete all tmp_LgNalLsz;
+  pushConditionforleave(tcUniNalog, #Perech);
+  _loop Perech novisual
+  {
+    ClearBuffer(#tmp_Perech);
+    tmp_Perech.VidPer := Perech.VidPer;
+    tmp_Perech.Param := Perech.Param;
+    tmp_Perech.NOMGRAF := Perech.NOMGRAF;
+    tmp_Perech.Socnal := Perech.Socnal;
+    tmp_Perech.NamePer := Perech.NamePer;
+    tmp_Perech.PRIZNOGR := Perech.PRIZNOGR;
+    tmp_Perech.lastdate := Perech.lastdate;
+    insert current tmp_Perech;
+  }
+#endif
+  timelog('FillFotFut->FillSumulSocBuf:003');
+  if GetFirst tmp_Perech where ((Vidper == tmp_Perech.Vidper)) <> tsOk
+    exit;
+  if (AM_Firstdate(MonFut, YeaFut) <> date(0,0,0)) and
+   (tmp_PERECH.LastDate <> date(0,0,0)) and (tmp_PERECH.LastDate < AM_Firstdate(MonFut, YeaFut))
+    exit;
+
+  timelog('FillFotFut->FillSumulSocBuf:003.001');
+#IFDEF _GP_
+#ELSE
+  if (not intinit) or (not InitStavSV)
+  {
+    abort;
+    exit;
+  }
+#ENDIF
+  NomScale := word(coGetTune('UP.ZAR.XP.SCALE_ESN'));
+
+  YearOtch := YeaFut;
+  timelog('FillFotFut->FillSumulSocBuf:003.002');
+  Form_tmp_KlShLg;    // процедура находится в rsv_IK.vpp
+  timelog('FillFotFut->FillSumulSocBuf:003.003');
+
+  pReadOgr;
+
+  // заполним временную таблицу данными из SumUlSoc
+  timelog('FillFotFut->FillSumulSocBuf:004');
+  if MPAI.First(LsNrec)
+  {
+    insert TAB_SOVM set TAB_SOVM.ADJACENT := MPAI.GetAdjacent, TAB_SOVM.LMain := true;
+    LS := MPAI.GetAdjacent;
+    if GetFirst SumUlSoc where ((LS     == SumUlSoc.cLsch and
+                                 VidPer == SumUlSoc.Vidper and
+                                 YeaFut == SumUlSoc.YEAR)) <> tsOK
+    {
+      //если нет записи в таблице SumUlSoc, то создадим во временной таблице новую
+      clearbuffer(#tp_SumUlSoc);
+      tp_SumUlSoc.YEAR   := YeaFut;
+      tp_SumUlSoc.cLsch  := LS;
+      tp_SumUlSoc.Vidper := Vidper;
+      insert current tp_SumUlSoc;
+    }
+    else //если запись в таблице SumUlSoc есть, то заносим ее во временную таблицу
+      insert into tp_SumUlSoc
+        select * from SumUlSoc
+        where (( vfillbuf.Ls == SumUlSoc.cLsch and
+                 VidPer == SumUlSoc.Vidper and
+                 vfillbuf.YeaFut == SumUlSoc.YEAR));
+
+    timelog('FillFotFut->FillSumulSocBuf:005');
+    if APAI.First(MPAI.GetAdjacent)
+    {
+      do
+      {
+       timelog('FillFotFut->FillSumulSocBuf:006');
+        insert TAB_SOVM set TAB_SOVM.ADJACENT := APAI.GetAdjacent, TAB_SOVM.LMain := false;
+        LS := APAI.GetAdjacent;
+        if GetFirst SumUlSoc where ((LS     == SumUlSoc.cLsch and
+                                     VidPer == SumUlSoc.Vidper and
+                                     YeaFut == SumUlSoc.YEAR)) <> tsOK
+        {
+          //если нет записи в таблице SumUlSoc, то создадим во временной таблице новую
+          clearbuffer(#tp_SumUlSoc);
+          tp_SumUlSoc.YEAR   := YeaFut;
+          tp_SumUlSoc.cLsch  := LS;
+          tp_SumUlSoc.Vidper := Vidper;
+          insert current tp_SumUlSoc;
+        }
+        else //если запись в таблице SumUlSoc есть, то заносим ее во временную таблицу
+          insert into tp_SumUlSoc
+            select * from SumUlSoc
+            where (( vfillbuf.Ls == SumUlSoc.cLsch and
+                     VidPer == SumUlSoc.Vidper and
+                     vfillbuf.YeaFut == SumUlSoc.YEAR));
+       timelog('FillFotFut->FillSumulSocBuf:007');
+      }
+      while APAI.Next;
+    }
+  }
+  else
+  {
+    timelog('FillFotFut->FillSumulSocBuf:008');
+    insert TAB_SOVM set TAB_SOVM.ADJACENT := LsNrec, TAB_SOVM.LMain := true;
+    if GetFirst SumUlSoc where ((LsNrec          == SumUlSoc.cLsch and
+                                 VidPer          == SumUlSoc.Vidper and
+                                 vfillbuf.YeaFut == SumUlSoc.YEAR)) <> tsOK
+    {
+      //если нет записи в таблице SumUlSoc, то создадим во временной таблице новую
+      clearbuffer(#tp_SumUlSoc);
+      tp_SumUlSoc.YEAR   := YeaFut;
+      tp_SumUlSoc.cLsch  := LsNrec;
+      tp_SumUlSoc.Vidper := Vidper;
+      insert current tp_SumUlSoc;
+    }
+    else  //если запись в таблице SumUlSoc есть, то заносим ее во временную таблицу
+      insert into tp_SumUlSoc
+        select * from SumUlSoc
+        where (( LsNrec == SumUlSoc.cLsch and
+                 VidPer == SumUlSoc.Vidper and
+                 vfillbuf.YeaFut == SumUlSoc.YEAR));
+    timelog('FillFotFut->FillSumulSocBuf:009');
+    if APAI.First(LsNrec)
+    {
+      do
+      {
+      timelog('FillFotFut->FillSumulSocBuf:010');
+        insert TAB_SOVM set TAB_SOVM.ADJACENT := APAI.GetAdjacent, TAB_SOVM.LMain := false;
+        LS := APAI.GetAdjacent;
+        if GetFirst SumUlSoc where ((LS              == SumUlSoc.cLsch and
+                                     VidPer          == SumUlSoc.Vidper and
+                                     vfillbuf.YeaFut == SumUlSoc.YEAR)) <> tsOK
+        {
+          //если нет записи в таблице SumUlSoc, то создадим во временной таблице новую
+          clearbuffer(#tp_SumUlSoc);
+          tp_SumUlSoc.YEAR   := YeaFut;
+          tp_SumUlSoc.cLsch  := LS;
+          tp_SumUlSoc.Vidper := Vidper;
+          insert current tp_SumUlSoc;
+        }
+        else //если запись в таблице SumUlSoc есть, то заносим ее во временную таблицу
+          insert into tp_SumUlSoc
+            select * from SumUlSoc
+            where (( vfillbuf.Ls == SumUlSoc.cLsch and
+                     VidPer == SumUlSoc.Vidper and
+                     vfillbuf.YeaFut == SumUlSoc.YEAR));
+        timelog('FillFotFut->FillSumulSocBuf:011');
+      }
+      while APAI.Next;
+    }
+  }
+  // заполним табличку с льготами
+ timelog('FillFotFut->FillSumulSocBuf:012');
+  _loop TAB_SOVM
+    FillLgot(TAB_SOVM.ADJACENT);
+  // если есть основной лицевой счет
+  if MPAI.First(LsNrec)
+  {
+    timelog('FillFotFut->FillSumulSocBuf:013');
+    InsSumsInTmp(MPAI.GetAdjacent);
+    FillSumm(MPAI.GetAdjacent, Vidper);
+    // если есть дополнительные лицевые счета
+    if APAI.First(MPAI.GetAdjacent)
+    {
+      do
+      {
+       timelog('FillFotFut->FillSumulSocBuf:014');
+        if (getfirst fastfirstrow LSCHET where ((APAI.GetAdjacent == LSCHET.NREC)) = tsok)
+        {
+          timelog('FillFotFut->FillSumulSocBuf:015');
+          InsSumsInTmp(APAI.GetAdjacent);
+          FillSumm(APAI.GetAdjacent, Vidper);
+        }
+      }
+      while APAI.Next;
+    }
+  }
+  else
+  {
+    timelog('FillFotFut->FillSumulSocBuf:017');
+    InsSumsInTmp(LsNrec);
+    FillSumm(LsNrec, Vidper);
+    // если есть дополнительные лицевые счета
+    if APAI.First(LsNrec)
+    {
+      do
+      {
+       timelog('FillFotFut->FillSumulSocBuf:018');
+        InsSumsInTmp(APAI.GetAdjacent);
+        FillSumm(APAI.GetAdjacent, Vidper);
+      }
+      while APAI.Next;
+    }
+  }
+
+  timelog('FillFotFut->FillSumulSocBuf:019');
+  pNakNb(Vidper); //заполним суммы с учетом совм-ва
+
+  delete all TAB_SOVM;
+  delete all tmp_PerevodTek;
+  delete all tmp_Nachisl;
+#IFDEF _GP_
+#ELSE
+  exitProc;
+  DoneStav;
+#ENDIF
+  timelog('FillFotFut->FillSumulSocBuf:020');
+} // FillSumulSocBuf
+
+//------------------------------------------------------------------------------
+Function GetSumulsocBuf(_cLsNrec: comp; _wVidper: word; var _Buff: tSumUlSoc): boolean;
+{
+  timelog('FillFotFut->GetSumulsocBuf _wVidper='+string(_wVidper));
+  GetSumulsocBuf := false;
+  FillSumulSocBuf(_cLsNrec, _wVidper, date(0,0,0));
+  cLs := _cLsNrec;
+  wVP := _wVidper;
+  Ye  := YeaFut;
+  if GetFirst tp_SumUlSocB <> tsOk
+   exit;
+  _Buff := type$SumUlSoc(tp_SumUlSocB.Buffer);
+  GetSumulsocBuf := true;
+}
+//------------------------------------------------------------------------------
+function GetSumUpSocBuf(LsNrec: comp; VidPer: word; var _Buff: tSumUpSoc): boolean;
+{
+  DateFut :=  Add_Months(dGetTune('UP.DATOTCH'), 1);
+  YeaFut := Ad_Year(DateFut);
+  YeaRep := Ad_Year(dGetTune('UP.DATOTCH'));
+
+  GetSumUpSocBuf := false;
+  delete all tp_SumUpSocDel;
+#IFDEF _GP_
+#ELSE
+  delete all tmp_Perech;
+  pushConditionforleave(tcUniNalog, #Perech);
+  _loop Perech novisual
+  {
+    ClearBuffer(#tmp_Perech);
+    tmp_Perech.VidPer := Perech.VidPer;
+    tmp_Perech.Param := Perech.Param;
+    tmp_Perech.NOMGRAF := Perech.NOMGRAF;
+    tmp_Perech.Socnal := Perech.Socnal;
+    tmp_Perech.NamePer := Perech.NamePer;
+    tmp_Perech.PRIZNOGR := Perech.PRIZNOGR;
+    tmp_Perech.lastdate := Perech.lastdate;
+    insert current tmp_Perech;
+  }
+#ENDIF
+  if GetFirst tmp_Perech where ((Vidper == tmp_Perech.Vidper)) <> tsOk
+    exit;
+  if (AM_Firstdate(MonFut, YeaFut) <> date(0,0,0)) and
+   (tmp_PERECH.LastDate <> date(0,0,0)) and (tmp_PERECH.LastDate < AM_Firstdate(MonFut, YeaFut))
+    exit;
+
+  if GetFirst SumUlSoc where ((LsNrec == SumUlSoc.Clsch and
+                               VidPer == SumUlSoc.VidPer and
+                               YeaFut == SumUlSoc.YEAR)) <> tsOk
+  {
+    clearbuffer(tntp_SumUpSoc);
+    tp_SumUpSoc.Clsch  := LsNrec;
+    tp_SumUpSoc.Vidper := VidPer;
+    tp_SumUpSoc.Year   := YeaFut;
+    insert current tp_SumUpSoc;
+  }
+  else
+    insert into tp_SumUpSoc
+    select * from SumUlSoc
+      where ((LsNrec          == SumUlSoc.Clsch and
+              VidPer          == SumUlSoc.VidPer and
+              vFillbuf.YeaFut == SumUlSoc.YEAR));
+
+  if GetFirst tp_SumUpSoc where ((LsNrec == tp_SumUpSoc.Clsch and
+                                  VidPer == tp_SumUpSoc.VidPer and
+                                  YeaFut == tp_SumUpSoc.YEAR)) <> tsOk
+    exit;
+  _Buff := tSumUpSoc(tp_Sumupsoc.Buffer);
+  GetSumUpSocBuf := true;
+}   //GetSumUpSocBuf
+
+HandleEvent
+cmOnVipLoad:
+{   // реализация "итератор по дополнительным лицевым счетам"
+  LoadVipRef(APAI, 'AdditionalPersonalAccountsIterator');
+  // реализация "итератор по основным лицевым счетам"
+  LoadVipRef(MPAI, 'MainPersonalAccountsIterator');
+
+  //необлагаемые суммы по м/п
+  timelog('FillFotFut->FillSumulSocBuf:002');
+  LoadVipRef(vNeoblSumForm, 'NeoblSumForm');
+  if (not intinit) or (not InitStavSV)
+  {
+    abort;
+    exit;
+  }
+  delete all tmp_Perech;
+  delete all tmp_LgNalLsz;
+  pushConditionforleave(tcUniNalog, #Perech);
+  _loop Perech novisual
+  {
+    ClearBuffer(#tmp_Perech);
+    tmp_Perech.VidPer := Perech.VidPer;
+    tmp_Perech.Param := Perech.Param;
+    tmp_Perech.NOMGRAF := Perech.NOMGRAF;
+    tmp_Perech.Socnal := Perech.Socnal;
+    tmp_Perech.NamePer := Perech.NamePer;
+    tmp_Perech.PRIZNOGR := Perech.PRIZNOGR;
+    tmp_Perech.lastdate := Perech.lastdate;
+    insert current tmp_Perech;
+  }
+  Inherited::HandleEvent(cmOnVipLoad);
+}
+cmOnVipUnLoad:
+{
+  exitProc;
+  DoneStav;
+   if Not NullVipRef(APAI)
+    { FreeVipInterface(APAI)
+
+    }
+   if Not NullVipRef(MPAI)
+    { FreeVipInterface(MPAI)
+
+    }
+   if Not NullVipRef(vNeoblSumForm)
+    { FreeVipInterface(vNeoblSumForm)
+    }
+
+  Inherited::HandleEvent(cmOnVipUnLoad);
+
+}
+end;
+end.

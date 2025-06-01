@@ -1,0 +1,238 @@
+/*************************************************************************************************\
+* Наименование: Доработка интерфейса "Графики режимов работ"                                      *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#49           |23/03/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Доработка   |#1262         |15/11/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Доработка   |#1303         |22/11/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_MenuDynamic.vih
+#include GP_FillKlndrFromWorkPattern.vih
+
+#component "Z_Calendar"
+//Просмотр графиков режимов работ
+alter interface Klndr;
+overload
+  function CreateSchedule(ScheduleYear: integer; ScheduleMonth: byte): boolean;
+end;
+ExtendFormats OpModesBrowse;
+
+Create view Klndrviev
+from
+  GP_KlndrExt,GP_KlRejimYear
+where((
+  KLREJIM.NRec == GP_KlRejimYear.cKlRejim and
+  Years.Value == GP_KlRejimYear.Year
+));
+
+browse OpModesBrowse (,, sci178EnEscIns) ;
+table KLREJIM;
+fields
+  GP_KlRejimYear.CheckDate 'Дата приема', 'графика':[14],NoProtect, NoDel, NoAutoSize;
+end;
+
+function IsCheckDate:boolean;
+{
+  result:=IsValidAll(tnGP_KlRejimYear);
+
+  if (result)
+    result:=GP_KlRejimYear.CheckDate<>ZeroDate;
+
+  if (result)
+    message('Для графика работ за текущий год заполнена дата приема графика.',error);
+}
+
+function CreateSchedule(ScheduleYear: integer; ScheduleMonth: byte): boolean;
+{
+  result:=false;
+
+  if (IsCheckDate) exit;
+
+  result:=inherited::CreateSchedule(ScheduleYear,ScheduleMonth);
+}
+
+TableEvent table KLREJIM;
+cmCheckField:{
+  if (CurField = #GP_KlRejimYear.CheckDate) {//Дата приема графика
+    if (getfirst KLNDRYEAR <> tsOk and GP_KlRejimYear.CheckDate <> ZeroDate) {
+      Message('График режима работы "' + KLREJIM.NREJIM + '" за ' + string(Years.Value) + ' год не сформирован.');
+      ReReadRecord(tnGP_KlRejimYear);
+      exit;
+    }
+
+    if (GP_KlRejimYear.CheckDate=ZeroDate) {
+      if (IsValidAll(tnGP_KlRejimYear))
+        delete current GP_KlRejimYear;
+    } else {
+      if (IsValidAll(tnGP_KlRejimYear))
+        update current GP_KlRejimYear
+      else {
+        GP_KlRejimYear.cKlRejim:=KLREJIM.NRec;
+        GP_KlRejimYear.Year:=Years.Value;
+        insert current GP_KlRejimYear;
+      }
+    }
+  } else {
+    case inherited :: handleEvent (cmCheckField) of
+      heAbort:{abort;exit;}
+      heStop:{stop;exit;}
+    end;
+  }
+}
+end;
+
+HandleEvent
+cmInit:{
+  case inherited :: handleEvent (cmInit) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  if (boGetTune('RGHTBL.NOUPDATE.GRAFIK')) {//Доступ к таблицам\Запретить модификацию\Каталога графика работы
+    DisableCommand(cmValue21);
+    ToggleFieldProtected(#GP_KlRejimYear.CheckDate,true);
+  }
+}
+cmDelete:{
+  if (IsCheckDate) {
+    abort;
+    exit;
+  }
+
+  case inherited :: handleEvent (cmDelete) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+}
+cmValue21:{//Сформировать график по шаблонам рабочих дней
+  if (not IsValidAll(tnKlRejim)) exit;
+  if (IsCheckDate) exit;
+
+  if getfirst KLNDRYEAR = tsOk
+  {
+    if (Message('График режима работы "' + KLREJIM.NREJIM + '" за ' + string(Years.Value) + ' год' + ' уже сформирован.'#13#13 +
+      'Переформировать график?', Confirmation + YesNo) <> cmYes)
+      exit;
+  }
+
+  if CreateSchedule(Years.Value, 0)
+  {
+    var FillKlndrFromWorkPattern:GP_FillKlndrFromWorkPattern;
+    FillKlndrFromWorkPattern.Run(KlRejim.Rejim,Years.Value);
+
+    SumDaysAndHours;
+    ReReadRecord(tnNoTable);
+    ReReadRecord(tnKlRejim);
+  }
+  else
+    ShowErrors;
+}
+cmRestoreDoc:{
+    if FocusedFormat <> OpModesBrowse
+      exit;
+
+    if (IsCheckDate) exit;
+
+    if Anchor = KLREJIM.REJIM
+    {
+      Message('Нельзя выполнить копирование графика на самого себя', Error + OkButton);
+      exit;
+    }
+
+    if getfirst fastfirstrow KLREJIMCPY where ((Anchor == KLREJIMCPY.REJIM)) <> tsOk
+    {
+      Message('Режим работы с кодом ' + string(Anchor) + ' не найден', Error + OkButton);
+      exit;
+    }
+
+    if Message('Скопировать график режима работы "'
+      + string(KLREJIMCPY.REJIM) + ', ' + KLREJIMCPY.NREJIM + '"?', Confirmation + YesNo) <> cmYes
+      exit;
+
+    // прибить график текущего режима работы
+    delete safe KLNDRYEAR;
+
+    var Broken: boolean;
+    Broken := false;
+
+    StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Копирование графика режима работы', 1);
+    _try
+      // скопировать график режима работы
+      _loop KLNDRYEAR where ((Anchor == KLNDRYEAR.REJIM and Years.Value == KLNDRYEAR.YEARK
+                              and KLNDRYEAR.REJIM == GP_KlndrExt.Rejim and KLNDRYEAR.YEARK == GP_KlndrExt.YearK
+                              and KLNDRYEAR.MonthK == GP_KlndrExt.MonthK))
+      {
+        KLNDRCPY.BUFFER := KLNDRYEAR.BUFFER;
+        KLNDRCPY.NREC := 0;
+        // код режима работы - нового родителя
+        KLNDRCPY.REJIM := KLREJIM.REJIM;
+        LogTableError((insert current KLNDRCPY), coKLNDR);
+        NextVisual;
+
+        if (KLNDRCPY.NREC<>0 and IsValidAll(tnGP_KlndrExt)) {
+          GP_KlndrExt.NRec:=0;
+          GP_KlndrExt.Rejim:=KLREJIM.REJIM;
+          LogTableError((insert current GP_KlndrExt), coGP_KlndrExt);
+        }
+      }
+    _except
+      on ExUserBreak:
+        Broken := true;
+    _finally
+    {
+      StopVisual('', 0);
+      #ifdef Gal9_1
+      // Сбросить кэши графиков паскалевского функционала
+      ResetInternalScheduleCaches;
+      #endif
+      ReReadRecord(#KLREJIM);
+      ShowErrors;
+      Message('Копирование графика ' + if(Broken, 'прервано', 'завершено'), Information);
+    }
+}
+end;
+
+end.
+
+//Добавление пункта меню "Заполнение полей из шаблонов рабочих дней"
+handler with replace GP_MenuDynamic_AddItems_Klndr on ExtensionPoint GP_MenuDynamic_AddItems
+action
+{
+  result:=true;
+  timelog('GP_MenuDynamic_AddItems_Z_CALENDAR::Klndr_HotKeys');
+  DeleteMenuHowDynamics('Z_CALENDAR::Klndr_HotKeys');
+
+  var MenuID:longint=0;
+  _try {
+    MenuID:=LoadMenuEx('Z_CALENDAR::Klndr_HotKeys',false,true);
+
+    AddMenuItem(MenuID,'separator',1);
+    AddMenuItemEx(MenuID,'Сформировать график по шаблонам рабочих дней',
+                         'Сформировать график по шаблонам рабочих дней','',cmValue21,0);
+
+    if (not StoreMenuHowDynamics(MenuID,'Z_CALENDAR::Klndr_HotKeys'))
+      _raise ExAddMenuItemError;
+  }
+  _except
+    on ExVip:{
+      message('Ошибка регистрации меню для интерфейса "Графики режимов работ"'#13+
+              ExploreException,error);
+    }
+  _finally {
+    if (MenuID<>0) DisposeLoadMenu(MenuID);
+  }
+  timelog('GP_MenuDynamic_AddItems_Klndr finish');
+}
+
+//Удаление пункта меню "Заполнение полей из шаблонов рабочих дней"
+handler with replace GP_MenuDynamic_DelItems_Klndr on ExtensionPoint GP_MenuDynamic_DelItems
+action
+{
+  result:=true;
+
+  DeleteMenuHowDynamics('Z_CALENDAR::Klndr_HotKeys');
+}

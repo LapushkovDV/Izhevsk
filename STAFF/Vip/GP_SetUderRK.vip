@@ -1,0 +1,285 @@
+//******************************************************************************
+//                                                      (с) корпорация Галактика
+//  Галактика 8.1 - Управление персоналом
+//  Реализация SetUderRK.vih  (работа по удержаниям через РК)
+//******************************************************************************
+#include GP_SetUderRK.vih // обработка удержаний
+#include MainLschetForPersons.vih // нахождение основного л\с
+
+#doc
+  Интерфейс реализации функций SetUderRK.vih
+#end
+interface GP_SetUderRK '';
+
+Create View  GP_SetUderRK
+  Var
+    MLFP: MainLschetForPersons;   // ссылка на главный л\с
+    iVidUd: longint; // вид доплаты
+From
+  Persons
+  , Appointments
+  , KlVidUd
+  , Lschet
+  , ZarSignal
+;
+
+create view vDoc
+var
+  _contdocNrec: comp;
+from contdoc, partdoc, titledoc
+where ((
+  _contdocNrec  == contdoc.nrec and
+  contdoc.cpart == partdoc.nrec and
+  partdoc.cdoc  == titledoc.nrec
+));
+
+//******************************************************************************
+//#region Внутренние процедуры и функции
+
+//Вставляет записи в РК с заполнением стандартных полей
+Function InsertUderRR (cPers: comp; cApp: comp): boolean;
+Var
+  dTmp1: date;
+  tTmp2: time;
+  wFl: word;
+{
+  ZarSignal.NRec := 0;
+  ZarSignal.SubSysCode := 1;
+  dTmp1 := Cur_Date;
+  tTmp2 := Cur_Time;
+  ZarSignal.FstDate := dTmp1;
+  ZarSignal.FstTime := tTmp2;
+  ZarSignal.LstDate := dTmp1;
+  ZarSignal.LstTime := tTmp2;
+  ZarSignal.tPerson := cPers;
+
+  if GetFirst FastFirstRow Persons  where ((cPers == Persons.Nrec)) = tsOK
+  {
+    ZarSignal.TABN    := Persons.TabNmb;
+    ZarSignal.StrTabn := Persons.StrTabN;
+    ZarSignal.CEX     := Persons.GalDep;
+  }
+  // проверим, нельзя ли эти же поля актуализировать
+  if getfirst FastFirstRow Appointments where ((cApp == Appointments.Nrec)) = tsOk
+  {
+    if GetFirst FastFirstRow Persons  where((cPers == Persons.Nrec)) = tsOK
+      if (Persons.AppointCur <> Appointments.Nrec)// не основное назначение
+        if (getfirst FastFirstRow LSchet  where ((Appointments.cAddNrec2 == LSchet.Nrec)) = tsOK)
+        {
+          ZarSignal.TABN    := LSchet.TabN;
+          ZarSignal.StrTabn := LSchet.StrTabN;
+        }
+
+    ZarSignal.CEXZPL := Appointments.nRec; // для удержаний всегда кладем ссылку на назначение
+  } //if getfirst FastFirstRow Appointments where ((cApp == Appointments.Nrec)) = tsOk
+
+  // попробуем найти лицевой счет для данной персоны
+  wFl := 2;
+
+  if (getfirst LSchet  where ((Appointments.cAddNrec2 == LSchet.Nrec)) = tsOK)
+    wFl := 0;
+  else
+  {
+    var cLschet: comp = 0;
+    if MLFP.GetMainLschet(Persons.nRec, cLschet)
+      if GetFirst FastFirstRow Lschet where ((cLschet == Lschet.nRec)) = tsOk
+        wFl := 0;
+  }
+  // удалось спозиционироваться на л\с
+  if (wFl <> 2)
+  {
+    ZarSignal.stFlags := wFl;
+    ZarSignal.TABNZPL := LSchet.TABN;
+    ZarSignal.CEXZPL := LSchet.CEX;
+    ZarSignal.cLschetZPL := Lschet.nRec;
+    ZarSignal.StrTABN := LSchet.StrTABN;
+  }
+  // сама вставка
+  if (insert current ZarSignal <> tsOK)
+  {
+    message(chr(3) + 'Ошибка при выполнении операции.' + chr(13) +
+       chr(3) + 'Сообщение о корректировке данных утеряно.', OkButton + Error);
+    InsertUderRR := False;
+  }
+  else
+    InsertUderRR := True;
+}
+
+// Заполняет поля, которые могут меняться - т.е. отличны от стандартных
+// возвращает False, если нет связи с зарплатным классификатором
+Function FillNeedingFieldsForOpen(_params: TGP_SetUderRK_Params): boolean;
+{
+  FillNeedingFieldsForOpen := False;
+  // теперь поля, которым все равно, апдейт или вставка
+  ZarSignal.SrcTable:= _params.wTable;
+  ZarSignal.SrcRec  := _params.cRec;
+  ZarSignal.Date1   := _params.dBeg;
+  ZarSignal.Date2   := _params.dEnd;
+  ZarSignal.Comp3   := _params.cRec;
+  ZarSignal.Double1 := _params.dSum;
+
+  if _params.wSumType < 2 // суммой
+  {
+    ZarSignal.Word1 := 1;
+    ZarSignal.Comp2 := _params.cVal; // ссылка на валюту
+  }
+  else
+    ZarSignal.Word1 := 2;
+
+  if (GetFirst KlVidUd where((_params.wVidUd == KlVidUd.VidUd)) = tsOK)
+  {
+    ZarSignal.Comp1 := KlVidUd.Nrec;
+    FillNeedingFieldsForOpen := true;
+  }
+  ZarSignal.Comp4 := _params.cContDoc;
+  vDoc._contdocNrec := _params.cContDoc;
+  if vDoc.getfirst contdoc = tsOk
+    if vDoc.getfirst partdoc = tsOK
+      if vDoc.getfirst titledoc = tsOk
+      {
+        ZarSignal.date10  := vDoc.titledoc.DocDate;
+        ZarSignal.string2 := vDoc.titledoc.DocNmb;
+      }
+}  //Procedure FillNeedingFieldsForOpen;
+
+//#endregion Внутренние процедуры и функции
+//******************************************************************************
+
+//******************************************************************************
+//#region Реализация внешних процедур и функций
+
+//Формирует сообщение в РК о постоянном удержании
+Function MsgRR (_params: TGP_SetUderRK_Params; _MsgCode: integer = 212): comp;
+{
+  MsgRR := 0;
+
+  var bUpdateSignal: boolean;
+  bUpdateSignal := False;
+  // проверяем, модифицировать последнюю необработанную запись или заводить новую
+  if (getFirst FastFirstRow ZarSignal
+      where((     1              == ZarSignal.SubSysCode
+              and _params.wTable == ZarSignal.SrcTable
+              and _params.cRec   == ZarSignal.SrcRec
+              and (ZarSignal.MsgCode = _MsgCode and (ZarSignal.FilialNo and 1 ) = 0) //неутвержденная
+           )) = tsOK)
+  {
+    if lockCurrent(tnZarSignal) = 0
+      bUpdateSignal := True;
+  }
+
+  if not bUpdateSignal
+  {
+    ClearBuffer(#ZarSignal);
+    ZarSignal.MsgCode  := _msgCode; // тип: назначение или удаление
+  }
+  // заполнение полей, обязательных как при апдейте, так и при вставке
+  if not FillNeedingFieldsForOpen(_params)
+    exit;
+  // теперь вставка или модификация
+  if bUpdateSignal                // Update Existing Signal
+  {
+    if update current ZarSignal = tsOK
+      MsgRR := ZarSignal.Nrec;
+  }
+  else
+  {
+    if InsertUderRR (_params.cPers, _params.cApp)
+      MsgRR := ZarSignal.Nrec;
+  }
+} //Function MsgRR
+
+//Формирует сообщение в РК о закрытии постоянного удержания
+Function CloseSU(_params: TGP_SetUderRK_Params): comp;
+{
+  CloseSU := 0;
+
+  ClearBuffer(#ZarSignal);
+  ZarSignal.MsgCode  := 213; // удаление постоянного удержания в зп
+  // заполнение полей, обязательных как при апдейте, так и при вставке
+  if not FillNeedingFieldsForOpen(_params)
+    exit;
+  // вставка вместе с заполнением стандартных полей
+  if InsertUderRR (_params.cPers, _params.cApp)
+    CloseSU := ZarSignal.Nrec;
+} //Function CloseSU(cPers: comp; cApp: comp; cPunish: comp; cContDoc: comp): boolean;
+
+//Формирует сообщение в РК об открытии постоянного удержания
+Function OpenSU(_params: TGP_SetUderRK_Params): comp;
+{
+  OpenSU := 0;
+
+  ClearBuffer(#ZarSignal);
+  ZarSignal.MsgCode := 212; // добавление постоянного удержания в зп
+  // заполнение полей, обязательных как при апдейте, так и при вставке
+  if not FillNeedingFieldsForOpen(_params)
+    exit;
+
+  if InsertUderRR (_params.cPers, _params.cApp)
+    OpenSU := ZarSignal.Nrec;
+} //Function OpenSU(cPers: comp; cApp: comp; cPunish: comp; cContDoc: comp): boolean;
+
+//Удаляет сообщение об удержании в РК
+Function DelSU(_SrcTable: word; _SrcRec: comp; _MsgCode: integer; _Flag: comp; _cContDoc: comp = 0): word;
+{
+  DelSU := 0; // невзрачный признак. Либо групповое удаление, либо не было удаленных сигналов
+
+  case _Flag of
+    1:  // все сразу
+    {
+      if (delete all ZarSignal
+        where((1         == ZarSignal.SubSysCode
+           and _SrcTable == ZarSignal.SrcTable
+           and _SrcRec   == ZarSignal.SrcRec
+           and (ZarSignal.MsgCode = _MsgCode)
+           ))) <> tsOk
+        DelSU := 100; // ошибка удаления
+    }
+    2:// только неутвержденные
+    {
+      if (delete all ZarSignal
+            where((1         == ZarSignal.SubSysCode
+               and _SrcTable == ZarSignal.SrcTable
+               and _SrcRec   == ZarSignal.SrcRec
+               and (ZarSignal.MsgCode = _MsgCode and (ZarSignal.FilialNo and 1) = 0)
+               ))) <> tsOk
+        DelSU := 100; // ошибка удаления
+    }
+    3:// утвержденные только
+    {
+      if (delete all ZarSignal
+            where((1         == ZarSignal.SubSysCode
+               and _SrcTable == ZarSignal.SrcTable
+               and _SrcRec   == ZarSignal.SrcRec
+               and (ZarSignal.MsgCode = _MsgCode and (ZarSignal.FilialNo and 1) = 1)
+           ))) <> tsOk
+        DelSU := 100; // ошибка удаления
+    }
+    5: // по конкретному приказу
+    {
+      While ( GetFirst FastFirstRow ZarSignal
+              where ((1         == ZarSignal.SubSysCode
+                   and _SrcTable == ZarSignal.SrcTable
+                   and _SrcRec   == ZarSignal.SrcRec
+                   and (ZarSignal.MsgCode = _MsgCode and ZarSignal.Comp4 = _cContDoc))) = tsOk)
+      do
+      {
+        case (ZarSignal.FilialNo and 1) of
+          0:
+          {
+            if DelSU <> 1 // если удалялся хоть один утв., то нужно оставлять его признак
+              DelSU := 2; // неутвержденные
+          }
+          1: DelSU := 1;// утвержденные
+        end; // case
+
+        if Delete current ZarSignal <> tsOk
+          DelSU := 100; // ошибка удаления
+      } //While GetFirst FastFirstRow ZarSignal
+    }
+  end; // case
+}//procedure DelSU(cPunish: comp; wFlag: word);
+
+//#endregion
+//******************************************************************************
+
+End.

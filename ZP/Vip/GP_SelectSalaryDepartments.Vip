@@ -1,0 +1,182 @@
+/*************************************************************************************************\
+* Наименование: Права доступа к лицевым счетам по подразделениям                                  *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: необходимо разработать отдельный функционал по разграничению прав доступа           *
+* по подразделениям аналогичному в модуле ЗП                                                      *
+* USERRIGHTS ->  GP_USERRIGHTS                                                                    *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1754         |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include  DepTree.vih
+#include AllowedDepartmentGroupList.vih // работа со списком разрешенных групп подразделений
+//---------------------------
+#include  GP_GetPodalN.Vih
+Interface GP_SelectSalaryDepartments;
+var
+  wTypeMode:word;
+//---------------------
+  NPOEM_OWN_Raise_Protect :word;//Использовать ограничения по подразделениям
+  // список разрешенных групп подразделений
+  ADGL:             IAllowedDepartmentGroupList;
+
+Parameters
+  wTypeMode;
+
+Procedure DisableGrup;
+{
+
+}
+
+procedure GP_CollectDepartments;
+{ PopBounds(#SDEPARTMENTS);
+    delete SDEPARTMENTS where (( RootNode >> SDEPARTMENTS.NREC));
+  //RootNode := if (ShowRoot, GetNextNrec(#KATPODR, 0), 0); - уже заполнено!
+    var _TreeView:boolean=TreeView;
+    var _UserName:string=UserName();
+    var _RootNode:comp  =RootNode;
+
+    if wTypeMode = 3 // ограничения по КБ
+    {
+       insert into SDEPARTMENTS (cPodr,Parent,Kod,Name,DISABLED,Nrec)
+                  select  if((KatPodr.CPODR <> 0) and _TreeView, KatPodr.CPODR, _RootNode)//сPodr
+                      , if(KatPodr.CPODR <> 0, KatPodr.CPODR, _RootNode)//SDEPARTMENTS.PARENT :=
+                      , KatPodr.KOD
+                      , KatPodr.NAME
+                      , false
+                      , KatPodr.Nrec
+                      from KatPodr
+                      where ((
+                           _UserName    /== GP_USERRIGHTS.OWNNAME
+                      and  KatPodr.Nrec /== GP_USERRIGHTS.crecds
+                      and  wTypeMode    /== GP_USERRIGHTS.wType
+                      ));
+    }
+      else
+      {
+                if NPOEM_OWN_Raise_Protect=1
+                { insert into SDEPARTMENTS (cPodr,Parent,Kod,Name,DISABLED,Nrec)
+                  select  if((KatPodr.CPODR <> 0) and _TreeView, KatPodr.CPODR, _RootNode)//сPodr
+                      , if(KatPodr.CPODR <> 0, KatPodr.CPODR, _RootNode)//SDEPARTMENTS.PARENT :=
+                      , KatPodr.KOD
+                      , KatPodr.NAME
+                      , false
+                      , KatPodr.Nrec
+                      from KatPodr
+                      ;
+                }
+                else if NPOEM_OWN_Raise_Protect=3
+                { insert into SDEPARTMENTS (cPodr,Parent,Kod,Name,DISABLED,Nrec)
+                  select  if((KatPodr.CPODR <> 0) and _TreeView, KatPodr.CPODR, _RootNode)//сPodr
+                      , if(KatPodr.CPODR <> 0, KatPodr.CPODR, _RootNode)//SDEPARTMENTS.PARENT :=
+                      , KatPodr.KOD
+                      , KatPodr.NAME
+                      , not ADGL.Has(KATPODR.CGRPODR)
+                      , KatPodr.Nrec
+                      from KatPodr
+                      ;
+                }
+                else
+                { insert into SDEPARTMENTS (cPodr,Parent,Kod,Name,DISABLED,Nrec)
+                  select  if((KatPodr.CPODR <> 0) and _TreeView, KatPodr.CPODR, _RootNode)//сPodr
+                      , if(KatPodr.CPODR <> 0, KatPodr.CPODR, _RootNode)//SDEPARTMENTS.PARENT :=
+                      , KatPodr.KOD
+                      , KatPodr.NAME
+                      , false
+                      , KatPodr.Nrec
+                      from KatPodr
+                      where ((
+                           _UserName    /== GP_USERRIGHTS.OWNNAME
+                      and  KatPodr.Nrec /== GP_USERRIGHTS.crecds
+                      and  0            /== GP_USERRIGHTS.wType
+                      ));
+                }
+      }
+    PushBounds(#SDEPARTMENTS);
+} // procedure GP_CollectDepartments;
+
+procedure CollectDepartments;
+{ PopBounds(#SDEPARTMENTS);
+  delete all SDEPARTMENTS;
+  RootNode := if (ShowRoot, GetNextNrec(#KATPODR, 0), 0);
+
+  if NPOEM_OWN_Raise_Protect=0
+  {
+    _try
+    {
+      var DI: IDepartmentIteratorEx;
+      LoadVipRef(DI, 'DepartmentIterator');
+      BindEvent(CollectDepartment, DI.CollectDepartmentEx);
+      DI.SetExtended(true);
+      IDepartmentValidatorEquipped(DI).SetDepartmentValidator(DepartmentValidator);
+      IDepartmentIterator(DI).IterateDepartments(0, if(prChange = 6, ifIgnoreUserRights, 0)
+           or if(TreeView or (((prChange = 0) or (prChange = 10)) and (ZAR_USER.PODRSHARE = '+')), 0, ifTreatAsPlainList));
+      UnBindEvent(CollectDepartment, DI.CollectDepartmentEx);
+    }
+    _finally
+    {
+      if (ShowRoot)
+      {
+        //фиктивный корневой узел
+        ClearBuffer(#SDEPARTMENTS);
+        SDEPARTMENTS.NREC := RootNode;
+        SDEPARTMENTS.KOD := '';
+        SDEPARTMENTS.NAME := 'Все '  + if((ZAR_USER.PODRSHARE = '+') and (prChange <> 6), 'доступные ', '') + 'подразделения';
+        insert current SDEPARTMENTS;
+      }
+    }
+  }
+  else
+  {  GP_CollectDepartments;
+  }
+} //procedure CollectDepartments;
+
+HandleEvent
+  cmInit:
+  { timelog_Init;
+     if  username = 'lapushkov_dv' then
+
+    NPOEM_OWN_Raise_Protect   :=wGetTune('NPOEM_OWN.Raise.Protect');//Использовать ограничения по подразделениям
+    //придется все таки выполнить
+    case inherited :: handleEvent (cmInit) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+    end;
+    timelog('GP_SelectSalaryDepartments->cmInit:Initialized='+string(Initialized));
+    if (Zar_User.PodrShare<>'+' and NPOEM_OWN_Raise_Protect=1 ) //все с учетом КБ
+    or (NPOEM_OWN_Raise_Protect=0 and wTypeMode <> 3) // По зарплате
+    or (Zar_User.PodrShare<>'+' and wTypeMode = 3)
+    {
+
+    } //if (Zar_User.PodrShare<>'+' and NPOEM_OWN_Raise_Protect=1)
+    Else
+    { GP_CollectDepartments;
+      ReScanPanel(#SDEPARTMENTS);
+    } //else if (Zar_User.PodrShare<>'+' and NPOEM_OWN_Raise_Protect=1)
+  } //cmInit
+  cmAccording:
+  {
+    if (Zar_User.PodrShare<>'+' and NPOEM_OWN_Raise_Protect=1) //все
+    or (NPOEM_OWN_Raise_Protect=0) // По зарплате
+    {
+      case inherited :: handleEvent (cmInit) of
+      heAbort:{abort;exit;}
+      heStop:{stop;exit;}
+      end;
+    }
+    else
+    { if (not Initialized)
+      exit;
+
+      TreeView := not TreeView;
+      LastDep := SDEPARTMENTS.NREC;
+      GP_CollectDepartments;
+      SetupBounds(false);
+      if not TreeJumpToRecord(DepTree, LastDep)
+        TreeOpenNode(DepTree);
+      ReScanPanel(#SDEPARTMENTS);
+    }
+  }
+
+end;
+end.

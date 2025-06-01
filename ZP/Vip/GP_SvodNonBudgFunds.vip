@@ -1,0 +1,653 @@
+/*************************************************************************************************\
+* Наименование: Сводка отчисления взносов во внебюджетные фонды                                   *
+* Контур/Модуль: Заработная плата                                                                 *
+* Пункт меню: Отчеты / Отчеты пользователя / Сводные отчеты по зарплате / Отчет о начисленном ФЗП *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1204         |13/12/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include PAFilter.vih // Объектный интерфейс Фильтра по лицевым счетам сотрудников
+#include History.vih
+#include FeeSigners.Vih // Функции работы с подписантами
+
+#define GPInt GP_SvodNonBudgFunds // #(GPInt)
+#define GPNam Сводка отчисления взносов во внебюджетные фонды // #(GPNam)
+
+interface GP_SvodNonBudgFunds '#(GPNam)' EscClose;
+
+  const
+    SG_CONST_REP = cgReport_7400; // код группы отчётов для выбора подписантов
+    SG_TAG_REP = 'SvodNonBudgFunds'; // код группы отчётов для выбора подписантов
+  end;
+
+  var
+    #include PaFilter.var
+
+  #include History.var
+  #include FeeSigners.var
+
+  table struct SData
+  (
+    Priority: Byte,         // Приоритет показа строки в форме
+    cOrder: tNRec,          // Ссылка на заказ
+    OrderName: String[100], // Название заказа
+    PF: Double,             // Пенсионный фонд: на страховую часть трудовой пенсии
+    PFList1: Double,        // Пенсионный фонд: дополнительные взносы для работников список 1
+    PFList2: Double,        // Пенсионный фонд: дополнительные взносы для работников список 2
+    PFList1Spec: Double,    // Пенсионный фонд: дополнительные взносы для работников список 1 со спецоценкой
+    PFList2Spec: Double,    // Пенсионный фонд: дополнительные взносы для работников список 1 со спецоценкой
+    FMS: Double,            // Фонд обязательного медицинского страхования
+    FSS: Double,            // Фонд социального страхования
+    FTR: Double             // Фонд отчисления на травматизм
+  )
+  With index
+  (
+    SData01 = cOrder,
+    SData02 = Priority + OrderName
+  );
+
+  create view
+    var
+      pMonth: Byte; // Месяц отчётного периода
+      pYear: Word; // Год отчётного периода
+      pSignerGrp: String; // Группа подписантов
+      CurVidOplS: Word; // Системный код вида оплат, на который начислен текущий налог на ФОТ
+      CurOrderNRec: tNRec; // Ссылка на заказ по текущему налогу на ФОТ
+      CurOrderCode: String; // Код заказа по текущему налогу на ФОТ
+    as select
+      (PAF.GetDepartmentFilterStr) (fieldName = FiltrPodr), // фильтр по подразделению
+      (PAF.GetPersonalAccountFilterStr) (fieldName = FiltrPublic) // фильтр по работникам
+    from
+      Zar_User,
+      SData (SData02),
+      PerevodTek (PerevTek03),
+      Perevod (Perevod08),
+      synonym Perech PerechP,
+      synonym NeNach NeNachP
+    where ((
+          UserName          == Zar_User.OwnName
+      and 0                 == ForMarks.Choice
+      and ForMarks.cPodr    == LSchet.NRec
+      and LSchet.TPerson    == Persons.NRec
+      // Налоги на ФОТ
+      // Текущий месяц
+      and pYear             == PerevodTek.YearN
+      and pMonth            == PerevodTek.MesN
+      and LSchet.NRec       == PerevodTek.cLSch
+      and PerevodTek.VidPer == Perech.VidPer
+      and PerevodTek.cNach  == Nachisl.NRec
+      and PerevodTek.cNach  == NeNach.NRec
+      // Прошлые месяцы
+      and LSchet.NRec       == Perevod.cLSch
+      and pYear             == Perevod.YearN
+      and pMonth            == Perevod.MesN
+      and Perevod.VidPer    == PerechP.VidPer
+      and Perevod.cNach     == SumVidOp.NRec
+      and Perevod.cNach     == NeNachP.NRec
+
+      and CurVidOplS        == KlVidOpl.VidOpl
+    ));
+
+  var
+    IsAborted: Boolean;
+    CPF, TPF: Double;
+    CPFList1, TPFList1: Double;
+    CPFList2, TPFList2: Double;
+    CPFList1Spec, TPFList1Spec: Double;
+    CPFList2Spec, TPFList2Spec: Double;
+    CFMS, TFMS: Double;
+    CFSS, TFSS: Double;
+    CFTR, TFTR: Double;
+
+  form Frm ('GP_SvodNonBudgFunds.out', 'GP_SvodNonBudgFunds');
+
+  // Минимально необходимый код из PAFilter.vpp для использования стандартных зарплатных фильтров
+  // #include PAFilter.vpp : begin
+  procedure ProcessCheck;
+  begin
+    case Zar_User.GrupStN xor PAF.GetFilterState of // какой фильтр изменился ?
+      1: // по подразделению
+        if (Zar_User.GrupStN and 1) > 0 then
+        begin
+          SelectField(#FiltrPodr);
+          putcommand(cmPick);
+        end else
+        begin
+          PAF.ClearDepartmentFilter;
+          ReReadRecord(#Zar_User);
+        end;
+      2: // по работникам
+        if (Zar_User.GrupStN and 2) > 0 then
+        begin
+          SelectField(#FiltrPublic);
+          putcommand(cmPick);
+        end else
+        begin
+          PAF.ClearPersonalAccountFilter;
+          ReReadRecord(#Zar_User);
+        end;
+    end;
+  end;
+
+  procedure PodrPubCheck;
+  begin
+    if CurField = #Zar_User.GrupsTN then
+      ProcessCheck;
+  end;
+
+  procedure PodrPubPick;
+  begin
+    case CurField of
+      #FiltrPodr:
+        begin
+          PAF.ChangeDepartmentFilter(true);
+          ReReadRecord(#Zar_User);
+        end;
+      #FiltrPublic:
+        begin
+          PAF.ChangePersonalAccountFilter(0);
+          ReReadRecord(#Zar_User);
+        end;
+    end;
+  end;
+
+  function FillMarks: Boolean;
+  begin
+    result := PAF.CheckPersonalAccountFilter(0);
+    if not result then
+    begin
+      SelectField(#FiltrPublic);
+      Message('Не задан фильтр по работникам', Error + OkButton);
+    end;
+    ReReadRecord(#Zar_User);
+  end;
+  // #include PAFilter.vpp : end
+
+  #include GP_Log.var
+
+  window winParam '#(GPNam)' DoAccept, EscClose, Gray;
+    show at (,, 74, 11);
+
+    screen scrParam ('',, sci1EnEsc);
+    fields
+      pMonth ('Месяц'):
+       [LIST
+         1 'Январь',
+         2 'Февраль',
+         3 'Март',
+         4 'Апрель',
+         5 'Май',
+         6 'Июнь',
+         7 'Июль',
+         8 'Август',
+         9 'Сентябрь',
+         10 'Октябрь',
+         11 'Ноябрь',
+         12 'Декабрь'
+       ], protect;
+      pYear ('Год отчетного периода'): noprotect, SpinButton [1, 1, 9999];
+      pSignerGrp ('Группа подписантов',, sci13EnEsc): protect;
+      Zar_User.GrupStN ('Выберите фильтр для расчета',, sci1Esc): NoProtect;
+      FiltrPodr   ('Заданный фильтр по подразделению',, sci13Esc): Protect, PickButton;
+      FiltrPublic ('Заданный фильтр по работикам',,sci13Esc): Protect, PickButton;
+    buttons
+      cmOk,,, 'Ввод - принять выбор',,sci1Esc;
+      cmCancel,,, 'Отмена',,sci1Esc;
+    <<
+
+`Отчетный период     `.@@@@@@@@@@@.@@@@@ года
+
+`Группа подписантов  `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ Фильтры по
+  [.] подразделению  `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] работникам     `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+                        <.  ~O~K  .> <.О~т~мена.>
+    >>
+    end;
+
+    handleEvent
+      cmPick:
+        case CurField of
+          #pSignerGrp:
+            begin
+              if iFeeSigners.RunMainWindow(1) then
+                set pSignerGrp := iFeeSigners.GetFeeSignersName;
+            end;
+        end;
+      cmOk:
+        PutCommand(cmDefault);
+      cmDefault:
+        // Сохраним выбранный фильтр
+        if update current Zar_User != tsOk then
+        begin
+        end;
+    end;
+  end;
+
+  function InitParam: Boolean;
+  var
+    // Настройка пользователя
+    pYearRas: Integer;
+    pMonthRas: Integer;
+    // pDayRas: Integer;
+    // pFirstDayRas: Date;
+    // pDatRas: Date;
+  begin
+    InitParam := False;
+    pYearRas := 0;
+    pMonthRas := 0;
+    // if not GetUserDate(pYearRas, pMonthRas, pDayRas, pFirstDayRas, pDatRas) then
+    if not GetUserDate(pYearRas, pMonthRas, 0, ZeroDate, ZeroDate) then
+      exit;
+    if not ReadMyDsk(pMonth, '#(GPInt)_pMonth', false) then
+      pMonth := pMonthRas;
+    if not ReadMyDsk(pYear, '#(GPInt)_pYear', false) then
+      pYear := pYearRas;
+    if not ReadMyDsk(pSignerGrp, 'FeeSigners_' + To_Char(SG_CONST_REP) + '_' + SG_TAG_REP, true) then
+      pSignerGrp := '';
+    InitParam := True;
+  end;
+
+  procedure SaveParam;
+  begin
+    SaveMyDsk(pMonth, '#(GPInt)_pMonth');
+    SaveMyDsk(pYear, '#(GPInt)_pYear');
+    SaveMyDsk(pSignerGrp, 'FeeSigners_' + To_Char(SG_CONST_REP) + '_' + SG_TAG_REP);
+  end;
+
+  function AskParam: Boolean;
+  begin
+    AskParam := False;
+    if not InitParam then
+      exit;
+    if RunWindowModal(winParam) = cmDefault then
+      if FillMarks then
+      begin
+        AskParam := True;
+        SaveParam;
+      end;
+  end;
+
+  procedure UpdateSData(_cOrder: tNRec; _OrderName: String);
+  begin
+    if getFirst SData where ((_cOrder == SData.cOrder)) = tsOk then
+    begin
+      SData.PF += CPF;
+      SData.PFList1 += CPFList1;
+      SData.PFList2 += CPFList2;
+      SData.PFList1Spec += CPFList1Spec;
+      SData.PFList2Spec += CPFList2Spec;
+      SData.FMS += CFMS;
+      SData.FSS += CFSS;
+      SData.FTR += CFTR;
+      if update current SData != tsOk then
+        oGP_Log.Error('Не удалось обновить запись в таблице SData');
+    end else
+    begin
+      ClearBuffer(#SData);
+      Priority := if(_cOrder = 0, 1, 0);
+      SData.cOrder := _cOrder;
+      SData.OrderName := _OrderName;
+      SData.PF := CPF;
+      SData.PFList1 := CPFList1;
+      SData.PFList2 := CPFList2;
+      SData.PFList1Spec := CPFList1Spec;
+      SData.PFList2Spec := CPFList2Spec;
+      SData.FMS := CFMS;
+      SData.FSS := CFSS;
+      SData.FTR := CFTR;
+      if insert current SData != tsOk then
+        oGP_Log.Error('Не удалось добавить запись в таблицу SData');
+    end;
+    TPF += CPF;
+    TPFList1 += CPFList1;
+    TPFList2 += CPFList2;
+    TPFList1Spec += CPFList1Spec;
+    TPFList2Spec += CPFList2Spec;
+    TFMS += CFMS;
+    TFSS += CFSS;
+    TFTR += CFTR;
+  end;
+
+  function LSInfo: String;
+  begin
+    result := '(Таб.№ ' + GetStrTabn(Lschet.TabN, Lschet.StrTabn) + ' ' + Persons.FIO + ')';
+  end;
+
+  // Возвращает, если два числа с плавающей точкой равны
+  function IsEqualDbl(N1: Double; N2: Double): Boolean;
+  begin
+    // Считаем два числа с плавающей точкой равными, если их разность меньше 0.001
+    result := Abs(N1 - N2) < 0.001;
+  end;
+
+  // Анализирует текущий налог на ФОТ по текущему работнику
+  #ifdef __DEBUG__
+  procedure AnalyseOnePerech(_VidPer: Word; _NamePer: String; _Otkuda: Byte; _SumPer: Double);
+  #else
+  procedure AnalyseOnePerech(_VidPer: Word; _SumPer: Double);
+  #end
+  var
+    SubClass: Double; // Код подкласса
+  begin
+    // Код подкласса
+    SubClass := Round(((Nachisl.Summa28 - Round(Nachisl.Summa28)) * 100), 2);
+    #ifdef __DEBUG__
+    oGP_Log.Info('  Налог на ФОТ ' + To_Char(_VidPer) + ' ' + _NamePer + '  сумма: ' + To_Char(_SumPer, 0, 2) + 
+     ' заказ: ' + CurOrderCode + ' подкласс: ' + To_Char(SubClass, 0, 2));
+    oGP_Log.Info('   ' + if(_Otkuda = 1, 'с ненач.суммы', 'с оплаты') + ' ' + To_Char(KlVidOpl.VidOplP) + ' ' + KlVidOpl.NVidOpl);
+    #end
+
+    CPF := 0;
+    CPFList1 := 0;
+    CPFList2 := 0;
+    CPFList1Spec := 0;
+    CPFList2Spec := 0;
+    CFMS := 0;
+    CFSS := 0;
+    CFTR := 0;
+    // Чтобы определить какой налог на ФОТ в какую колонку выводить
+    // не вижу другого выхода, как хардкодить по коду налога на ФОТ
+    case _VidPer of
+      2: // ФСС (Фонд социального страхования)
+       CFSS := _SumPer;
+      3: // ФФОМС (Федеральный фонд обязат.мед.страхования)
+       CFMS := _SumPer;
+      5: // Страховые взносы в ПФР
+       CPF := _SumPer;
+      8: // Обязательное страхование от несчастных случаев
+       CFTR := _SumPer;
+     11: // Дополнительный тариф для Списка 1
+       if IsEqualDbl(SubClass, 3.1) then
+         CPFList1Spec := _SumPer
+       else
+         CPFList1 := _SumPer;
+     12: // Дополнительный тариф для Списка 2
+       if IsEqualDbl(SubClass, 3.1) then
+         CPFList2Spec := _SumPer
+       else
+         CPFList2 := _SumPer;
+    end;
+    UpdateSData(CurOrderNRec, CurOrderCode);
+  end;
+
+  // Анализ КАУ и определение заказа
+  procedure AnalyzeKAU(_Tbl: tTabKau; _cKau: tGetKau);
+  var
+    I: Byte;
+  begin
+    CurOrderNRec := 0;
+    CurOrderCode := '';
+    for (I := 1; I <= 6; I++)
+    begin
+      case _Tbl[I] of
+        cgKau_Zakaz:
+          begin
+            CurOrderNRec := _cKau[I];
+            if GetAnyKau(cgAkSimple, cgKau_Zakaz, CurOrderNRec) then
+              CurOrderCode := GivenAnName(cgAnCode);
+            exit;
+          end;
+      end;
+    end;
+  end;
+
+  // Анализирует все налоги на ФОТ по текущему работнику
+  procedure ProcessPerech;
+  begin
+    // Анализируем налоги на ФОТ, начисленные в текущем месяце
+    _loop PerevodTek
+    begin
+      if IsAborted or not NextVisual then
+      begin
+        IsAborted := true;
+        break;
+      end;
+      if not IsValidAll(tnPerech) then
+      begin
+        oGP_Log.Error('Налог на ФОТ с кодом ' + To_Char(PerevodTek.VidPer) + ' не найден в классификаторе налогов на ФОТ ' + LSInfo);
+        continue;
+      end;
+      // Определяем, на какой вид оплат был начислен этот налог на ФОТ
+      CurVidOplS := 0;
+      if PerevodTek.Otkuda = 1 then
+      begin
+        // Налог с неначисляемой суммы
+        if not IsValidAll(tnNeNach) then
+        begin
+          oGP_Log.Error('Не найдена неначисляемая сумма, с которой удержан налог ' + LSInfo);
+          continue;
+        end;
+        set CurVidOplS := NeNach.VidOplS;
+        AnalyzeKAU(NeNach.TblD, NeNach.cKauD);
+      end else
+      begin
+        // Налог с оплаты
+        if not IsValidAll(tnNachisl) then
+        begin
+          oGP_Log.Error('Не найдена оплата, с которой удержан налог ' + LSInfo);
+          continue;
+        end;
+        set CurVidOplS := Nachisl.VidOplS;
+        AnalyzeKAU(Nachisl.TblD, Nachisl.cKauD);
+      end;
+      /*
+      // Мне кажется, можно было бы брать номер заказа прямо из налога на ФОТ, но в ТЗ написано брать из оплаты
+      AnalyzeKAU(PerevodTek.TblD, PerevodTek.cKauD);
+      if CurOrderNRec = 0 then
+        AnalyzeKAU(PerevodTek.TblExtr, PerevodTek.KauExtr);
+      */
+      #ifdef __DEBUG__
+      AnalyseOnePerech(PerevodTek.VidPer, Perech.NamePer, PerevodTek.Otkuda, PerevodTek.SumPer);
+      #else
+      AnalyseOnePerech(PerevodTek.VidPer, PerevodTek.SumPer);
+      #end
+    end;
+    // Анализируем налоги на ФОТ, начисленные в прошлых месяцах
+    _loop Perevod
+    begin
+      if IsAborted or not NextVisual then
+      begin
+        IsAborted := true;
+        break;
+      end;
+      if not IsValidAll(tnPerechP) then
+      begin
+        oGP_Log.Error('Налог на ФОТ с кодом ' + To_Char(Perevod.VidPer) + ' не найден в классификаторе налогов на ФОТ ' + LSInfo);
+        continue;
+      end;
+      // Определяем, на какой вид оплат был начислен этот налог на ФОТ
+      CurVidOplS := 0;
+      if Perevod.Otkuda = 1 then
+      begin
+        // Налог с неначисляемой суммы
+        if not IsValidAll(tnNeNachP) then
+        begin
+          oGP_Log.Error('Не найдена неначисляемая сумма, с которой удержан налог ' + LSInfo);
+          continue;
+        end;
+        set CurVidOplS := NeNachP.VidOplS;
+        AnalyzeKAU(NeNachP.TblD, NeNachP.cKauD);
+      end else
+      begin
+        // Налог с оплаты
+        if not IsValidAll(tnSumVidOp) then
+        begin
+          oGP_Log.Error('Не найдена оплата, с которой удержан налог ' + LSInfo);
+          continue;
+        end;
+        set CurVidOplS := SumVidOp.VidOpl;
+        AnalyzeKAU(SumVidOp.TblD, SumVidOp.cKauD);
+      end;
+      /*
+      // Мне кажется, можно было бы брать номер заказа прямо из налога на ФОТ, но в ТЗ написано брать из оплаты
+      AnalyzeKAU(Perevod.TblD, Perevod.cKauD);
+      if CurOrderNRec = 0 then
+        AnalyzeKAU(Perevod.TblExtr, Perevod.KauExtr);
+      */
+      #ifdef __DEBUG__
+      AnalyseOnePerech(Perevod.VidPer, PerechP.NamePer, Perevod.Otkuda, Perevod.SumPer);
+      #else
+      AnalyseOnePerech(Perevod.VidPer, Perevod.SumPer);
+      #end
+    end;
+  end;
+
+  procedure PrepareData;
+  begin
+    IsAborted := false;
+    oGP_Log.Init('#(GPInt).log', true, true, true);
+    oGP_Log.SetVerboseMode(true);
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, ''#3'Анализ данных...'#13, RecordsInTable(#ForMarks));
+    #ifdef __DEBUG__
+    oGP_Log.Info('#(GPNam):');
+    #end
+    TPF := 0;
+    TPFList1 := 0;
+    TPFList2 := 0;
+    TPFList1Spec := 0;
+    TPFList2Spec := 0;
+    TFMS := 0;
+    TFSS := 0;
+    TFTR := 0;
+    _loop ForMarks
+    begin
+      if IsAborted or not NextVisual then
+      begin
+        IsAborted := true;
+        break;
+      end;
+      #ifdef __DEBUG__
+      oGP_Log.Info('');
+      oGP_Log.Info('Таб.№ ' + GetStrTabN(Persons.TabNmb, Persons.StrTabN) + ' ' + Persons.FIO);
+      #end
+      ProcessPerech;
+    end;
+    StopVisual('', 0);
+    oGP_Log.Done(true);
+  end;
+
+  procedure OutForm;
+  var
+    Total, TTotal: Double;
+  begin
+    if IsAborted then
+      exit;
+    if RecordsInTable(#SData) = 0 then
+    begin
+      Message('Нет налогов на ФОТ за ' + DateToStr(To_Date(1, pMonth, pYear), 'month YYYY') + 
+       ' по выбранным работникам');
+      exit;
+    end;
+
+    Frm.Write(pYear); // pYear
+    Frm.Write(pMonth); // pMonth
+    Frm.Write(oHistory.sGetField(coKatOrg, coGetTune('MyOrg'), 'REP.KATORGNAME', To_Date(1, pMonth, pYear))); // pOwnOrg
+
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, ''#3'Формирование отчёта...'#13, 1);
+    _loop SData
+    begin
+      if IsAborted or not NextVisual then
+      begin
+        IsAborted := true;
+        break;
+      end;
+      Frm.PutEventByID(feDoLoop, fcOrders);
+      Frm.Write(SData.cOrder);
+      Frm.Write(SData.OrderName);
+      Frm.Write(SData.PF);
+      Frm.Write(SData.PFList1);
+      Frm.Write(SData.PFList2);
+      Frm.Write(SData.PFList1Spec);
+      Frm.Write(SData.PFList2Spec);
+      Frm.Write(SData.FMS);
+      Frm.Write(SData.FSS);
+      Frm.Write(SData.FTR);
+      Total := SData.PF + SData.PFList1 + SData.PFList2 + SData.PFList1Spec + SData.PFList2Spec + 
+       SData.FMS + SData.FSS + SData.FTR;
+      Frm.Write(Total);
+    end;
+    Frm.Write(TPF);
+    Frm.Write(TPFList1);
+    Frm.Write(TPFList2);
+    Frm.Write(TPFList1Spec);
+    Frm.Write(TPFList2Spec);
+    Frm.Write(TFMS);
+    Frm.Write(TFSS);
+    Frm.Write(TFTR);
+    TTotal := TPF + TPFList1 + TPFList2 + TPFList1Spec + TPFList2Spec + TFMS + TFSS + TFTR;
+    Frm.Write(TTotal);
+    StopVisual('', 0);
+
+    if not Frm.Error then
+      Frm.ShowFile();
+  end;
+
+  handleEvent
+    cmInit:
+      begin
+        iFeeSigners.InitFeeSigners(SG_CONST_REP);
+        if AskParam then
+        begin
+          PrepareData;
+          OutForm;
+        end;
+        abort;
+      end;
+    cmCheckField:
+      PodrPubCheck; // Процедура для фильтров по подразд. и работникам
+    cmPick:
+      PodrPubPick; // Процедура для фильтров по подразд. и работникам
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_GP_SvodNonBudgFunds implements IUserReport;
+
+interface UserReport_GP_SvodNonBudgFunds;
+
+  procedure Run;
+  begin
+    RunInterface('GP_SvodNonBudgFunds');
+  end;
+
+  function GetReportName: String;
+  begin
+    // Зачем называть пункт меню "Отчет о начисленном ФЗП" если форма называется "Сводка
+    // отчисления взносов во внебюджетные фонды" нужно спросить у постановщиков
+    result := 'Отчет о начисленном ФЗП';
+  end;
+
+  function GetGroupName(Level: Word): String;
+  begin
+    result := '';
+    case Level of
+      1: result := 'Сводные отчеты по зарплате';
+    end;
+  end;
+
+  function GetPriority: Integer;
+  begin
+    result := 0;
+  end;
+
+  function VisibleInModule(Ind: Byte): String;
+  begin
+    result := '';
+    case Ind of
+      1: VisibleInModule := 'MENUZARP';
+      2: result := 'STAFFMAINMENU';
+    end;
+  end;
+
+end.

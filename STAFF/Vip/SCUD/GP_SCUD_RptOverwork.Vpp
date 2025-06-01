@@ -1,0 +1,829 @@
+//   (Issue #177) Отчет СКУД 4 Отчет о переработках
+//#region Вспомогательные функции
+function TimeToDouble(t: Time):Double;
+{
+   Result := Hour(t)+Minute(t)/60;
+}
+
+function IsBitOn (field: word; n: word): boolean;
+{  IsBitOn := (((field shr (n-1)) and word(1)) > 0);
+}
+
+/*function GetShortFIOLast(FIO:string):string;
+{
+  result:='';
+  if (iStrFunc.GetFioIn(FIO))
+    result:=FIO;
+}                        */
+Function GetPost(cPers : comp) : string; cacheable;
+{
+  var res : string; res := '';
+
+  if (cPers <> comp(0))
+    if (GetLast Appointments = tsOk)
+        if (GetFirst Catalogs  = tsOk)
+          res := Catalogs.Name;
+  result := res;
+}
+
+Function GetTimeFromDouble(w:double):time;
+{ //            HH              MM
+  Result:=ZeroTime;
+  if w<0 then Exit;
+  var hh:word=word(trunc(w,0));
+  var mm:word=word((w-hh)*60);
+  //if hh>90 then exit;
+  if mm>=60
+  { hh++;
+    mm:=mm-60;
+  }
+  Result:=Time(hh, mm ,0,0 );
+} //Function GetTimeFromDouble(w:double):time;
+
+const
+  c1OverWork     =1;// сверхурочные
+  c2OverWork2    =2;// переработка
+  c3Holiday      =3;// выходные
+  c4MisConDuct   =4;// выходные
+  c5GrafCh       =5;// рабочих часов
+end;
+//#endregion
+var FirstCalc:boolean;
+
+//------------------------------------
+// Расчет значений всех полей по Сотруднику CalcByPers
+//------------------------------------
+Procedure CalcByPers(_wType:word;_cScud_Pers:comp;_DateCalc:Date);
+var
+   need_ins:boolean;
+   _wDay:word;
+{ #__UNUSED__(_wType,_cScud_Pers,_DateCalc)
+  need_ins:=true;
+
+// --------------------------------------
+//  По событиям СКУД
+// --------------------------------------
+  if (cPerCalc <>_cScud_Pers) or (DateCalcE < _DateCalc) or (_DateCalc < DateCalcB) // нужен расчет по другому сотруднику
+  {
+
+    // почему-то после первого расчета CalcAll,  GetCalc_CH_Over выдаёт 0. Потом работает нормально.
+    //if FirstCalc    iGP_SCUD_EventsEdit_Cacl.CalcAll(_cScud_Pers,Year(_DateCalc), Month(_DateCalc),if(NPOEM_OWN_HEAD_V_VID=2,3,NPOEM_OWN_HEAD_V_VID));
+    if timelog_status>0
+    { timelog(mtGroup.Fio+'  _DateCalc='+string(_DateCalc)+', DateCalcE='+string(DateCalcE))
+    }
+    FirstCalc := False;
+    iGP_SCUD_EventsEdit_Cacl.CalcAll(_cScud_Pers,Year(_DateCalc), Month(_DateCalc)
+       ,if(NPOEM_OWN_HEAD_V_VID=2,3,NPOEM_OWN_HEAD_V_VID)//0 при расчета считаются , что на все сверхурочные есть приказ
+                      //1 учитываются только проведенные приказы, если задан _DayCalc - то это вызов из приказа, и за этот день не учитываются
+       ,false // true - с перерасчетом
+       ,0 //DayCalc:word =0//при расчете для приказов указать день
+    );
+    DateCalc := _DateCalc;
+    cPerCalc := _cScud_Pers;
+    DateCalcB := Date(                 1, Month(DateCalc), Year(DateCalc));
+    DateCalcE := Date(Last_Day(DateCalc), Month(DateCalc), Year(DateCalc));
+    if getfirst mtGroup_tmp=tsok
+    { mtGroup_tmp.OverWork   := iGP_SCUD_EventsEdit_Cacl.GetCalc_CH_Over;
+      mtGroup_tmp.OverWork2  := iGP_SCUD_EventsEdit_Cacl.GetCalc_CH_Over2;//11:31/П6.54
+      mtGroup_tmp.Holiday    := iGP_SCUD_EventsEdit_Cacl.GetCalc_CH_Holiday;
+      mtGroup_tmp.GrafCh     := iGP_SCUD_EventsEdit_Cacl.GetCalc_CH_Graf;
+      mtGroup_tmp.Fact       := iGP_SCUD_EventsEdit_Cacl.GetCalc_CH_Fact;
+      //mtGroup_tmp.ItogOver   := mtGroup_tmp.OverWork + mtGroup_tmp.OverWork2 + mtGroup_tmp.Holiday,
+      mtGroup_tmp.ItogOver   :=
+        //iGP_SCUD_EventsEdit_Cacl.GetCalc_CH_Over
+        //+iGP_SCUD_EventsEdit_Cacl.GetCalc_CH_Holiday
+        iGP_SCUD_EventsEdit_Cacl.GetCalc_CH_Over2;
+      mtGroup_tmp.tOverWork  := GetTimeFromDouble(mtGroup_tmp.OverWork);
+      mtGroup_tmp.tOverWork2 := GetTimeFromDouble(mtGroup_tmp.OverWork2);
+      mtGroup_tmp.tHoliday   := GetTimeFromDouble(mtGroup_tmp.Holiday);
+      mtGroup_tmp.tGrafCh    := GetTimeFromDouble(mtGroup_tmp.GrafCh);
+      mtGroup_tmp.tFact      := GetTimeFromDouble(mtGroup_tmp.Fact);
+      mtGroup_tmp.tItogOver  := GetTimeFromDouble(mtGroup_tmp.ItogOver);
+      mtGroup_tmp.StateMents := 0;
+      mtGroup_tmp.StateMentsR := 0;
+      UpDate current mtGroup_tmp;
+// --------------------------------------
+// По документам Заявления на отсутствие
+// --------------------------------------
+
+      var _DT:date=ZeroDate;
+      var _TmB,_TmE,_PlanTime:time=ZeroTime;
+      var _wType:word=0;
+      var _cNrec:comp=0;
+       if iGP_SCUD_StateMentOnAbsent_Calc.GetFirstPeriodWithOutMisConDuct(cPerCalc,DateCalcB,DateCalcE,
+                         _DT,_TMB,_TME,_PlanTime
+                         ,_wType //_need_calc
+                         ,_cNrec
+                         ,true)
+       {
+         mtGroup_tmp.StateMents := 0;
+         mtGroup_tmp.StateMentsR := 0;
+           do
+           { case _wType of
+             0,1: mtGroup_tmp.StateMents := mtGroup_tmp.StateMents + TimeToDouble(_PlanTime);//Sub_Time(_TME,_TMB));
+             2  : mtGroup_tmp.StateMentsR:= mtGroup_tmp.StateMentsR+ TimeToDouble(_PlanTime);//Sub_Time(_TME,_TMB));
+             end;
+             if Timelog_Status>0
+             {   Timelog('Заявления от '+DateToStr(_DT,'DD.MM.YYYY')+', время='+TimeToStr(_TmB,'HH:MM')
+                  +', выход на '+String(TimeToDouble(_PlanTime))
+                 );
+             }
+             _PlanTime:=ZeroTime;
+           } while iGP_SCUD_StateMentOnAbsent_Calc.GetNextPeriodWithOutMisConDuct(_DT,_TMB,_TME,_PlanTime,_wType,_cNrec)
+         mtGroup_tmp.tStateMents := GetTimeFromDouble(mtGroup_tmp.StateMents );
+         mtGroup_tmp.tStateMentsR:= GetTimeFromDouble(mtGroup_tmp.StateMentsR);
+         mtGroup_tmp.ItogOver   := mtGroup_tmp.ItogOver - mtGroup_tmp.StateMents;
+         mtGroup_tmp.tItogOver  := if(mtGroup_tmp.ItogOver>0,GetTimeFromDouble( mtGroup_tmp.ItogOver),ZeroTime);
+         mtGroup_tmp.tItogOverM := if(mtGroup_tmp.ItogOver<0,GetTimeFromDouble(-mtGroup_tmp.ItogOver),ZeroTime);
+         UpDate current mtGroup_tmp;
+       }
+     } //if getfirst mtGroup_tmp=tsok
+  }  // if (cPerCalc <>_cScud_Pers...
+
+    // Если время все сутки - возможно была вторая смена
+    //IF FASLE // пока нет
+    _Loop Fullcache mtMain_tmp
+    {
+      _wDay:=Day(mtMain_tmp.EventDate);
+      if timelog_status>0
+      { timelog('GP_SCUD_RptOverwork->CalcByPers:_wDay='+string(_wDay)+',mtMain_tmp.t1='+string(mtMain_tmp.t1)+', mtMain_tmp.t2='+string(mtMain_tmp.t2));
+      }
+
+      //--------------------------
+      mtMain_tmp.OverWork   := iGP_SCUD_EventsEdit_Cacl.GetExtData(c1OverWork  , _wDay);
+      mtMain_tmp.OverWork2  := iGP_SCUD_EventsEdit_Cacl.GetExtData(c2OverWork2 , _wDay);
+      mtMain_tmp.Holiday    := iGP_SCUD_EventsEdit_Cacl.GetExtData(c3Holiday   , _wDay);
+      mtMain_tmp.MisConDuct := iGP_SCUD_EventsEdit_Cacl.GetExtData(c4MisConDuct, _wDay);
+      mtMain_tmp.GrafCh     := iGP_SCUD_EventsEdit_Cacl.GetExtData(c5GrafCh    , _wDay);
+      mtMain_tmp.tOverWork  := GetTimeFromDouble(mtMain_tmp.OverWork);
+      mtMain_tmp.tOverWork2 := GetTimeFromDouble(mtMain_tmp.OverWork2);
+      mtMain_tmp.tHoliday   := GetTimeFromDouble(mtMain_tmp.Holiday);
+      mtMain_tmp.tGrafCh    := GetTimeFromDouble(mtMain_tmp.GrafCh);
+      mtMain_tmp.Rejim      := iGP_SCUD_EventsEdit_Cacl.GetRejim(_wDay,0);
+      mtMain_tmp.t1         := iGP_SCUD_EventsEdit_Cacl.GetCalc_TMB_Day(_wDay);
+      mtMain_tmp.t2         := iGP_SCUD_EventsEdit_Cacl.GetCalc_TME_Day(_wDay);
+      update current mtMain_tmp;
+      //--------------------------
+
+      if mtMain_tmp.t1=ZeroTime and mtMain_tmp.t2>time(20,0,0,0)
+      { var _tShift1End,_tShift2Start :time;
+        var _tShift2End :time;
+        var _Graf2:Time;
+
+        _tShift1End:=_tShift2Start:=_Graf2:=ZeroTime;
+        if iGP_SCUD_EventsEdit_Cacl.FindMidleExit(_wDay,_tShift1End,_tShift2Start,_Graf2)
+        { _tShift2End:=mtMain_tmp.t2;
+          mtMain_tmp.t2    := _tShift1End;
+          mtMain_tmp.GrafCh:=mtMain_tmp.GrafCh-iGP_SCUD_EventsEdit_Cacl.GetDoubleFromTime(_Graf2);
+          mtMain_tmp.tGrafCh    := GetTimeFromDouble(mtMain_tmp.GrafCh);
+          mtMain_tmp.Rejim := iGP_SCUD_EventsEdit_Cacl.GetRejim(Day(mtMain_tmp.EventDate),1);
+          update current mtMain_tmp;
+
+
+          mtMain_add.cGP_SCUD_Pers := mtMain_tmp.cGP_SCUD_Pers;
+          mtMain_add.EventDate     := mtMain_tmp.EventDate;
+          mtMain_add.wYear         := mtMain_tmp.wYear;
+          mtMain_add.wMonth        := mtMain_tmp.wMonth;
+          mtMain_ADD.FIO           := mtMain_ADD.FIO;
+          mtMain_ADD.PA            := 1;
+          mtMain_add.OverWork   := 0;
+          mtMain_add.OverWork2  := 0;
+          mtMain_add.Holiday    := 0;
+          mtMain_add.MisConDuct := 0;
+          mtMain_add.GrafCh     :=iGP_SCUD_EventsEdit_Cacl.GetDoubleFromTime(_Graf2);
+          mtMain_add.tGrafCh    := GetTimeFromDouble(mtMain_tmp.GrafCh);
+          mtMain_add.tOverWork  := ZeroTime;
+          mtMain_add.tOverWork2 := ZeroTime;
+          mtMain_add.tHoliday   := ZeroTime;
+          mtMain_add.tGrafCh    := ZeroTime;
+          mtMain_add.t1         := _tShift2Start;
+          mtMain_add.t2         := _tShift2End;
+          mtMain_add.Rejim      := iGP_SCUD_EventsEdit_Cacl.GetRejim(Day(mtMain_tmp.EventDate),2);
+          insert current mtMain_ADD;
+
+        }
+      } //if mtMain_tmp.t1=ZeroTime and mtMain_tmp.t2=time(24,0,0)
+
+
+
+    }//_Loop Fullcache mtMain
+
+} //Procedure CalcByPers
+
+
+Procedure SborData;
+var chet:longint;
+   _IdTable:longint;
+{ chet:=0;
+  delete all mtMain_free;
+  delete all mtGroup_free;
+  delete all mtMain_Add;
+  DTB_L := DTB; DTE_L := DTE;
+
+  //====== DSQL =======
+  SQLLog_TP := 1 ;
+  CreateTempVib;
+  ClearQuery(vliSQLCommand);
+
+  //-----------------------------
+
+  if IsBitOn(wFilter,2) //Подразделения
+    InsTempVibByMarker(02,Marker_KatPodr );// Подразделения
+  if IsBitOn(wFilter,3) //Сотрудники
+    InsTempVibByMarker(03,Marker_Persons );// Сотрудники
+
+  PrepareSQLQuery('select  DISTINCT ');
+  PrepareSQLQuery('   GP_SCUD_PERS.Nrec as cGP_SCUD_PERS                           ');
+  PrepareSQLQuery('  ,GP_SCUD_PERS.FIO      as FIO                            ');
+  PrepareSQLQuery('  ,GP_SCUD_PERS.cPersons as cPersons                            ');
+  PrepareSQLQuery('  ,GP_SCUD_PERS.cKatPodr as cKatPodr                            ');
+  PrepareSQLQuery('  , Cast(Ceiling((GP_SCUD_Events.EnterDate-65536*Cast(Ceiling(GP_SCUD_Events.EnterDate/65536) As Integer) )/256) As Integer) as wMonth');
+  PrepareSQLQuery('  , Cast(Ceiling(GP_SCUD_Events.EnterDate/65536) As Integer) wYear');
+  PrepareSQLQuery('  , KatPodr.Kod + GP_SCUD_PERS.fio as SortFld                     ');
+  PrepareSQLQuery('From GP_SCUD_PERS                                               ');
+  PrepareSQLQuery(' inner join KatPodr on GP_SCUD_PERS.cKatPodr = KatPodr.Nrec     ');
+  PrepareSQLQuery(' inner join GP_SCUD_Events on GP_SCUD_Events.cGp_SCUD_PERS = Gp_SCUD_PERS.Nrec');   // чтоб условия по дате ограничит GP_SCUD_Events, а inner join сработает на весь запрос
+
+  if DTB > ZeroDate
+  PrepareSQLQuery(' and GP_SCUD_Events.EnterDate>=#Date('+DateToStr(DTB,'DD,MM,YYYY')+') ');
+  if DTE > ZeroDate
+  PrepareSQLQuery(' and GP_SCUD_Events.EnterDate<=#Date('+DateToStr(DTE,'DD,MM,YYYY')+') ');
+
+  if false // не заполнено поле GP_SCUD_PERS.CGP_SCUD_Kateg
+  PrepareSQLQuery(' inner join GP_SCUD_KATEG  on GP_SCUD_PERS.CGP_SCUD_Kateg = GP_SCUD_KATEG.nRec and GP_SCUD_KATEG.WTYPE > 1');
+
+  if IsBitOn(wFilter,2) //Подразделения
+  PrepareSQLQuery(' inner join tempvib VibKatPodr on VibKatPodr.wlist=2 and VibKatPodr.crec = GP_SCUD_PERS.cKatPodr');
+  if IsBitOn(wFilter,3) //Сотрудники
+  PrepareSQLQuery(' inner join tempvib VibSCUD_Pers on VibSCUD_Pers.wlist=3 and VibSCUD_Pers.crec = GP_SCUD_PERS.cPersons');
+  PrepareSQLQuery(' where GP_SCUD_PERS.Nrec>#Comp(0)');
+  if not NPOEM_OWN_SCUD_Pers_Other
+  { PrepareSQLQuery(' and GP_SCUD_PERS.wType=0');
+  }
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfconfirm,''#3'Загрузка данных',LongInt(RecordsInTable(#mtGroup)/100));
+  UpDate mtGroup set mtGroup.dFirst := Date ( 1, mtGroup.wMonth, mtGroup.wYear);
+ //=== RUN DSQL
+  stmt := sqlAllocStmt;
+  _IdTable :=#mtGroup;
+  ExecDSQLex2(_IdTable,1);
+
+  UpDate mtGroup_free set mtGroup_free.dFirst := Date( 1, mtGroup_free.wMonth, mtGroup_free.wYear),
+                          mtGroup_free.dLast  := Date(Last_Day(mtGroup_free.dFirst), mtGroup_free.wMonth, mtGroup_free.wYear)
+                          ;
+
+
+
+ //===== end 1DSQL
+  ClearQuery(vliSQLCommand);
+ //===========================
+
+  PrepareSQLQuery('select  DISTINCT ');
+  PrepareSQLQuery('   GP_SCUD_PERS.Nrec as cGP_SCUD_PERS                           ');
+  PrepareSQLQuery('  ,GP_SCUD_PERS.FIO  as FIO                                     ');
+  PrepareSQLQuery('  ,GP_SCUD_Events.EnterDate as EventDate                        ');
+  PrepareSQLQuery('  ,Cast(Ceiling((GP_SCUD_Events.EnterDate-65536*Cast(Ceiling(GP_SCUD_Events.EnterDate/65536) As Integer) )/256) As Integer) as wMonth');
+  PrepareSQLQuery('  ,Cast(Ceiling(GP_SCUD_Events.EnterDate/65536) As Integer) wYear');
+  PrepareSQLQuery('From GP_SCUD_PERS                                               ');
+  PrepareSQLQuery(' inner join KatPodr on Gp_SCUD_PERS.cKatPodr = KatPodr.Nrec     ');
+  PrepareSQLQuery(' inner join GP_SCUD_Events on GP_SCUD_Events.cGp_SCUD_PERS = Gp_SCUD_PERS.Nrec');   // чтоб с 'Where' не морочится, условия по дате ограничит GP_SCUD_Events, а он через inner join сработает на весь запрос
+
+  if DTB > ZeroDate
+  PrepareSQLQuery(' and GP_SCUD_Events.EnterDate>=#Date('+DateToStr(DTB,'DD,MM,YYYY')+') ');
+  if DTE > ZeroDate
+  PrepareSQLQuery(' and GP_SCUD_Events.EnterDate<=#Date('+DateToStr(DTE,'DD,MM,YYYY')+') ');
+
+  if false // не заполнено поле GP_SCUD_PERS.CGP_SCUD_Kateg
+  PrepareSQLQuery(' inner join GP_SCUD_KATEG  on GP_SCUD_PERS.CGP_SCUD_Kateg = GP_SCUD_KATEG.nRec and GP_SCUD_KATEG.WTYPE > 1');
+
+  if IsBitOn(wFilter,2) //Подразделения
+  PrepareSQLQuery(' inner join tempvib VibKatPodr on VibKatPodr.wlist=2 and VibKatPodr.crec = GP_SCUD_PERS.cKatPodr');
+  if IsBitOn(wFilter,3) //Сотрудники
+  PrepareSQLQuery(' inner join tempvib VibSCUD_Pers on VibSCUD_Pers.wlist=3 and VibSCUD_Pers.crec = GP_SCUD_PERS.cPersons');
+
+ //=== RUN DSQL
+  stmt := sqlAllocStmt;
+  _IdTable:=#mtMain;
+  ExecDSQLex2(_IdTable,1);
+
+ //===== end 2DSQL
+
+ /*
+  _Loop mtMain ordered by nRec
+   if getfirst fastfirstrow GP_SCUD_Pers = tsOk
+   if getfirst fastfirstrow KatPodr = tsOk
+  {
+    {
+      inc(chet);
+      if chet mod 100=0
+      { if not nextvisual then break;
+      }
+//      GetDataPers; //!!!
+        mtMain.SortFld := KatPodr.kod + GP_SCUD_Pers.fio + string(GP_SCUD_Pers.cPersons,0) + DateToStr(mtMain.EventDate,'YYYYMMDD');
+        UpDate Current mtMain;
+    }
+  }
+   */
+  SetOrder(tibySortFld);
+  if getfirst mtMain = tsOk{}
+
+
+  StopVisual('',0);
+} //Procedure SborData
+
+
+//=======================================
+//   Печать отчета в excel
+//=======================================
+var
+    xl_Res : boolean;
+    xl_Ymax: longint;
+    xl_X0  : longint;
+    xl_Y0  : longint;
+    xl_Yi  : longint;
+    xl_Y   : longint;
+    xl_X   : longint;
+    sOut: string;
+    dBreak: boolean;
+
+var // для листа "по дням"
+    xl_X2: longint;
+    xl_Y20:longint;
+
+Procedure ToExcel( dY: longint; sOut: string);
+{
+  xl_Res := xlSetCellStringValue(sOut, xl_X, xl_Y0+dY, xl_X, xl_Y0+dY);
+}
+Procedure ToExcelD( dY: longint; sOut: double);
+{
+  xl_Res := xlSetCellNumberValue(sOut, xl_X, xl_Y0+dY, xl_X, xl_Y0+dY);
+}
+
+Procedure ToExcel2( dY: longint; sOut: string);
+{
+  xl_Res := xlSetCellStringValue(sOut, xl_X2, xl_Y20+dY, xl_X2, xl_Y20+dY);
+}
+//---------------------------------------
+//   Печать данные за все дни в месяце по сотруднику
+//   в отдельный лист
+//---------------------------------------
+procedure PrintPers(_WType:word=0);
+{
+//  XLADDSHEET;
+//  sOut := GetShortFIOLast(GP_SCUD_PERS.fio) + DateToStr( mtMain.EventDate, ' MONTH YYYY');
+//  sOut := Replace(sOut,'.','');
+
+//  xlSetSheetName(1,sOut);
+  var _sdvig:word=0;
+  if _wType=0
+  { if not xlSetActiveSheetByName('По Дням')  message( 'Не найден лист ''''По Дням''''');
+    HeaderStrCount:=xl_X2; // для последующего вывода сетки
+    wexrow:=HeaderStrCount;
+    MyXlCreaMatrix(100, 6);
+    matrixkl:=true;
+    matrixsdvig:=wexrow;
+  }
+  else
+  { _sdvig:=5;
+
+  }
+//  xlCopyToBuff(1,1,1,20);
+//  xlSetActiveSheetByName(sOut);
+//  xlPasteAllFromBuff(1,1,1,20);
+
+    _Loop mtMain
+    {
+      //xl_X2++;
+      wexrow++;
+      wexcol:=1;
+      if _wType=1
+      {
+        MyPutExcel( GP_SCUD_Pers.Fio ,10,0,-1,-1);               // ФИО
+        MyPutExcel( KatPodr.kod      ,10,0,-1,-1);               // код подразделения
+        MyPutExcel( GetPost(mtGroup.cGP_SCUD_Pers),10,0,-1,-1 ); // Должность
+        MyPutExcel( mtGroup.wYear ,10,0,-1,-1);
+        MyPutExcel( mtGroup.wMonth,10,0,-1,-1);
+      } //if _wType=1
+      MyPutExcel(DateToStr( mtMain.EventDate, '''DD.MM.YYYY'),10,0,-1,-1); // 1 Дата
+      MyPutExcel(TimeToStr( mtMain.t1, '''HH:MM') ,10,0,-1,-1);            // 2 первый вход
+      MyPutExcel(TimeToStr( mtMain.t2, '''HH:MM') ,10,0,-1,-1);            // 3 последний  выход
+      MyPutExcel(mtMain.Rejim,10,0,-1,-1);                                 // 4 режим работы
+      //MyPutExcel(TimeToStr(GetTimeFromDouble( mtMain.OverWork2),'''HH:MM'),10,0,-1,-1); // 5 Переработано ЧЧ:ММ
+      MyPutExcelNumber(mtMain.OverWork2/24,5,10,0,-1,-1); // 5 Переработано ЧЧ:ММ
+      MyPutExcelNumber(mtMain.OverWork2,2,10,0,-1,-1);                             // 6 Переработано доли часа
+
+
+      if wexrow mod 10=0
+      {
+        dBreak := not nextvisual;
+        if dBreak then break;
+      }
+    }
+  if _wType=0
+  { xl_X2:=wexrow;
+    MyxlWriteMatrix(wexrow);
+    xlFreeMatrix;
+    matrixkl:=False;
+    xlWrapText(HeaderStrCount, 1, wexrow, 6);
+    MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount+1 ,1,wexrow,6); //Обрамление
+  }
+}
+
+
+Procedure PrintDoc;
+  var sXLTFileName:string;
+//      sOut: string;
+
+{
+//  Листы в ШАБЛОНЕ
+//    'За Месяц'
+//    'По Дням'
+
+  xl_Y0 := 0;
+  xl_X0 := 1;
+  xl_X2 := 1;
+
+  sXLTFileName := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' + 'GP_SCUD_RptOverwork.xlsx';
+
+  if (not ExistFile(sXLTFileName)) {
+    message('Не найден шаблон отчета "'+sXLTFileName+'"',error);
+    exit;
+  }
+
+  if (not xlCreateNewExcelWithTemplate(sXLTFileName,true)) {
+    message('Ошибка создания нового файла в Excel"'+sXLTFileName+'".',error);
+    exit;
+  }
+
+  xlDisplayAlerts(false);
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Вывод отчета в Excel ...', LongInt(RecordsInTable(#mtGroup)/10));
+
+  xl_X := xl_X0;
+  dBreak := false;
+
+  var Main_Person: comp;
+  var Main_Person_OFF: boolean=False;
+  Main_Person := comp(0);
+  PushPos(#mtGroup);
+    If not BoundActive(tbByPersons)
+    { Main_Person := pFlt_Persons;
+      pFlt_Persons := mtGroup.cPersons;
+      AddBounds(tbByPersons);
+      Main_Person_OFF := true;
+    }
+      _Loop mtGroup
+      if getfirst GP_SCUD_Pers = tsOk
+      if getfirst KatPodr = tsOk
+      {
+        xl_X++;
+        if getfirst mtMain = tsOk  PrintPers;
+        if dBreak then break;
+
+        xlSetActiveSheetByName('За Месяц');
+        ToExcel( 1, GP_SCUD_Pers.Fio );               // ФИО
+        ToExcel( 2, KatPodr.kod      );               // код подразделения
+        ToExcel( 3, GetPost(mtGroup.cGP_SCUD_Pers) ); // Должность
+        ToExcel( 4, mtGroup.wYear );
+        ToExcel( 5, mtGroup.wMonth);
+
+        //ToExcel( 6, TimeToStr(GetTimeFromDouble( mtGroup.OverWork2), '''HH:MM')); // Переработано ЧЧ:ММ
+        ToExcelD( 6, mtGroup.OverWork2/24); // Переработано ЧЧ:ММ
+        ToExcel( 7, mtGroup.OverWork2); // Переработано доли часа
+
+        ToExcel( 8, mtGroup.StateMents) ; // Заявлений доли часа
+        //ToExcel( 9, TimeToStr( mtGroup.tStateMents, '''HH:MM'));     // 9  Заявлений ЧЧ:MM
+        ToExcelD( 9, mtGroup.StateMents/24);     // 9  Заявлений ЧЧ:MM
+
+        ToExcel(10, mtGroup.StateMentsR); // Поручение руководителя доли часа
+        //ToExcel(11, TimeToStr( mtGroup.tStateMentsR, '''HH:MM'));     // 9  Заявлений ЧЧ:MM
+        ToExcelD(11, mtGroup.StateMentsR/24);     // 9  Заявлений ЧЧ:MM
+
+        ToExcel(12, mtGroup.OverWork);   // Сверхурочные
+        ToExcel(13, mtGroup.Holiday );   // Выходные
+
+        ToExcel(14, mtGroup.ItogOver );  // Чистая переработка/использованно сверх (доли часа)
+        //ToExcel(15, TimeToStr( mtGroup.tItogOver , '''HH:MM')); // Чистая переработка/использованно сверх(ч:м)
+        if mtGroup.ItogOver>0
+        { ToExcelD(15, mtGroup.ItogOver/24 );  // Чистая переработка/использованно сверх (доли часа)
+          ToExcelD(16, 0 );  // Использовано сверх переработанного(ч:м)
+        }
+        else
+        { ToExcelD(15, 0 );  // Чистая переработка/использованно сверх (доли часа)
+          ToExcelD(16, -mtGroup.ItogOver/24 );  // Использовано сверх переработанного(ч:м)
+        }
+      }
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, xl_X0+1, 1, xl_X, 16);
+
+  if not xlSetActiveSheetByName('По Дням')  message( 'Не найден лист ''''По Дням''''');
+  xlCopyToBuff(1,1,xl_X2,20);
+  xlSetActiveSheetByName('За Месяц');
+  xl_X++;
+  xlPasteAllFromBuff(xl_X,1,xl_X+xl_X2,20);
+  //xlSetRowHeight(30,xl_X,1,xl_X,1);
+  xlWrapText(xl_X,1,xl_X+xl_X2,20);
+
+    xlKillExcel;
+
+    IF Main_Person_OFF
+    { SubBounds(tbByPersons);
+      pFlt_Persons := Main_Person;
+    }
+  PopPos(#mtGroup);
+  rescanPanel(#mtGroup);
+  StopVisual;
+}//Procedure PrintDoc;
+
+
+Procedure PrintDoc01;
+  var sXLTFileName:string;
+{
+//  Листы в ШАБЛОНЕ
+//    'За Месяц'
+//    'По Дням'
+
+  xl_Y0 := 0;
+  xl_X0 := 1;
+  xl_X2 := 1;
+  var isAllOk:boolean=true;
+  sXLTFileName := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' + 'GP_SCUD_RptOverwork01.xlsx';
+
+  if (not ExistFile(sXLTFileName)) {
+    message('Не найден шаблон отчета "'+sXLTFileName+'"',error);
+    exit;
+  }
+
+  if (not xlCreateNewExcelWithTemplate(sXLTFileName,true)) {
+    message('Ошибка создания нового файла в Excel"'+sXLTFileName+'".',error);
+    exit;
+  }
+
+  xlDisplayAlerts(false);
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Вывод отчета в Excel ...'
+    , RecordsInTable(#mtGroup)*2+RecordsInTable(#mtMain)/10);
+
+  xl_X := xl_X0;
+  dBreak := false;
+
+  var Main_Person: comp;
+  var Main_Person_OFF: boolean=False;
+  Main_Person := comp(0);
+  PushPos(#mtGroup);
+  xlSetActiveSheetByName('За Месяц');
+  HeaderStrCount:=1; // для последующего вывода сетки
+  wexrow:=HeaderStrCount;
+  MyXlCreaMatrix(100, 16);
+  matrixkl:=true;
+  matrixsdvig:=wexrow;
+
+  _Loop mtGroup
+  {   if not NextVisual
+      { isAllOk:=false;
+        break;
+
+      }
+      if getfirst GP_SCUD_Pers = tsOk
+      if getfirst KatPodr = tsOk
+      {
+        wexrow:=wexrow+1;
+        wexcol:=1;
+
+        //if getfirst mtMain = tsOk  PrintPers(01);
+        //if dBreak then break;
+
+        MyPutExcel(GP_SCUD_Pers.Fio ,10,0,-1,-1);               //1 ФИО
+        MyPutExcel(KatPodr.kod      ,10,0,-1,-1);               //2 код подразделения
+        MyPutExcel(GetPost(mtGroup.cGP_SCUD_Pers) ,10,0,-1,-1); //3 Должность
+        MyPutExcel(mtGroup.wYear ,10,0,-1,-1); //4
+        MyPutExcel(mtGroup.wMonth,10,0,-1,-1); //5
+
+        //MyPutExcel(TimeToStr(GetTimeFromDouble( mtGroup.OverWork2), '''HH:MM'),10,0,-1,-1); //6 Переработано ЧЧ:ММ
+        MyPutExcelNumber(mtGroup.OverWork2/24,5,10,0,-1,-1); //6 Переработано ЧЧ:ММ
+        MyPutExcelNumber(mtGroup.OverWork2,2,10,0,-1,-1); //7 Переработано доли часа
+
+        MyPutExcelNumber(mtGroup.StateMents ,2,10,0,-1,-1); //8 Заявлений доли часа
+        //MyPutExcel(TimeToStr( mtGroup.tStateMents, '''HH:MM'),10,0,-1,-1);     // 9  Заявлений ЧЧ:MM
+        MyPutExcelNumber(mtGroup.StateMents/24 ,5,10,0,-1,-1);     // 9  Заявлений ЧЧ:MM
+
+        MyPutExcelNumber(mtGroup.StateMentsR,2,10,0,-1,-1); //10 Заявлений доли часа
+        //MyPutExcel(TimeToStr( mtGroup.tStateMentsR, '''HH:MM'),10,0,-1,-1);     //11  Заявлений ЧЧ:MM
+        MyPutExcelNumber(mtGroup.StateMentsR/24,5,10,0,-1,-1);     //11  Заявлений ЧЧ:MM
+
+        MyPutExcel(mtGroup.OverWork,10,0,-1,-1);   //12 Сверхурочные
+        MyPutExcelNumber(mtGroup.Holiday ,2,10,0,-1,-1);   //13 Выходные
+
+        MyPutExcelNumber(mtGroup.ItogOver,2 ,10,0,-1,-1);  //14 Чистая переработка/использованно сверх (доли часа)
+        //MyPutExcel(TimeToStr( mtGroup.tItogOver , '''HH:MM'),10,0,-1,-1); //14 Чистая переработка/использованно сверх(ч:м)
+        if mtGroup.ItogOver>0
+        { MyPutExcelNumber(mtGroup.ItogOver/24,5,10,0,-1,-1); //15 Чистая переработка/использованно сверх(ч:м)
+          MyPutExcelNumber(0                  ,5,10,0,-1,-1); //16 Использовано сверх переработанного(ч:м)
+        }
+        else
+        { MyPutExcelNumber( 0                  ,5,10,0,-1,-1); //15 Чистая переработка/использованно сверх(ч:м)
+          MyPutExcelNumber(-mtGroup.ItogOver/24,5,10,0,-1,-1); //16 Использовано сверх переработанного(ч:м)
+        }
+      }
+  }  //_Loop mtGroup
+  MyxlWriteMatrix(wexrow);
+  xlFreeMatrix;
+  matrixkl:=False;
+  xlWrapText(HeaderStrCount, 1, wexrow, 11);
+  MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount+1 ,1,wexrow,16); //Обрамление
+
+  if not xlSetActiveSheetByName('По Дням')  message( 'Не найден лист ''''По Дням''''')
+  else
+  if isAllOk
+  { HeaderStrCount:=1; // для последующего вывода сетки
+    wexrow:=HeaderStrCount;
+    MyXlCreaMatrix(100, 11);
+    matrixkl:=true;
+    matrixsdvig:=wexrow;
+
+    _Loop mtGroup
+    { if not NextVisual
+      { isAllOk:=false;
+        break;
+      }
+      if getfirst GP_SCUD_Pers = tsOk
+      if getfirst KatPodr = tsOk
+      {
+        if getfirst mtMain = tsOk  PrintPers(01);
+        if dBreak then break;
+      }
+    }
+    MyxlWriteMatrix(wexrow);
+    xlFreeMatrix;
+    matrixkl:=False;
+    xlWrapText(HeaderStrCount, 1, wexrow, 11);
+    MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount+1 ,1,wexrow,11); //Обрамление
+    //xlSetColumnWidth(15, 1, 1, 1, 6);
+  }
+  xlSetActiveSheetByName('За Месяц');
+
+  xlKillExcel;
+
+  PopPos(#mtGroup);
+  rescanPanel(#mtGroup);
+  StopVisual;
+}//Procedure PrintDoc01;
+
+
+Procedure PrintDoc02;
+  var sXLTFileName:string;
+{
+//  Листы в ШАБЛОНЕ
+//    'За Месяц'
+//    'По Дням'
+  delete all mtGroupAll;
+
+
+  xl_Y0 := 0;
+  xl_X0 := 1;
+  xl_X2 := 1;
+  var isAllOk:boolean=true;
+  sXLTFileName := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' + 'GP_SCUD_RptOverwork01.xlsx';
+
+  if (not ExistFile(sXLTFileName)) {
+    message('Не найден шаблон отчета "'+sXLTFileName+'"',error);
+    exit;
+  }
+
+  if (not xlCreateNewExcelWithTemplate(sXLTFileName,true)) {
+    message('Ошибка создания нового файла в Excel"'+sXLTFileName+'".',error);
+    exit;
+  }
+
+  xlDisplayAlerts(false);
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Вывод отчета в Excel ...'
+    , RecordsInTable(#mtGroup)*4+RecordsInTable(#mtMain)/10);
+
+  xl_X := xl_X0;
+  dBreak := false;
+
+  var Main_Person: comp;
+  var Main_Person_OFF: boolean=False;
+  Main_Person := comp(0);
+  PushPos(#mtGroup);
+  xlSetActiveSheetByName('За Месяц');
+  HeaderStrCount:=1; // для последующего вывода сетки
+  wexrow:=HeaderStrCount;
+  MyXlCreaMatrix(100, 16);
+  matrixkl:=true;
+  matrixsdvig:=wexrow;
+  _Loop mtGroup
+  { if not NextVisual
+      { isAllOk:=false;
+        break;
+
+      }
+    if getfirst mtGroupAll where ((
+      mtGroup.SortFld == mtGroupAll.SortFld
+    and  mtGroup.cGP_SCUD_Pers == mtGroupAll.cGP_SCUD_Pers
+    )) <>tsok
+    { mtGroupAll.buffer:=type$mtGroupAll(mtGroup.buffer);
+      mtGroupAll.wYear :=0;
+      mtGroupAll.wMonth:=0;
+      insert current mtGroupAll;
+    }
+    else
+    { mtGroupALL.OverWork2  +=mtGroup.OverWork2  ;//переработка
+      mtGroupAll.StateMents +=mtGroup.StateMents ;//8 Заявлений доли часа
+      mtGroupAll.StateMentsR+=mtGroup.StateMentsR;//10 Заявлений доли часа
+      mtGroupAll.OverWork   +=mtGroup.OverWork   ;//12 Сверхурочные
+      mtGroupAll.Holiday    +=mtGroup.Holiday    ;//13 Выходные
+      mtGroupAll.ItogOver   +=mtGroup.ItogOver   ;//14 Чистая переработка/использованно сверх (доли часа)
+      //mtGroupAll.tItogOver:=Add_Time(mtGroupALL.ItogOver,mtGroup.ItogOver); //15 Чистая переработка/использованно сверх(ч:м)
+      update current mtGroupAll;
+    }
+
+
+  }
+  if isAllOk
+  _Loop mtGroupAll
+  {   if not NextVisual
+      { isAllOk:=false;
+        break;
+
+      }
+      if getfirst GP_SCUD_Pers where (( mtGroupAll.cGP_SCUD_Pers == GP_SCUD_Pers.nRec  )) = tsOk
+      if getfirst KatPodr where (( GP_SCUD_Pers.cKatPodr == KatPodr.nRec )) = tsOk
+      {
+        wexrow:=wexrow+1;
+        wexcol:=1;
+
+        //if getfirst mtMain = tsOk  PrintPers(01);
+        //if dBreak then break;
+
+        MyPutExcel(GP_SCUD_Pers.Fio ,10,0,-1,-1);               //1 ФИО
+        MyPutExcel(KatPodr.kod      ,10,0,-1,-1);               //2 код подразделения
+        MyPutExcel(GetPost(mtGroupAll.cGP_SCUD_Pers) ,10,0,-1,-1); //3 Должность
+        MyPutExcel(mtGroupAll.wYear ,10,0,-1,-1); //4
+        MyPutExcel(mtGroupAll.wMonth,10,0,-1,-1); //5
+
+        MyPutExcelNumber(mtGroupAll.OverWork2/24,5,10,0,-1,-1); //6 Переработано ЧЧ:ММ
+        MyPutExcelNumber(mtGroupAll.OverWork2   ,2,10,0,-1,-1); //7 Переработано доли часа
+
+        MyPutExcelNumber(mtGroupAll.StateMents   ,2,10,0,-1,-1); //8 Заявлений доли часа
+        MyPutExcelNumber(mtGroupAll.StateMents/24,5,10,0,-1,-1); // 9  Заявлений ЧЧ:MM
+
+        MyPutExcelNumber(mtGroupAll.StateMentsR   ,2,10,0,-1,-1); //10 Заявлений доли часа
+        MyPutExcelNumber(mtGroupAll.StateMentsR/24,5,10,0,-1,-1); //11  Заявлений ЧЧ:MM
+
+        MyPutExcel(mtGroupAll.OverWork,10,0,-1,-1);   //12 Сверхурочные
+        MyPutExcelNumber(mtGroupAll.Holiday  ,2,10,0,-1,-1);   //13 Выходные
+
+        MyPutExcelNumber(mtGroupAll.ItogOver ,2 ,10,50,-1,-1);  //14 Чистая переработка/использованно сверх (доли часа)
+        if mtGroupAll.ItogOver>0
+        { MyPutExcelNumber(mtGroupAll.ItogOver/24 ,5,10,0,-1,-1); //15 Чистая переработка/использованно сверх(ч:м)
+          MyPutExcelNumber(0                  ,5,10,0,-1,-1); //16 Использовано сверх переработанного(ч:м)
+        }
+        else
+        { MyPutExcelNumber( 0                  ,5,10,0,-1,-1); //15 Чистая переработка/использованно сверх(ч:м)
+          MyPutExcelNumber(-mtGroupAll.ItogOver/24,5,10,0,-1,-1); //16 Использовано сверх переработанного(ч:м)
+        }
+      }
+  }  //_Loop mtGroup
+  MyxlWriteMatrix(wexrow);
+  xlFreeMatrix;
+  matrixkl:=False;
+  xlWrapText(HeaderStrCount, 1, wexrow, 11);
+  MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount+1 ,1,wexrow,15); //Обрамление
+
+  if not xlSetActiveSheetByName('По Дням')  message( 'Не найден лист ''''По Дням''''')
+  else
+  if isAllOk
+  { HeaderStrCount:=1; // для последующего вывода сетки
+    wexrow:=HeaderStrCount;
+    MyXlCreaMatrix(100, 11);
+    matrixkl:=true;
+    matrixsdvig:=wexrow;
+
+    _Loop mtGroup
+    { if not NextVisual
+      { isAllOk:=false;
+        break;
+      }
+      if getfirst GP_SCUD_Pers = tsOk
+      if getfirst KatPodr = tsOk
+      {
+        if getfirst mtMain = tsOk  PrintPers(01);
+        if dBreak then break;
+      }
+    }
+    MyxlWriteMatrix(wexrow);
+    xlFreeMatrix;
+    matrixkl:=False;
+    xlWrapText(HeaderStrCount, 1, wexrow, 11);
+    MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount+1 ,1,wexrow,11); //Обрамление
+    //xlSetColumnWidth(15, 1, 1, 1, 6);
+  }
+  xlSetActiveSheetByName('За Месяц');
+
+  xlKillExcel;
+
+  PopPos(#mtGroup);
+  rescanPanel(#mtGroup);
+  StopVisual;
+}//Procedure PrintDoc02;

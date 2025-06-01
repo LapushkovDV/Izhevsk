@@ -1,0 +1,2222 @@
+/**************************************************************************************************
+* Наименование: Реализация класса GP_RepLaborContract "Печать трудового договора"                 *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *                            `
+* Разработка  |#44           |09/02/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Разработка  |#167.#56      |10/09/19|Торохов А.П.             |НПО Энергомаш                    *
+**************************************************************************************************/
+
+#include FeeSigners.vih
+#include WorkWithContract.vih  // Объект для работы с трудовыми договорами сотрудника
+#include NumberOfAddAgreement.vih
+#include CatFunc.vih           // Функции работы с Catalogs
+#include StrFunc.vih           // Функции работы со строками
+#include DeptIer.vih           // Функции работы с подразделениями
+#include AdrFunc.vih           // Функции работы с адресами
+#include InsZars.vih
+#include AppointKps.vih        // Условия труда на рабочем месте
+#include ExtClass.vih
+#include ExtAttr.vih
+#include AttrTablePick.vih
+#include odecl.vih             // Функции склонения ФИО
+#include SpecialPropetiesForG.vih      // Для обработки склонений справочника
+#include ChildDoc.vih        // Функции работы с документами родственников
+
+#include GP_DepFunc.vih
+#include GP_ODecl.Vih
+#include GP_DepChief.vih
+#include Word.vih              //Библиотека классов для работы с MS Word
+
+#include GP_RepLaborContract.vih
+interface GP_RepLaborContract;
+
+type
+  tArVal=array[1..100] of string;
+
+#include FeeSigners.var
+#include ExtClass.var
+#include ExtAttr.var
+#include GP_DepFunc.var
+#include GP_DepChief.var
+var ArTemplate:array[0..0] of string;
+    MSWord:com_Application(coApplication) new;
+    WordDoc:coDocument;
+    WordVar:comVariable;
+    WordVariables:comVariables;
+    wCurTypeOper: word;
+    iWWC:WorkWithContract;        // для работы с трудовыми договорами сотрудника
+    NOAA:NumberOfAddAgreement new;
+    iCatFunc:CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+    iStrFunc:StringFunctions;     // Переменная типа интерфейс StringFunctions
+    IDepartIer:DepartIer;         // Переменная типа интерфейс DepartIer
+    iAdrFunc:AddressFunc;         // Переменная типа интерфейс AddressFunc
+    InsZarFunc:IncRecordToZarsignal;
+    AKps:AppointKps;              // условия труда на рабочем месте
+    iOdecl:declension;
+    SPFG:SpecialPropetiesForG;  // работа с визирующими лицами, поворотами и склонениямти подразделений
+    iChildDoc:ChildDocFunc;          // Переменная типа интерфейс ChildDocFunc
+    CurTypeRep:integer;
+    oAttrTablePick:AttrTablePick;
+    iGP_ODecl:GP_ODecl;
+    wNIIMash:word;
+
+create view
+var sSigners:string;
+    CurTemplInd:longint;
+from
+  TitleDoc,PartDoc,ContDoc,ContDoc ContDocOld,ContDoc ContDoc2,Appointments,AppHist,
+  Persons,Persons Persons2,Passports,
+  Fortune,Raise,RaiseHist,KlVidOpl,
+  KatOrg,KatCity,KatPodr,Catalogs,KlKatego,KlSovm,KlSisOpl,
+  KlRejim,KlRejim KlRejimb,SpGraf,SpWork,GP_SpWorkExt,
+  VacationSts,KlOtpusk,PersVacation,
+  StaffStruct,AdvFeatures,
+  Attestation,
+  KatKod,NormDateSFO,NormGroupSFO,GroupSFO,KatEd,
+  Appendix,Conscription,
+  Appointments NewAppoint,
+  Experience,KlVal,
+  Education,Notes,
+  Vacations,SalScale,UOWrkTabel,
+  FactOtpusk,WorkPeriod,
+  PsnLinks,Sys_Uder,
+  PutVacCon,PutVacation,
+  OtpOtz,AllVacCon,
+  PrMemo,AttrVal,
+  DelRaise
+  , synonym ContDoc  SourceContDoc
+  , synonym PartDoc  SourcePartDoc
+  , synonym TitleDoc SourceTitleDoc
+  , InfPsn1
+  , synonym SalScale WWSalScale
+  , Catalogs CatalogsPassName
+  , Catalogs CatPodr
+
+
+  ;
+
+window WinRepParam 'Параметры печати' Gray;
+show(20,10,80,17);
+
+screen ScRepParam(,,sci1Esc);
+fields
+  CurTemplInd('Шаблон отчета',,sci13Esc):[list ''],protect;
+  sSigners('Подписант',,sci13Esc):protect,pickbutton;
+buttons
+  cmOK,,,'Запуск',,;
+  cmCancel,,,'Выход',,;
+<<
+ `Шаблон отчета`
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Подписант`
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ <. ~С~формировать .>                         <. ~З~акрыть .>
+>>
+end;
+
+function CheckInPutVars:boolean;
+{
+  result:=false;
+
+  if (not ExistFile(ArTemplate[CurTemplInd])) {
+    message('Не найден шаблон отчета "'+ArTemplate[CurTemplInd]+'".',error);
+    exit;
+  }
+
+  result:=true;
+}
+
+function FindTempl:boolean;
+var sRootDir,sTempl:string;
+    ArTempl:array[0..0] of string;
+    i,DefTempl:integer;
+{
+  result:=false;
+
+  sRootDir:=StartPathName+'XLS_ЭМ\Staff\';
+
+  sRootDir+='РПД_'+string(wCurTypeOper);
+  if (CurTypeRep=0) sRootDir+='\Договор' else sRootDir+='\Приказ';
+  if (not VerifyPathName(sRootDir,true)) {
+    message('Не найдена папка для шаблона отчета "'+sRootDir+'"!',error);
+    exit;
+  }
+
+  sTempl:=GetFirstFile(sRootDir,'*.dotm');
+
+  i:=0;
+  DefTempl:=0;
+  setlimit(ArTempl,0);
+  setlimit(ArTemplate,0);
+  do {
+    while(sTempl<>strDataIsEmpty and SubStr(BuhXml_ExtractFileName(sTempl),1,2)='~$')
+      sTempl:=GetNextFile;
+    if (sTempl=strDataIsEmpty) break;
+
+    ArTemplate[i]:=sTempl;
+    ArTempl[i]:=BuhXml_ExtractFileName(sTempl);
+    if (pos('по умолчанию',LoCase(ArTempl[i]))<>0) DefTempl:=i;
+
+    i++;
+    sTempl:=GetNextFile;
+  }
+  while(sTempl<>strDataIsEmpty and Count(ArTempl)<100);
+
+  if (i=0) {
+    message('Не найдено ни одного шаблона отчета в папке "'+sRootDir+'"!',error);
+    exit;
+  }
+
+  SetEnumList(ScRepParam,fnCurTemplInd,ArTempl);
+  CurTemplInd:=DefTempl;
+
+  result:=true;
+}
+
+HandleEvent
+cmInit:{
+  if (not FindTempl) {
+    abort;
+    exit;
+  }
+
+  iFeeSigners.InitFeeSigners(cgReport_KASSFRO);
+  sSigners:='';
+  ReadMyDsk(sSigners,#__InterfaceName__+'sSigners',true);
+  if (sSigners='')
+    sSigners:=sGetTune('UP.Staff.SignatoryAuthority');
+  if (not iFeeSigners.FindFeeSignersByName(cgReport_KASSFRO, sSigners))
+    sSigners:='';
+}
+cmDone:{
+  SaveMyDsk(sSigners,#__InterfaceName__+'sSigners');
+}
+cmOK:{
+  //Проверка параметров
+  if (not CheckInPutVars) exit;
+
+  CloseWindowEx(CurWindow,cmDefault);
+}
+end;
+end;//WinRepParam
+
+procedure InsVar(VarName:string;VarVal:string=' ';AddVal:boolean=false);
+{
+//  LogStrToFile('#InsVar.txt',VarName + ' ' + VarVal);
+
+   if (VarVal='') VarVal:=' ';//Если передать пустую строку, то переменная удаляется
+   if (AddVal and Trim(VarVal)='') exit;
+
+   WordVar:=WordVariables.Item(VarName);
+   if (WordVar=NullRef)
+     WordVariables.Add(VarName,VarVal)
+   else {
+     if (AddVal)
+       MSWord.Run('AddToVar',VarName,VarVal)
+     else
+       WordVar.Value:=VarVal;
+   }
+
+   NextVisual;
+}
+
+function DateToString(dVal:date):string;
+{
+  result:=if(dVal=ZeroDate,'',DateToStr(dVal,'DD.MM.YYYY'));
+}
+
+procedure InsVarD(VarName:string;VarVal:date);
+{
+  InsVar(VarName,DateToString(VarVal));
+}
+
+function DateToStrInWords(dVal:date):string;
+{
+  result:=if(dVal=ZeroDate,'',DateToStr(dVal,'"DD" mon YYYY г.'))
+}
+
+procedure InsVarDW(VarName:string;VarVal:date);
+{
+  InsVar(VarName,DateToStrInWords(VarVal));
+}
+
+function DoubleToStringWithBracket(Val:double):string;
+var i,p:byte;
+    sTmp:string;
+{
+  result:=Trim(DoubleToString(0,Val));
+
+  p:=0;
+  for(i:=Length(result)-2;i>0;i--) {
+    sTmp:=LoCase(SubStr(result,i,3));
+    if (sTmp='коп') p:=i
+    else if (sTmp='руб') {
+      p:=i;
+      break;
+    }
+  }
+
+  if (p<>0)
+    result:='('+SubStr(result,1,p-2)+')'+SubStr(result,p-1,255);
+}
+
+function NumberToStr(Val:double):string;
+{
+  result:='';
+
+  if (Trunc(Val)<>0)
+    result+=DoubleToStr(Val,'4');
+
+  if (Val-Trunc(Val)>0)
+    result+=DoubleToStr(Val,'5');
+
+  if (result<>'')
+    result:=Trim(UpCase(result[1])+SubStr(result,2,255));
+}
+
+function GetShortFIO(FIO:string):string;
+{
+  result:=SubStr(iStrFunc.Get_FirstName(FIO),1,1)+'. '+
+          SubStr(iStrFunc.GetPatronymic(FIO),1,1)+'. '+
+          iStrFunc.Get_LastName(FIO);
+}
+
+function GetShortFIOLast(FIO:string):string;
+{
+  result:='';
+  if (iStrFunc.GetFioIn(FIO))
+    result:=FIO;
+}
+
+function GetShortIO(FIO:string):string;
+{
+  result:=iStrFunc.Get_FirstName(FIO)+' '+iStrFunc.GetPatronymic(FIO);
+}
+
+function GetDepNameAndCodeByTabN(TabN:string):string;
+var cRec:comp;
+{
+  result:='';
+  if (getfirst fastfirstrow Persons2
+      where(('С'==Persons2.IsEmployee and 0==Persons2.TabNmb and TabN==Persons2.StrTabn))<>tsok) exit;
+  if (Persons2.AppointCur<>0) cRec:=Persons2.AppointCur else cRec:=Persons2.AppointLast;
+  if (getfirst fastfirstrow NewAppoint where((cRec==NewAppoint.NRec))<>tsok) exit;
+
+  result:=iCatFunc.GetCatalogsName(NewAppoint.Department)+' ('+iCatFunc.GetCatalogsCode(NewAppoint.Department)+')';
+}
+
+procedure FindDescendants(mCat:longint;cCat:comp);
+{
+  _loop Catalogs where((cCat==Catalogs.cParent)) {
+    InsertMarker(mCat,Catalogs.NRec);
+    PushPos(tnCatalogs);
+    FindDescendants(mCat,Catalogs.NRec);
+    PopPos(tnCatalogs);
+  }//_loop Catalogs
+}
+
+function GetAdvFeatures(cStaffStr:comp;CatName:string):tArVal;
+var Rez:tArVal;
+    cCat:comp;
+    mCat:longint;
+{
+  setlimit(Rez,0);
+  result:=Rez;
+
+  cCat:=iCatFunc.GetCatalogsNRec(83);
+  if (getfirst fastfirstrow Catalogs
+      where((0==Catalogs.lPr and cCat==Catalogs.MainLink and CatName==Catalogs.Name))<>tsok) exit;
+
+  mCat:=InitMarker('',8,0,1);
+  FindDescendants(mCat,Catalogs.NRec);
+  _loop AdvFeatures where((2==AdvFeatures.ObjType and cStaffStr==AdvFeatures.ObjNrec))
+    if (FoundMarker(mCat,AdvFeatures.Position)) {
+      if (Rez[1]<>'') Rez[1]+=', ';
+      if (AdvFeatures.ValType = 6)
+        Rez[1]+=iCatFunc.GetCatalogsName(Comp(AdvFeatures.ValString))
+      else
+        Rez[1]+=AdvFeatures.ValString;
+
+      if (Rez[2]<>'') Rez[2]+=', ';
+      Rez[2]+=iCatFunc.GetCatalogsName(AdvFeatures.Position);
+    }
+  DoneMarker(mCat,'');
+
+  result:=Rez;
+}
+
+// Возвращает строковое представление срока службы - единственная форма, подходящая для "До износа"
+Function GetSrokStr(exSrok: Word): String;
+{
+  GetSrokStr := '';
+
+  case (exSrok) of
+  //------------
+    0: GetSrokStr := 'разовая';
+  //------------
+    rvMaxWord: GetSrokStr := 'до износа';
+  //------------
+  else
+    GetSrokStr := String(exSrok)+' мес.';
+  //------------
+  end;
+}
+
+function GetCatalogsNameDeclension(cCat:comp;Pp:byte;IsPost:boolean=false):string;
+var nCat:string;
+    iSpace:byte;
+{
+  // поищем нужный атрибут с указанным падежом
+  result := Trim(SPFG.GetNeedString(true, Pp, cCat, ''));
+  if (result<>'') exit;
+
+  nCat:=Trim(iCatFunc.GetCatalogsName(cCat));
+
+  if (IsPost) {
+    iSpace:=Pos(' ',nCat);
+    if (iSpace<>0)
+      result := Trim(iOdecl.FIODeclension(0, SubStr(nCat,1,iSpace-1), Pp)) + ' ' + SubStr(nCat,iSpace+1,255);
+  }
+
+  if (result='')
+    result := Trim(iOdecl.FIODeclension(0, nCat, Pp));
+
+  if (result=nCat) //Если ничего не помогло...
+    result := iGP_ODecl.My_Sclonenie(nCat,Pp);
+}
+
+function GetPostName(cPost:comp):string;
+{
+  if ( boGetTune('UP.STAFF.USE_LONGNAME_ANK') )//Выводить длинное наименование должности в анкетной форме
+    result:=iCatFunc.GetCatalogsLongName(cPost)
+  else
+    result:=iCatFunc.GetCatalogsName(cPost);
+}
+
+function PodrNrecCat(cpodr:comp):comp;
+{
+  result:=0h;
+
+  if getfirst CatPodr where (( cpodr==CatPodr.nrec )) = tsok
+  {
+    if Length(CatPodr.Code)=3 then result:=CatPodr.nrec;
+    else result:=PodrNrecCat(CatPodr.cparent);
+  };
+}
+function PodrNameCat(cpodr:comp):string;
+{
+  result:='';
+
+  if getfirst CatPodr where (( cpodr==CatPodr.nrec )) = tsok
+  {
+    if Length(CatPodr.Code)=3 then result:=CatPodr.name;
+    else result:=PodrNameCat(CatPodr.cparent);
+  };
+}
+
+function GetYearsOfMortgageRefund(Sum:double):word;
+{
+  if (Sum<500000)
+    result:=5
+  else if (Sum<1000000)
+    result:=7
+  else if (Sum<=2000000)
+    result:=10
+  else
+    result:=0;
+}
+
+function GetWorkPeriodByVacations: string;
+{
+  result := '';
+  if (Getfirst fastfirstrow PutVacation where((Vacations.cPutVac==PutVacation.NRec)) = tsOK )
+  {
+    if PutVacation.wTypeVac = 1 //если это остаток - берем период, за который остаток
+    {
+      if (Getfirst fastfirstrow WorkPeriod where((PutVacation.cWPRemain==WorkPeriod.NRec)) = tsOK )
+        result :=DateToString(WorkPeriod.dPerBeg) + ' - ' + DateToString(WorkPeriod.dPerEnd);
+    }
+    else //если это обычная запись - берем ссылку на период
+    {
+      if (Getfirst fastfirstrow WorkPeriod where((PutVacation.cWorkPeriod==WorkPeriod.NRec)) = tsOK )
+        result :=DateToString(WorkPeriod.dPerBeg) + ' - ' + DateToString(WorkPeriod.dPerEnd);
+    }
+  }
+}
+
+function GetWorkPeriodByFactOtpusk: string;
+{
+  result := '';
+  if (Getfirst fastfirstrow Vacations where((FactOtpusk.NRec==Vacations.cFactOtpusk)) = tsOK )
+    result := GetWorkPeriodByVacations;
+
+  if result = ''
+    if (getfirst fastfirstrow WorkPeriod where((FactOtpusk.cWorkPeriod == WorkPeriod.NRec))=tsok)
+      result := DateToString(WorkPeriod.dPerBeg) + ' - ' + DateToString(WorkPeriod.dPerEnd);
+}
+
+#Declare InsMemo(Tbl,Fld,VarName)
+  if (IsMemoText(tn#(Tbl))) {
+    var hMemo:longint;
+    hMemo:=CreateFileHandle('');
+    if (File_OpenMemo(#Tbl.#Fld,hMemo)) {
+      var MemoStr:string='';
+      while(not File_EOF(hMemo)) {
+        File_ReadLn(MemoStr,hMemo);
+        if (not bFirst) MemoStr:=' '+MemoStr;
+        InsVar(#VarName,MemoStr,not bFirst);
+        bFirst:=false;
+      }
+      File_Close(hMemo);
+    }
+    DeleteFileHandle(hMemo);
+  }
+#end
+
+procedure Run(TypeOper,TypeRep:integer;cContDoc,cPerson,cAppointment:comp);
+var wClassCodeDurationWork:word;
+    ArVal:tArVal;
+    DateVal,TitleDocDate:date;
+    tmpDouble:double;
+    bFirst:boolean;
+    cRec,cAgreement:comp;
+    cAttrReasonOfRecall,cAttrRejimNote:comp;
+{
+  if timelog_Status>2 timelog('Входящие параметры: cPerson = '+string(cPerson,0,0)+' cAppointment = '+string(cAppointment,0,0));
+  wNIIMash:=wGetTune('UP.NIIMASHGAL.NIIMASH');
+  if DeleteFile('#InsVar.txt') {}
+  if DeleteFile('#sOtpStr.txt') {}
+
+  if (TypeOper=0) exit;
+  if (TypeOper=1) {// Приказ о приеме на работу
+
+   if cPerson =comp(0) and cAppointment<>comp(0){
+          cPerson := if(getfirst Appointments where ((cAppointment == Appointments.nrec)) = tsOk,
+                         Appointments.PERSON, 0);
+          if timelog_Status>2 timelog('Заполняем пустые поля 1: cPerson = '+string(cPerson,0,0)+' cAppointment = '+string(cAppointment,0,0));
+       }
+       if cPerson <>comp(0) and cAppointment=comp(0){
+          cAppointment := if(getfirst Appointments where ((cPerson == Appointments.Person)) = tsOk,
+                         Appointments.Nrec, 0);
+          if timelog_Status>2 timelog('Заполняем пустые поля 2: cPerson = '+string(cPerson,0,0)+' cAppointment = '+string(cAppointment,0,0));
+       }
+
+    if (getfirst fastfirstrow ContDoc where (( TypeOper==ContDoc.TypeOper and
+                                               cPerson==ContDoc.Person and
+                                               cAppointment==ContDoc.ObjNrec
+                                            )) <>tsok) {
+      //Если приказ не найден - возвращаем информацию из первого назначения сотрудника
+       if cPerson =comp(0) and cAppointment<>comp(0){
+          cPerson := if(getfirst Appointments where ((cAppointment == Appointments.nrec)) = tsOk,
+                         Appointments.PERSON, 0);
+          if timelog_Status>2 timelog('Не нашли приказ 1: cPerson = '+string(cPerson,0,0)+' cAppointment = '+string(cAppointment,0,0));
+       }
+       if cPerson <>comp(0) and cAppointment=comp(0){
+          cAppointment := if(getfirst Appointments where ((cPerson == Appointments.Person)) = tsOk,
+                         Appointments.Nrec, 0);
+          if timelog_Status>2 timelog('Не нашли приказ 2 cPerson = '+string(cPerson,0,0)+' cAppointment = '+string(cAppointment,0,0));
+       }
+      /*cAppointment := if(getfirst Appointments where ((cPerson == Appointments.Person)) = tsOk,
+                         Appointments.Nrec, 0);*/
+    }
+  } else if (TypeOper=3 or //Приказ на Временное замещение без освобождения от своих обязанностей (РПД-3)
+             TypeOper=4 or //Приказ на совмещение \ внутреннее совместительство (РПД-4)
+             TypeOper=5 or //Приказ на перемещение (РПД-5)
+             TypeOper=70) {//Приказ на Временное замещение с освобождением от своих обязанностей (РПД-70)
+    if (getfirst fastfirstrow ContDocOld where((cContDoc==ContDocOld.NRec))<>tsok) {
+      message('Не найдена запись таблицы ContDoc с NRec='+string(cContDoc,0,0),error);
+      exit;
+    }
+    if (getfirst fastfirstrow ContDoc
+        where((
+          ContDocOld.cPart == ContDoc.cPart
+          and ContDocOld.TypeOper == ContDoc.TypeOper
+          and ContDocOld.Person == ContDoc.Person
+          and Integer(1) << ContDoc.SeqNmb
+          and ContDocOld.wRec == ContDoc.wRec(noIndex)
+    ))<>tsok) {
+      message('Не найдена запись таблицы ContDoc связанная с новым назначением (SeqNmb>1)',error);
+      exit;
+    }
+    cAppointment:=ContDoc.cStr;
+  } else if (TypeOper=8) {//Приказ "Увольнение сотрудника"
+    if (getfirst fastfirstrow ContDoc
+    where((
+      TypeOper==ContDoc.TypeOper and cPerson==ContDoc.Person and
+      cAppointment==ContDoc.cStr(NoIndex) and integer(1)==ContDoc.SeqNmb(NoIndex)
+    ))<>tsok) {
+      message('Не найдена запись таблицы ContDoc с TypeOper='+string(TypeOper)+
+              ', Person='+string(cPerson,0,0)+' и cStr='+string(cAppointment,0,0),error);
+      exit;
+    }
+  } else {//Прочие приказы
+    if (getfirst fastfirstrow ContDoc where((cContDoc==ContDoc.NRec))<>tsok) {
+      message('Не найдена запись таблицы ContDoc с NRec='+string(cContDoc,0,0),error);
+      exit;
+    }
+  }
+
+  if TypeOper<>ContDoc.TypeOper and not (TypeOper=1 and cContDoc=0)
+    TypeOper:=ContDoc.TypeOper;
+
+  if (cPerson=0)
+    cPerson:=ContDoc.Person;
+  if (getfirst fastfirstrow Persons where((cPerson==Persons.NRec))<>tsok) {
+    message('Не найдена запись таблицы Persons с NRec='+string(cPerson,0,0),error);
+    exit;
+  }
+
+  if (cAppointment=0)
+    cAppointment:=ContDoc.cStr;
+  if (getfirst fastfirstrow Appointments where((cAppointment==Appointments.NRec))<>tsok) {
+    message('Не найдена запись таблицы Appointments с NRec='+string(cAppointment,0,0),error);
+    exit;
+  }
+
+  CurTypeRep:=TypeRep;
+  wCurTypeOper := TypeOper;
+  if (RunWindowModal(WinRepParam)<>cmDefault) exit;
+
+  StartNewVisual(vtRotateVisual, vfTimer+vfBreak+vfConfirm,if(TypeRep=0,'Печать трудового договора...','Печать приказа...'), 0);
+
+  _try {
+    WordDoc:=MSWord.Documents.Add(ArTemplate[CurTemplInd]);
+    WordVariables:=WordDoc.Variables;
+
+    wClassCodeDurationWork:=oExtClass.CreateClass(coKlRejim,'Продолжительность рабочего времени',1);
+    cAttrReasonOfRecall:=oExtAttr.AttrID(coContDoc,'Причина отзыва из отпуска');
+    cAttrRejimNote:=oExtAttr.AttrID(coKlRejim,'Описание режима работы');
+
+    cAgreement:=0;
+    if (TypeOper=50 or TypeOper=60 or TypeOper=61 or TypeOper=62 or TypeOper=65) {
+      if (getfirst fastfirstrow AppHist where((ContDoc.Nrec==AppHist.cContDoc))=tsok)
+        cAgreement:=NOAA.GetFirstAgreementByLink(coAppHist, AppHist.NRec);
+    } else if (TypeOper=3 or TypeOper=4 or TypeOper=5 or TypeOper=70) {
+      cAgreement:=NOAA.GetFirstAgreementByLink(coContDoc, ContDocOld.NRec);
+    } else {
+      cAgreement:=NOAA.GetFirstAgreementByLink(coContDoc, ContDoc.NRec);
+    }
+
+    if (Appointments.ResComp[1]=0)
+      cRec:=NOAA.GetContractByAgreement(cAgreement)
+    else
+      cRec:=Appointments.ResComp[1];
+
+    InsVar('Номер договора',iWWC.GetContractNmb(cRec));
+    InsVarD('Дата договора',iWWC.GetContractDate(cRec));
+    InsVarDW('Дата договора, прописью',iWWC.GetContractDate(cRec));
+    InsVarD('Дата окончания договора',iWWC.GetContractEnd(cRec));
+    InsVarDW('Дата окончания договора, прописью',iWWC.GetContractEnd(cRec));
+
+    InsVar('Номер доп. соглашения',NOAA.GetAgreementNmb(cAgreement));
+    InsVarD('Дата доп. соглашения',NOAA.GetAgreementDate(cAgreement));
+    InsVarDW('Дата доп. соглашения, прописью',NOAA.GetAgreementDate(cAgreement));
+
+    setlimit(ArVal,0);
+    TitleDocDate:=ZeroDate;
+    if (getfirst fastfirstrow PartDoc where((ContDoc.cPart==PartDoc.NRec))=tsok)
+      if (getfirst fastfirstrow TitleDoc where((PartDoc.cDoc==TitleDoc.NRec))=tsok) {
+        ArVal[1]:=TitleDoc.DocNmb;
+        ArVal[2]:=DateToString(TitleDoc.DocDate);
+        ArVal[3]:=DateToStrInWords(TitleDoc.DocDate);
+        TitleDocDate:=TitleDoc.DocDate;
+      }
+    InsVar('Номер приказа',ArVal[1]);
+    InsVar('Дата приказа',ArVal[2]);
+    InsVar('Дата приказа прописью',ArVal[3]);
+
+    InsVar('ФИО сотрудника',Persons.FIO);
+    InsVar('ФИО сотрудника в родительном падеже',iOdecl.FIODeclension(Persons.NRec,Persons.FIO,2));
+    InsVar('ФИО сотрудника в дательном падеже',iOdecl.FIODeclension(Persons.NRec,Persons.FIO,3));
+    InsVar('ФИО сотрудника в винительном падеже',iOdecl.FIODeclension(Persons.NRec,Persons.FIO,4));
+    InsVar('ФИО сотрудника в творительном падеже',iOdecl.FIODeclension(Persons.NRec,Persons.FIO,5));
+    InsVar('ФИО сотрудника ИО',GetShortIO(Persons.FIO));
+    InsVar('ФИО сотрудника с инициалами',GetShortFIO(Persons.FIO));
+//доработка для Факела 27.10.2022 Погосский
+    InsVar('Фамилия сотрудника',iStrFunc.Get_LastName(Persons.FIO));
+    InsVar('Имя сотрудника',iStrFunc.Get_FirstName(Persons.FIO));
+    InsVar('Отчество сотрудника', iStrFunc.GetPatronymic(Persons.FIO));
+//-------------------
+    InsVar('Таб. номер',GetStrTabn(Persons.TabNmb,Persons.StrTabn));
+    if (Appointments.lPrizn = 0)
+      InsVar('Таб. номер из приказа',GetStrTabn(Persons.TabNmb,Persons.StrTabn))
+    else
+      InsVar('Таб. номер из приказа',GetStrTabN(Appointments.AppTabNmb, Appointments.StrTabN));
+    InsVar('Год рождения',DateToStr(Persons.BornDate,'YYYY'));
+    InsVarD('Дата рождения',Persons.BornDate);
+    InsVar('Место рождения',iAdrFunc.GetFullAddressInd(Persons.BornAddr));
+
+    //Должность
+    InsVar('Должность',GetPostName(Appointments.Post));
+    InsVar('Должность в родительном падеже',GetCatalogsNameDeclension(Appointments.Post,2,true));
+    InsVar('Должность в дательном падеже',GetCatalogsNameDeclension(Appointments.Post,3,true));
+
+    //Категория персонала
+    if (getfirst fastfirstrow KlKatego where((Appointments.EmpCategory==KlKatego.nRec))=tsok)
+      InsVar('Категория персонала',KlKatego.NaiKat)
+    else
+      InsVar('Категория персонала');
+    InsVar('Разряд',Appointments.Category);
+    InsVar('Разряд, прописью',string(Appointments.Category)+' разряд');
+    if (wNIIMash = 1)
+    {
+      InsVar('Подразделение',PodrNameCat(Appointments.Department));
+    }
+    else
+    {
+      InsVar('Подразделение',oGP_DepFunc.GetFullDepName(Appointments.Department));
+    }
+//доработка для Факела 28.10.2022 Погосский
+    InsVar('Подразделение с разделителем',oGP_DepFunc.GetFullDepName(Appointments.Department, DF_FROM_ROOT, 1, '/'));
+    InsVar('Подр. с разд. в родительном падеже',oGP_DepFunc.GetFullDepName(Appointments.Department, DF_FROM_ROOT, 2, '/'));
+    InsVar('Подр. с разд. в дательном падеже',oGP_DepFunc.GetFullDepName(Appointments.Department, DF_FROM_ROOT, 3, '/'));
+//доработка для Факела 16.03.2023 Погосский
+    InsVar('Подразделение без разделителя',oGP_DepFunc.GetFullDepName(Appointments.Department, DF_FROM_ROOT, 1, ' '));
+    InsVar('Подр. без разд. в родительном падеже',oGP_DepFunc.GetFullDepName(Appointments.Department, DF_FROM_ROOT, 2, ' '));
+    InsVar('Подр. без разд. в дательном падеже',oGP_DepFunc.GetFullDepName(Appointments.Department, DF_FROM_ROOT, 3, ' '));
+//Обратный порядок вывода уровней дерева каталога подразделений:
+    InsVar('Подразделение с разделителем(обратный)',oGP_DepFunc.GetFullDepName(Appointments.Department, 0, 1, '/'));
+    InsVar('Подр. с разд.(обратный) в родительном падеже',oGP_DepFunc.GetFullDepName(Appointments.Department, 0, 2, '/'));
+//доработка для Факела 27.03.2023 Погосский
+    InsVar('Подр. без разд.(обратный) в родительном падеже (все строчные)',LoCase(oGP_DepFunc.GetFullDepName(Appointments.Department, 0, 2, ' ')));
+//-------------------
+    InsVar('Подр. с разд.(обратный) в дательном падеже',oGP_DepFunc.GetFullDepName(Appointments.Department, 0, 3, '/'));
+    InsVar('Подразделение без разделителя(обратный)',oGP_DepFunc.GetFullDepName(Appointments.Department, 0, 1, ' '));
+    InsVar('Подр. без разд.(обратный) в родительном падеже',oGP_DepFunc.GetFullDepName(Appointments.Department, 0, 2, ' '));
+    InsVar('Подр. без разд.(обратный) в дательном падеже',oGP_DepFunc.GetFullDepName(Appointments.Department, 0, 3, ' '));
+//-------------------
+    InsVar('Подразделение код',iCatFunc.GetCatalogsCode(Appointments.Department));
+
+    if (wNIIMash = 1)
+    {
+      InsVar('код подразделения (первые три цифры)',iCatFunc.GetCatalogsCode(PodrNrecCat(Appointments.Department)));
+    }
+    else
+    {
+      InsVar('код подразделения (первые три цифры)',SubStr(iCatFunc.GetCatalogsCode(Appointments.Department),1,3));
+    }
+
+    //InsVar('код подразделения (первые три цифры)',SubStr(iCatFunc.GetCatalogsCode(Appointments.Department),1,3));
+
+    //Адрес подразделения
+    if (getfirst fastfirstrow KatPodr where((InsZarFunc.GalDepartmentNrec(Appointments.Department)==KatPodr.NRec))=tsok)
+      InsVar('Адрес подразделения',iAdrFunc.GetFullAddressInd(KatPodr.cUser))
+    else
+      InsVar('Адрес подразделения');
+
+    //Руководитель подразделения
+    setlimit(ArVal,0);
+    cRec:=oGP_DepChief.GetPersChief(Persons.NRec, TitleDocDate, 0, 0);
+    if (cRec<>0)
+      if (getfirst fastfirstrow Persons2 where((cRec==Persons2.NRec))=tsok)
+        ArVal[1]:=Persons2.FIO;
+    InsVar('Руководитель подразделения',ArVal[1]);
+
+    //прежнее назначение
+    setlimit(ArVal,0);
+    if (TypeOper=3 or //Приказ на Временное замещение без освобождения от своих обязанностей (РПД-3)
+        TypeOper=4 or //Приказ на совмещение \ внутреннее совместительство (РПД-4)
+        TypeOper=5 or //Приказ на перемещение (РПД-5)
+        TypeOper=70) {//Приказ на Временное замещение с освобождением от своих обязанностей (РПД-70)
+      if (getfirst fastfirstrow NewAppoint where((ContDocOld.cStr==NewAppoint.NRec))=tsok) {
+        ArVal[1]:=oGP_DepFunc.GetFullDepName(NewAppoint.Department);
+        ArVal[10]:=LoCase(oGP_DepFunc.GetFullDepName(NewAppoint.Department, 0, 2, ' '));
+        ArVal[2]:=iCatFunc.GetCatalogsCode(NewAppoint.Department);
+        ArVal[3]:=GetPostName(NewAppoint.Post);
+        ArVal[4]:=GetCatalogsNameDeclension(NewAppoint.Post,2,true);
+        ArVal[5]:=GetCatalogsNameDeclension(NewAppoint.Post,3,true);
+        ArVal[8]:=iCatFunc.GetCatalogsName(NewAppoint.Department)+' '+ArVal[2];
+      }
+      ArVal[6]:=DateToString(ContDocOld.dat1);
+      ArVal[7]:=DateToString(ContDocOld.dat2);
+
+      if (TypeOper=3)
+        if (getfirst fastfirstrow NewAppoint where((ContDoc.cRezerv==NewAppoint.NRec))=tsok)
+          ArVal[9]:=GetStrTabN(NewAppoint.AppTabNmb, NewAppoint.StrTabN);
+      if (TypeOper=4)
+        ArVal[9]:=GetStrTabN(Appointments.AppTabNmb, Appointments.StrTabN);
+    }
+
+     if (wNIIMash = 1)
+     {
+       InsVar('Подразделение до перевода',PodrNameCat(NewAppoint.Department));
+     }
+     else
+     {
+      InsVar('Подразделение до перевода',ArVal[1]);
+     }
+    InsVar('Подр. до перевода без разд.(обратный) в род. падеже (все строчные)',ArVal[10]);
+    InsVar('Подразделение Код до перевода',ArVal[2]);
+    InsVar('Подразделение Код до перевода (первые три цифры)',SubStr(ArVal[2],1,3));
+    InsVar('Должность до перевода',ArVal[3]);
+    InsVar('Должность до перевода в родительном падеже',ArVal[4]);
+    InsVar('Должность до перевода в дательном падеже',ArVal[5]);
+    InsVar('Замещает с',ArVal[6]);
+    InsVar('Замещает по',ArVal[7]);
+    InsVar('Замещаемая ставка',ArVal[8]);
+    InsVar('Таб. номер совмещ',ArVal[9]);
+    InsVar('Причина совмещ',iCatFunc.GetCatalogsName(Appointments.TYPEMOVE));
+
+    InsVar('Источник комплектования',iCatFunc.GetCatalogsName(ContDoc.cCat2));
+    InsVar('Характер работы',iCatFunc.GetCatalogsName(Persons.JobNature));
+    //Вид работы
+    if (getfirst fastfirstrow KlSovm where((word(ContDoc.cNew2)==KlSovm.Sovm))=tsok)
+      InsVar('Вид работы',KlSovm.NSovm)
+    else
+      InsVar('Вид работы');
+    InsVar('Условия труда на рабочем месте',AKps.GetKpsSTR(ContDoc.cNew3));
+    InsVarD('Зачислить с',Appointments.AppointDate);
+    InsVarDW('Зачислить с, прописью',Appointments.AppointDate);
+    InsVarD('Зачислить по',Appointments.DateEnd);
+    InsVarD('Испытательный срок по',ContDoc.Dat1);
+    InsVar('Количество месяцев испытательного срока',
+      if(longint(ContDoc.Dat1)=0,'',iStrFunc.GetCountMonths(Appointments.AppointDate, ContDoc.Dat1)));
+    InsVar('Испытательный срок с или без',
+      if(longint(ContDoc.Dat1)=0,'без испытательного срока','с испытательным сроком'));
+
+    //За отсутствующего работника
+    if (TypeOper=3 or //Приказ на Временное замещение без освобождения от своих обязанностей (РПД-3)
+        TypeOper=70)  //Приказ на Временное замещение с освобождением от своих обязанностей (РПД-70)
+      cRec:=ContDoc.ObjNRec
+    else
+      cRec:=Appointments.ResComp[2];
+    if (getfirst fastfirstrow Persons2 where((cRec==Persons2.NRec))=tsok) {
+      InsVar('За отсутствующего работника','за отсутствующего работника '+
+                                           GetStrTabn(Persons2.TabNmb,Persons2.StrTabn)+' '+Persons2.FIO);
+      InsVar('на пер.отсут','дату выхода основного работника');
+    } else {
+      InsVar('За отсутствующего работника');
+      InsVar('на пер.отсут');
+    }
+
+    //на период отсут.осн.работника
+    if (TypeOper=1 or TypeOper=4)
+      InsVar('на период отсут.осн.работника',iCatFunc.GetCatalogsCode(Appointments.KindApp))
+    else if (TypeOper=3 or TypeOper=70)
+      InsVar('на период отсут.осн.работника',iCatFunc.GetCatalogsCode(Appointments.TypeMove))
+    else
+      InsVar('на период отсут.осн.работника');
+
+    if (getfirst fastfirstrow KatOrg where((coGetTune('MYORG')==KatOrg.NRec))=tsok) {
+      //Город
+      if (getfirst fastfirstrow KatCity where((KatOrg.cCity==KatCity.NRec))=tsok)
+        InsVar('Город',KatCity.Name)
+      else
+        InsVar('Город');
+      InsVar('Наименование организации',trim(KatOrg.Name));
+ //20200214 заполняем константой      InsVar('Альтернативное наименование организации',oExtAttr.sGetAttr(coKatOrg,KatOrg.NRec,'Полное наименование')); //trim(KatOrg.ShortName));  10/06/2019  сказали заполнять полным ...
+      InsVar('Альтернативное наименование организации',oExtAttr.sGetAttr(coKatOrg,KatOrg.NRec,'Полное наименование'));
+      InsVar('Полное наименование организации',oExtAttr.sGetAttr(coKatOrg,KatOrg.NRec,'Полное наименование'));
+      InsVar('ИНН организации',KatOrg.UNN);
+      InsVar('Юридический адрес организации',iAdrFunc.GetFullAddressInd(KatOrg.cJuridicalAddr));
+      InsVar('Код ОКПО',KatOrg.OKPO);
+      InsVar('Орг_телефон',KatOrg.TEL);
+    } else {
+      InsVar('Город');
+      InsVar('Наименование организации');
+      InsVar('Альтернативное наименование организации');
+      InsVar('Полное наименование организации');
+      InsVar('ИНН организации');
+      InsVar('Юридический адрес организации');
+      InsVar('Код ОКПО');
+      InsVar('Орг_телефон');
+    }
+
+    setlimit(ArVal,0);
+    if (iFeeSigners.FeeSignersIsValid and sSigners <> '') {
+      if (not iFeeSigners.RestrictFeeByRole(2,'UtvLico'))
+        iFeeSigners.GetSignerFirst;
+      ArVal[1]:=iFeeSigners.GetSignerPosition(1);
+      ArVal[2]:=iFeeSigners.GetSignerPosition(2);
+      ArVal[17]:=iFeeSigners.GetSignerPosition(3);
+      ArVal[3]:=iFeeSigners.GetSignerFIO(1);
+      ArVal[4]:=GetShortFIO(iFeeSigners.GetSignerFIO(1));
+      ArVal[18]:=GetShortFIOLast(iFeeSigners.GetSignerFIO(1));
+      ArVal[5]:=iFeeSigners.GetSignerFIO(2);
+      ArVal[19]:=iFeeSigners.GetSignerFIO(3);
+      ArVal[20]:=GetShortFIOLast(iFeeSigners.GetSignerFIO(3));
+      ArVal[6]:=iFeeSigners.GetSignerInfo(1);
+      if (iFeeSigners.RestrictFeeByRole(2,'Otvetstv')) {
+        ArVal[7]:=iFeeSigners.GetSignerPosition(2)+' '+GetShortFIOLast(iFeeSigners.GetSignerFIO(2));
+        ArVal[13]:=iFeeSigners.GetSignerPosition(4);
+        ArVal[14]:=iFeeSigners.GetSignerFIO(4);
+        ArVal[15]:=iFeeSigners.GetSignerPosition(3);
+        ArVal[16]:=iFeeSigners.GetSignerFIO(3);
+      }
+      if (iFeeSigners.RestrictFeeByRole(2,'KontaktLico'))
+        ArVal[8]:=iFeeSigners.GetSignerPosition(3)+' '+
+                  GetDepNameAndCodeByTabN(iFeeSigners.GetSignerTabN)+' '+
+                  GetShortFIOLast(iFeeSigners.GetSignerFIO(3));
+      if (iFeeSigners.RestrictFeeByRole(2,'Koord'))
+        ArVal[9]:=iFeeSigners.GetSignerPosition(3)+' '+GetShortFIOLast(iFeeSigners.GetSignerFIO(3));
+      if (iFeeSigners.RestrictFeeByRole(2,'Otvetstv'))
+        ArVal[10]:=iFeeSigners.GetSignerPosition(3)+' '+GetShortFIOLast(iFeeSigners.GetSignerFIO(3));
+      if (iFeeSigners.RestrictFeeByRole(2,'GlBux'))
+        ArVal[11]:=iFeeSigners.GetSignerPosition(3)+' '+GetShortFIOLast(iFeeSigners.GetSignerFIO(3));
+      if (iFeeSigners.RestrictFeeByRole(2,'ProvLico'))
+        ArVal[12]:=iFeeSigners.GetSignerPosition(2)+' '+GetShortFIOLast(iFeeSigners.GetSignerFIO(2));
+//доработка для Факела 16.03.2023 Погосский
+      if (iFeeSigners.RestrictFeeByRole(2,'UtvLico'))
+      {
+        ArVal[30]:=iFeeSigners.GetSignerPosition(1);
+        ArVal[31]:=iFeeSigners.GetSignerPosition(2);
+        ArVal[32]:=iFeeSigners.GetSignerPosition(3);
+
+        ArVal[33]:=iFeeSigners.GetSignerFIO(1);
+        ArVal[34]:=iFeeSigners.GetSignerFIO(2);
+        ArVal[35]:=iFeeSigners.GetSignerFIO(3);
+
+        ArVal[36]:=GetShortFIO(iFeeSigners.GetSignerFIO(1));
+        ArVal[37]:=GetShortFIOLast(iFeeSigners.GetSignerFIO(1));
+
+        ArVal[38]:=iFeeSigners.GetSignerInfo(1);
+        ArVal[39]:=iFeeSigners.GetSignerInfo(3);
+      }
+      if (iFeeSigners.RestrictFeeByRole(2,'Otvetstv'))
+      {
+        ArVal[40]:=iFeeSigners.GetSignerPosition(1);
+        ArVal[41]:=iFeeSigners.GetSignerPosition(2);
+        ArVal[42]:=iFeeSigners.GetSignerPosition(3);
+               
+        ArVal[43]:=iFeeSigners.GetSignerFIO(1);
+        ArVal[44]:=iFeeSigners.GetSignerFIO(2);
+        ArVal[45]:=iFeeSigners.GetSignerFIO(3);
+               
+        ArVal[46]:=GetShortFIO(iFeeSigners.GetSignerFIO(1));
+        ArVal[47]:=GetShortFIOLast(iFeeSigners.GetSignerFIO(1));
+               
+        ArVal[48]:=iFeeSigners.GetSignerInfo(1);
+        ArVal[49]:=iFeeSigners.GetSignerInfo(3);
+      }
+      if (iFeeSigners.RestrictFeeByRole(2,'GlBux'))
+      {
+        ArVal[50]:=iFeeSigners.GetSignerPosition(1);
+        ArVal[51]:=iFeeSigners.GetSignerPosition(2);
+        ArVal[52]:=iFeeSigners.GetSignerPosition(3);
+               
+        ArVal[53]:=iFeeSigners.GetSignerFIO(1);
+        ArVal[54]:=iFeeSigners.GetSignerFIO(2);
+        ArVal[55]:=iFeeSigners.GetSignerFIO(3);
+               
+        ArVal[56]:=GetShortFIO(iFeeSigners.GetSignerFIO(1));
+        ArVal[57]:=GetShortFIOLast(iFeeSigners.GetSignerFIO(1));
+               
+        ArVal[58]:=iFeeSigners.GetSignerInfo(1);
+        ArVal[59]:=iFeeSigners.GetSignerInfo(3);
+      }
+//--------------------
+      iFeeSigners.ClearRestriction;
+    }
+    InsVar('Должность подписанта',ArVal[1]);
+//доработка для Факела 27.03.2023 Погосский
+    InsVar('Должность подписанта (все прописные)',UpCase(ArVal[1]));
+//--------------------
+    InsVar('Должность подписанта род.падеж',ArVal[2]);
+    InsVar('Должность подписанта дат.падеж',ArVal[17]);
+    InsVar('ФИО подписанта',ArVal[3]);
+    InsVar('ФИО подписанта с инициалами',ArVal[4]);
+    InsVar('ФИО подписанта с инициалами в конце',ArVal[18]);
+    InsVar('ФИО подписанта род.падеж',ArVal[5]);
+    InsVar('ФИО подписанта дат.падеж',ArVal[19]);
+    InsVar('ФИО подписанта дат.падеж с инициалами в конце',ArVal[20]);
+    InsVar('Доверенность',if(Pos('Устав',ArVal[6])=0,'Доверенности ','')+ArVal[6]);
+    InsVar('ст_п1',ArVal[7]);
+    InsVar('ст_п4',ArVal[8]);
+    InsVar('ст_п7',ArVal[9]);
+    InsVar('ст_п8',ArVal[10]);
+    InsVar('ст_п9',ArVal[11]);
+    InsVar('ст_п10',ArVal[12]);
+    InsVar('Должность Ответственный вин.падеж',ArVal[13]);
+    InsVar('ФИО Ответственный вин.падеж',ArVal[14]);
+    InsVar('Должность бухгалтера в дат. падеже',ArVal[15]);
+    InsVar('ФИО бухгалтера в дат. падеже',ArVal[16]);
+//доработка для Факела 16.03.2023 Погосский
+    InsVar('Должность UtvLico'               ,ArVal[30]);
+//доработка для Факела 27.03.2023 Погосский
+    InsVar('Должность UtvLico (все прописные)',UpCase(ArVal[30]));
+//--------------------
+    InsVar('Должность UtvLico род.падеж'     ,ArVal[31]);
+    InsVar('Должность UtvLico дат.падеж'     ,ArVal[32]);
+                                                      
+    InsVar('ФИО UtvLico'                     ,ArVal[33]);
+    InsVar('ФИО UtvLico род.падеж'           ,ArVal[34]);
+    InsVar('ФИО UtvLico дат.падеж'           ,ArVal[35]);
+                                                      
+    InsVar('ФИО UtvLico с инициалами'        ,ArVal[36]);
+    InsVar('ФИО UtvLico с инициалами в конце',ArVal[37]);
+                                                      
+    InsVar('Доверенность UtvLico'            ,ArVal[38]);
+    InsVar('Примечание UtvLico'              ,ArVal[39]);
+
+    InsVar('Должность Otvetstv'               ,ArVal[40]);
+    InsVar('Должность Otvetstv род.падеж'     ,ArVal[41]);
+    InsVar('Должность Otvetstv дат.падеж'     ,ArVal[42]);
+                                                     
+    InsVar('ФИО Otvetstv'                     ,ArVal[43]);
+    InsVar('ФИО Otvetstv род.падеж'           ,ArVal[44]);
+    InsVar('ФИО Otvetstv дат.падеж'           ,ArVal[45]);
+                                                     
+    InsVar('ФИО Otvetstv с инициалами'        ,ArVal[46]);
+    InsVar('ФИО Otvetstv с инициалами в конце',ArVal[47]);
+                                                     
+    InsVar('Доверенность Otvetstv'            ,ArVal[48]);
+    InsVar('Примечание Otvetstv'              ,ArVal[49]);
+
+    InsVar('Должность GlBux'               ,ArVal[50]);
+    InsVar('Должность GlBux род.падеж'     ,ArVal[51]);
+    InsVar('Должность GlBux дат.падеж'     ,ArVal[52]);
+                                                    
+    InsVar('ФИО GlBux'                     ,ArVal[53]);
+    InsVar('ФИО GlBux род.падеж'           ,ArVal[54]);
+    InsVar('ФИО GlBux дат.падеж'           ,ArVal[55]);
+                                                    
+    InsVar('ФИО GlBux с инициалами'        ,ArVal[56]);
+    InsVar('ФИО GlBux с инициалами в конце',ArVal[57]);
+                                                    
+    InsVar('Доверенность GlBux'            ,ArVal[58]);
+    InsVar('Примечание GlBux'              ,ArVal[59]);
+//--------------------
+    //Руководитель стажировки
+    setlimit(ArVal,0);
+    if (Appointments.ResComp[3]<>0)
+      if (getfirst fastfirstrow Persons2 where((Appointments.ResComp[3]==Persons2.NRec))=tsok) {
+        ArVal[1]:=Persons2.FIO;
+        ArVal[2]:=iOdecl.FIODeclension(Persons2.NRec,Persons2.FIO,2);
+        ArVal[3]:=iOdecl.FIODeclension(Persons2.NRec,Persons2.FIO,3);
+        ArVal[4]:=iOdecl.FIODeclension(Persons2.NRec,Persons2.FIO,4);
+        if (Persons2.AppointCur<>0)
+          cRec:=Persons2.AppointCur
+        else
+          cRec:=Persons2.AppointLast;
+        if (getfirst fastfirstrow NewAppoint where((cRec==NewAppoint.NRec))=tsok)
+          ArVal[5]:=GetCatalogsNameDeclension(NewAppoint.Post,2,true);
+      }
+    InsVar('Руководитель стажировки',ArVal[1]);
+    InsVar('ФИО руководителя стажировки в родительном падеже',ArVal[2]);
+    InsVar('ФИО руководителя стажировки в дательном падеже',ArVal[3]);
+    InsVar('ФИО руководителя стажировки в винительном падеже',ArVal[4]);
+    InsVar('Должность руководителя стажировки в родительном падеже',ArVal[5]);
+
+    InsVar('Условия приема на работу',iCatFunc.GetCatalogsName(Appointments.TypeMove));
+    InsVar('Причина перевода',iCatFunc.GetCatalogsName(Appointments.TypeMove));
+    InsVar('Вид перевода',if(longint(Appointments.DateEnd)=0,'постоянно','временно'));
+
+    //По результатам
+    if (getfirst fastfirstrow StaffStruct where((Appointments.StaffStr==StaffStruct.NRec))=tsok)
+      InsVar('По результатам',if(longint(StaffStruct.dNew1)<>0,'специальной оценки условий труда',''))
+    else
+      InsVar('По результатам');
+    InsVar('Срок договора',if(iWWC.GetContractEnd(Appointments.ResComp[1])=ZeroDate,'неопределенный срок',
+                           'на определенный срок по '+DateToString(iWWC.GetContractEnd(Appointments.ResComp[1]))));
+    InsVar('Основание приказа',Appointments.Foundation);
+
+    if (TypeOper=3 or //Приказ на Временное замещение без освобождения от своих обязанностей (РПД-3)
+        TypeOper=4 or //Приказ на совмещение \ внутреннее совместительство (РПД-4)
+        TypeOper=5)   //Приказ на перемещение (РПД-5)
+      InsVar('Основание: ручной ввод',ContDocOld.SBottom)
+    else
+      InsVar('Основание: ручной ввод',ContDoc.SBottom);
+
+    if (ContDoc.wAttrDoc2 = 0) {//основное назначение
+      InsVarD('Дата увольнения',Appointments.dOrderDisDate);
+      InsVarDW('Дата увольнения, прописью',Appointments.dOrderDisDate);
+      InsVar('Основание увольнения код',iCatFunc.GetCatalogsCode(Appointments.cDisReason));
+      InsVar('Основание увольнения наименование',iCatFunc.GetCatalogsName(Appointments.cDisReason));
+      InsVar('Основание',iCatFunc.GetCatalogsName(Appointments.cDisDasis));
+       if (wGetTune('UP.FAKELGAL.FAKEL') = 1)
+      {
+        InsVar('Выплата',if(Appointments.cDisReason=comp(000A00000003B825h),oExtAttr.sGetAttr(coCatalogs,Appointments.cDisReason,'Выплата'),'') );
+      }
+    } else {//совмещение
+      InsVarD('Дата увольнения',ContDoc.dat1);
+      InsVarDW('Дата увольнения, прописью',Appointments.dOrderDisDate);
+      InsVar('Основание увольнения код',iCatFunc.GetCatalogsCode(Appointments.cRef1));
+      InsVar('Основание увольнения наименование',iCatFunc.GetCatalogsName(Appointments.cRef1));
+      InsVar('Основание',iCatFunc.GetCatalogsName(Appointments.cRef2));
+    }
+    InsVar('Количество неиспользованных дней отпуска',
+           if (trim(ContDoc.LastUser)<>'', if(Double(ContDoc.LastUser)>0,Trim(ContDoc.LastUser), '0'), '0'));
+    InsVar('Количество использованных дней отпуска авансом',
+           if (trim(ContDoc.LastUser)<>'', if(Double(ContDoc.LastUser)<0,Trim(ContDoc.LastUser), '0'), '0'));
+
+    setlimit(ArVal,0);
+    if (getfirst fastfirstrow PutVacCon where((coContDoc == PutVacCon.wTable and ContDoc.NRec == PutVacCon.cTable))=tsok)
+      if (getfirst fastfirstrow PutVacation where((PutVacCon.cPutVacation == PutVacation.NRec))=tsok) {
+        if (PutVacation.cWPRemain<>0)
+          if (getfirst fastfirstrow WorkPeriod where((PutVacation.cWPRemain == WorkPeriod.NRec))=tsok) {
+            ArVal[1]:=DateToString(WorkPeriod.dPerBeg);
+            ArVal[2]:=DateToString(WorkPeriod.dPerEnd);
+            ArVal[3]:=DateToStrInWords(WorkPeriod.dPerBeg);
+            ArVal[4]:=DateToStrInWords(WorkPeriod.dPerEnd);
+          }
+        if (ArVal[1]='' and PutVacation.cWorkPeriod<>0)
+          if (getfirst fastfirstrow WorkPeriod where((PutVacation.cWorkPeriod == WorkPeriod.NRec))=tsok) {
+            ArVal[1]:=DateToString(WorkPeriod.dPerBeg);
+            ArVal[2]:=DateToString(WorkPeriod.dPerEnd);
+            ArVal[3]:=DateToStrInWords(WorkPeriod.dPerBeg);
+            ArVal[4]:=DateToStrInWords(WorkPeriod.dPerEnd);
+          }
+      }
+    InsVar('Рабочий период отпуска с',ArVal[1]);
+    InsVar('Рабочий период отпуска по',ArVal[2]);
+    InsVar('Рабочий период отпуска с, прописью',ArVal[3]);
+    InsVar('Рабочий период отпуска по, прописью',ArVal[4]);
+
+    ArVal:=GetAdvFeatures(Appointments.StaffStr,'Смывающие средства');
+    InsVar('Смывающие средства',ArVal[1]);
+    InsVar('Смывающие средства, наименование',ArVal[2]);
+
+    setlimit(ArVal,0);
+    var i,d:word;
+    bFirst:=true;
+    if (getfirst fastfirstrow AppHist where((ContDoc.Nrec==AppHist.cContDoc))=tsok) {
+      //Оклад (тарифная ставка)
+      ArVal[16]:=DoubleToStr(AppHist.TaxRate,'[|-]3666 666 666.88');
+      //Оклад (тарифная ставка)  прописью
+      ArVal[1]:=DoubleToStringWithBracket(AppHist.TaxRate);
+      //Количество ставок
+      ArVal[19]:=String(AppHist.coef1);
+      //Система оплаты
+      if (getfirst fastfirstrow KlSisOpl where((AppHist.PayModel==KlSisOpl.SisOpl))=tsok) {
+        ArVal[20]:=KlSisOpl.NaSisOpl;
+        ArVal[23]:=if(KlSisOpl.SisOpl < 30, 'в час', 'в месяц');
+      }
+
+      if (getfirst fastfirstrow KlRejim where((AppHist.WorkRegime==KlRejim.Nrec))=tsok) {
+        //График работы
+        ArVal[2]:=KLRejim.NREJIM;
+        //Плановый режим графика
+        if (getfirst fastfirstrow KLRejimb where((KLRejim.rejimc==KLRejimb.rejim))=tsok)
+          ArVal[3]:=KLRejimb.NREJIM;
+        //Продолжительность рабочего времени (вн.классификация)
+        ArVal[17]:=oExtClass.GetSegName(wClassCodeDurationWork,KlRejim.NRec);
+        //Интервал
+        ArVal[4]:=icase(KlRejim.INTERVAL;'','день','неделя';'');
+        //Продолжительность рабочей недели
+        tmpDouble:=KlRejim.HOURS+KlRejim.MINUTES/60;
+        if (abs(tmpDouble-trunc(tmpDouble))<0.001)
+          ArVal[5]:=string(longint(tmpDouble))
+        else
+          ArVal[5]:=DoubleToStr(tmpDouble,'[|-]3666 666 666,88');
+
+        if (getfirst fastfirstrow SpGraf
+            where((KlRejim.cCalendar==SpGraf.cGrafik and 0<<SpGraf.DayChas(noindex)))=tsok) {
+          ArVal[24]:=string(SpGraf.DayChas);
+          _loop SpWork where((SpGraf.cWorkPattern==SpWork.cWorkPattern and SpWork.NRec==GP_SpWorkExt.cSpWork)) {
+            //Начало рабочего дня
+            if (ArVal[6]='')
+              ArVal[6]:=TimeToStr(SpWork.tStart,'HH:MM');
+            //Начало обеда 1
+            if (ArVal[7]='' and (SpWork.RazrChas<>0 or SpWork.RazrMin<>0))
+              ArVal[7]:=TimeToStr(GP_SpWorkExt.StartBreak1,'HH:MM');
+            //Окончание обеда 1
+            if (ArVal[8]='' and (SpWork.RazrChas<>0 or SpWork.RazrMin<>0))
+              ArVal[8]:=TimeToStr(GP_SpWorkExt.EndBreak1,'HH:MM');
+            //Начало обеда 2
+            if (ArVal[9]='' and (SpWork.RazrChas<>0 or SpWork.RazrMin<>0))
+              ArVal[9]:=TimeToStr(GP_SpWorkExt.StartBreak2,'HH:MM');
+            //Окончание обеда 2
+            if (ArVal[10]='' and (SpWork.RazrChas<>0 or SpWork.RazrMin<>0))
+              ArVal[10]:=TimeToStr(GP_SpWorkExt.EndBreak2,'HH:MM');
+          }//_loop SpWork
+        }
+
+        //Окончание рабочего дня
+        if (getlast SpGraf
+            where((KlRejim.cCalendar==SpGraf.cGrafik and 0<<SpGraf.DayChas(noindex)))=tsok)
+          if (getprev SpGraf
+              where((KlRejim.cCalendar==SpGraf.cGrafik and 0<<SpGraf.DayChas(noindex)))=tsok)
+            if (getlast fastfirstrow SpWork where((SpGraf.cWorkPattern==SpWork.cWorkPattern))=tsok)
+              ArVal[11]:=TimeToStr(SpWork.tEnd,'HH:MM');
+
+        //Окончание рабочего дня в пятницу
+        if (getfirst fastfirstrow SpGraf
+            where((KlRejim.cCalendar==SpGraf.cGrafik and date(1, 1, 5)==SpGraf.dDate))=tsok)
+          if (getlast fastfirstrow SpWork where((SpGraf.cWorkPattern==SpWork.cWorkPattern))=tsok)
+            ArVal[12]:=TimeToStr(SpWork.tEnd,'HH:MM');
+
+        i:=0;
+        _loop SpGraf where((KlRejim.cCalendar==SpGraf.cGrafik and 0==SpGraf.DayChas(noindex))) {
+          i++;
+          d:=Year(SpGraf.dDate);
+          //Выходной день 1
+          if (i=1) {
+            if (d>0 and d<32) ArVal[13]:=DateToStr(date(d,1,1),'day');
+          }
+          //Выходной день 2
+          if (i=2) {
+            if (d>0 and d<32) ArVal[14]:=DateToStr(date(d,1,1),'day');
+          }
+          //Выходные дни, список
+          if (d>0 and d<32) {
+            if (i>1) ArVal[25]+=', ';
+            ArVal[25]+=DateToStr(date(d,1,1),'day');
+          }
+        }//_loop SpGraf
+        //Количество выходных дней
+        ArVal[15]:=i;
+      }
+      //Условия труда
+      ArVal[18]:=iCatFunc.GetCatalogsName(if(AppHist.WorkCond<>0,AppHist.WorkCond,Appointments.WorkCond));
+      //Дата С
+      ArVal[21]:=DateToString(AppHist.DRec);
+      //Дата По
+      ArVal[22]:=DateToString(AppHist.DEnd);
+
+      //Режим работ, описание (мемо-поле)
+      if (getfirst fastfirstrow AttrVal
+          where((coKlRejim==AttrVal.wTable and AppHist.WorkRegime==AttrVal.cRec and cAttrRejimNote==AttrVal.cAttrNam))=tsok) {
+        #InsMemo(AttrVal,vLVar,'Режим работ, описание (мемо-поле)')
+      }
+    }
+    InsVar('Оклад (тарифная ставка)',ArVal[16]);
+    InsVar('Оклад (тарифная ставка)  прописью',ArVal[1]);
+    InsVar('График работы',ArVal[2]);
+    InsVar('Плановый режим графика',ArVal[3]);
+    InsVar('Продолжительность рабочего времени (вн.классификация)',ArVal[17]);
+    InsVar('Интервал',ArVal[4]);
+    InsVar('Продолжительность рабочей недели',ArVal[5]);
+    InsVar('Начало рабочего дня',ArVal[6]);
+    InsVar('Начало обеда 1',ArVal[7]);
+    InsVar('Окончание обеда 1',ArVal[8]);
+    InsVar('Начало обеда 2',ArVal[9]);
+    InsVar('Окончание обеда 2',ArVal[10]);
+    InsVar('Окончание рабочего дня',ArVal[11]);
+    InsVar('Окончание рабочего дня в пятницу',ArVal[12]);
+    InsVar('Выходной день 1',ArVal[13]);
+    InsVar('Выходной день 2',ArVal[14]);
+    InsVar('Количество выходных дней',ArVal[15]);
+    InsVar('Условия труда',ArVal[18]);
+    InsVar('Количество ставок',ArVal[19]);
+    InsVar('Система оплаты',ArVal[20]);
+    if (TypeOper=3 or //Приказ на Временное замещение без освобождения от своих обязанностей (РПД-3)
+        TypeOper=70) {//Приказ на Временное замещение с освобождением от своих обязанностей (РПД-70)
+      InsVar('Дата С',DateToString(ContDocOld.Dat1));
+      InsVar('Дата По',DateToString(ContDocOld.Dat2));
+    } else {
+      InsVar('Дата С',ArVal[21]);
+      InsVar('Дата По',ArVal[22]);
+    }
+    InsVar('в час, в месяц',ArVal[23]);
+    InsVar('Продолжительность ежедневной работы',ArVal[24]);
+    if (bFirst) InsVar('Режим работ, описание (мемо-поле)');
+    InsVar('Действие режима работы','по '+ArVal[22]+'г.');
+    InsVar('Выходные дни, список',ArVal[25]);
+
+    //Отпуска
+    var ArVac:array[1] of word;
+    setlimit(ArVac,0);
+    _loop VacationSts where((Appointments.StaffStr==VacationSts.cStaffStruct and VacationSts.cKotPus==KlOtpusk.KotPus)) {
+      if (VacationStS.dBegExist<>ZeroDate and Appointments.DateEnd<>ZeroDate)
+        if (VacationStS.dBegExist>Appointments.DateEnd) continue;
+      if (VacationStS.dEndExist<>ZeroDate)
+        if (VacationStS.dEndExist<Appointments.Appointdate) continue;
+
+      if (KlOtpusk.TypeOtp=0)
+        ArVac[3]+=VacationSts.wCountDay
+      else if (pos('вредн',LoCase(KlOtpusk.NOTPUS))<>0)
+        ArVac[1]+=VacationSts.wCountDay
+      else if (pos('ненорм',LoCase(KlOtpusk.NOTPUS))<>0)
+        ArVac[2]+=VacationSts.wCountDay;
+    }//_loop VacationSts
+    InsVar('Дополнительный отпуск за вредность',ArVac[1]);
+    InsVar('Дополнительный отпуск за ненормированный рабочий день',ArVac[2]);
+    InsVar('Ненормированный рабочий день',if(ArVac[2]>0,'ненормированный',''));
+    bFirst:=false;
+    _loop PersVacation where((Persons.NRec==PersVacation.cPersons and PersVacation.cKotPus == KlOtpusk.KotPus)) {
+      if (PersVacation.dBegExist<>ZeroDate and PersVacation.dBegExist<ContDoc.dPrik) continue;
+
+      if (KlOtpusk.TypeOtp=0) {
+        bFirst:=true;
+        ArVac[4]+=PersVacation.wCountDay;
+      }
+    }//_loop PersVacation
+    if (bFirst) ArVac[3]:=ArVac[4];
+    InsVar('Основной отпуск, дней',ArVac[3]);
+
+    //Доплата за вредность
+    setlimit(ArVal,0);
+    if (TypeOper=3 or //Приказ на Временное замещение без освобождения от своих обязанностей (РПД-3)
+        TypeOper=4 or //Приказ на совмещение \ внутреннее совместительство (РПД-4)
+        TypeOper=5 or //Приказ на перемещение (РПД-5)
+        TypeOper=70)  //Приказ на Временное замещение с освобождением от своих обязанностей (РПД-70)
+      cRec:=ContDocOld.nRec
+    else
+      cRec:=ContDoc.nRec;
+    _loop Raise
+    where((
+      cRec==Raise.cRDop and Raise.RaiseType==Catalogs.Nrec and
+      longint(Substr(Catalogs.CatData, 1, 5))==KlVidOpl.VidOpl
+    )) 
+    {
+
+      if (pos('вредн',LoCase(Catalogs.Name))<>0) 
+      {
+
+        ArVal[1]:=string(Raise.Sum);
+        ArVal[2]:=if(Raise.RaiseAttr = 0, 'руб.',if(Raise.RaiseAttr = 2, '%', ' '));
+        if (ArVal[3]='')
+          if (IsValidAll(tnKlVidOpl))
+            ArVal[3]:=string(KlVidOpl.VidOplP);
+
+        if (getfirst fastfirstrow AppHist where((cRec==AppHist.cContDoc))=tsok) 
+        {
+          if(Raise.RaiseAttr = 2)
+          {
+            //Сумма %
+            ArVal[4] := DoubleToStr(AppHist.TaxRate*Raise.Sum/100,'[|-]3666 666 666.88');
+            //Сумма %  прописью
+            ArVal[5] := DoubleToStringWithBracket(AppHist.TaxRate*Raise.Sum/100);
+          }
+          else
+          {
+            ArVal[4] := DoubleToStr(Raise.Sum,'[|-]3666 666 666.88');
+            ArVal[5] := DoubleToStringWithBracket(Raise.Sum);
+          }
+        }
+
+        break;
+      }//if (pos('вредн',LoCase(Catalogs.Name))<>0) 
+
+    }//_loop Raise
+    InsVar('Доплата за вредность',ArVal[1]);
+    InsVar('Доплата за вредность валюта',ArVal[2]);
+    InsVar('Вид оплаты',ArVal[3]);
+    InsVar('Доплата за вредность суммой',ArVal[4]);
+    InsVar('Доплата за вредность суммой(прописью)',ArVal[5]);
+//доработка для Факела 27.03.2023 Погосский
+    InsVar('Доплата за вредность (полный текст)',', доплата за вредн.условия '+ArVal[1]+' '+ArVal[2]);
+//доработка для Факела 17.03.2023 Погосский
+    //Индексирующая выплата
+    _loop Raise
+    where((
+      cRec==Raise.cRDop and Raise.RaiseType==Catalogs.Nrec and
+      longint(Substr(Catalogs.CatData, 1, 5))==KlVidOpl.VidOpl
+    )) 
+    {
+
+      if (pos('индекс',LoCase(Catalogs.Name))<>0) 
+      {
+
+        ArVal[11]:=string(Raise.Sum);
+        ArVal[12]:=if(Raise.RaiseAttr = 0, 'руб.',if(Raise.RaiseAttr = 2, '%', ' '));
+        if (ArVal[13]='')
+          if (IsValidAll(tnKlVidOpl))
+            ArVal[13]:=string(KlVidOpl.VidOplP);
+
+        if (getfirst fastfirstrow AppHist where((cRec==AppHist.cContDoc))=tsok) 
+        {
+          if(Raise.RaiseAttr = 2)
+          {
+            //Сумма %
+            ArVal[14] := DoubleToStr(AppHist.TaxRate*Raise.Sum/100,'[|-]3666 666 666.88');
+            //Сумма %  прописью
+            ArVal[15] := DoubleToStringWithBracket(AppHist.TaxRate*Raise.Sum/100);
+          }
+          else
+          {
+            ArVal[14] := DoubleToStr(Raise.Sum,'[|-]3666 666 666.88');
+            ArVal[15] := DoubleToStringWithBracket(Raise.Sum);
+          }
+        }//if (pos('Индекс',LoCase(Catalogs.Name))<>0) 
+
+        break;
+      }
+
+    }//_loop Raise
+    InsVar('Индексирующая выплата',ArVal[11]);
+    InsVar('Индексирующая выплата валюта',ArVal[12]);
+    InsVar('Вид оплаты(Индексирующая выплата)',ArVal[13]);
+    InsVar('Индексирующая выплата суммой',ArVal[14]);
+    InsVar('Индексирующая выплата суммой(прописью)',ArVal[15]);
+//------------------------------
+    //Доплата
+    setlimit(ArVal,0);
+    if (TypeOper=20 or TypeOper=21 or TypeOper=30) {
+      if (getfirst fastfirstrow Fortune where((ContDoc.Nrec==Fortune.cFCont))=tsok) {
+        ArVal[1]:=iCatFunc.GetCatalogsName(Fortune.cFType);
+        ArVal[10]:=iCatFunc.GetCatalogsCode(Fortune.cFType);
+        ArVal[2]:=string(Fortune.DocSum);
+        ArVal[9]:=NumberToStr(Fortune.DocSum);
+        if (Fortune.wAttr1 <> 1)
+          ArVal[3]:=if(Fortune.wAttr1 = 2, 'проценты', 'нац.валюта')
+        else if (getfirst fastfirstrow KlVal where((Fortune.FortCurr == KlVal.NRec))=tsok)
+          ArVal[3]:=KlVal.SimvolV;
+        ArVal[4]:=DateToString(Fortune.Dat1);
+        ArVal[5]:=DateToString(Date(Last_Day(Fortune.Dat1), Month(Fortune.Dat1), Year(Fortune.Dat1)));
+        ArVal[6]:=DateToStrInWords(Fortune.Dat1);
+        ArVal[7]:=DateToStrInWords(Date(Last_Day(Fortune.Dat1), Month(Fortune.Dat1), Year(Fortune.Dat1)));
+        ArVal[8]:=DateToStr(Fortune.Dat1,'Month YYYY');
+
+      }
+      tmpDouble:=0;
+      _loop ContDoc2 where((ContDoc.cPart==ContDoc2.cPart and 0<<ContDoc2.SeqNmb))
+        _loop Fortune where((ContDoc2.Nrec==Fortune.cFCont))
+          if (Fortune.wAttr1=0) tmpDouble+=Fortune.DocSum;
+      ArVal[11]:=DoubleToStr(tmpDouble,'[|-]3666 666 666.88');
+      ArVal[12]:=NumberToStr(tmpDouble);
+    } else if (TypeOper=1 or TypeOper=211 or
+               TypeOper=3 or //Приказ на Временное замещение без освобождения от своих обязанностей (РПД-3)
+               TypeOper=4 or //Приказ на совмещение \ внутреннее совместительство (РПД-4)
+               TypeOper=5 or //Приказ на перемещение (РПД-5)
+               TypeOper=70) {//Приказ на Временное замещение с освобождением от своих обязанностей (РПД-70)
+      if (TypeOper=1 or TypeOper=211) cRec:=ContDoc.nRec else cRec:=ContDocOld.nRec;
+      if (getfirst fastfirstrow Raise where((cRec==Raise.cRDop))=tsok) {
+        ArVal[1]:=iCatFunc.GetCatalogsName(Raise.RaiseType);
+        ArVal[10]:=iCatFunc.GetCatalogsCode(Raise.RaiseType);
+        ArVal[2]:=string(Raise.Sum);
+        ArVal[9]:=NumberToStr(Raise.Sum);
+        if (Raise.RaiseAttr <> 1)
+          ArVal[3]:=if(Raise.RaiseAttr = 2, 'проценты', 'нац.валюта')
+        else if (getfirst fastfirstrow KlVal where((Raise.RaiseCurr == KlVal.NRec))=tsok)
+          ArVal[3]:=KlVal.SimvolV;
+        ArVal[4]:=DateToString(Raise.FromDate);
+        ArVal[5]:=DateToString(Raise.ToDate);
+        ArVal[6]:=DateToStrInWords(Raise.FromDate);
+        ArVal[7]:=DateToStrInWords(Raise.ToDate);
+      }
+    } else if (TypeOper=10) {//Снятие персональных надбавок
+      if (getfirst fastfirstrow DelRaise
+          where((cgDelRaiseRPD10 == DelRaise.wTypeInfo and ContDoc.nRec == DelRaise.cOrderCont1))=tsok) {
+        ArVal[1]:=iCatFunc.GetCatalogsName(DelRaise.cRaiseType);
+        ArVal[10]:=iCatFunc.GetCatalogsCode(DelRaise.cRaiseType);
+        ArVal[2]:=string(DelRaise.dSum1);
+        ArVal[9]:=NumberToStr(DelRaise.dSum1);
+        if (DelRaise.iRaseAttr <> 1)
+          ArVal[3]:=if(DelRaise.iRaseAttr = 2, 'проценты', 'нац.валюта')
+        else if (getfirst fastfirstrow KlVal where((DelRaise.cCurrency == KlVal.NRec))=tsok)
+          ArVal[3]:=KlVal.SimvolV;
+        ArVal[4]:=DateToString(DelRaise.dFromDate);
+        ArVal[5]:=DateToString(DelRaise.dToDate);
+        ArVal[6]:=DateToStrInWords(DelRaise.dFromDate);
+        ArVal[7]:=DateToStrInWords(DelRaise.dToDate);
+        ArVal[13]:=DateToString(DelRaise.dRaiseAbort);
+        ArVal[16]:=DateToStrInWords(DelRaise.dRaiseAbort);
+
+        if (DelRaise.cOrderCont2<>0)
+          cRec:=NOAA.GetFirstAgreementByLink(coContDoc, DelRaise.cOrderCont2)
+        else
+          cRec:=0;
+        if (cRec<>0) {
+          ArVal[14]:=NOAA.GetAgreementNmb(cRec);
+          ArVal[15]:=DateToString(NOAA.GetAgreementDate(cRec));
+        }
+      }
+    } else {
+      if (getfirst fastfirstrow RaiseHist where((ContDoc.nRec==RaiseHist.cContDoc))=tsok) {
+        ArVal[1]:=iCatFunc.GetCatalogsName(RaiseHist.cRaiseType);
+        ArVal[10]:=iCatFunc.GetCatalogsCode(RaiseHist.cRaiseType);
+        ArVal[2]:=string(RaiseHist.rHSum);
+        ArVal[9]:=NumberToStr(RaiseHist.rHSum);
+        if (RaiseHist.iHAttr <> 1)
+          ArVal[3]:=if(RaiseHist.iHAttr = 2, 'проценты', 'нац.валюта')
+        else if (getfirst fastfirstrow KlVal where((RaiseHist.cRef1 == KlVal.NRec))=tsok)
+          ArVal[3]:=KlVal.SimvolV;
+        ArVal[4]:=DateToString(RaiseHist.dRec);
+        ArVal[5]:=DateToString(RaiseHist.dDat2);
+        ArVal[6]:=DateToStrInWords(RaiseHist.dRec);
+        ArVal[7]:=DateToStrInWords(RaiseHist.dDat2);
+      }
+    }
+    InsVar('Доплата наименование',ArVal[1]);
+    InsVar('Код доплаты',ArVal[10]);
+    InsVar('Доплата сумма/процент',ArVal[2]);
+    InsVar('Доплата сумма/процент прописью',ArVal[9]);
+    InsVar('Доплата валюта',ArVal[3]);
+    InsVar('Доплата с даты',ArVal[4]);
+    InsVar('Доплата по дату',ArVal[5]);
+    InsVar('Доплата с даты, прописью',ArVal[6]);
+    InsVar('Доплата по дату, прописью',ArVal[7]);
+    InsVar('Дата выплаты премии',ArVal[8]);
+    InsVar('Итого сумма премии',ArVal[11]);
+    InsVar('Итого сумма премии (прописью)',ArVal[12]);
+    InsVar('Доплата - Дата снятия',ArVal[13]);
+    InsVar('Доплата - Дата снятия, прописью',ArVal[16]);
+    InsVar('Доплата - Доп.соглашение - №',ArVal[14]);
+    InsVar('Доплата - Доп.соглашение - Дата',ArVal[15]);
+
+    //Паспорт
+    bFirst:=getfirst fastfirstrow Passports where((Persons.PasspRus==Passports.NRec))=tsok;
+    if (not bFirst)
+      bFirst:=getfirst fastfirstrow Passports where((cPerson==Passports.Person and 502==Passports.SysCode))=tsok;
+    if (bFirst) {
+      InsVar('Серия паспорта',Passports.Ser);
+      InsVar('Номер паспорта',Passports.Nmb);
+      InsVar('Паспорт выдан',Passports.GivenBy);
+      InsVar('Паспорт выдан код подразделения',Passports.GivenPodr);
+      InsVarD('Дата выдачи паспорта',Passports.GivenDate);
+    } else {
+      InsVar('Серия паспорта');
+      InsVar('Номер паспорта');
+      InsVar('Паспорт выдан');
+      InsVar('Паспорт выдан код подразделения');
+      InsVar('Дата выдачи паспорта');
+    }
+
+    //Место прописки работника
+    if ((TypeOper=1 or TypeOper=300 or TypeOper=211) and ContDoc.cCat1<>0)
+      cRec:=ContDoc.cCat1
+    else
+      cRec:=Persons.PasspAddr;
+    InsVar('Место прописки работника',iAdrFunc.GetFullAddressInd(cRec));
+    InsVar('Место проживания',iAdrFunc.GetFullAddressInd(Persons.LiveAddr));
+
+    //Работник, СНИЛС, ИНН
+    if (getfirst fastfirstrow Passports where((cPerson==Passports.Person and 501==Passports.SysCode))=tsok)
+      InsVar('Работник, СНИЛС',Passports.Nmb)
+    else
+      InsVar('Работник, СНИЛС');
+//доработка для Факела 27.10.2022 Погосский
+    if (getfirst fastfirstrow Passports where ((cPerson  == Passports.Person  and  //для ИНН
+                                            Integer(505) == Passports.SysCode)) = tsOk)
+      InsVar('Работник, ИНН',  Passports.Nmb);
+    else
+      InsVar('Работник, ИНН');
+//--------------------
+    //Договор о мат.ответственности
+    bFirst:=false;
+    _loop Passports where((cPerson==Passports.Person and 1469==Passports.SysCode)) {
+      if (TitleDocDate<Passports.GivenDate) continue;
+      if (TitleDocDate>Passports.ToDate and Passports.ToDate<>ZeroDate) continue;
+
+      InsVar('Договор о мат.ответственности',iCatFunc.GetCatalogsName(Passports.DocName));
+      InsVar('Номер договора о мат.ответственности','№ '+Passports.Nmb);
+      InsVar('Дата начала договора о мат.ответственности','Дата действия с '+DateToString(Passports.GivenDate));
+      InsVar('Дата окончания договора о мат.ответственности','по '+DateToString(Passports.ToDate));
+      bFirst:=true;
+      break;
+    }//_loop Passports
+    if (not bFirst) {
+      InsVar('Договор о мат.ответственности');
+      InsVar('Номер договора о мат.ответственности');
+      InsVar('Дата начала договора о мат.ответственности');
+      InsVar('Дата окончания договора о мат.ответственности');
+    }
+     // социальная ипотека
+    var insIpot : boolean= false;
+    DateVal:=ZeroDate;
+     _loop ContDoc2
+    where((
+      cPerson == ContDoc2.Person and
+      109 == ContDoc2.TypeOper and
+      1 == ContDoc2.SeqNmb
+    )) {
+ //     if ((ContDoc2.FilialNo and 1)=0) continue;
+
+ //     if (ContDoc2.dRezerve<=TitleDocDate and ContDoc2.dRezerve>DateVal) {
+//        cRec:=NOAA.GetFirstAgreementByLink(coContDoc, ContDoc2.NRec);
+//        if (cRec<>0) {
+          DateVal:=ContDoc2.dRezerve;
+          InsVar('Социальная ипотека','Отдел соц.программ (гостиница, 1 эт., 1 каб). Наличие социальной ипотеки');
+          insIpot := true;
+//        }
+//      }
+    }//_loop ContDoc2
+
+   if (not insIpot) InsVar('Социальная ипотека');
+
+     // Выплата молодому специалисту / после армии
+    var insViplat : boolean= false;
+    DateVal:=ZeroDate;
+     _loop ContDoc2
+    where((
+      cPerson == ContDoc2.Person and
+      104 == ContDoc2.TypeOper and
+      1 == ContDoc2.SeqNmb and
+      ContDoc2.nrec /== RaiseHist.CCONTDOC
+    ))
+     and (RaiseHist.CRAISETYPE=comp(000A00000003956Fh) or RaiseHist.CRAISETYPE=comp(000A000000039570h))
+   {
+//      if ((ContDoc2.FilialNo and 1)=0) continue;
+
+//      if (ContDoc2.dRezerve<=TitleDocDate and ContDoc2.dRezerve>DateVal)
+//      {
+//        cRec:=NOAA.GetFirstAgreementByLink(coContDoc, ContDoc2.NRec);
+//        if (cRec<>0) {
+          DateVal:=ContDoc2.dRezerve;
+          InsVar('ВыплатаМА','Отдел соц.программ (гостиница, 1 эт., 1 каб). Выплата молодому специалисту / после армии');
+          insViplat := true;
+//        }
+//      }
+    }//_loop ContDoc2
+
+   if (not insViplat) InsVar('ВыплатаМА');
+
+
+
+    var insETSP : boolean= false;
+    var insKLEYMO : boolean= false;
+
+   if TypeOper = 8 // увольнение
+    _loop Passports where((cPerson==Passports.Person))
+     if getfirst CatalogsPassName where ((Passports.DOCNAME == CatalogsPassName.nrec)) = tsOK
+     {
+      if CatalogsPassName.name = 'Электронная цифровая подпись'
+      {
+        if (TitleDocDate<=Passports.ToDate or Passports.ToDate=ZeroDate)
+         {
+           InsVar('ЕСТЬ Электронная цифровая подпись','сдать ЭЦП');
+           insETSP := true;
+         }
+      }
+       if CatalogsPassName.name = 'Личное клеймо'
+       {
+        if (TitleDocDate<=Passports.ToDate or Passports.ToDate=ZeroDate)
+         {
+           InsVar('ЕСТЬ личное клеймо','сдать личное клеймо');
+           insKLEYMO := true;
+         }
+       }
+      }//_loop Passports
+
+    if (not insETSP) InsVar('ЕСТЬ Электронная цифровая подпись');
+    if (not insKLEYMO) InsVar('ЕСТЬ личное клеймо');
+
+    //Заключение медицинского осмотра
+    if ((getlast Attestation
+         where((
+           Persons.NRec==Attestation.Person and
+           attProfInspect==Attestation.wDop1(noindex)
+         )) ordered by Attestation.AttDate)=tsok) {
+      InsVarD('Заключение медицинского осмотра',Attestation.AttDate);
+    }
+    else
+     InsVar('Заключение медицинского осмотра');
+
+    //Средства индивидуальной защиты
+    bFirst:=true;
+    if (getfirst fastfirstrow KatKod
+        where((
+          cgKatKod_NormSFO==KatKod.wType and
+          Appointments.Post==KatKod.cOrg1 and
+          InsZarFunc.GalDepartmentNrec(Appointments.Department)==KatKod.cOrg2
+       ))=tsok)
+      if (GetLast NormDateSFO where((KatKod.cGroup==NormDateSFO.cNormSFO ))=tsOk)
+        _loop NormGroupSFO
+        where((
+          NormDateSFO.NRec==NormGroupSFO.cNormDate and
+          NormGroupSFO.cGroupSFO==GroupSFO.nRec and
+          GroupSFO.cED==KatED.nRec
+        )) {
+          ArVal[1]:=GroupSFO.Name+' '+string(NormGroupSFO.firstKol)+' '+KatED.ABBR+' '+GetSrokStr(NormGroupSFO.Srok);
+          if (not bFirst) ArVal[1]:=', '+ArVal[1];
+          InsVar('Средства индивидуальной защиты',ArVal[1],not bFirst);
+          bFirst:=false;
+        }//_loop NormGroupSFO
+    if (bFirst) InsVar('Средства индивидуальной защиты');
+
+    //Должностная инструкция
+    bFirst:=true;
+    if (getfirst fastfirstrow Appendix
+        where((
+          word(777)==Appendix.ObjBlock and
+          word(777)==Appendix.ObjType and
+          Appointments.Post==Appendix.ObjNRec
+        ))=tsok) {
+      #InsMemo(Appendix,Contents,'Должностная инструкция')
+    }
+    if (bFirst) InsVar('Должностная инструкция');
+
+    //Сведения о воинском учете
+    if (getfirst fastfirstrow Conscription where((Persons.Nrec==Conscription.Person))=tsok) {
+      InsVar('Воинское звание',iCatFunc.GetCatalogsName(Conscription.MilRank));
+      ArVal[1]:=iCatFunc.GetCatalogsName(Conscription.VUS);
+      ArVal[2]:=iCatFunc.GetCatalogsCode(Conscription.VUS);
+      InsVar('Военно-учетная специальность',if(ArVal[1]<>'',Trim(ArVal[2] + ' ' + ArVal[1]),ArVal[2]));
+      InsVar('Военкомат',iCatFunc.GetCatalogsName(Conscription.MilComiss));
+      InsVar('Адрес Военкомата',iCatFunc.GetCatalogsLongName(Conscription.MilComiss));
+    } else {
+      InsVar('Воинское звание');
+      InsVar('Военно-учетная специальность');
+      InsVar('Военкомат');
+      InsVar('Адрес Военкомата');
+    }
+
+    //Замещение, совмещение
+    setlimit(ArVal,0);
+    if (TypeOper=1 or TypeOper=4) {//Приказ на совмещение \ внутреннее совместительство (РПД-4)
+      if (getfirst fastfirstrow Persons2 where((Appointments.ResComp[2] == Persons2.NRec))=tsok)
+        ArVal[2]:=iOdecl.FIODeclension(Persons2.NRec,Persons2.FIO,2);
+    } else if (TypeOper=3 or //Приказ на Временное замещение без освобождения от своих обязанностей
+               TypeOper=70) {//Приказ на Временное замещение с освобождением от своих обязанностей (РПД-70)
+      if (getfirst fastfirstrow NewAppoint where((ContDoc.cStr == NewAppoint.Nrec))=tsok)
+        ArVal[1]:=GetCatalogsNameDeclension(NewAppoint.Post,2,true);
+      if (getfirst fastfirstrow Persons2 where((ContDoc.ObjNRec == Persons2.NRec))=tsok)
+        ArVal[2]:=iOdecl.FIODeclension(Persons2.NRec,Persons2.FIO,2);
+    } else if (TypeOper=7) {//Приказ "Закрытие совмещения (снятие надбавок за совмещение)"
+      if (getfirst fastfirstrow NewAppoint where((ContDoc.cStr == NewAppoint.Nrec))=tsok)
+        ArVal[1]:=GetCatalogsNameDeclension(NewAppoint.Post,2,true);
+    } else if (TypeOper=44) {//Приказ "Досрочное завершение временного замещения" (РПД-44)
+      if (getfirst fastfirstrow NewAppoint where((ContDoc.cStr == NewAppoint.Nrec))=tsok)
+        ArVal[1]:=GetCatalogsNameDeclension(NewAppoint.Post,2,true);
+      if (getfirst fastfirstrow ContDoc2
+          where((
+            ContDoc.cStr == ContDoc2.cstr and
+            1            << ContDoc2.SeqNmb(noindex)
+          ))=tsok)
+        if (getfirst fastfirstrow Persons2 where((ContDoc2.ObjNRec == Persons2.NRec))=tsok)
+          ArVal[2]:=iOdecl.FIODeclension(Persons2.NRec,Persons2.FIO,2);
+    }
+    InsVar('Должность, которую замещают',ArVal[1]);
+    InsVar('ФИО работника, которого замещают',ArVal[2]);
+
+    //Предыдущая трудовая деятельность
+    setlimit(ArVal,0);
+    if ((getlast fastfirstrow Experience
+         where((Persons.Nrec==Experience.Person))
+         ordered by Experience.EntranceDate)=tsok) {
+      ArVal[1]:=iCatFunc.GetCatalogsName(Experience.EnterpriseName);
+      ArVal[2]:=iAdrFunc.GetFullAddressInd(Experience.EnterpriseLoc);
+      ArVal[3]:=iCatFunc.GetCatalogsName(Experience.Post);
+    }
+    InsVar('Наименование предыдущего места работы',ArVal[1]);
+    InsVar('Адрес предыдущего места работы',ArVal[2]);
+    InsVar('Должность предыдущего места работы',ArVal[3]);
+
+    //повышение квалификации
+    DateVal:=ZeroDate;
+    sql
+      select max(case when Education.DiplomDate>#date(0,0,0) then Education.DiplomDate else Education.ToDate end):date
+      from
+        Education
+        inner join Catalogs on (Education.level = Catalogs.NRec)
+        inner join Catalogs Parent on (Catalogs.cParent = Parent.NRec)
+        inner join Catalogs Parent2 on (Parent.cParent = Parent2.NRec)
+      where
+        Education.Person = :(Persons.NRec) and
+        (702 = Parent.SysCode or 702 = Parent2.SysCode or 'Договор целевого обучения' = Parent.Name)
+      into (DateVal);
+    InsVarD('Дата оконч.ученич.договора',DateVal);
+
+    DateVal:=ZeroDate;
+    sql
+      select max(Education.DiplomDate):date
+      from
+        Education
+        inner join Catalogs on (Education.level = Catalogs.NRec and Catalogs.Code = '19')
+        inner join Catalogs Univer on (Education.Name = Univer.NRec and Univer.Name = 'Аспирантура АО "НПО Энергомаш"')
+      where
+        Education.Person = :(Persons.NRec)
+      into (DateVal);
+    InsVarD('Дата окончания аспирантуры Энергомаш',DateVal);
+
+    //обучение
+    setlimit(ArVal,0);
+    if (TypeOper=1 or TypeOper=211 or TypeOper=300)
+      bFirst:=(getlast fastfirstrow Education where((Persons.NRec == Education.Person)) ordered by Education.FromDate)=tsok
+    else if (TypeOper=37)
+      bFirst:=getfirst fastfirstrow Education where((ContDoc.ObjNrec == Education.NRec))=tsok
+    else
+      bFirst:=getfirst fastfirstrow Education where((ContDoc.NRec == Education.cContDoc))=tsok;
+    if (bFirst) {
+      ArVal[1]:=DateToString(Education.FromDate);
+      ArVal[2]:=DateToString(Education.ToDate);
+      ArVal[3]:=iCatFunc.GetCatalogsName(Education.Speciality);
+      ArVal[4]:=iCatFunc.GetCatalogsCatData(Education.Speciality);
+      if (SubStr(ArVal[4],4,2)='00')
+        ArVal[4]:=SubStr(ArVal[4],1,3)+SubStr(iCatFunc.GetCatalogsCatData(Education.Level),1,2)+SubStr(ArVal[4],6,3);
+      ArVal[5]:=iCatFunc.GetCatalogsName(Education.Name);
+      ArVal[6]:=iCatFunc.GetCatalogsLongName(Education.Name);
+      ArVal[7]:=string(Education.PaySum);
+      ArVal[8]:=iCatFunc.GetCatalogsName(Education.cAddInf1);
+      ArVal[9]:=string(Education.Course);
+      ArVal[10]:=iCatFunc.GetCatalogsName(Education.cDirect);
+      ArVal[11]:=GetCatalogsNameDeclension(Education.Mode,2);
+    }
+    InsVar('Обуч. дата начала',ArVal[1]);
+    InsVar('Обуч. дата окончания',ArVal[2]);
+    InsVar('Обуч. специальность',ArVal[3]);
+    InsVar('Обуч. код.специальности',ArVal[4]);
+    InsVar('Обуч. ВУС(СУЗ)',ArVal[5]);
+    InsVar('Обуч. ВУС(СУЗ) полное название',ArVal[6]);
+    InsVar('Стоимость обучения',ArVal[7]);
+    InsVar('Тема обучения',ArVal[8]);
+    InsVar('Курс - номер',ArVal[9]);
+    InsVar('Направление обучения в именительном падеже',ArVal[10]);
+    InsVar('Форма обучения в родительном падеже',ArVal[11]);
+
+    //Приказ о направлении на обучение
+    setlimit(ArVal,0);
+    if (TypeOper=36 or TypeOper=37 or TypeOper=236) {
+      //отменяемый приказ
+      if (getfirst fastfirstrow Education where((ContDoc.ObjNrec == Education.NRec))=tsok)
+        if (getfirst fastfirstrow ContDoc2 where((Education.cContDoc == ContDoc2.NRec))=tsok)
+          if (getfirst fastfirstrow PartDoc where((ContDoc2.cPart == PartDoc.NRec))=tsok)
+            if (getfirst fastfirstrow TitleDoc where((PartDoc.cDoc == TitleDoc.nrec))=tsok)
+              ArVal[1]:='№ ' + TitleDoc.DocNmb + ' от ' + DateToString(TitleDoc.DocDate);
+    }
+    InsVar('Приказ о направлении на обучение',ArVal[1]);
+
+    //Приказ о прохождении стажировки - нужно нырнуть в соседнее РПД № 9
+    setlimit(ArVal,0);
+    if (TypeOper=1) {
+      if (getfirst fastfirstrow PartDoc where((ContDoc.cPart==PartDoc.NRec))=tsok) {
+        cRec:=PartDoc.cDoc;
+        if (getfirst fastfirstrow PartDoc where((9==PartDoc.TypeOper and cRec==PartDoc.cDoc))=tsok) {
+          if (getfirst fastfirstrow ContDoc2
+              where((
+                PartDoc.NRec == ContDoc2.cPart and
+                0 << ContDoc2.SeqNmb
+              ))=tsok) {
+            if (getfirst fastfirstrow NewAppoint where((ContDoc2.cStr == NewAppoint.Nrec))=tsok) {
+              ArVal[1]:=GetCatalogsNameDeclension(NewAppoint.Post,2,true);
+              ArVal[1]+=' ('+iCatFunc.GetCatalogsCode(NewAppoint.Department)+')';
+            }
+
+            if (getfirst fastfirstrow Persons2 where((ContDoc2.Person == Persons2.NRec))=tsok) {
+               ArVal[1]+=' '+iOdecl.FIODeclension(Persons2.NRec,Persons2.FIO,2);
+               ArVal[4]:=GetShortFIOLast(iOdecl.FIODeclension(Persons2.NRec,Persons2.FIO,3));
+            }
+
+            if (getfirst fastfirstrow RaiseHist where((ContDoc2.nRec==RaiseHist.cContDoc))=tsok) {
+              ArVal[3]:=iCatFunc.GetCatalogsName(RaiseHist.cRaiseType);
+              if (getfirst fastfirstrow KlVidOpl
+                  where((longint(Substr(iCatFunc.GetCatalogsCatData(RaiseHist.cRaiseType), 1, 5))==KlVidOpl.VidOpl))=tsok)
+                ArVal[3]+=' - '+string(KlVidOpl.VidOplP);
+
+              ArVal[2]:=string(RaiseHist.rHSum);
+              if (RaiseHist.iHAttr <> 1)
+                ArVal[2]+=if(RaiseHist.iHAttr = 2, '%', ' руб.')
+              else if (getfirst fastfirstrow KlVal where((RaiseHist.cRef1 == KlVal.Nrec))=tsok)
+                ArVal[2]+=' '+KlVal.SimvolV;
+            }
+          }
+        }
+      }
+    }
+    InsVar('ст_п2',ArVal[1]);
+    InsVar('ст_п2_сум',ArVal[2]);
+    InsVar('ст_п9_во',ArVal[3]);
+    InsVar('ст_п3',ArVal[4]);
+
+    //Ученический договор
+    setlimit(ArVal,0);
+    DateVal:=ZeroDate;
+    _loop ContDoc2
+    where((
+      Persons.NRec == ContDoc2.Person and
+      135 == ContDoc2.TypeOper and
+      1 == ContDoc2.SeqNmb
+    )) {
+      if ((ContDoc2.FilialNo and 1)=0) continue;
+
+      if (ContDoc2.dRezerve<=TitleDocDate and ContDoc2.dRezerve>DateVal) {
+        cRec:=NOAA.GetFirstAgreementByLink(coContDoc, ContDoc2.NRec);
+        if (cRec<>0) {
+          DateVal:=ContDoc2.dRezerve;
+          ArVal[1]:='Наличие ученического договора: Ученический договор № '+NOAA.GetAgreementNmb(cRec)+
+                    ' от '+DateToString(NOAA.GetAgreementDate(cRec));
+        }
+      }
+    }//_loop ContDoc2
+    InsVar('Ученический договор',ArVal[1]);
+
+    //Целевой договор
+    setlimit(ArVal,0);
+    _loop ContDoc2
+    where((
+      Persons.NRec == ContDoc2.Person and
+      136 == ContDoc2.TypeOper and
+      1 == ContDoc2.SeqNmb and
+      ContDoc2.cStr == NewAppoint.NRec
+    )) {
+      if ((ContDoc2.FilialNo and 1)=0) continue;
+
+      if (ContDoc2.dRezerve<=TitleDocDate and NewAppoint.ResComp[1]<>0) {
+        if (iWWC.GetContractString(NewAppoint.ResComp[1])<>'') {
+          ArVal[1]:='Наличие ученического договора: Учеба по целевому набору';
+          break;
+        }
+      }
+    }//_loop ContDoc2
+    if (ArVal[1]='') {
+      tmpDouble:=0;
+      sql
+        select Count(Education.NRec):double
+        from
+          Education
+          inner join Catalogs on (Education.level = Catalogs.NRec)
+          inner join Catalogs Parent on (Catalogs.cParent = Parent.NRec)
+          inner join Catalogs Parent2 on (Parent.cParent = Parent2.NRec)
+          inner join ExClassVal on (Education.NRec = ExClassVal.cRec and :(coEducation) = ExClassVal.wTable)
+          inner join ExClassName on (ExClassVal.ClassCode = ExClassName.ClassCode and 'Целевое обучение' = ExClassName.Name)
+        where
+          Education.Person = :(Persons.NRec) and
+          (701 = Parent.SysCode or 701 = Parent2.SysCode)
+        into (tmpDouble);
+
+      if (tmpDouble<>0)
+        ArVal[1]:='Наличие ученического договора: Учеба по целевому набору';
+    }
+    InsVar('Целевой договор',ArVal[1]);
+
+    //доп. условия
+    bFirst:=true;
+    if (getfirst fastfirstrow Notes where((cKadryDopInfo == Notes.choice and ContDoc.Nrec == Notes.Owner))=tsok) {
+      #InsMemo(Notes,Note,'Дополнительные выплаты')
+    }
+    if (bFirst) InsVar('Дополнительные выплаты','нет');
+
+    //Неявки/Отпуска
+    setlimit(ArVal,0);
+    cRec:=0;
+    DateVal:=ZeroDate;
+    if (TypeOper=40) {//Отзыв из отпуска
+      if (getfirst fastfirstrow OtpOtz where((ContDoc.ObjNrec == OtpOtz.NRec))=tsok) {
+        var sOtpStr: string;
+        tmpDouble:=0;
+        i:=1;
+        _loop AllVacCon
+        where((
+          0 == AllVacCon.wTable and 0 == AllVacCon.cTable and OtpOtz.nRec == AllVacCon.cOtpOtz
+          and AllVacCon.resword[1] == KlOtpusk.KOtpus
+        )) {
+//#167.#56 С данным условием почти все отзывы перестали корректно печататься
+//Отключил до более точного определения условий
+//          if not (AllVacCon.ResDouble[3] > 0) continue; // пропускаем больничные, отзывы и отпуска, которые прошли
+
+          if (getfirst fastfirstrow FactOtpusk where((ContDoc.cNew1 == FactOtpusk.NRec))=tsok) {
+//            if (ContDoc.wAttrDoc3<>0) //признак, был выбран пакет или отпуск
+//              if (getfirst fastfirstrow KlOtpusk where((FactOtpusk.VacType == KlOtpusk.KOtpus))=tsok)
+            if ArVal[1] = '' ArVal[1] := KlOtpusk.Notpus;
+            if ArVal[6] = '' ArVal[6] := GetWorkPeriodByFactOtpusk;
+
+            if (FactOtpusk.cPrikaz<>0)
+              if (getfirst fastfirstrow TitleDoc where((FactOtpusk.cPrikaz == TitleDoc.NRec))=tsok)
+              if i =1 {
+                ArVal[7]:=TitleDoc.DocNmb;
+                ArVal[8]:=DateToString(TitleDoc.DocDate);
+            }
+          }
+             if ArVal[1] = ''
+             if (ContDoc.wAttrDoc3=0)
+               if (IsValidAll(tnKlOtpusk))
+                 ArVal[1]:=KlOtpusk.Notpus;
+
+             if (ArVal[9]='' and AllVacCon.rescomp[1]<>0) {
+               ArVal[9]:=DateToString(From_Days(AllVacCon.rescomp[1]));
+               if (AllVacCon.rescomp[2]<>0)
+                 ArVal[10]:=DateToString(From_Days(AllVacCon.rescomp[2]));
+               ArVal[11]:=DoubleToStr(AllVacCon.ResDouble[1],'\d,[|-]3666 666 666~9999999');
+             }
+
+          tmpDouble+=AllVacCon.ResDouble[3];
+
+          // Для работы шаблона с "масивом"
+          sOtpStr := if(i=1,'',''#13) + '"'+ KLOTPUSK.NOTPUS + '" за период работы ' + trim(GetWorkPeriodByFactOtpusk) + ' c ' +
+                          DateToString(From_Days(AllVacCon.rescomp[1])) +  ' года по ' +
+                          DateToString(From_Days(AllVacCon.rescomp[2])) +  ' года ('
+                          +if ((AllVacCon.resdouble[1] > 0), DoubleToStr(AllVacCon.ResDouble[1],'\d,[|-]3666 666 666~9999999'), '0')+' календарных дня)';
+
+          InsVar('ОтзывОтпуск'+i, sOtpStr);
+
+          i++;
+
+        }//_loop AllVacCon
+        while i <= 10 do
+        {InsVar('ОтзывОтпуск'+i, '');
+         //LogStrToFile('#sOtpStr.txt',i + ' пусто' );
+         i++;
+        }
+
+        // ArVal[1]:='';
+        ArVal[12]:=string(longint(tmpDouble));
+        ArVal[13]:=string(longint(OtpOtz.KolDn));
+        ArVal[14]:=DateToString(OtpOtz.DataN);
+        ArVal[15]:=DateToString(OtpOtz.DatOk);
+
+      }
+    } else if (TypeOper=41) {//Предоставление отпуска
+      if (getfirst fastfirstrow KlOtpusk where((ContDoc.cNew1 == KlOtpusk.NRec))=tsok)
+        ArVal[1]:=KlOtpusk.Notpus;
+      ArVal[4]:=DateToString(ContDoc.Dat1);
+      ArVal[5]:=DateToString(ContDoc.Dat2);
+      if (ContDoc.cWorkPeriod<>0)
+        if (getfirst fastfirstrow WorkPeriod where((ContDoc.cWorkPeriod == WorkPeriod.NRec))=tsok)
+          ArVal[6]:=DateToString(WorkPeriod.dPerBeg) + ' - ' + DateToString(WorkPeriod.dPerEnd);
+//доработка для Факела 27.03.2023 Погосский
+      ArVal[11]:=DoubleToStr(OtpKolDn(KlOtpusk.IsRabDn//1-по календарным с оплатой дней, продленных за счет праздников
+                            , ContDoc.Dat1
+                            , ContDoc.Dat2
+                            , Appointments.cAddNrec2),'\d,[|-]3666 666 666~9999999');
+    } else if (TypeOper=42 and ContDoc.wAttrDoc3<>0) {//Перенос отпуска
+      if (getfirst fastfirstrow FactOtpusk where((ContDoc.cNew1 == FactOtpusk.NRec))=tsok) {
+        if (getfirst fastfirstrow KlOtpusk where((FactOtpusk.VacType == KlOtpusk.KOtpus))=tsok)
+          ArVal[1]:=KlOtpusk.Notpus;
+        ArVal[4]:=DateToString(FactOtpusk.FactYearBeg);
+        ArVal[5]:=DateToString(FactOtpusk.FactYearEnd);
+
+      ArVal[6] := GetWorkPeriodByFactOtpusk;
+
+      if (FactOtpusk.cPrikaz<>0)
+        if (getfirst fastfirstrow TitleDoc where((FactOtpusk.cPrikaz == TitleDoc.NRec))=tsok) {
+          ArVal[7]:=TitleDoc.DocNmb;
+          ArVal[8]:=DateToString(TitleDoc.DocDate);
+        }
+      }
+    } else if (ContDoc.ObjNrec<>0) {
+      if (getfirst fastfirstrow Vacations where((ContDoc.ObjNrec == Vacations.NRec))=tsok) {
+        if (getfirst fastfirstrow KlOtpusk where((Vacations.VacType == KlOtpusk.NRec))=tsok)
+          ArVal[1]:=KlOtpusk.Notpus;
+        ArVal[2]:=string(longint(Vacations.Duration));
+        ArVal[3]:=Time2StrDef(double(Vacations.LastUser));
+        ArVal[4]:=DateToString(Vacations.FactYearBeg);
+        ArVal[5]:=DateToString(Vacations.FactYearEnd);
+        if (getfirst fastfirstrow FactOtpusk where((Vacations.cFactOtpusk == FactOtpusk.NRec))=tsok) {
+          if (getfirst fastfirstrow WorkPeriod where((FactOtpusk.cWorkPeriod == WorkPeriod.NRec))=tsok)
+            ArVal[6]:=DateToString(WorkPeriod.dPerBeg) + ' - ' + DateToString(WorkPeriod.dPerEnd);
+          if (FactOtpusk.cPrikaz<>0)
+            if (getfirst fastfirstrow TitleDoc where((FactOtpusk.cPrikaz == TitleDoc.NRec))=tsok) {
+              ArVal[7]:=TitleDoc.DocNmb;
+              ArVal[8]:=DateToString(TitleDoc.DocDate);
+            }
+        }
+
+        if (TypeOper=71) {
+          cRec:=Vacations.VacType;
+          DateVal:=Vacations.FactYearBeg;
+        }
+      }
+    }
+    InsVar('Вид отпуска',ArVal[1]);
+    InsVar('Количество дней по неявке',ArVal[2]);
+    InsVar('Количество часов по неявке',ArVal[3]);
+    InsVar('Дата начала отпуска',ArVal[4]);
+    InsVar('Дата окончания отпуска',ArVal[5]);
+    InsVar('Наименование отпуска',ArVal[1]);
+    InsVar('Рабочий период',ArVal[6]);
+    if (TypeOper=40) {//Отзыв из отпуска
+      InsVar('Исходная дата начала отпуска',ArVal[9]);
+      InsVar('Исходная дата окончания отпуска',ArVal[10]);
+      InsVar('Кол. дней отпуска',ArVal[11]);
+      InsVarD('Начало переноса',ContDoc.dat1);
+      InsVarD('Окончание переноса',ContDoc.dat2);
+// тест - #11 #13 РАБОТАЕТ внутри переменной!!!
+//      InsVar('Начало переноса','Начало переноса'#11'Начало переноса');          // #11 перенос строки = Alt+Enter
+//      InsVar('Окончание переноса','Окончание переноса'#13'Окончание переноса'); // #13 Новый Абзац = Enter
+
+    } else {
+//доработка для Факела 27.03.2023 Погосский
+    if (TypeOper=41) {//Предоставление отпуска
+      InsVarD('Исходная дата начала отпуска',ContDoc.dat1);
+      InsVarD('Исходная дата окончания отпуска',ContDoc.dat2);
+      InsVar('Кол. дней отпуска',ArVal[11]);
+      InsVar('Начало переноса');
+      InsVar('Окончание переноса');
+    } else {
+      InsVarD('Исходная дата начала отпуска',ContDoc.dat1);
+      InsVarD('Исходная дата окончания отпуска',ContDoc.dat2);
+      InsVar('Кол. дней отпуска',DoubleToStr(ContDoc.wOrder,'\d,[|-]3666 666 666~9999999'));
+      InsVar('Начало переноса');
+      InsVar('Окончание переноса');
+    }
+    }
+    InsVarD('Дата начала пер.отпуска',ContDoc.dPrik);
+    InsVarD('Дата окончания пер.отпуска',_GetDate(_FromSec100(ContDoc.cCat2)));
+    InsVar('Номер приказа предоставленного отпуска',ArVal[7]);
+    InsVar('Дата приказа предоставленного отпуска',ArVal[8]);
+    InsVar('Дни переноса',ArVal[12]);
+    InsVar('Дни отзыва',ArVal[13]);
+    InsVar('Начало отзыва',ArVal[14]);
+    InsVar('Окончание отзыва',ArVal[15]);
+
+    InsVar('Причина отзыва из отпуска',oAttrTablePick.sGetValue(coContDoc,cAttrReasonOfRecall,ContDoc.NRec));
+
+    setlimit(ArVal,0);
+    if (TypeOper=71) {
+      i:=0;
+      _loop ContDoc2
+      where((
+        ContDoc.cPart == ContDoc2.cPart and 0 << ContDoc2.SeqNmb and
+        ContDoc.Person == ContDoc2.Person (noindex) and
+        ContDoc2.ObjNrec == Vacations.NRec
+      )) {
+        if (ContDoc.NRec = ContDoc2.NRec) continue;
+        if (not IsValidAll(tnVacations)) continue;
+        if (Vacations.VacType <> cRec) continue;
+
+        ArVal[1+3*i]:=string(longint(Vacations.Duration));
+        ArVal[2+3*i]:=DateToString(Vacations.FactYearBeg);
+        ArVal[3+3*i]:=DateToString(Vacations.FactYearEnd);
+        if (DateVal>Vacations.FactYearBeg)
+          DateVal:=Vacations.FactYearBeg;
+        i++;
+        if (i=3) break;
+      }//_loop ContDoc2
+    }
+    for(i:=0;i<3;i++) {
+      InsVar('Количество дней по неявке '+string(i+1),ArVal[1+3*i]);
+      InsVar('Дата начала отпуска '+string(i+1),ArVal[2+3*i]);
+      InsVar('Дата окончания отпуска '+string(i+1),ArVal[3+3*i]);
+    }
+
+    //уход за ребенком-инвалидом
+    setlimit(ArVal,0);
+    _loop PsnLinks
+    where((
+      Persons.NRec == PsnLinks.FromPerson and
+      PsnLinks.NRec == Sys_Uder.cex and
+      '2' == Sys_Uder.NMNEM and
+      psnLinksDocInv == Sys_Uder.prkauot (noindex)
+    )) {
+      if (IsValidAll(tnSys_Uder))
+        if (DateVal=ZeroDate or Sys_Uder.DATOK=ZeroDate or Sys_Uder.DATOK>DateVal)
+          if (iChildDoc.IsMainCurator(PsnLinks.NRec)) {
+            ArVal[1]:=PsnLinks.RFIO;
+            ArVal[2]:=DateToString(PsnLinks.RBornDate);
+            ArVal[3]:=iCatFunc.GetCatalogsName(Sys_Uder.cHozOper)+', '+Sys_Uder.LastUser+', '+
+                      DateToString(Sys_Uder.LastDate)+', '+
+                      Sys_Uder.NMpodr + Sys_Uder.Param + Sys_Uder.Csubschk + Sys_Uder.CSCHETK;
+          }
+    }//_loop PsnLinks
+    InsVar('ФИО ребенка-инвалида',ArVal[1]);
+    InsVar('Дата рождения ребенка-инвалида',ArVal[2]);
+    InsVar('Док. об инвалидности',ArVal[3]);
+
+    DateVal:=ZeroDate;
+    if (ContDoc.cAddInf<>0)
+      if (getfirst fastfirstrow PsnLinks where((ContDoc.cAddInf == PsnLinks.nRec))=tsok)
+        DateVal:=PsnLinks.rBornDate;
+    InsVarD('Дата рождения ребенка',DateVal);
+    InsVarD('Дата 3-х лет',Add_Months(DateVal, 36));
+    InsVarD('Дата 1.5 лет',Add_Months(DateVal, 18));
+
+    //Условное обозначение
+    setlimit(ArVal,0);
+//    if (getfirst fastfirstrow SalScale where((0 == SalScale.wTblCode and ContDoc.NRec == SalScale.cUnit))=tsok)
+    _loop SalScale where((0 == SalScale.wTblCode and ContDoc.NRec == SalScale.cUnit)) {
+      if (getfirst fastfirstrow UOWrkTabel where((comp(SalScale.LastUser) == UOWrkTabel.Nrec))=tsok)
+        ArVal[1]:=UOWrkTabel.NUM + ', ' + UOWrkTabel.Name;
+      ArVal[2]:=ArVal[2]+ if(ArVal[2] = '',' ',', ') + Time2StrDef(SalScale.fSum0);
+      ArVal[3]:=ArVal[3]+ if(ArVal[3] = '',' ',', ') + DateToString(SalScale.LastDate);
+      ArVal[4]:=ArVal[4]+ if(ArVal[4] = '',' ',', ') + DateToString(Add_Day(SalScale.LastDate, SalScale.FilialNo));
+//доработка для Факела 16.03.2023 Погосский
+      ArVal[7]:=timetostr(tGetAttr(coSalScale,SalScale.Nrec,'Время начала отклонения'),'HH:MM');
+      ArVal[8]:=timetostr(tGetAttr(coSalScale,SalScale.Nrec,'Время окончания отклонения'),'HH:MM');
+//------------------
+        if getfirst fastfirstrow InfPsn1 where ((SalScale.NRec == InfPsn1.cPers
+                                           and skkRPD91       == InfPsn1.cRef2)) = tsOk
+          if getfirst fastfirstrow SourceContDoc where (( InfPsn1.cRef1 == SourceContDoc.NRec)) = tsOK
+             if getfirst fastfirstrow SourcePartDoc where ((SourceContDoc.cPart == SourcePartDoc.NRec)) = tsOK
+              if getfirst fastfirstrow SourceTitleDoc where ((SourcePartDoc.cDoc == SourceTitleDoc.NRec)) = tsOK
+               if getfirst fastfirstrow WWSalScale where ((InfPsn1.cRef3 == WWSalScale.NRec )) = tsOK
+              {
+                ArVal[5]:=ArVal[5]+ if(ArVal[5] = '',' ',', ') + DateToString(WWSalScale.LastDate);
+                ArVal[6]:=ArVal[6]+ if(ArVal[6] = '',' ',', ') + 'приказ № ' + SourceTitleDoc.DocNmb + ' от '+ DateToString(SourceTitleDoc.DocDate);
+              }
+    }
+    InsVar('Условное обозначение',ArVal[1]);
+    InsVar('Количество часов отклонений',ArVal[2]);
+    InsVar('Дата начала отклонения',ArVal[3]);
+    InsVar('Дата окончания отклонения',ArVal[4]);
+    InsVar('Выходной день за который отдыхает',ArVal[5]);
+    InsVar('Приказ за который отдыхает',ArVal[6]);
+//доработка для Факела 16.03.2023 Погосский
+    InsVar('Время начала отклонения',ArVal[7]);
+    InsVar('Время окончания отклонения',ArVal[8]);
+//------------------
+    //Шапка раздела
+    bFirst:=true;
+    if (getfirst fastfirstrow PrMemo where((ContDoc.cPart == PrMemo.cDoc and 2 == PrMemo.wRef))=tsok) {
+      #InsMemo(PrMemo,Info,'Шапка приказа')
+    }
+    if (bFirst) InsVar('Шапка приказа');
+
+    //Примечание (кнопка)
+    bFirst:=true;
+    if (getfirst fastfirstrow Notes where((cKadryDisNotes == Notes.choice and ContDoc.Nrec == Notes.Owner))=tsok) {
+      #InsMemo(Notes,Note,'Примечание (кнопка)')
+    }
+    if (bFirst) InsVar('Примечание (кнопка)');
+
+    tmpDouble:=0;
+    sql
+      select Sum(ROUND(DopInfo.fFldSum[3]*DopInfo.fFldSum[4]/100,2)):double
+      from
+        DopInfo
+        inner join DopTables on (DopInfo.cDopTbl = DopTables.NRec and
+                                 'Проценты по ипотеке к возмещению' = DopTables.sTblName)
+      where
+        DopInfo.cPerson = :(Persons.Nrec)
+      into (tmpDouble);
+    InsVar('Общая сумма возмещения %% по ипотеке',DoubleToStr(tmpDouble,'[|-]3666 666 666,88'));
+    InsVar('Общая сумма возмещения %% по ипотеке, прописью',DoubleToString(0,tmpDouble));
+    InsVar('Количество лет возмещения % по ипотеке (от суммы)',GetYearsOfMortgageRefund(tmpDouble));
+
+    tmpDouble:=0;
+    sql
+      select Count(DopInfo.NRec):double
+      from
+        DopInfo
+        inner join DopTables on (DopInfo.cDopTbl = DopTables.NRec and
+                                 'Проценты по ипотеке к возмещению' = DopTables.sTblName)
+      where
+        DopInfo.cPerson = :(Persons.Nrec)
+      into (tmpDouble);
+    InsVar('Количество лет возмещения % по ипотеке',longint(Trunc(tmpDouble/12)));
+
+    DateVal:=ZeroDate;
+    setlimit(ArVal,0);
+    _loop ContDoc2
+    where((
+      Persons.NRec == ContDoc2.Person and
+      114 == ContDoc2.TypeOper and
+      1 == ContDoc2.SeqNmb and
+      ContDoc2.cPart /== PartDoc.NRec and PartDoc.cDoc /== TitleDoc.nrec
+    )) {
+      if (TitleDoc.DocDate<=TitleDocDate and TitleDoc.DocDate>DateVal) {
+        cRec:=NOAA.GetFirstAgreementByLink(coContDoc, ContDoc2.NRec);
+        if (cRec<>0) {
+          DateVal:=TitleDoc.DocDate;
+          ArVal[1]:=DateToStrInWords(NOAA.GetAgreementDate(cRec));
+        }
+      }
+    }//_loop ContDoc2
+    InsVar('Дата доп.соглашения Проценты по ипотеке', ArVal[1]);
+
+    WordDoc.Fields._Update;
+    WordDoc.UndoClear;
+    MSWord.Visible:=true;
+  }
+  _except
+   on ExOle:Message(ExploreException,error);
+  _finally {
+    if (not NullVipRef(MSWord))
+      if (not MSWord.Visible)
+        MSWord.Quit(wdDoNotSaveChanges,wdWordDocument);
+
+    WordVar:=NullRef;
+    WordVariables:=NullRef;
+    WordDoc:=NullRef;
+    MSWord:=NullRef;
+  }
+
+  StopVisual;
+}
+
+HandleEvent
+cmInit:abort;
+cmPick:{
+  case CurField of
+    fnsSigners:{
+      if iFeeSigners.RunMainWindow(1)
+        set sSigners:=iFeeSigners.GetFeeSignersName;
+    }
+  end;
+}
+cmDelOnProtect:{
+  case CurField of
+    fnsSigners:{
+      iFeeSigners.ClearFeeSigners;
+      set sSigners:='';
+    }
+  end;
+}
+end;
+
+end.
+// \\Dep968-gal-share\erpdb_stend\GAL\exe\XLS_ЭМ\Staff\РПД_40\Приказ

@@ -1,0 +1,377 @@
+//---------------------------------------
+//Формирование отчетов по событиям
+//---------------------------------------
+create view vBlisnet
+var
+ pLschet:comp;
+ pPersons:comp;
+ pGP_Scud_Pers:comp;
+ DTB,DTE :date;
+From
+   Lschet
+  ,KatPodr
+  ,Catalogs CatPost
+  ,Blisnet
+  ,Otpusk
+  ,KLVIDPOS
+  ,KlOtpusk
+  ,GP_SCUD_DOC
+  ,GP_SCUD_MISCON_D
+where ((
+    pLschet        == Lschet.Nrec
+and Lschet.cex     == KatPodr.Nrec
+and Lschet.cAppoint == CatPost.Nrec
+//-------------------------
+and pLschet        == Blisnet.cLsch
+and DTE           >>= Blisnet.DataN(noindex)
+and DTB           <<= Blisnet.DatOk(noindex)
+and BLISNET.VIDPOS == KLVIDPOS.VIDPOS
+//-------------------------
+and pLschet        == Otpusk.cLsch
+and DTE >>= Otpusk.DataN(noindex)
+and DTB <<= Otpusk.DatOk(noindex)
+and Otpusk.KOtpus == klOtpusk.KOtpus
+//-------------------------
+and pGP_Scud_Pers == GP_SCUD_MISCON_D.cGP_SCUD_PERS
+and DTB <<=  GP_SCUD_MISCON_D.DT_Ev(noindex)
+and DTE >>=  GP_SCUD_MISCON_D.DT_Ev(noindex)
+and (  GP_SCUD_MISCON_D.wMisConDuct=6
+    or ZeroTime = GP_SCUD_MISCON_D.TM_Ev
+   )
+and GP_SCUD_MisCon_D.cMisConDuct == GP_SCUD_DOC.Nrec
+
+));//
+
+//---------------------------------------
+//формирования списка для выбора
+//---------------------------------------
+SQL QUERY SqlTmp_Vib =
+  SELECT
+     GP_SCUD_PERS.Nrec  as cGP_Scud_Pers
+   , COALESCE(Lschet.Nrec,#comp(0)) as cLschet
+   , GP_SCUD_PERS.cPersons as cPersons
+   , GP_SCUD_PERS.Fio as FIO
+  From GP_SCUD_PERS
+  Left outer join Lschet on Lschet.tPerson = GP_SCUD_PERS.cPersons
+    and (3 <> Lschet.Sovm) /// не будем смотреть по совместителям
+//   and (Lschet.DatUV=#Date(0,0,0) or Lschet.DatUV>=:(DTB_A))
+   and (Lschet.DatUV=#Date(0,0,0) or Lschet.DatUV>=:DTB_A)
+//  inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:(sUserName) ))  //Filter_User
+  inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName ))  //Filter_User
+  where  (ZU.POdrShare <> '+'
+    or (GP_SCUD_PERS.cKatPodr in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+      )
+  %Filter_Vib
+  ;
+//---------------------
+Procedure Fill_Tmp_Rep_Vib;
+var stmt:longint;
+    ExecuteErrorCode:longint;
+{ _Try
+  { stmt:=0;
+    Timelog('GP_SCUD_Events->Fill_Tmp_Rep_Vib:Start');
+    //sqlSetMacro('Filter_User',''''+sUserName+'''');
+    var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and GP_SCUD_PERS.cKatPodr ',Marker_KatPodr));
+    }
+    if IsBitCTW(wFilter,2)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and GP_SCUD_PERS.Nrec ',Marker_GP_SCUD_Pers));
+    }
+    if IsBitCTW(wFilter,3)
+    and sFio_Flt<>''
+    { sqlAddStr(hStrFilter,' and GP_SCUD_PERS.Fio like ''%'+sFio_Flt+ '%'' ');
+    }
+    if IsBitCTW(wFilter,4)
+    and sPropusk_Flt<>''
+    { sqlAddStr(hStrFilter,' and GP_SCUD_PERS.Propusk like ''%'+sFio_Flt+ '%'' ');
+    }
+    if (hStrFilter<>0)
+    { SqlsetMacro('Filter_Vib',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('Filter_Vib','');
+    }
+    Timelog('GP_SCUD_Events->Fill_Tmp_Rep_Vib:002');
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_Vib);
+    if timelog_Status>1  Timelog('GP_SCUD_Events->Fill_Tmp_Rep_Vib 001:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      sqlBindParamByName(stmt,'DTB_A'    , DTB_A);
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_SCUD_Events->Fill_Tmp_Rep_Vib:002:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Rep_Vib);
+              Timelog('GP_SCUD_Events->Fill_Tmp_Rep_Vib; 003:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Rep_Vib)));
+      }
+    } // ExecuteError
+  } // _try
+  _finally
+  { if (ExecuteErrorCode <> 0)
+      TimeLog('Ошибка при выполнении SQL-сценария '
+       +chr(13) +' выбор из картотеки скуд: код = ' + String(ExecuteErrorCode)
+       );
+  } // _finally
+} //Procedure Fill_Tmp_Rep_Vib;
+
+//-------------------
+// Сама печать
+//-------------------
+Function PrintRep:boolean;
+var
+  _wErr:longint;
+  _MaxColCount:longint;
+  isAllOk:boolean;
+{ Result:=false;
+  StartNewVisual(vtNumericVisual, vfTimer + vfBreak + vfConfirm,
+          'Ждите, идет формирование отчета по событиям', 0);
+  PushPos(#GP_SCUD_Events);
+  isAllOk:=true;
+  do{
+    NmTemplate:='GP_Scud_EventsRep.xlsx';
+    _werr:=ExcelInit(nmtemplate,true);
+    _MaxColCount:=10;
+    MTRetrieve(#tmp_Rep_Ev,mfFilters + mfClear);//+mfClearFilters
+    delete all tmp_Rep_Ev;
+    MTRetrieve(#tmp_Rep_Vib,mfFilters + mfClear);//+mfClearFilters
+    delete all tmp_Rep_Vib;
+    //************************************
+    //**** Заполнить таблицу с выбором ***
+    //************************************
+    var _pLschet:comp=0;
+    if BoundActive(tbbyGP_SCUD_PersM)
+    or BoundActive(tbByPers)
+    { timelog('GP_SCUD_Events->PrintRep:BoundActive(tbbyGP_SCUD_PersM)');
+      if getfirst GP_SCUD_Pers where (( pGP_SCUD_Pers == GP_SCUD_Pers.Nrec )) =tsok {}
+      vTabel.pPersons:=GP_SCUD_Pers.cPersons;
+      if vTabel.Getfirst Lschet=tsok _pLschet:=vTabel.Lschet.Nrec;
+      insert into tmp_Rep_Vib set
+           tmp_Rep_Vib.cGP_SCUD_Pers := pGP_SCUD_Pers
+          ,tmp_Rep_Vib.cLschet :=_pLschet
+          ,tmp_Rep_Vib.cPersons:=GP_SCUD_Pers.cPersons
+          ,tmp_Rep_Vib.Fio     :=GP_SCUD_Pers.Fio
+          ;
+    }
+    else
+    { //Здесь можно вставить на DSQL
+      timelog('GP_SCUD_Events->PrintRep: not BoundActive(tbbyGP_SCUD_PersM)');
+      Fill_Tmp_Rep_Vib;
+    }
+    //************************************
+    //**** Сбор данных по событиям *******
+    //************************************
+    _Loop GP_SCUD_Events
+    { if not NextVisual
+      { isAllOk:=false;
+        break;
+      }
+      insert into tmp_Rep_Ev Set
+        tmp_Rep_Ev.FIO       :=GP_Scud_Pers.Fio// "Сотрудник (Посетитель)"
+      , tmp_Rep_Ev.cGP_Scud_Pers=GP_SCUD_Events.cGP_SCUD_Pers
+      , tmp_Rep_Ev.EnterDate :=GP_SCUD_Events.EnterDate// "Дата"
+      , tmp_Rep_Ev.PlanTime  :=Plan_Time// "Начало/окончание рабочего дня"
+      , tmp_Rep_Ev.EnterTime :=GP_SCUD_Events.EnterTime// "Время"
+      , tmp_Rep_Ev.Podr_Kod  :=KatPodr.Kod// "Подразделение"
+      , tmp_Rep_Ev.Post      :=GetPostByPers(GP_Scud_Pers.cPersons)// "Подразделение"
+      , tmp_Rep_Ev.Event_Type:=''//  "Событие"
+      , tmp_Rep_Ev.wResource :=GP_SCUD_Events.wResource// "Ресурс устройства"
+      , tmp_Rep_Ev.Areal     :=GP_SCUD_AREAS.DISPLAY_NAME// "Помещение"
+      , tmp_Rep_Ev.Zauv      :=If(IsValidAll(#GP_SCUD_DOC_A),GP_SCUD_DOC_A.DocNMB,'')//  "Наличие контрольной карты"
+      , tmp_Rep_Ev.ColorEV   :=GetColorEvents(GP_SCUD_Events.Nrec)
+      , tmp_Rep_Ev.Diff      :=Plan_Diff
+      , tmp_Rep_Ev.MisConDuct:=sMisConDuct;
+      ;
+    } //_Loop GP_Scud_Events
+    if not isAllOk break;
+    //************************************
+    // Дополним из других источников
+    //************************************
+    vBlisnet.DTB:=DTB_A;
+    vBlisnet.DTE:=DTE_A;
+    var _DTB:date=Zerodate;
+    var _DTE:date=Zerodate;
+    var _sReason:string='';
+    delete tmp_rep_Vib where (( 0 == tmp_rep_Vib.clschet ));
+    _Loop tmp_rep_Vib
+    { if not NextVisual
+      { isAllOk:=false;
+        break;
+      }
+      timelog('GP_SCUD_Events->PrintRep:tmp_rep_Vib.Fio='+tmp_rep_Vib.Fio+','+string(tmp_rep_Vib.cLschet));
+
+      vBlisnet.pLschet      :=tmp_rep_Vib.cLschet;
+      vBlisnet.pPersons     :=tmp_rep_Vib.cPersons;
+      vBlisnet.pGP_Scud_Pers:=tmp_rep_Vib.cGP_Scud_Pers;
+      if vBlisnet.getfirst Lschet=tsok {}
+      if vBlisnet.getfirst KatPodr=tsok {}
+      if vBlisnet.getfirst CatPost=tsok {}
+      //************************************
+      //**** Информация по командировкам ***
+      //************************************
+
+      if not isAllOk break;
+      //************************************
+      //**** Информация по больничным ******
+      //************************************
+      vBlisnet._Loop Blisnet
+      { _DTB:=vBlisnet.Blisnet.Datan;
+        _DTE:=vBlisnet.Blisnet.Datok;
+        if _DTB>DTE_A continue;
+        if _DTE<DTB_A continue;
+        if _DTB<DTB_A _DTB:=DTB_A;
+        if _DTE>DTE_A _DTE:=DTE_A;
+        timelog('GP_SCUD_Events->PrintRep:vBlisnet.Blisnet.Datan='+DateToStr(vBlisnet.Blisnet.Datan,'DD.MM.YYYY'));
+        _sReason:='';
+        if vBlisnet.getfirst klVidPos=tsok
+          _sReason:=vBlisnet.klVidPos.NPos;
+        do
+        { tmp_Rep_Ev.FIO       :=tmp_Rep_Vib.Fio;// "Сотрудник (Посетитель)"
+          tmp_Rep_Ev.cGP_Scud_Pers:=tmp_Rep_Vib.cGP_SCUD_Pers;
+          tmp_Rep_Ev.EnterDate :=_DTB; // "Дата"
+          tmp_Rep_Ev.PlanTime  :=ZeroTime;// "Начало/окончание рабочего дня"
+          tmp_Rep_Ev.EnterTime :=ZeroTime;// "Время"
+          tmp_Rep_Ev.Podr_Kod  :=vBlisnet.KatPodr.Kod;// "Подразделение"
+          tmp_Rep_Ev.Post      :=vBlisnet.CatPost.Name;
+          tmp_Rep_Ev.Event_Type:=_sReason;//  "Событие"
+          tmp_Rep_Ev.wResource :=12;// "Ресурс устройства"
+          tmp_Rep_Ev.Areal     :='';// "Помещение"
+          tmp_Rep_Ev.Zauv      :='';//  "Наличие контрольной карты"
+          tmp_Rep_Ev.ColorEV   :=100;
+          tmp_Rep_Ev.Diff      :=ZeroTime;
+          tmp_Rep_Ev.MisConDuct:='';
+          insert current tmp_Rep_Ev;
+
+          _DTB:=Add_Day(_DTB,1);
+        } while _DTB<=_DTE
+      } //vBlisnet._Loop Blisnet
+      if not isAllOk break;
+      //************************************
+      //**** Информация по отпускам ******
+      //************************************
+      vBlisnet._Loop Otpusk
+      { _DTB:=vBlisnet.Otpusk.Datan;
+        _DTE:=vBlisnet.Otpusk.Datok;
+        timelog('GP_SCUD_Events->PrintRep:vBlisnet.Otpusk.Datan='+DateToStr(vBlisnet.Otpusk.Datan,'DD.MM.YYYY'));
+        if _DTB>DTE_A continue;
+        if _DTE<DTB_A continue;
+        if _DTB<DTB_A _DTB:=DTB_A;
+        if _DTE>DTE_A _DTE:=DTE_A;
+
+        _sReason:='';
+        if vBlisnet.getfirst klOtpusk=tsok
+          _sReason:=vBlisnet.klOtpusk.NOtpus;
+        do
+        { tmp_Rep_Ev.FIO       :=tmp_Rep_Vib.Fio;// "Сотрудник (Посетитель)"
+          tmp_Rep_Ev.cGP_Scud_Pers:=tmp_Rep_Vib.cGP_SCUD_Pers;
+          tmp_Rep_Ev.EnterDate :=_DTB; // "Дата"
+          tmp_Rep_Ev.PlanTime  :=ZeroTime;// "Начало/окончание рабочего дня"
+          tmp_Rep_Ev.EnterTime :=ZeroTime;// "Время"
+          tmp_Rep_Ev.Podr_Kod  :=vBlisnet.KatPodr.Kod;// "Подразделение"
+          tmp_Rep_Ev.Post      :=vBlisnet.CatPost.Name;
+          tmp_Rep_Ev.Event_Type:=_sReason;//  "Событие"
+          tmp_Rep_Ev.wResource :=12;// "Ресурс устройства"
+          tmp_Rep_Ev.Areal     :='';// "Помещение"
+          tmp_Rep_Ev.Zauv      :='';//  "Наличие контрольной карты"
+          tmp_Rep_Ev.ColorEV   :=100;
+          tmp_Rep_Ev.Diff      :=ZeroTime;
+          tmp_Rep_Ev.MisConDuct:='';
+          insert current tmp_Rep_Ev;
+
+          _DTB:=Add_Day(_DTB,1);
+        } while _DTB<=_DTE
+
+      } //vBlisnet._Loop Otpusk
+
+      if not isAllOk break;
+      //************************************
+      //**** Информация по прогулам   ******
+      //************************************
+      vBlisnet._Loop GP_SCUD_MISCON_D
+      {
+        tmp_Rep_Ev.FIO       :=tmp_Rep_Vib.Fio;// "Сотрудник (Посетитель)"
+        tmp_Rep_Ev.cGP_Scud_Pers:=tmp_Rep_Vib.cGP_SCUD_Pers;
+        tmp_Rep_Ev.EnterDate :=vBlisnet.GP_SCUD_MISCON_D.DT_Ev; // "Дата"
+        tmp_Rep_Ev.PlanTime  :=ZeroTime;// "Начало/окончание рабочего дня"
+        tmp_Rep_Ev.EnterTime :=if(vBlisnet.GP_SCUD_MISCON_D.TM_Ev<>ZeroTime,vBlisnet.GP_SCUD_MISCON_D.TM_Ev,Time(24,0,0,0));// "Время"
+        tmp_Rep_Ev.Podr_Kod  :=vBlisnet.KatPodr.Kod;// "Подразделение"
+        tmp_Rep_Ev.Post      :=vBlisnet.CatPost.Name;
+        tmp_Rep_Ev.Event_Type:=iGP_SCUD_MISCONDuctEdit.GetMisConDuctTypeName(vBlisnet.GP_SCUD_MISCON_D.wMisConDuct)
+          +', '+TimeToStr(vBlisnet.GP_SCUD_MISCON_D.tDiff,'HH:MM:SS')
+          ;//  "Событие"
+        tmp_Rep_Ev.wResource :=2;// "Ресурс устройства"
+        tmp_Rep_Ev.Areal     :='';// "Помещение"
+        tmp_Rep_Ev.Zauv      :='';
+        vBlisnet._Loop GP_SCUD_DOC
+          tmp_Rep_Ev.Zauv      :=vBlisnet.GP_SCUD_DOC.DocNMB;;//  "Наличие контрольной карты"
+        tmp_Rep_Ev.ColorEV   :=ColorSysRed;
+        tmp_Rep_Ev.Diff      :=vBlisnet.GP_SCUD_MISCON_D.tDiff;
+        tmp_Rep_Ev.MisConDuct:=tmp_Rep_Ev.Event_Type;
+        insert current tmp_Rep_Ev;
+
+      } //vBlisnet._Loop GP_SCUD_MISCON_D
+    } //_Loop tmp_rep_Vib
+
+    if not isAllOk break;
+    //************************************
+    //*********** Печать *****************
+    //************************************
+    matrixkl:=false;
+    wexrow:=1;
+    wexcol:=1;
+    //    События за период с 01 янв. 2018  по 13 апр. 2018
+    MyPutExcel('События за период с '+DateToStr(DTB_A,'DD mon YYYY')+' по '+DateToStr(DTE_A,'DD mon YYYY') ,10,0,-1,-1); //2
+    HeaderStrCount:=4;
+    wexrow:=HeaderStrCount+1;
+//IFDEF _XLSMATRIX_
+    MyXlCreaMatrix(500, _maxColCount);
+    wexrow--;
+//ENDIF
+    _Loop tmp_Rep_Ev
+    { if not NextVisual
+      { isAllOk:=false;
+        break;
+      }
+
+      wexrow++; wexcol:=1;
+      MyPutExcel(MyGetInitial(tmp_Rep_Ev.FIO,true),0,0,-1,-1);// "Сотрудник (Посетитель)"
+      MyPutExcel(chr(39)+DateToStr(tmp_Rep_Ev.EnterDate,'DD/MM/YY'),0,0,-1,-1);// "Дата"
+      if tmp_Rep_Ev.Event_Type<>''
+      { xlMergeCells(wexrow,wexcol, wexrow,_maxColCount-1);
+        MyPutExcel(tmp_Rep_Ev.Event_Type,0,0,-1,-1);// "Подразделение"
+        xlSetBackColor(08CE6F0h, wexrow,3, wexrow,_maxColCount);
+
+      }
+      else
+      { MyPutExcel(chr(39)+TimeToStr(tmp_Rep_Ev.PlanTime,'HH:MM'),0,0,-1,-1);//"Начало рабочего дня/окончание рабочего дня"
+        if tmp_Rep_Ev.ColorEV<>0 and tmp_Rep_Ev.ColorEV<>ColorSysBlack
+        { //xlSetBackColor(0FA8072h, wexrow,wexcol, wexrow,wexcol);
+          xlSetBackColor(07280FAh, wexrow,wexcol, wexrow,wexcol);
+        }
+        MyPutExcel(chr(39)+TimeToStr(tmp_Rep_Ev.EnterTime,'HH:MM:SS'),0,0,-1,-1);// "Время"
+        MyPutExcel(chr(39)+tmp_Rep_Ev.Podr_Kod,0,0,-1,-1);// "Подразделение"
+        MyPutExcel(tmp_Rep_Ev.Post,0,0,-1,-1);// "Подразделение"
+        MyPutExcel('Проход',0,0,-1,-1);//  "Событие"
+        MyPutExcel(if(tmp_Rep_Ev.wResource=0,'Выход','Вход'),0,0,-1,-1);// "Ресурс устройства"
+        MyPutExcel(tmp_Rep_Ev.Areal,0,0,-1,-1);// "Помещение"
+      }
+      wexcol:=_maxColCount;
+      MyPutExcel(tmp_Rep_Ev.Zauv,0,0,-1,-1);// "Наличие контрольной карты"
+    } //_Loop tmp_Rep_Ev
+    //IFDEF _XLSMATRIX_
+    MyxlWriteMatrix(wexrow);
+    xlFreeMatrix;
+    matrixkl:=False;
+    //ENDIF
+    MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount+1 ,1,wexrow,_maxColCount); //Обрамление
+    xlWrapText(HeaderStrCount, 1, wexrow, _maxColCount);
+  } while False;
+  PopPos     (#GP_SCUD_Events);
+  ReScanPanel(#GP_SCUD_Events);
+  XlKillExcel;
+  StopVisual('',0);
+  Result:=isAllOk;
+} //Function PrintRep:boolean;

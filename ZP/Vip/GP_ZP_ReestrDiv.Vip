@@ -1,0 +1,1261 @@
+/*************************************************************************************************\
+* Наименование: Деление реестров по перечислению заработной платы                                 *
+* Контур/Модуль:Заработная плата                                                                  *
+* Примечание: требуется докомпиляция стандартных интерфейсов для набивки маркера                  *
+*             Z_PAYREP::REESAVAN.SCRHEADING.docName' =3(новый)                                    *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#795          |07/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#3119         |22/07/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include DeterminantAdviser.vih
+#include IGK_Dog.vih
+#include GP_ZP_RaspZakazPers.Vih
+#include Query.vih
+#include GP_QueryBuilder.vih
+
+#doc
+ запускается после формирования реестров по зарплате
+#end
+//000017
+//======================================
+Interface GP_ZP_ReestrDiv 'Деление реестров по счетам на перечисление' ;
+//======================================
+table struct tNachislZakazKoefs
+(
+  cLsch: comp
+, percent: array [0..4] of double
+)
+with index
+(
+  i1 = cLsch
+);
+
+table struct tmp_zarOper = ZarOper;
+table struct tmp_reestr
+( name:string[30]
+ ,csbban :comp
+ ,summa  :double
+ ,cKatBank:comp
+ ,cVplan  :comp
+ ,cSbBanMain: comp
+ ,wType  :word//0 - обычный, дальше № счета субсидии
+)
+with index
+( tmp_reestr01 = name
+ ,tmp_reestr02 = cKatBank + cVplan
+ ,tmp_reestr03 = wType + cSbBanMain + summa
+ ,tmp_reestr04 = cSbBan
+) ;
+table struct tmp_reestrsp
+(   csbban :comp
+  , summa  :double
+  , SUMNach:double
+  , cSppLBan :comp
+  , cSppLBan_new:comp
+  , cLsch     :comp
+  , wType     : word
+)
+with index
+(  tmp_reestrsp01=csbban+cSppLBan+wType
+  ,tmp_reestrsp02=cSppLBan //cLsch
+  ,tmp_reestrsp03=cSppLBan_new
+) ;
+
+table struct tmp_prnaryad
+(  NRMTIME :double
+  ,cVpLan  :comp
+  ,cKatBank:comp
+)
+with index
+( tmp_prnaryad01 = cVpLan+cKatBank
+);
+
+var
+  oIGK_Dog: iIGK_Dog;
+  iGP_ZP_RaspZakazPers:GP_ZP_RaspZakazPers;//Для поиска разноски по заказам авансов
+
+  ATTR_KATBANK:comp;//ВА "Банковские счета"
+  ATTR_SB_VPLAN:comp;//ВА Группа заказов к SBBAB
+  ActualHours: double;//кол-во часов по табелю
+  Marker_vPlan:Longint;
+  Marker_vPlan_Count:Longint;
+
+  Div_R_Round_Znak:integer;//Плинда от 19.01.2017
+
+//Управление персоналом \ Общие настройки \ Больничные, отпуска, расчеты по среднему \ Печать дополнительного протокола отладки"
+//включить в любое значение при проблемах
+//также переключить следует сделать настройку  UP.CACHELOGGING (Управление персоналом \ Кэшировать запись сообщений в протокол)
+//пользовательской и включить в "Нет". Смотреть лог в ZARERROR.OUT
+  UP_ZAR_ZU_DFLAG7  :word;
+  FIN_USER_CPLANSSCH:comp;
+  cVPlan: array [0..3] of comp;
+  sVPlan: array [0..3] of string;
+create view vZP_ReestrDiv
+var
+ Marker
+,MarkerNewSbBan
+,Mrkcount
+,I :longint;
+   Item :comp ;
+   wc_sbban : comp;
+   kl_first, kl_first_sp :boolean;
+   wc_spplban:comp;
+   _SuSPRasp: double;//итого по спецификации
+   _SuSP  : double;//сумма к перечислению по строке
+   _SuSb  : double;//сумма по оригинальному реестру после дробления
+   _SuNach: double;//сумма распределенной суммы начислений
+   wnom :word;
+   wyear,wmesn:word;//год месяц из настройки
+   dtb,dte     :date;// Период поиска номеров реестров
+   dtb_p,dte_p :date;// Период реестра
+   NomReestr: string ; //Номер реестра
+   wc_zaroper:comp;
+   wc_zaroper_first:comp;
+   _SuSP1:double; //Суммы 2 - для округления разбивки по аналитике
+   dProcent:double;//процент деления
+   Type_Div:word;//Тип деления
+   PeriodBeginning:Date;//Начало отчетного периода
+   //----------- ссылки на таблицы
+   pMnPlan :Comp;//заказы
+   pvPlan  :comp;
+   pKatBank:Comp;//банки
+   pLschet :Comp;//лиц.счет
+   pwType  : word;
+   wWorkType: word;
+   cVPlanUnSubsidy: comp;
+   bbAvans : boolean;
+as select sbban.nrec
+from sbban, uder , spplban , sbban sbbandiv,tmp_reestr ,sbban sbban_nom
+   ,spplban spplbandiv
+   ,zaroper , zaroper zaroperdiv
+   ,tmp_reestr tmp_reestr01 , tmp_reestrsp
+   ,MnPlan
+   ,KatBank
+   ,Lschet
+   ,GP_RASPAVANS
+   ,prnaryad
+   ,tmp_prnaryad
+   ,tmp_zarOper
+   ,tNachislZakazKoefs
+   ,KatPodr
+   ,KlVidOpl
+where ((
+  Item  == sbban.nrec
+and sbban.nrec == spplban.csbban
+and sbban.cplat ==  nplat.nrec
+and SppLBan.vidud == uder.viduds
+and spplban.cLsch  == prnaryad.clsch
+and spplban.Cex    == KatPodr.NRec
+and prnaryad.mnrec == sys_nar.nrec  // костыль для ограничения по  sys_nar
+and dte_p>>=prnaryad.DataN(noindex)
+and (Date(1, month(dte_p), year(dte_p))<=prnaryad.DatOk or prnaryad.DatOk=ZeroDate)
+
+and spplban.cLsch  == GP_RASPAVANS.cLschet
+and              0 == GP_RaspAvans.isArh
+and         dte_p >>= GP_RaspAvans.DataN
+and    (    GP_RaspAvans.DataOk >= dtb_p
+         or GP_RaspAvans.DataOk  = ZeroDate
+       )
+
+and lschet.nrec == uder.clsch
+and wyear == uder.yearv(noindex)
+and wmesn == uder.mesv (noindex)
+and wc_sbban == sbbandiv.nrec
+and wc_spplban == spplbandiv.nrec
+and dtb <<=SbBan_nom.DForm
+and dte >>=SbBan_nom.DForm
+and tmp_reestrsp.cSppLBan == ZAROPER.CPLPOR
+and coSPPLBAN == ZAROPER.PRIZPR(noindex)
+and wc_zaroper == ZAROPERDIV.NREC
+//  Поиск шапок реестров
+and pKatBank == tmp_reestr.cKatBank
+and pvPlan   == tmp_reestr.cVplan
+
+// Для поиска заказов
+and pMnPlan == MnPlan.Nrec
+and /*MnPlan.CVPLAN*/ pvPlan  == VPLAN.Nrec // группа заказов
+and pKatBank == KatBank.Nrec
+// Для поиска лицевых счетов
+and pLschet == Lschet.Nrec
+// Распределение затрат
+and pcCostSharing   == PRVIDOPL.CHOICE
+and pLschet         == PRVIDOPL.CLSCH
+and PeriodBeginning == PRVIDOPL.DATAN (noindex)
+
+)) ;
+//======================================
+parameters Marker, bbAvans;
+//======================================
+
+//==============================================================================
+//
+//==============================================================================
+Procedure MyLog(ww:string);
+{
+ timelog(ww)
+}
+
+
+Function GetLastNumSBban :string;
+var ww_nom :string ;
+{ ww_nom:='0000000' ;
+  _loop fullcache SbBan_nom
+  {  if ww_nom<SbBan_nom.lastuser then ww_nom:=SbBan_nom.lastuser;
+  }
+  GetLastNumSBban:=NextNumStr(ww_nom);
+}
+
+//---------------------------------------
+// Найти банк по заказу
+//---------------------------------------
+Function GetKatBankByZakaz(_pMnPlan:comp;_pvPlan:comp):comp;
+{ Result:=0;
+  set pMnPlan:=_pMnPlan;
+  set pvPlan:=_pvPlan;
+  pKatBank:=0;
+  MyLog(' GetKatBankByZakaz _pMnPlan='+string(_pMnPlan) );
+  if pMnPlan>0
+  {
+    if GetFirst MnPlan<>tsok exit;
+    var _VPLANNAME : string = '';
+    if pvPlan=0
+    {
+      set pvPlan:=MnPlan.cvPlan;
+      if getfirst VPLAN=tsok {
+       _VPLANNAME := VPLAN.NAME
+      }
+    }
+       MyLog(' GetKatBankByZakaz _pMnPlan='+string(_pMnPlan)
+          +', Number='+MnPlan.Number
+          +', VPLAN.NAME='+_VPLANNAME
+        );
+
+/* берем банк только из группы планов
+    if MNPLAN.WKODGR1=5064
+    { set pKatBank:=MNPLAN.CANVAL1;
+      if getfirst KatBank<>tsok pKatBank:=0;
+    }
+    if pKatBank=0
+    if MNPLAN.WKODGR2=5064
+    { set pKatBank:=MNPLAN.CANVAL2;
+      if getfirst KatBank<>tsok pKatBank:=0;
+    }
+*/
+    if pKatBank=0
+    { set pKatBank:=coGetAttrID(coVPLAN,pvPlan,ATTR_KATBANK);
+    }
+  }
+  if pKatBank=0
+  { set pvPlan:=_pvPlan;
+    if getfirst VPLAN =tsok
+        set pKatBank:=coGetAttrID(coVPLAN,VPLAN.Nrec,ATTR_KATBANK);
+  }
+  // ДЕЛИМ ТОЛЬКО С ГОСКОНТРАКТОМ
+  IF oIGK_Dog.GetFullIGKByBank(pKatBank)=''
+    pKatBank:=0;
+
+  Result:=pKatBank;
+  MyLog(' GetKatBankByZakaz 0_0 Result='+string(Result) )
+}//Function GetKatBankByZakaz(_pMnPlan:comp):comp;
+//======================================
+
+//===========================================
+// Получить процент из распределения по затратам
+//===========================================
+Procedure GetParamFromCostSharing;
+{ dProcent:=Round(PrVidopl.ChasF*100/ActualHours,2);
+  pMnPlan :=0;
+  pvPlan  :=0;
+  var ii:word;
+  For(ii:=1;ii<=6;ii++)
+  { if PrVidopl.TblD[ii]=cgKau_Zakaz
+    { pMnPlan:=PrVidopl.cKauD[ii];
+      break;
+    } //if PrVidopl.TblD[ii]=cgKau_Zakaz
+  } //For(ii:=1;ii<=6;ii++)
+
+} //Procedure GetParamFromCostSharing:
+
+
+//===========================================
+// Получить процент из распределения по затратам
+//===========================================
+Procedure GetParamFromPrnaryad;
+{ dProcent:=Round(tmp_Prnaryad.NRMTIME*100/ActualHours,2);
+  pMnPlan :=0;
+  pvPlan  :=0;
+  var ii:word;
+  For(ii:=1;ii<=6;ii++)
+  { if Prnaryad.TblD[ii]=cgKau_Zakaz
+    { pMnPlan:=Prnaryad.cKauD[ii];
+      break;
+    } //if Prnaryad.TblD[ii]=cgKau_Zakaz
+  } //For(ii:=1;ii<=6;ii++)
+
+} //Procedure GetParamFromPrnaryad:
+
+//---------------------------------------------------
+// Рассчитаем кол-во часов итого по распределению
+//---------------------------------------------------
+Function CalcActualHours(_pLschet:comp) :double; Cacheable;
+{ Result:=0;
+  #__UNUSED__(_pLschet) // только для кэширования
+  _Loop PrVidopl
+  { Result+=PrVidopl.ChasF;
+  }
+} //Function CalcActualHours(_pLschet:comp) : Cacheable;
+
+
+
+//===========================================
+// Найти первую запись
+// 0 Разделить по распределению работников по заказу
+// 1 Разделить по распределению затрат
+//===========================================
+Function GetFirstZakazProcent(wTp:word):boolean;
+{
+  pMnPlan:=0;
+  dProcent:=0;
+  Result:=false;
+   MyLog('GetFirstZakazProcent wTp= '+string(wTp) );
+  case wTp of
+  0: //Распределение затрат
+  { Result:=iGP_ZP_RaspZakazPers.FindFirstRaspZakazByPeriod(
+           0 //_pPerson: tNRec;
+          ,spplban.cLsch//  _pLschet:tNRec;
+          ,dtb_p//  _DataN: Date;
+          ,dte_p//  _DataOk: Date;
+          ,pMnPlan
+          ,dProcent
+          ,pvPlan
+          ,pwType
+          ) ;
+     MyLog('iGP_ZP_RaspZakazPers.FindFirstRaspZakazByPeriod(');
+     MyLog('                      ,spplban.cLsch = '+spplban.cLsch);
+     MyLog('                      ,dtb_p         = '+dtb_p        );
+     MyLog('                      ,dte_p         = '+dte_p        );
+     MyLog('                      ,pMnPlan       = '+pMnPlan      );
+     MyLog('                      ,dProcent      = '+dProcent     );
+     MyLog('                      ,pvPlan        = '+pvPlan       );
+     MyLog('                      ,pwType        = '+pwType       );
+
+  } //0
+  1: //Распределение затрат - табель
+  {
+    //if ActualHours=0 Exit;
+    ActualHours:=CalcActualHours(PrVidopl.cLsch);
+    if getfirst PrVidopl=tsok
+    {
+      Result:=true;
+      GetParamFromCostSharing;
+    }
+  }
+  2: //Распределение затрат - наряды
+  { if getfirst Prnaryad=tsok
+    { ActualHours:=0;
+      delete all tmp_Prnaryad;
+      _Loop Prnaryad
+      if sys_nar.choice < 900 // только пошедшие в оплату, по идее 3 бы поставить, но ... по разговору с Петром М. решили ставить меньше 900 (все что выше это наши доработки)
+      { ActualHours:=ActualHours+Prnaryad.chasF; //было NRMTIME но1 только для ERP нарядов совпадает с chasF , а для АММ нет, соответственно берем часы фактические
+        GetParamFromPrnaryad;
+        pvPlan:=0;
+        pKatBank:=GetKatBankByZakaz(pMnPlan,pvPlan);
+        if pMnPlan=0 and pvPlan=0  continue;
+        if pKatBank=0 then continue;// Не нашли банк - пропускаем!
+        if Marker_vPlan_Count>0
+        { if not FoundMarker(Marker_vPlan,pvPlan) then continue;
+        }
+        if getfirst tmp_prnaryad where ((
+          pVplan == tmp_prnaryad.cVpLan
+         and pKatBank == tmp_prnaryad.cKatBank
+        )) <>tsok
+        { clearbuffer(#tmp_prnaryad);
+          tmp_Prnaryad.NRMTIME:=Prnaryad.chasF; //было NRMTIME но1 только для ERP нарядов совпадает с chasF , а для АММ нет, соответственно берем часы фактические
+          tmp_Prnaryad.cVpLan:=pvPlan;
+          tmp_Prnaryad.cKatBank:=pKatBank;
+          insert current tmp_Prnaryad;
+        }
+        else
+        { update current tmp_Prnaryad set
+             tmp_prnaryad.NRMTIME:=tmp_prnaryad.NRMTIME+Prnaryad.chasF; //было NRMTIME но1 только для ERP нарядов совпадает с chasF , а для АММ нет, соответственно берем часы фактические
+        }
+      }
+      Result:=true;
+      if getfirst tmp_Prnaryad=tsok {}
+      dProcent:=Round(tmp_Prnaryad.NRMTIME*100/ActualHours,2);
+    }
+  }
+  end;
+} //Function GetFirstZakazProcent(wTp:word):boolean;
+
+//===========================================
+// Найти первую запись
+// 0 Разделить по распределению работников по заказу
+// 1 Разделить по распределению затрат
+//===========================================
+Function GetNextZakazProcent(wTp:word):boolean;
+{
+  pMnPlan:=0;
+  dProcent:=0;
+  Result:=false;
+     MyLog('GetNextZakazProcent wTp='+wTp);
+  case wTp of
+  0: //Распределение затрат
+  { Result:=iGP_ZP_RaspZakazPers.FindNextRaspZakazByPeriod(
+           0 //_pPerson: tNRec;
+          ,spplban.cLsch//  _pLschet:tNRec;
+          ,dtb_p//  _DataN: Date;
+          ,dte_p//  _DataOk: Date;
+          ,pMnPlan
+          ,dProcent
+          ,pvPlan
+          ,pwType
+          );
+     MyLog('iGP_ZP_RaspZakazPers.FindNextRaspZakazByPeriod(');
+     MyLog('                      ,spplban.cLsch = '+spplban.cLsch);
+     MyLog('                      ,dtb_p         = '+dtb_p        );
+     MyLog('                      ,dte_p         = '+dte_p        );
+     MyLog('                      ,pMnPlan       = '+pMnPlan      );
+     MyLog('                      ,dProcent      = '+dProcent     );
+     MyLog('                      ,pvPlan        = '+pvPlan       );
+     MyLog('                      ,pwType        = '+pwType       );
+
+  } //0
+  1: //Распределение затрат
+  { if ActualHours=0 Exit;
+    if getNext PrVidopl=tsok
+    { Result:=true;
+      GetParamFromCostSharing;
+    }
+
+  }
+  2:
+  { if ActualHours=0 Exit;
+
+    if getNext tmp_prnaryad=tsok
+    { Result:=true;
+      dProcent:=Round(tmp_Prnaryad.NRMTIME*100/ActualHours,2);
+      //GetParamFromPrnaryad;
+    }
+
+  }
+  end;
+} //Function GetNextZakazProcent(wTp:word):boolean;
+
+
+//===========================================
+// 0 Разделить по распределению работников по заказу
+// 1 Разделить по распределению затрат
+// 2 Разделить по нарядно
+//===========================================
+Procedure Div_ByRaspPersToZakaz(wTp:word=0);
+{
+  pMnPlan:=0;
+  dProcent:=0;
+  pvPlan:=0;
+  pKatBank:=0;
+  _SuSPRasp:=0;
+  pLschet:=SPPLBAN.cLsch;
+  Mylog('-- Реестр '+sbban.lastuser+',sbban.CBANKPOL='+string(sbban.CBANKPOL));
+  var eps: double = 0;
+  if GetFirstZakazProcent(wTp)
+  do {
+    if dProcent=0 continue;
+    //------------------------
+    if wTp=2
+    { pvPlan  :=tmp_Prnaryad.cVpLan;
+      pKatBank:=tmp_Prnaryad.cKatBank;
+    }
+    else
+    { pKatBank:=GetKatBankByZakaz(pMnPlan,pvPlan);
+    }
+    MyLog(GetStrTabn(spplban.Tabn, spplban.StrTabn)+' процент='+string(dProcent,0,2)
+//       +', pMnPlan='+string(pMnPlan)
+       +', pvPlan='+string(pvPlan)
+       +', pKatBank='+string(pKatBank)
+       );
+
+    //------------------------
+    if pMnPlan=0 and pvPlan=0  continue;
+    if pKatBank=0 then continue;// Не нашли банк - пропускаем!
+    if Marker_vPlan_Count>0
+    { if not FoundMarker(Marker_vPlan,pvPlan) then continue;
+    }
+    //если банк одинаков,
+    //но есть заказ то берем только его
+    if pKatBank=sbban.CBANKPOL
+    { if pvPlan=0
+      { continue;
+      }
+    }
+    if round(SPPLBAN.SUMOPL*dProcent/100, Div_R_Round_Znak) <> round(SPPLBAN.SUMOPL*dProcent/100 + eps, Div_R_Round_Znak)
+      displ('Накопленная ошибка округления по ' + GetStrTabn(lschet.tabn,Lschet.StrTabn) + ' отнесена на реестр ' + SbBan.LastUser);
+    var sumToSet: double = SPPLBAN.SUMOPL*dProcent/100 + eps;
+    _SuSP:=round(sumToSet, Div_R_Round_Znak);
+    eps := sumToSet - _SuSP;
+    if _SuSPRasp+_SuSP>spplban.SUMOPL
+    { //сумму
+      displ('сумма процентов >100% с удержанной по '+GetStrTabn(lschet.tabn,Lschet.StrTabn)
+                     +' к переч. '+string(spplban.SUMOPL,0,2)+', удерж.'+string(_SuSPRasp,0,2));
+      _SuSP:=spplban.SUMOPL-_SuSPRasp;
+    }
+    _SuSPRasp:=_SuSPRasp+_SuSP;
+
+    if getfirst tmp_reestr <> tsOk
+    { wc_sbban:=sbban.nrec;
+      if getfirst fastfirstrow sbbandiv=0
+      {
+        var sNameVPlan: string = '';
+        if pvPlan <> 0
+          if getfirst vPlan = tsOK
+            sNameVPlan := vPlan.Name;
+
+        sbbandiv.nrec:=0;
+        sbbandiv.lastuser:=NomReestr;
+        //sbbandiv.CPOL    :=KatBank.cOrg;
+        //sbbandiv.CBANKPOL:=pKatBank;
+        sbbandiv.CPOL    :=sbban.CPOL;
+        sbbandiv.CBANKPOL:=sbban.CBANKPOL;
+        sbbandiv.Name    :=sbBan.Name + if(pvPlan <> 0, if(pvPlan <> cVPlanUnSubsidy, ', г/заказ ', ', ') + sNameVPlan, '');
+        insert current sbbandiv;
+        InsertMarker(MarkerNewSbBan,sbbandiv.nrec);
+        if pvPlan<>0
+          coSetAttrID(coSbBan,sbbandiv.nrec,ATTR_SB_vPlan,pvPlan,sNameVPlan);
+        NomReestr:=NextNumStr(NomReestr)
+      }
+      insert into tmp_reestr
+          set  tmp_reestr.name :=uder.param
+              ,tmp_reestr.summa:=_SuSP
+              ,tmp_reestr.csbban:=sbbandiv.nrec
+              ,tmp_reestr.cKatBank:=pKatBank
+              ,tmp_reestr.cVplan  :=pvPlan
+              ,tmp_reestr.cSbBanMain := SbBan.NRec
+          ;
+    } //if getfirst tmp_reestr<>0
+    else
+    { update current tmp_reestr set
+            tmp_reestr.summa:=tmp_reestr.summa+_SuSP ;
+    }
+
+    var _wsu:double;
+    _wsu:=round(spplban.SUMMA0*_SuSP/spplban.SUMOPL,Div_R_Round_Znak);
+    MyLog(' dProcent ='+string(dProcent)+', _SuSP='+string(_SuSP)
+                   +', spplban.SUMOPL='+string(spplban.SUMOPL,0,2) );
+    if getfirst tmp_reestrsp where ((tmp_reestr.csbban == tmp_reestrsp.csbban
+                                     and  spplban.nrec == tmp_reestrsp.cSppLBan
+                                           and  pwType == tmp_reestrsp.wType
+                                   )) <> tsok
+                {
+                  insert tmp_reestrsp set
+                      tmp_reestrsp.csbban       := tmp_reestr.csbban
+                    , tmp_reestrsp.summa        := _SuSP
+                    , tmp_reestrsp.cSppLBan     := spplban.nrec
+                    , tmp_reestrsp.cSppLBan_new := if(kl_first_sp,spplban.nrec,0)
+                    , tmp_reestrsp.SUMNach      := _wsu
+                    , tmp_reestrsp.wType        := pwType
+                   ;
+                  MyLog(' insert tmp_reestrsp set            ');
+                  MyLog('         tmp_reestrsp.csbban        '+tmp_reestrsp.csbban        );
+                  MyLog('         tmp_reestrsp.summa         '+tmp_reestrsp.summa         );
+                  MyLog('         tmp_reestrsp.cSppLBan      '+tmp_reestrsp.cSppLBan      );
+                  MyLog('         tmp_reestrsp.cSppLBan_new  '+tmp_reestrsp.cSppLBan_new  );
+                  MyLog('         tmp_reestrsp.SUMNach       '+tmp_reestrsp.SUMNach       );
+                  MyLog('         tmp_reestrsp.wType         '+tmp_reestrsp.wType         );
+                }
+                else
+                {
+                  update current tmp_reestrsp set
+                     tmp_reestrsp.summa   := tmp_reestrsp.summa   + _SuSP //#3119
+                   , tmp_reestrsp.SUMNach := tmp_reestrsp.SUMNach + _wsu
+                  ;
+                  MyLog(' update current tmp_reestrsp set            ');
+                  MyLog('         tmp_reestrsp.csbban        '+tmp_reestrsp.csbban        );
+                  MyLog('         tmp_reestrsp.summa         '+tmp_reestrsp.summa         );
+                  MyLog('         tmp_reestrsp.cSppLBan      '+tmp_reestrsp.cSppLBan      );
+                  MyLog('         tmp_reestrsp.cSppLBan_new  '+tmp_reestrsp.cSppLBan_new  );
+                  MyLog('         tmp_reestrsp.SUMNach       '+tmp_reestrsp.SUMNach       );
+                  MyLog('         tmp_reestrsp.wType         '+tmp_reestrsp.wType         );
+
+                }
+    _SuNach:=_SuNach+_wsu; 
+    kl_first_sp:=false;
+    pMnPlan:=0;
+    dProcent:=0;
+    if _SuSPRasp>=spplban.SUMOPL break;
+
+  } while GetNextZakazProcent(wTp);
+  _SuSPRasp:=spplban.SUMOPL-_SuSPRasp;
+          insert tmp_reestrsp set
+              tmp_reestrsp.csbban       := SbBan.Nrec
+            , tmp_reestrsp.summa        := _SuSPRasp
+            , tmp_reestrsp.cSppLBan     := spplban.nrec
+            , tmp_reestrsp.cSppLBan_new := spplban.nrec
+            , tmp_reestrsp.SUMNach      := spplban.SUMMA0-_SuNach
+            , tmp_reestrsp.wType        := pwType
+         ;
+  update current spplban set
+       spplban.SUMOPL:=_SuSPRasp
+      ,spplban.SUMMA0:=spplban.SUMMA0-_SuNach
+      ;
+
+} //Procedure Div_ByRaspPersToZakaz;
+
+function GetNachislZakazKoefs(cSbBan: comp; mesN, yearN: word): boolean;
+{
+  Result := false;
+  var cANUns: comp = ExtAttr_ID(coMnPlan, 'Несубсидируемое');
+  mtClear(tntNachislZakazKoefs, mfNormal);
+  sql select 
+    tblResult.cLsch cLSch
+  , tblResult.percentUns "percent[0]"
+  , case when sumAllUns = 0 then 0.0 else tblResult.sum1 / tblResult.sumAllUns end "percent[1]"
+  , case when sumAllUns = 0 then 0.0 else tblResult.sum2 / tblResult.sumAllUns end "percent[2]"
+  , case when sumAllUns = 0 then 0.0 else tblResult.sum3 / tblResult.sumAllUns end "percent[3]"
+  , case when sumAllUns = 0 then 0.0 else tblResult.sum4 / tblResult.sumAllUns end "percent[4]"
+  from
+  (
+    select
+      allSums.cLsch
+    , sum(case when allSums.wType = 1 then allSums.sm else 0.0 end) / sum(allSums.sm) percentUns
+    , sum(case when allSums.wType = 0 and allSums.Schet = '20' then allSums.sm else 0.0 end)          sum1
+    , sum(case when allSums.wType = 0 and allSums.Schet in ('23', '25') then allSums.sm else 0.0 end) sum2
+    , sum(case when allSums.wType = 0 and allSums.Schet = '26' then allSums.sm else 0.0 end)          sum3
+    , sum(case when allSums.wType = 0 and allSums.Schet = '96' then allSums.sm else 0.0 end)          sum4
+    , sum(case when allSums.wType = 0 then allSums.sm else 0.0 end) sumAllUns
+    from
+    (
+      select
+        NachislZakaz.cLsch
+      , NachislZakaz.cSchetD Schet
+      , case when coalesce(AttrVal.vLongint, 0) = 1 then 1 else 0 end wType: word
+      , Sum(NachislZakaz.Summa) sm
+      from (select distinct cLsch from SpPlBan where SpPlBan.cSbBan = :(cSbBan)) SpPl
+      inner join NachislZakaz on SpPl.cLsch = NachislZakaz.cLsch and :(mesN) = NachislZakaz.MesN and :(yearN) = NachislZakaz.YearN
+      left join AttrVal on 11027 = AttrVal.wTable and NachislZakaz.cKauD[1] = AttrVal.cRec and :(cANUns) = AttrVal.cAttrNam
+      inner join KlVidOpl on NachislZakaz.VidOpls = KlVidOpl.VidOpl and KlVidOpl.NAlg <> 98 and KlVidOpl.cSchetD <> '91' and KlVidOpl.cSchetD <> '44' and KlVidOpl.cSchetD <> '69' and KlVidOpl.cSchetD <> '76'
+      group by
+        NachislZakaz.cLsch
+      , NachislZakaz.cSchetD
+      , case when coalesce(AttrVal.vLongint, 0) = 1 then 1 else 0 end
+    ) allSums
+    group by allSums.cLsch
+  ) tblResult
+  where tblResult.percentUns > 0 or tblResult.sum1 > 0 or tblResult.sum2 > 0 or tblResult.sum3 > 0
+  into tNachislZakazKoefs ByName
+  ;
+  Result := true;
+}
+
+function RecalcNewSbBan(cSbBan: comp): boolean;
+{
+  Result := false;
+  if cSbBan = 0
+    exit;
+  if getfirst sbbandiv where ((cSbBan == sbbandiv.NRec)) <> tsOK
+    exit;
+  _loop spplbandiv where ((sbbandiv.NRec == spplbandiv.cSbBan))
+  {
+    _loop zaroperdiv where ((coSpPlBan == zaroperdiv.PrizPr and spplbandiv.NRec == zaroperdiv.cPlPor))
+    {
+      spplbandiv.SumOpl += zaroperdiv.Summa;
+    }
+    spplbandiv.SumOpl := round(spplbandiv.SumOpl, Div_R_Round_Znak);
+    sbbandiv.Summa += spplbandiv.SumOpl;
+    update current spplbandiv;
+  }
+  sbbandiv.Summa := round(sbbandiv.Summa, Div_R_Round_Znak);
+  update current sbbandiv;
+  Result := true;
+}
+
+function DivReestrByNachislZakaz(marker: TPtr): boolean;
+var iSbBan, j, wType: longint;
+    cSbBan, cSpPlBan: array[0..3] of comp;
+    SpPlBanSum: array[0..3] of double;
+    bufZarOper: Type$ZarOper;
+    bufSpPlBan: Type$SpPlBan;
+{
+  Result := false;
+  MyLog('DivReestrByNachislZakaz Start');
+  sVPlan[0] := 'Несубсидируемое';
+  sVPlan[1] := '0100 001';
+  sVPlan[2] := '0888 001';
+  sVPlan[3] := '0888 013';
+  for (j := 0; j <= 3; j++)
+    if getfirst vPlan where ((sVPlan[j] == vPlan.Name)) = tsOk
+      cVPlan[j] := vPlan.NRec;
+
+  for (iSbBan := 0; iSbBan < GetMarkerCount(marker); iSbBan++)
+  {
+    if not GetMarker(Marker, iSbBan, Item)
+      continue;
+    if getfirst sbban <> tsOk
+      continue;
+    MyLog('DivReestrByNachislZakaz sbban: ' + SbBan.LastUser);
+    if getfirst nplat = tsOK
+      if word(nplat.kodplat) > 1 
+        continue; // 20200729 Лапушков по задаче Бабича: если код платежа больше 1 то не делить реестр
+
+    for (j := 0; j <= 3; j++)
+      cSbBan[j] := 0;
+    var dt: date = if(bbAvans, Sub_Months(SbBan.DataN, 1), SbBan.DataN);
+    GetNachislZakazKoefs(SbBan.NRec, Month(dt), Year(dt));
+    MyLog('DivReestrByNachislZakaz GetNachislZakazKoefs');
+
+    _Loop fullcache spplban
+    {
+      if Substr(KatPodr.Kod, 1, 3) = '446' or Substr(KatPodr.Kod, 1, 3) = '957'
+        continue;
+      if getfirst tNachislZakazKoefs where ((SpPlBan.cLsch == tNachislZakazKoefs.cLsch)) <> tsOk
+        continue;
+      MyLog(SpPlBan.StrTabN + ': ' + tNachislZakazKoefs.percent[0] + ';' + tNachislZakazKoefs.percent[1] + ';' + tNachislZakazKoefs.percent[2] + ';' + tNachislZakazKoefs.percent[3] + ';' + tNachislZakazKoefs.percent[4]);
+      
+      bufSpPlBan := SpPlBan.Buffer;
+      for (j := 0; j <= 3; j++)
+      {
+        cSpPlBan[j] := 0;
+        SpPlBanSum[j] := 0;
+      }
+
+      _loop fullcache ZarOper where ((coSpPlBan == ZarOper.PrizPr and SpPlBan.NRec == ZarOper.cPlPor))
+      {
+        if getfirst KlVidOpl where ((ZarOper.FilialNo == KlVidOpl.VidOpl)) = tsOK
+          if KlVidOpl.cSchetD = '91' or KlVidOpl.cSchetD = '44' or KlVidOpl.cSchetD = '69' or KlVidOpl.cSchetD = '76'
+            continue;
+          if KlVidOpl.VidOplP = 78 or KlVidOpl.VidOplP = 79 or KlVidOpl.VidOplP = 80
+          or KlVidOpl.VidOplP = 81 or KlVidOpl.VidOplP = 83 or KlVidOpl.VidOplP = 84
+          or KlVidOpl.VidOplP = 95 or KlVidOpl.VidOplP = 97 or KlVidOpl.VidOplP = 102
+            continue;
+
+        bufZarOper := ZarOper.Buffer;
+        for (wType := 0; wType <= 3; wType++)
+        {
+          if tNachislZakazKoefs.percent[wType] = 0
+            continue;
+          if ZarOper.Summa <= 0
+            continue;
+          var koef: double = tNachislZakazKoefs.percent[wType] + if(wType = 0, 0, tNachislZakazKoefs.percent[wType] * tNachislZakazKoefs.percent[4] / (tNachislZakazKoefs.percent[1] + tNachislZakazKoefs.percent[2] + tNachislZakazKoefs.percent[3]));
+          MyLog(wType + ': ' + koef);
+          if koef <= 0
+            continue;
+          
+          if cSbBan[wType] = 0
+          {
+            sbbandiv.Buffer := SbBan.Buffer;
+            sbbandiv.NRec     := 0;
+            sbbandiv.LastUser := NomReestr;
+            sbbandiv.Name     := sbBan.Name + ', ' + sVPlan[wType];
+            sbbandiv.Summa    := 0;
+            insert current sbbandiv;
+            InsertMarker(MarkerNewSbBan, sbbandiv.NRec);//???
+            coSetAttrID(coSbBan, sbbandiv.nrec, ATTR_SB_vPlan, cVPlan[wType], sVPlan[wType]);
+            NomReestr := NextNumStr(NomReestr);//???
+            cSbBan[wType] := sbbandiv.nrec;
+          }
+
+          if cSpPlBan[wType] = 0
+          {
+            spplbandiv.buffer := bufSpPlBan;
+            spplbandiv.nrec := 0;
+            spplbandiv.cSbBan := cSbBan[wType];
+            spplbandiv.SumOpl :=0;
+            spplbandiv.SumUd :=0;
+            spplbandiv.Summa0 :=0;
+            insert current spplbandiv;
+            cSpPlBan[wType] := spplbandiv.nrec;
+          }
+          
+          zaroperdiv.Buffer := bufZarOper;
+          zaroperdiv.NRec     := 0;
+          zaroperdiv.cPlPor   := cSpPlBan[wType];
+          zaroperdiv.Summa    := bufZarOper.Summa    * koef;
+          zaroperdiv.Proc     := bufZarOper.Proc     * koef;
+          zaroperdiv.SummaVkl := bufZarOper.SummaVkl * koef;
+          zaroperdiv.SumAlim  := bufZarOper.SumAlim  * koef;
+
+          if zaroperdiv.Summa > ZarOper.Summa  zaroperdiv.Summa := ZarOper.Summa ;
+          if zaroperdiv.Summa > SpPlBan.SumOpl zaroperdiv.Summa := SpPlBan.SumOpl;
+          if zaroperdiv.Summa > SbBan.Summa    zaroperdiv.Summa := SbBan.Summa   ;
+
+          if zaroperdiv.Proc     > ZarOper.Proc     zaroperdiv.Proc     := ZarOper.Proc    ;
+          if zaroperdiv.SummaVkl > ZarOper.SummaVkl zaroperdiv.SummaVkl := ZarOper.SummaVkl;
+          if zaroperdiv.SumAlim  > ZarOper.SumAlim  zaroperdiv.SumAlim  := ZarOper.SumAlim ;
+
+          if zaroperdiv.Summa = 0
+            continue;
+          insert current zaroperdiv;
+          MyLog('inserted: ' + zaroperdiv.Summa);
+          
+          SpPlBanSum[wType] += zaroperdiv.Summa;
+
+          zaroper.Summa    -= zaroperdiv.Summa   ;
+          zaroper.Proc     -= zaroperdiv.Proc    ;
+          zaroper.SummaVkl -= zaroperdiv.SummaVkl;
+          zaroper.SumAlim  -= zaroperdiv.SumAlim ;
+
+          SpPlBan.SumOpl -= zaroperdiv.Summa;
+          SbBan.Summa -= zaroperdiv.Summa;
+
+          if wType = 0 //Для несубсидируемых - процент от всей суммы, для остальных - за минусом несубсидируемых
+            bufZarOper := ZarOper.Buffer;
+        }
+        if abs(zaroper.Summa) < 0.000001
+          delete zaroperdiv where ((ZarOper.NRec == zaroperdiv.nrec));
+        else
+          update current zaroper;
+      }//_loop ZarOper
+      
+      var delta: double = 0;
+      if round(SpPlBan.SumOpl, Div_R_Round_Znak) = 0
+        delete spplbandiv where ((SpPlBan.NRec == spplbandiv.NRec));
+      else
+      {
+        if getlast ZarOper where ((coSpPlBan == ZarOper.PrizPr and SpPlBan.NRec == ZarOper.cPlPor)) = tsOk
+        {
+          delta := round(SpPlBan.SumOpl, Div_R_Round_Znak) - SpPlBan.SumOpl;
+          ZarOper.Summa += delta;
+          update current ZarOper;
+          SpPlBan.SumOpl += delta;
+          SbBan.Summa += delta;
+        }
+        SpPlBan.SumOpl := round(SpPlBan.SumOpl, Div_R_Round_Znak);
+        update current SpPlBan;
+      }   
+      for (j := 0; j <= 3; j++)
+        if cSpPlBan[j] <> 0
+          if getfirst spplbandiv where ((cSpPlBan[j] == spplbandiv.NRec)) = tsOk
+            if getlast ZarOper where ((coSpPlBan == ZarOper.PrizPr and spplbandiv.NRec == ZarOper.cPlPor)) = tsOk
+            {
+              MyLog('delta: ' + string(ZarOper.Summa, 0, 8) + ' += ' + round(SpPlBanSum[j], Div_R_Round_Znak) + ' - ' + string(SpPlBanSum[j], 0, 8));
+              SpPlBanSum[j] -= delta;
+              ZarOper.Summa -= delta;
+              delta := round(SpPlBanSum[j], Div_R_Round_Znak) - SpPlBanSum[j];
+              ZarOper.Summa += delta;
+              update current ZarOper;
+            }
+
+    } //_loop SpPlBan
+    if round(SbBan.Summa, Div_R_Round_Znak) = 0
+      delete current SbBan;
+    else
+    {
+      SbBan.Summa := round(SbBan.Summa, Div_R_Round_Znak);
+      update current SbBan;
+    }
+    MyLog('DivReestrByNachislZakaz RecalcNewSbBan');
+    for (j := 0; j <= 3; j++)
+      RecalcNewSbBan(cSbBan[j]);
+  } //for SbBan
+  MyLog('DivReestrByNachislZakaz end');
+  Result := true;
+}
+//---------------------------------------
+// Получить тип распределения
+//---------------------------------------
+Function GetType_Div2:word;
+{ Result:=0;
+
+ if getfirst GP_RASPAVANS=tsok // после 20210422 все должно быть исключительно в GP_RASPAVANS
+  { MyLog(' тип 1(процент в авансах) ');
+    Result:=1;
+  }
+  else if getfirst prnaryad=tsok
+  { MyLog(' тип 2(процент в нарядах) ');
+    Result:=2
+  }
+  else if getfirst prvidopl=tsok
+  { MyLog(' тип 3(процент в табеле) ');
+          //LoadWorkingTable(pLschet, Month(dtb_p), year(dtb_p));
+          //ActualHours := WT_GetHours(hkPaid, stActual);
+    MyLog(' тип 3(процент в табеле) '+string(ActualHours,0,4));
+    Result:=3;
+  }
+} //Functiob GetType_Div(_pLsch:comp):word;
+
+//===========================================
+// Делить реестры
+//===========================================
+
+Function DivReestr(_Marker:longint):boolean;
+var _count, _count_all:longint;
+    _boNeed:boolean;
+    minSumSb: double;
+{ 
+  if getfirst vPlan where (('Несубсидируемое' == vPlan.Name)) = tsOK
+    cVPlanUnSubsidy := vPlan.NRec;
+  UP_ZAR_ZU_DFLAG7 :=wGetTune('UP.ZAR.ZU.DFLAG7');
+  FIN_USER_CPLANSSCH:=coGetTune('FIN.USER.CPLANSSCH');
+  minSumSb:=doGetTune('NPOEM_OWN.ZP.COMREESTRMINSUM');
+  Marker:=_Marker;
+  Mrkcount:=GetMarkerCount(Marker);
+  //logstrtofile('\\dep968-terminal\User_disk\Galaktika\WorkFolder\ERPDB_STEND\Aleksey.Kurennykh\logsbban.log', 'Function DivReestr(_Marker:longint):boolean;');
+  //logstrtofile('\\dep968-terminal\User_disk\Galaktika\WorkFolder\ERPDB_STEND\Aleksey.Kurennykh\logsbban.log', '----------------------------------------------------------');
+  InitWorkingTable ;
+
+  MyLog('LoadInterface Start');
+  MyLog('Отобрано '+string(Mrkcount)+' реестров');
+  MyLog('Установлен фильтр по заказам, отобрано '+String(GetMarkerCount(Marker_vPlan)));
+  _count:=0; _count_all:=Mrkcount;
+  for(i:=0;i<Mrkcount;i:=i+1)
+  { NextVisual;
+    if not GetMarker(Marker, i, Item) then continue;
+    SQL
+      select count(*) from spPlBan
+      where spPlBan.cSbBan=:(Item)
+      into (_count);
+    _count_All+=_count;
+  }
+  ClearFuncCache;
+  //StartNewVisual(vtNumericVisual,vfTimer,'Деление реестров', 0);
+  StartNewVisual(vtIndicatorVisual,vfTimer,'Деление реестров', _count_all);
+  //определим рабочий период
+  PeriodBeginning:=dgettune('UP.DATOTCH');
+  wyear:=year(PeriodBeginning);
+  wmesn:=month(PeriodBeginning);
+
+  dtb:=date(1,1,wyear) ; dte:=date(31,12,wyear);
+
+  NomReestr:=GetLastNumSBban;
+  ATTR_KATBANK :=ExtAttr_CreateComp(coVPLAN,'Банковские счета', cgAttrType_Comp, word(0), cgKau_KatBank );
+  ATTR_SB_VPLAN:=ExtAttr_CreateComp(coSBBAN,'Группа заказов', cgAttrType_Comp, word(100), coVPlan );
+  for(i:=0;i<Mrkcount;i:=i+1)
+  { NextVisual;
+    if not GetMarker(Marker, i, Item) then continue;
+    if getfirst sbban<>0 then continue;
+    if getfirst nplat = tsOK
+     {
+       if word(nplat.kodplat) > 1 then continue; // 20200729 Лапушков по задаче Бабича: если код платежа больше 1 то не делить реестр
+     }
+    //поскольку оригинальный реестр должен содержать остаток - всегда false
+    //kl_first:=true;
+    kl_first:=false;
+    delete all tmp_reestr01;
+    delete all tmp_reestrsp;
+    // накопим суммы  разбивке
+    _SuSb:=0;
+    //--------------------------------------------------------
+    mylog('SBBAN.PREFIX = ' + SBBAN.PREFIX);
+    // Авансы
+    if bbAvans
+    { dtb_p := Date(15,month(SBBAN.DATOK),year(SBBAN.DATOK));
+      dte_p := dtb_p;
+    }
+    else
+    { dtb_p := Date(Last_day(SBBAN.DATAN),month(SBBAN.DATAN),year(SBBAN.DATAN));
+      dte_p := dtb_p;
+    }
+    _boNeed:=false;
+    Div_R_Round_Znak:=0;
+    if SBBAN.PREFIX='S$' // страховые
+      Div_R_Round_Znak:=2;
+
+    _Loop fullcache spplban
+    {
+      pLschet:=spplban.cLsch;
+      if getfirst Lschet=tsok {}
+      //поскольку оригинальный реестр должен содержать остаток - всегда false
+      //kl_first_sp:=true;
+      kl_first_sp:=false;
+      NextVisual;
+      _SuNach:=0;
+      //--------------------------------------------------------
+      // Авансы
+      if bbAvans
+      { //dtb_p:=Date(15,month(SBBAN.DATOK),year(SBBAN.DATOK));
+        //dte_p:=dtb_p;
+        if (SBBAN.PREFIX !='R$A')
+        {
+          SBBAN.PREFIX :='R$A';
+          update current SBBAN;//20241217 Семичев по задаче от Бабича - если реестр делаем авансовый, то и префикс ему ставим авансовый
+        }
+        _boNeed:=True;
+        Div_ByRaspPersToZakaz(0);
+      } //if SBBAN.PREFIX='R$A'
+      else
+      {
+        //------------------------------------
+        if SBBAN.PREFIX='R$Z' // Зарплата
+        or SBBAN.PREFIX='S$' // Налоги на ФОТ
+        { //dtb_p:=Date(Last_day(SBBAN.DATOK),month(SBBAN.DATOK),year(SBBAN.DATOK));
+          //dtb_p:=Date(Last_day(SBBAN.DATAN),month(SBBAN.DATAN),year(SBBAN.DATAN));
+          //dte_p:=dtb_p;
+          type_div :=GetType_Div2;
+          if type_div<>0
+          { _boNeed:=True;
+          }
+          MyLog(' Зарплата '+spplban.Fio+','+string(type_div));
+          if type_div=1//getfirst GP_RASPAVANS=tsok
+          { MyLog(' тип 1(процент в авансах) ');
+            Div_ByRaspPersToZakaz(0);
+          }
+          else if type_div=2//if getfirst prnaryad=tsok
+          { MyLog(' тип 2(процент в нарядах) ');
+            Div_ByRaspPersToZakaz(2);
+          }
+          else if type_div=3//getfirst prvidopl=tsok
+          { MyLog(' тип 3(процент в табеле) ');
+            //LoadWorkingTable(pLschet, Month(dtb_p), year(dtb_p));
+            //ActualHours := WT_GetHours(hkPaid, stActual);
+            //MyLog(' тип 3(процент в табеле) '+string(ActualHours,0,4));
+            Div_ByRaspPersToZakaz(1);
+          }
+          /* Отключим
+          else
+          { MyLog(' тип 4(nachislzakaz) ');
+            Div_ByNachisl;
+          }
+          */
+          /* Вариант до 01.01.2018
+          Case type_div of
+          1: Div_ByRaspPersToZakaz(0);
+          2,3:
+          { LoadWorkingTable(Lschet.Nrec, Month(dtb_p), year(dtb_p));
+            ActualHours := WT_GetHours(hkWorking, stActual);
+            Div_ByRaspPersToZakaz(1);
+          }
+          end;
+          */
+        } //if SBBAN.PREFIX='R$Z'
+      }
+
+      _SuSb:=_SuSb+spplban.SumOPL;
+    } //spplban
+    if not _boNeed continue;
+    update current sbban set sbban.Summa:=_SuSb;
+    MyLog('Обновили информацию по реестру '+SBBAN.LASTUSER+', Сумма='+String(sbban.Summa,0,2));
+    insert into tmp_reestr
+          set  tmp_reestr.name :=SBBAN.NAME
+              ,tmp_reestr.summa:=_SuSB
+              ,tmp_reestr.csbban  :=sbban.nrec
+              ,tmp_reestr.cKatBank:=SBBAN.cBankPol
+              ;
+    
+    if _SuSb < minSumSb
+    {
+      MyLog('Сумма реестра меньше минимальной ('+String(minSumSb,0,2) + '). Переносим его в самый крупный ГОЗ');
+      _loop SpPlBan
+      {
+        if SpPlBan.SumOpl < 0.001
+          continue;
+
+        _loop backward tmp_reestr where ((0 == tmp_reestr.wType and sbban.nrec == tmp_reestr.cSbBanMain)) ordered by tmp_reestr.summa
+        {
+          //0 - накладные, 1 - прямые  == tmp_reestrsp.wType
+          if getfirst tmp_reestrsp where ((tmp_reestr.csbban == tmp_reestrsp.csbban and spplban.nrec == tmp_reestrsp.cSppLBan)) = tsok
+          {
+            update current tmp_reestrsp set
+                tmp_reestrsp.summa   := tmp_reestrsp.summa   + SpPlBan.SumOpl
+              , tmp_reestrsp.SUMNach := tmp_reestrsp.SUMNach + SpPlBan.Summa0
+            ;
+            update current tmp_reestr set tmp_reestr.summa := tmp_reestr.summa + SpPlBan.SumOpl;
+            
+            update tmp_reestrsp where ((SpPlBan.NRec == tmp_reestrsp.cSppLBan_new)) set tmp_reestrsp.summa := 0, tmp_reestrsp.SUMNach := 0;
+            update tmp_reestr where ((SbBan.NRec == tmp_reestr.csbban)) set tmp_reestr.summa := tmp_reestr.summa - SpPlBan.SumOpl;
+            break;
+          }
+        }
+      }
+    }
+
+    //--------------------------------------------------------
+    // перераспределим реестры
+    _loop tmp_reestrsp
+    { wc_spplban:=tmp_reestrsp.cSppLBan;
+      wc_sbban  :=tmp_reestrsp.csbban;
+
+      if getfirst SBBANDIV=0 {}
+      if getfirst SPPLBANDIV=0
+      { if tmp_reestrsp.cSppLBan_new=0
+        { spplbandiv.nrec:=0;
+          insert current spplbandiv;
+          mylog('insert current spplbandiv;');
+          mylog(' current buffer tmp_reestrsp');
+          mylog('              csbban       =' + tmp_reestrsp.csbban);
+          mylog('              summa        =' + tmp_reestrsp.summa);
+          mylog('              SUMNach      =' + tmp_reestrsp.SUMNach);
+          mylog('              cSppLBan     =' + tmp_reestrsp.cSppLBan);
+          mylog('              cSppLBan_new =' + tmp_reestrsp.cSppLBan_new);
+          mylog('              cLsch        =' + tmp_reestrsp.cLsch       );
+          mylog('              wType        =' + tmp_reestrsp.wType       );
+
+
+          dosetattr(coSpplBan,spplbandiv.nrec,coAttrSpplBan_wtype_Zatraty,tmp_reestrsp.wtype);
+
+          delete all tmp_zarOper;
+          var _wc_spplban:comp=wc_spplban;
+          SQL select ZarOper.* from Zaroper
+          where ZAROPER.CPLPOR=:(_wc_spplban)
+          and ZAROPER.PRIZPR= 16061 //coSPPLBAN
+          into  tmp_zarOper ;
+          kl_first:=true;
+          wc_zaroper_first:=0;
+          _SuSP:=0;_SuSP1:=0;
+          _Loop tmp_zarOper
+          { _SuSP1:=_SuSP1+tmp_zaroper.summa;
+          }
+          _Loop tmp_zarOper
+          {  _SuSP:=_SuSP+round(tmp_reestrsp.summa*tmp_Zaroper.Summa/_SuSP1,Div_R_Round_Znak);
+          }
+          // запишем сумму
+
+          _loop fullcache tmp_zaroper
+          // where (( tmp_reestrsp.cSppLBan == ZAROPER.CPLPOR
+          // and coSPPLBAN == ZAROPER.PRIZPR(noindex)
+          //))
+          { wc_zaroper:=tmp_Zaroper.Nrec;
+            if getfirst ZaroperDiv<>0 continue;
+            if getfirst Zaroper where (( wc_zaroper == Zaroper.Nrec )) <>tsok then continue;
+            ZaroperDiv.Nrec:=0;
+            ZaroperDiv.Summa:=round(tmp_reestrsp.summa*Zaroper.Summa/_SuSP1,Div_R_Round_Znak);
+            ZaroperDiv.sumalim:=round(tmp_reestrsp.summa*Zaroper.sumalim/_SuSP1,Div_R_Round_Znak);
+            ZaroperDiv.CPLPOR:=SPPLBANDIV.NREC;
+            if kl_first //погрешность запишем на первую запись
+            { ZaroperDiv.Summa:=ZaroperDiv.Summa+tmp_reestrsp.summa-_SuSP;
+              kl_first:=False;
+            }
+            if Zaroper.Summa>0
+            {  ZaroperDiv.PROC :=Zaroper.PROC*ZaroperDiv.Summa/Zaroper.Summa;
+               ZaroperDiv.SUMMAVKL:=Zaroper.SUMMAVKL*ZaroperDiv.Summa/Zaroper.Summa;
+            }
+            if (insert current ZaroperDiv) <>tsok
+            { timelog(' ERR INS  '+String(ZaroperDiv.Summa,0,2));
+            }
+            else
+            { timelog(' SUC INS  '+String(ZaroperDiv.Summa,0,2)+', '+string(ZaroperDiv.Nrec,0,0));
+            }
+            //надо исправить первоначальный
+            if (update current Zaroper set
+              Zaroper.Summa:=Zaroper.Summa - ZaroperDiv.Summa
+             ,Zaroper.PROC :=Zaroper.PROC  - ZaroperDiv.PROC
+             ,Zaroper.SUMMAVKL :=Zaroper.SUMMAVKL -ZaroperDiv.SUMMAVKL
+             ,Zaroper.sumalim  :=Zaroper.sumalim - ZaroperDiv.sumalim
+             )  <>tsok
+            { timelog(' ERR UPD  '+String(Zaroper.Summa,0,2));
+            }
+            else
+            { timelog(' SUC UPD  '+String(Zaroper.Summa,0,2)+', '+string(Zaroper.Nrec,0,0));
+            }
+
+          } //_loop fullcache tmp_zaroper
+        } //if tmp_reestrsp.cSppLBan_new=0
+        update current spplbandiv set
+               spplbandiv.sumud:=tmp_reestrsp.summa
+              ,SPPLBANDIV.SUMOPL:=tmp_reestrsp.summa
+              ,spplbandiv.csbban:=tmp_reestrsp.csbban
+              ,spplbandiv.SUMMA0:=tmp_reestrsp.SUMNach
+              ;
+      }
+    } //_loop tmp_reestrsp
+
+    // подправим оставшийся zaroper на старом реестре
+    _loop tmp_reestrsp where ( tmp_reestrsp.cSppLBan_new>0)
+    { wc_spplban:=tmp_reestrsp.cSppLBan;
+      wc_sbban  :=tmp_reestrsp.csbban;
+      if getfirst SBBANDIV=0 {}
+      if getfirst SPPLBANDIV=0 {}
+      _SuSP:=0; _SuSP1:=0;
+      // сначала соберем все
+      _loop fullcache zaroper where (( tmp_reestrsp.cSppLBan == ZAROPER.CPLPOR
+             and coSPPLBAN == ZAROPER.PRIZPR(noindex)
+            ))
+      {  _SuSP1:=_SuSP1+Zaroper.Summa;
+      }
+      // подсчитаем округленную сумму
+      _loop fullcache zaroper where ((  tmp_reestrsp.cSppLBan == ZAROPER.CPLPOR
+           and coSPPLBAN == ZAROPER.PRIZPR(noindex)
+         ))
+      { _SuSP:=_SuSP+round(SPPLBANDIV.SUMOPL*Zaroper.Summa/_SuSP1,Div_R_Round_Znak);
+
+      }
+      kl_first:=True;
+      // запишем сумму
+      _loop fullcache zaroper where (( tmp_reestrsp.cSppLBan == ZAROPER.CPLPOR
+             and coSPPLBAN == ZAROPER.PRIZPR(noindex)
+         ))
+      { Zaroper.Summa:=round(SPPLBANDIV.SUMOPL*Zaroper.Summa/_SuSP1,Div_R_Round_Znak);
+        if kl_first //погрешность запишем на первую запись
+        { Zaroper.Summa:=Zaroper.Summa+SPPLBANDIV.SUMOPL-_SuSP;
+          kl_first:=False;
+        }
+        update current Zaroper;
+      }
+
+    } //_loop tmp_reestrsp where ( tmp_reestrsp.cSppLBan_new>0)
+
+    // поменяем сумму и наименования  полученных реестрах
+    wnom:=0;
+    _loop tmp_reestr01
+    { wc_sbban:=tmp_reestr01.csbban;
+      wnom:=wnom+1;
+      if getfirst sbbandiv=0
+      { update current sbbandiv set
+           sbbandiv.Summa:=tmp_reestr01.summa
+       //   ,sbbandiv.LASTUSER:=sbbandiv.LASTUSER+if(recordsintable(#tmp_reestr01)>1,'/'+string(wnom),'')
+        ;
+
+      }//if getfirst sbbandiv=0
+    } //_loop tmp_reestr01
+    //------------------
+    //Проверим старые реестры
+    if getfirst sbban<>0 then continue;
+    var _kl_need:boolean=false;
+    _Loop fullcache spplban
+    { if abs(spplban.SUMOPL)<0.001
+      { if delete ZarOper where ((spplban.Nrec == ZAROPER.CPLPOR
+             and coSPPLBAN == ZAROPER.PRIZPR
+             ))=tsok {}
+        //перекинем ссылки на реестры
+        if spplban.VidUd=220 //182 or spplban.VidUd=183 or spplban.VidUd=184
+        { if getfirst tmp_reestrsp where (( //spplban.cLsch == tmp_reestrsp.cLsch
+                spplban.Nrec == tmp_reestrsp.cSppLBan
+            and (tmp_reestrsp.cSppLBan_new>0) ))=0
+          { update uder where ((
+               spplban.cLsch == uder.cLsch
+            and tuSpplBan    == Uder.TypePaymentUd(noindex)
+            and spplban.Nrec == Uder.PaymentLinkUd(noindex)
+            and (182 = Uder.VidUdS or 183 = Uder.VidUdS or 184 = Uder.VidUdS)
+            )) set Uder.PaymentLinkUd:=tmp_reestrsp.cSppLBan_new;
+          }
+        } //if spplban.VidUd=182 or spplban.VidUd=183 or spplban.VidUd=184
+        delete current spplban;
+
+      }
+      else _kl_need:=true
+    } //_Loop SpPlBan
+    if not _kl_need
+    { delete current SBBan
+
+    }
+  } //for(i:=0;i<Mrkcount;i:=i+1)
+
+  if wWorkType = 4
+    DivReestrByNachislZakaz(Marker);
+
+  ShowErrors;
+  DoneWorkingTable ;
+
+  StopVisual('',0);
+
+
+  Result:=true;
+
+}//Function DivReestr(_Marker:longint):boolean;
+
+HandleEvent
+cmInit:
+{
+  if not(ReadMyDsk(wWorkType, 'GP_ZP_ReestrDiv_WorkType', true))
+    wWorkType := 3;
+  Div_R_Round_Znak:=0;
+  Marker_vPlan :=InitMarker('GP_ZP_ReestrDiv_vPlan'  , 8, 50, 10, True);
+  Marker_vPlan_Count:=GetMarkerCount(Marker_vPlan);
+  MarkerNewSbBan :=InitMarker(''  , 8, 50, 10, True);
+  DivReestr(Marker);
+  ClearMarker(Marker_vPlan);
+  DoneMarker (Marker_vPlan,'GP_ZP_ReestrDiv_vPlan');
+  DoneMarker(MarkerNewSbBan,'');
+
+} //cmInit:
+end;
+end.

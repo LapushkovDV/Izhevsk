@@ -1,0 +1,639 @@
+/* Контур/Модуль: Кадры/Зарплата                                                                   *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#195          |25/12/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+#Include GP_WorkTable.Vih
+//-----------------------------------------------------------------------------
+Interface GP_WorkTable '';
+//-----------------------------------------------------------------------------
+const //Z_Lschet::PerxodEdit.Vip
+  parPodr          = 1; // подразделение
+  parRejim         = 4; // режим
+  parPosition      = 5; // должность
+end;
+//-----------------------------------------------------------------------------
+Table Struct tmp_mask_day
+( cLschet:comp
+ ,Mesn   :word
+ ,YearN  :word
+ ,MaskDay:longint  "Маска дней"
+ ,Rejim : array[1..31] of word "Режимы"
+ ,DayStart: byte
+ ,DayEnd  : byte
+ ,cPodr  :comp
+ ,cPost  :comp
+)
+with index
+( tmp_mask_day01 = cLschet + Yearn+ MesN + cPodr+ cPost +DayStart+DayEnd
+);
+//-----------------------------------------------------------------------------
+Table Struct tmp_mask_rejim
+( cLschet:comp
+ ,Mesn   :word
+ ,YearN  :word
+ ,MaskDay:longint  "Маска дней"
+ ,cPodr  :comp
+ ,cPost  :comp
+ ,Rejim  :word
+ ,DayStart: byte
+ ,DayEnd  : byte
+)
+with index
+( tmp_mask_rejim01 = cLschet + Yearn+ MesN + cPodr+ cPost + Rejim
+);
+
+
+//================================
+var
+  CS: IContextSession; // для захвата прикладного контекста табеля
+//-----------------------------------------------------------------------------
+var
+ sLastError:string;
+ boTable:boolean;// признак наличия табеля
+ //-----------------------------
+ WT_Hanler_Filtr_Depart: Longint;// Для фильтрации табеля по подразделению
+ WT_PPodr_filter       : comp;
+ boLoadWT :boolean;//загрузка табеля
+
+
+Create view
+var
+  pLschet:comp; //ссылка на лицевой счет
+  pPodr  :comp; //ссылка на подразделение
+  pPost  :comp; //ссылка на должность
+  wMonth :word; //месяц расчета
+  wYear  :word; //год расчета
+  wMonth_Save:word;//месяц расчета
+  wYear_Save:word;//год расчета
+  dBeg :word;//дата начала периодв
+  dEnd :word;//дата окончания периодв
+  wDayStart: byte;
+  wDayEnd  : byte;
+as select lschet.nrec
+From
+   Lschet
+ , LsTab
+ , Perexod
+ , tmp_mask_day
+ , tmp_mask_rejim
+where
+((  pLschet == Lschet.Nrec
+// табель
+and pLschet == LsTab.cLschet
+and wYear   == LsTab.YearN
+and wMonth  == LsTab.MesN
+//---------------------
+/*
+and wRejim  == KLNDR.Rejim
+and wYear   == Klndr.YearK
+and wMonth  == Klndr.MonthK
+//---------------------
+and wRejim  == GP_KlndrExt.Rejim
+and wYear   == GP_KlndrExt.YearK
+and wMonth  == GP_KlndrExt.MonthK
+//----------------------
+and wRejim  == KlRejim.Rejim
+*/
+//---- переходы
+and pLschet == Perexod.CLSCH
+and dEnd>>=Perexod.DatIzm
+and (  (Perexod.Flags2 and 11001b)>0
+   and  ( Perexod.DATOK=ZeroDate
+        or Perexod.DATOK>=dBeg//GP_SCUD_Events.EnterDate
+       )
+   and (
+        (month(Perexod.DatIzm)=wMonth
+     and year(Perexod.DatIzm)=wYear
+        )
+        //если вдруг временный начался в прошлом месяце
+        or
+        (month(Perexod.DatOk)=wMonth
+     and year(Perexod.DatOk)=wYear
+        )
+     )
+  )
+//-------------------------------
+and pLschet == tmp_mask_day.cLschet
+and wYear   == tmp_mask_day.YearN
+and wMonth  == tmp_mask_day.MesN
+and pPodr   == tmp_mask_day.cPodr
+and pPost   == tmp_mask_day.cPost
+and wDayStart==tmp_mask_day.DayStart
+and wDayEnd  ==tmp_mask_day.DayEnd
+
+//-------------------------------
+and pLschet == tmp_mask_rejim.cLschet
+and wYear   == tmp_mask_rejim.YearN
+and wMonth  == tmp_mask_rejim.MesN
+and pPodr   == tmp_mask_rejim.cPodr
+and pPost   == tmp_mask_rejim.cPost
+));
+
+
+//-----------------------------------------------------------------------------
+// инициализация
+//-----------------------------------------------------------------------------
+Constructor Init;
+{ Result:=True;
+  InitGlobal;
+}
+//-----------------------------------------------------------------------------
+// освобождение
+//-----------------------------------------------------------------------------
+Destructor  Done;
+{
+
+}
+//-----------------------------------------------------------------------------
+// Общая инициализация
+//-----------------------------------------------------------------------------
+Function  InitGlobal      : boolean;
+{ Result:=true;
+  boTable:=false;
+  MTRetrieve(#tmp_Mask_day  ,mfFilters + mfClear);
+  MTRetrieve(#tmp_Mask_rejim,mfFilters + mfClear);
+}
+
+
+//-----------------------------------------------------------------------------
+// перечитать все
+//-----------------------------------------------------------------------------
+Procedure ReReadAllTables;
+{ ReReadREcord(#LsTab);
+  MTRetrieve(#tmp_Mask_day  ,mfFilters + mfClear);
+  MTRetrieve(#tmp_Mask_rejim,mfFilters + mfClear);
+  ClearFuncCache;
+}
+
+
+
+//-----------------------------------------------------------------------------
+// Получить последнюю ошибку
+//-----------------------------------------------------------------------------
+Function GetLastError : string;
+{ Result:=sLastError;
+} //Function GetLastError : string;
+
+//-------------------------------------------------
+// инициализировать табель
+//-------------------------------------------------
+Procedure Init_WT;
+{ if boLoadWT exit;
+  boLoadWT:=true;
+  var CL: ContextList;
+  WT_Hanler_Filtr_Depart:=0;
+  WT_PPodr_filter:=-9999;
+  if (not CL.Add(CS, 'WorkingTable'))
+  { abort;
+    exit;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Загрузить табель
+//-----------------------------------------------------------------------------
+Procedure Load_Wt(_pLschet:comp;_pPodr:comp);
+{ //без этого табельные функции не пашут.
+  Init_WT;
+  Loadworkingtable(_pLschet,wMonth,wYear);
+  // старый вариант  WT_AddDepartmentFilter(_PPodr)
+  if _PPodr=0 then exit;
+  if WT_PPodr_filter<>_PPodr
+  { WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+    if WT_Hanler_Filtr_Depart<>0
+    { DestroyDF(WT_Hanler_Filtr_Depart);
+    }
+    WT_Hanler_Filtr_Depart := CreateDepartmentDF(_PPodr); // создали фильтр
+    WT_PPodr_filter:=_PPodr;
+    WT_AddFilter(WT_Hanler_Filtr_Depart); // наложили фильтр
+  }
+} //Procedure Load_Wt(_pPodr:comp);
+
+
+
+//-----------------------------------------------------------------------------
+//Заполнить маску за период
+//-----------------------------------------------------------------------------
+Procedure Fill_tmp_mask_day_period(_pPodr_Flt:comp
+      ;_pPost_flt:comp
+      ;_pPodr:comp
+      ;_pPost:comp
+      ;_Rejim:word
+      ;iBeg:word
+      ;iEnd:word
+      );
+var
+    ii:word;
+    Mask, MaskAll:longint;
+    boFlt:boolean;
+{ Mask:=1;
+  boFlt:=True;
+  if _pPodr_Flt<>0
+  { if _pPodr_Flt<>_pPodr boFlt:=false;
+  }
+  if _pPost_Flt<>0
+  { if _pPost_Flt<>_pPost boFlt:=false;
+  }
+//-------------------------------
+  if not boFlt exit; //если не подходит под фильтр, то не берем
+//-------------------------------
+  MaskAll:=0;
+  For(ii:=iBeg;ii<=iEnd;ii++)
+  { tmp_mask_day.Rejim[ii]:=_Rejim;
+    MaskAll:=MaskAll+(Mask shl (ii-1));
+  }//For(ii:=iBeg;ii<=iEnd;ii++)
+  tmp_mask_day.MaskDay:=tmp_mask_day.MaskDay or MaskAll;
+  if getfirst tmp_mask_rejim where ((
+      pLschet == tmp_mask_rejim.cLschet
+  and wYear   == tmp_mask_rejim.YearN
+  and wMonth  == tmp_mask_rejim.MesN
+  and pPodr   == tmp_mask_rejim.cPodr
+  and pPost   == tmp_mask_rejim.cPost
+  and _Rejim  == tmp_mask_rejim.Rejim
+  ))<>tsok
+  { ClearBuffer(#tmp_mask_rejim);
+    tmp_mask_rejim.cLschet:=pLschet;
+    tmp_mask_rejim.YearN:=wYear;
+    tmp_mask_rejim.MesN :=wMonth;
+    tmp_mask_rejim.cPodr:=pPodr;
+    tmp_mask_rejim.cPost:=pPost;
+    tmp_mask_rejim.Rejim:=_Rejim;
+    tmp_mask_Rejim.MaskDay:=MaskAll;
+    insert current tmp_mask_rejim;
+  }
+  else
+  { update current tmp_mask_rejim set tmp_mask_Rejim.MaskDay:=tmp_mask_Rejim.MaskDay or MaskAll;
+
+  }
+} //Procedure Fill_tmp_mask_day(_pPodr_Flt:comp=0;_pPost_flt:comp=0;_pPodr:comp=0;_pPost:comp=0;_Rejim:word=0);
+
+Procedure Fill_tmp_mask_day(_pPodr:comp=0;_pPost:comp=0;
+   DayRangeStart: Byte=1;DayRangeEnd : Byte=31);
+var _podr:comp;
+    _post:comp;
+    _Rejim:word;
+    iBeg,iEnd:word;
+{ pPodr:=_pPodr;
+  pPost:=_pPost;
+  wDayStart:=DayRangeStart;
+  wDayEnd  :=DayRangeEnd;
+
+  if getfirst tmp_mask_day=tsok then exit;
+  clearbuffer(#tmp_mask_day);
+  tmp_mask_day.cLschet:=Plschet;
+  tmp_mask_day.cPodr:=_PPodr;
+  tmp_mask_day.cPost:=_pPost;
+  tmp_mask_day.DayStart:=DayRangeStart;
+  tmp_mask_day.DayEnd  :=DayRangeEnd;
+  if boTable
+  { _podr:=LSTAB.CEX;
+    _post:=LSTAB.CAPPOINT;
+    _Rejim:=LSTAB.Rejim;
+  }
+  else
+  { _podr:=Lschet.cex;
+    _post:=Lschet.CAPPOINT;
+    _Rejim:=Lschet.Rejim;
+  }
+  Fill_tmp_mask_day_period(_pPodr,_pPost,_podr,_post,_rejim,1,31);
+  if (RecordExists Perexod)=tsok
+  _Loop fullcache Perexod
+  { if Perexod.DatOk=ZeroDate
+    { iEnd:=DayRangeEnd;
+    }
+    else
+    if Perexod.DatOk>=DEnd
+    { iEnd:=DayRangeEnd;
+    }
+    else
+    { iEnd:=Day(Perexod.DatOk);
+    }
+    iBeg:=Day(Perexod.DatIzm);
+    if ibeg<wDayStart iBeg:=wDayStart;
+    if IsBitCTL(Perexod.FLAGS2,parPodr)    // 1; подразделение
+      _podr:=Perexod.cexp;
+    if IsBitCTL(Perexod.FLAGS2,parRejim)   // 4; режим
+      _rejim:=Perexod.rejim;
+    if IsBitCTL(Perexod.FLAGS2,parPosition)// 5; должность
+       _post:=Perexod.cAppoint;
+    Fill_tmp_mask_day_period(_pPodr,_pPost,_podr,_post,_rejim,iBeg,iEnd);
+  }
+  insert current tmp_mask_day;
+} //Procedure Fill_tmp_mask_day(_pPodr:comp=0;_pPost:comp=0);
+
+
+//------------------------------------------------------------------------------
+#doc
+ Установить позицию
+#end
+Function LoadTable(_pLschet:comp; _Month:word; _Year:word):boolean;
+{ Result:=false;
+  if pLschet<>_pLschet
+    pLschet:=_pLschet;
+  if wMonth <>_Month
+    wMonth :=_Month;
+  if wYear <>_Year
+    wYear  :=_Year;
+  boTable:=(getfirst Lstab=tsok);
+  if getfirst Lschet=tsok {}
+  Result:=boTable;
+} //Function LoadTable(_cLschet:comp; _Month:word; _Year:word):boolean;
+//------------------------------------------------------------------------------
+Function LoadTableByNrec(_cLsTab:comp):boolean;
+{ Result:=false;
+  boTable:=false;
+  if getfirst Lstab where (( _cLsTab == LsTab.Nrec ))=tsok
+    Result:=LoadTable(LstAb.cLschet,LsTab.Mesn,LsTab.yearn);
+}
+
+//------------------------------------------------------------------------------
+// Вызвать предварительно LoadTable
+//------------------------------------------------------------------------------
+Function GetHoursBwDaysEx (
+   HourKind            : Word
+  ;BeginningHour       : Double
+  ;MaxDailyHoursAmount : Double
+  ;ScheduleType        : Integer
+  ;DayRangeStart       : Byte
+  ;DayRangeEnd         : Byte
+  ;Flags               : LongInt
+  ;_pPodr:comp=0
+  ;_pPost:comp=0
+) : Double; Cacheable;
+var _Mask:longint;
+    _Month:word;
+    _Year:word;
+    _pLschet:comp;
+{
+  Result:=0;
+  _Mask :=tmp_mask_day.MaskDay;
+  _Month:=wMonth;
+  _Year :=wYear;
+  _pLschet:=pLschet;
+  case ScheduleType of
+  // Константа  Значение  Описание
+  stActual://  1  фактические данные (табель)
+  { case HourKind of
+    hkWorking://  1  рабочие часы
+    { if _pPodr=0 and _pPost=0 and DayRangeStart=1 and DayRangeEnd=31
+      { SQL Select Sum(LsTab.Chasf)
+        From Lstab where LsTab.cLschet=:(_pLschet)
+                      and LsTab.Yearn  =:(_Year)
+                      and LsTab.MesN   =:(_Month)
+        into (Result);
+      }
+      else
+      { SQL Select Sum(
+           CASE WHEN BITAND(:(_Mask),01        )=0 THEN 0.00 ELSE LSTAB.DAYCHF[01] END
+         + CASE WHEN BITAND(:(_Mask),02        )=0 THEN 0.00 ELSE LSTAB.DAYCHF[02] END
+         + CASE WHEN BITAND(:(_Mask),04        )=0 THEN 0.00 ELSE LSTAB.DAYCHF[03] END
+         + CASE WHEN BITAND(:(_Mask),08        )=0 THEN 0.00 ELSE LSTAB.DAYCHF[04] END
+         + CASE WHEN BITAND(:(_Mask),16        )=0 THEN 0.00 ELSE LSTAB.DAYCHF[05] END
+         + CASE WHEN BITAND(:(_Mask),32        )=0 THEN 0.00 ELSE LSTAB.DAYCHF[06] END
+         + CASE WHEN BITAND(:(_Mask),64        )=0 THEN 0.00 ELSE LSTAB.DAYCHF[07] END
+         + CASE WHEN BITAND(:(_Mask),128       )=0 THEN 0.00 ELSE LSTAB.DAYCHF[08] END
+         + CASE WHEN BITAND(:(_Mask),256       )=0 THEN 0.00 ELSE LSTAB.DAYCHF[09] END
+         + CASE WHEN BITAND(:(_Mask),512       )=0 THEN 0.00 ELSE LSTAB.DAYCHF[10] END
+         + CASE WHEN BITAND(:(_Mask),1024      )=0 THEN 0.00 ELSE LSTAB.DAYCHF[11] END
+         + CASE WHEN BITAND(:(_Mask),2048      )=0 THEN 0.00 ELSE LSTAB.DAYCHF[12] END
+         + CASE WHEN BITAND(:(_Mask),4096      )=0 THEN 0.00 ELSE LSTAB.DAYCHF[13] END
+         + CASE WHEN BITAND(:(_Mask),8192      )=0 THEN 0.00 ELSE LSTAB.DAYCHF[14] END
+         + CASE WHEN BITAND(:(_Mask),16384     )=0 THEN 0.00 ELSE LSTAB.DAYCHF[15] END
+         + CASE WHEN BITAND(:(_Mask),32768     )=0 THEN 0.00 ELSE LSTAB.DAYCHF[16] END
+         + CASE WHEN BITAND(:(_Mask),65536     )=0 THEN 0.00 ELSE LSTAB.DAYCHF[17] END
+         + CASE WHEN BITAND(:(_Mask),131072    )=0 THEN 0.00 ELSE LSTAB.DAYCHF[18] END
+         + CASE WHEN BITAND(:(_Mask),262144    )=0 THEN 0.00 ELSE LSTAB.DAYCHF[19] END
+         + CASE WHEN BITAND(:(_Mask),524288    )=0 THEN 0.00 ELSE LSTAB.DAYCHF[20] END
+         + CASE WHEN BITAND(:(_Mask),1048576   )=0 THEN 0.00 ELSE LSTAB.DAYCHF[21] END
+         + CASE WHEN BITAND(:(_Mask),2097152   )=0 THEN 0.00 ELSE LSTAB.DAYCHF[22] END
+         + CASE WHEN BITAND(:(_Mask),4194304   )=0 THEN 0.00 ELSE LSTAB.DAYCHF[23] END
+         + CASE WHEN BITAND(:(_Mask),8388608   )=0 THEN 0.00 ELSE LSTAB.DAYCHF[24] END
+         + CASE WHEN BITAND(:(_Mask),16777216  )=0 THEN 0.00 ELSE LSTAB.DAYCHF[25] END
+         + CASE WHEN BITAND(:(_Mask),33554432  )=0 THEN 0.00 ELSE LSTAB.DAYCHF[26] END
+         + CASE WHEN BITAND(:(_Mask),67108864  )=0 THEN 0.00 ELSE LSTAB.DAYCHF[27] END
+         + CASE WHEN BITAND(:(_Mask),134217728 )=0 THEN 0.00 ELSE LSTAB.DAYCHF[28] END
+         + CASE WHEN BITAND(:(_Mask),268435456 )=0 THEN 0.00 ELSE LSTAB.DAYCHF[29] END
+         + CASE WHEN BITAND(:(_Mask),536870912 )=0 THEN 0.00 ELSE LSTAB.DAYCHF[30] END
+         + CASE WHEN BITAND(:(_Mask),1073741824)=0 THEN 0.00 ELSE LSTAB.DAYCHF[31] END
+         )
+         From Lstab where LsTab.cLschet=:(_pLschet)
+                      and LsTab.Yearn  =:(_Year)
+                      and LsTab.MesN   =:(_Month)
+         into (Result);
+      }
+    } //if _pPodr=0 and _pPost=0
+    // по мере прописывания будем убирать
+    /*
+    hkHoliday://  4  часы работы в праздничные дни, кроме работы за отгул (сумма hkWorkingHoliday и hkWeekendHoliday )
+    { if _pPodr=0 and _pPost=0
+      { SQL Select Sum(LsTab.HOLIDAY)
+        From Lstab where LsTab.cLschet=:(_pLschet)
+                      and LsTab.Yearn  =:(_Year)
+                      and LsTab.MesN   =:(_Month)
+        into (Result);
+      }
+    }
+    */
+    /*
+    hkWeekend://  5  часы работы в выходные за оплату
+    {
+
+    }
+    hkOverwork://  6  сверхурочные
+    {
+
+    } */
+    /* по мере прописывания будем убирать
+    hkEvening://  2  часы работы вечером
+    {
+
+    } //hkEvening:
+    hkNight                      ://  3  часы работы ночью
+    hkOverworkRest               ://  7  остаток сверхурочных
+    hkWorkingForAvgEarnings      ://  10  рабочие часы с точки зрения расчета по среднему
+    hkAdvanceable                ://  11  часы, за которые можно выплатить аванс (рабочие часы в день, считающийся по плану рабочим, плюс часы не входящих в рабочие часы оплачиваемых отклонений, приходящихся на такой день)
+    hkPaid                       ://  12  оплачиваемые часы (рабочие часы плюс часы приходящегося на день оплачиваемого отклонения)
+    hkOverworkForPeriod          ://* 14  переработка за период
+    hkCarry                      ://  17  рабочие часы, переходящие на следующие сутки (не работает: всегда 0 )
+    hkTimeForSickListEnteringKind://  18  рабочие часы для расчета времени по больничному (учет входимости видов оплат)
+    hkWorkDayAvgTime             ://  20  средняя продолжительность рабочего дня, часов
+    hkWholeWorking               ://  21  все отработанные часы (без учета настроек "рабочие часы за вычетом...")
+    hkWorkingHoliday             ://  22  часы работы в рабочие по плану праздники
+    hkWeekendHoliday             ://  23  часы работы в нерабочие по плану праздники за оплату
+    hkAbsenceForValidReason      ://  24  часы отсутствия по уважительной причине
+    hkAppearance                 ://  25  часы явки
+    hkDecreasingStandardTime     ://  26  часы уменьшающих норму неявок
+    hkHarmfulConditions          ://* 27  часы отклонений с признаком "Условия работы" = "вредные"/"особо вредные" в условном обозначении (для Беларуси - "Вредные условия" = "да").
+    hkOverPlannedHoliday         ://  28  часы работы в праздник сверх плана
+    hkOrderedWeekendWork         ://  29  часы работы по приказу на работу в выходные
+    hkPaidOrderedWeekendWork     ://  30  оплачиваемые часы работы по приказу на работу в выходные
+    hkOrderedWeekendWorkForLeave ://  13  часы работы по приказу на работу в выходные/праздники за отгул (сумма hkWeekendForLeave и hkHolidayForLeave )
+    hkOrderedOvertimeWorkForLeave://  15  часы работы по приказу на сверхурочную работу за отгул
+    hkOvertimeWorkOrder          ://  31  часы работы по приказу на сверхурочную работу за оплату
+    */
+    else
+    { Load_Wt(_Plschet,_pPodr);
+      Result:=WT_GetHoursBwDaysEx (
+         HourKind
+        ,BeginningHour
+        ,MaxDailyHoursAmount
+        ,ScheduleType
+        ,DayRangeStart
+        ,DayRangeEnd
+        ,Flags
+        );
+    }
+    end;
+  } //stActual
+  stPlanned://  0  плановый график
+  { var _Rejim: word;
+    var _wsu:double;
+    _Loop tmp_mask_rejim
+    { _Rejim:=tmp_mask_rejim.Rejim;
+      _Mask :=tmp_mask_rejim.MaskDay;
+
+    SQL Select Sum(
+       CASE WHEN BITAND(:(_Mask),01        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[01]+KLNDR.DAYMIN[01]/60 END
+     + CASE WHEN BITAND(:(_Mask),02        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[02]+KLNDR.DAYMIN[02]/60 END
+     + CASE WHEN BITAND(:(_Mask),04        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[03]+KLNDR.DAYMIN[03]/60 END
+     + CASE WHEN BITAND(:(_Mask),08        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[04]+KLNDR.DAYMIN[04]/60 END
+     + CASE WHEN BITAND(:(_Mask),16        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[05]+KLNDR.DAYMIN[05]/60 END
+     + CASE WHEN BITAND(:(_Mask),32        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[06]+KLNDR.DAYMIN[06]/60 END
+     + CASE WHEN BITAND(:(_Mask),64        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[07]+KLNDR.DAYMIN[07]/60 END
+     + CASE WHEN BITAND(:(_Mask),128       )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[08]+KLNDR.DAYMIN[08]/60 END
+     + CASE WHEN BITAND(:(_Mask),256       )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[09]+KLNDR.DAYMIN[09]/60 END
+     + CASE WHEN BITAND(:(_Mask),512       )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[10]+KLNDR.DAYMIN[10]/60 END
+     + CASE WHEN BITAND(:(_Mask),1024      )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[11]+KLNDR.DAYMIN[11]/60 END
+     + CASE WHEN BITAND(:(_Mask),2048      )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[12]+KLNDR.DAYMIN[12]/60 END
+     + CASE WHEN BITAND(:(_Mask),4096      )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[13]+KLNDR.DAYMIN[13]/60 END
+     + CASE WHEN BITAND(:(_Mask),8192      )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[14]+KLNDR.DAYMIN[14]/60 END
+     + CASE WHEN BITAND(:(_Mask),16384     )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[15]+KLNDR.DAYMIN[15]/60 END
+     + CASE WHEN BITAND(:(_Mask),32768     )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[16]+KLNDR.DAYMIN[16]/60 END
+     + CASE WHEN BITAND(:(_Mask),65536     )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[17]+KLNDR.DAYMIN[17]/60 END
+     + CASE WHEN BITAND(:(_Mask),131072    )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[18]+KLNDR.DAYMIN[18]/60 END
+     + CASE WHEN BITAND(:(_Mask),262144    )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[19]+KLNDR.DAYMIN[19]/60 END
+     + CASE WHEN BITAND(:(_Mask),524288    )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[20]+KLNDR.DAYMIN[20]/60 END
+     + CASE WHEN BITAND(:(_Mask),1048576   )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[21]+KLNDR.DAYMIN[21]/60 END
+     + CASE WHEN BITAND(:(_Mask),2097152   )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[22]+KLNDR.DAYMIN[22]/60 END
+     + CASE WHEN BITAND(:(_Mask),4194304   )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[23]+KLNDR.DAYMIN[23]/60 END
+     + CASE WHEN BITAND(:(_Mask),8388608   )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[24]+KLNDR.DAYMIN[24]/60 END
+     + CASE WHEN BITAND(:(_Mask),16777216  )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[25]+KLNDR.DAYMIN[25]/60 END
+     + CASE WHEN BITAND(:(_Mask),33554432  )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[26]+KLNDR.DAYMIN[26]/60 END
+     + CASE WHEN BITAND(:(_Mask),67108864  )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[27]+KLNDR.DAYMIN[27]/60 END
+     + CASE WHEN BITAND(:(_Mask),134217728 )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[28]+KLNDR.DAYMIN[28]/60 END
+     + CASE WHEN BITAND(:(_Mask),268435456 )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[29]+KLNDR.DAYMIN[29]/60 END
+     + CASE WHEN BITAND(:(_Mask),536870912 )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[30]+KLNDR.DAYMIN[30]/60 END
+     + CASE WHEN BITAND(:(_Mask),1073741824)=0 THEN 0.00 ELSE KLNDR.DAYCHAS[31]+KLNDR.DAYMIN[31]/60 END
+     )
+     from klndr where klndr.YEARK = :(_Year)
+                 and klndr.MONTHK= :(_Month)
+                 and klndr.rejim = :(_Rejim)
+     into (_wsu);
+     Result+=_wsu;
+    } //_Loop tmp_mask_rejim
+  } //stPlanned:
+  stBalanced://  -1  балансный график
+  { var _Rejim: word;
+    var _wsu:double;
+    _Loop tmp_mask_rejim
+    { _Rejim:=tmp_mask_rejim.Rejim;
+      _Mask :=tmp_mask_rejim.MaskDay;
+
+    SQL Select Sum(
+       CASE WHEN BITAND(:(_Mask),01        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[01]+KLNDR.DAYMIN[01]/60 END
+     + CASE WHEN BITAND(:(_Mask),02        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[02]+KLNDR.DAYMIN[02]/60 END
+     + CASE WHEN BITAND(:(_Mask),04        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[03]+KLNDR.DAYMIN[03]/60 END
+     + CASE WHEN BITAND(:(_Mask),08        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[04]+KLNDR.DAYMIN[04]/60 END
+     + CASE WHEN BITAND(:(_Mask),16        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[05]+KLNDR.DAYMIN[05]/60 END
+     + CASE WHEN BITAND(:(_Mask),32        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[06]+KLNDR.DAYMIN[06]/60 END
+     + CASE WHEN BITAND(:(_Mask),64        )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[07]+KLNDR.DAYMIN[07]/60 END
+     + CASE WHEN BITAND(:(_Mask),128       )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[08]+KLNDR.DAYMIN[08]/60 END
+     + CASE WHEN BITAND(:(_Mask),256       )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[09]+KLNDR.DAYMIN[09]/60 END
+     + CASE WHEN BITAND(:(_Mask),512       )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[10]+KLNDR.DAYMIN[10]/60 END
+     + CASE WHEN BITAND(:(_Mask),1024      )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[11]+KLNDR.DAYMIN[11]/60 END
+     + CASE WHEN BITAND(:(_Mask),2048      )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[12]+KLNDR.DAYMIN[12]/60 END
+     + CASE WHEN BITAND(:(_Mask),4096      )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[13]+KLNDR.DAYMIN[13]/60 END
+     + CASE WHEN BITAND(:(_Mask),8192      )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[14]+KLNDR.DAYMIN[14]/60 END
+     + CASE WHEN BITAND(:(_Mask),16384     )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[15]+KLNDR.DAYMIN[15]/60 END
+     + CASE WHEN BITAND(:(_Mask),32768     )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[16]+KLNDR.DAYMIN[16]/60 END
+     + CASE WHEN BITAND(:(_Mask),65536     )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[17]+KLNDR.DAYMIN[17]/60 END
+     + CASE WHEN BITAND(:(_Mask),131072    )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[18]+KLNDR.DAYMIN[18]/60 END
+     + CASE WHEN BITAND(:(_Mask),262144    )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[19]+KLNDR.DAYMIN[19]/60 END
+     + CASE WHEN BITAND(:(_Mask),524288    )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[20]+KLNDR.DAYMIN[20]/60 END
+     + CASE WHEN BITAND(:(_Mask),1048576   )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[21]+KLNDR.DAYMIN[21]/60 END
+     + CASE WHEN BITAND(:(_Mask),2097152   )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[22]+KLNDR.DAYMIN[22]/60 END
+     + CASE WHEN BITAND(:(_Mask),4194304   )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[23]+KLNDR.DAYMIN[23]/60 END
+     + CASE WHEN BITAND(:(_Mask),8388608   )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[24]+KLNDR.DAYMIN[24]/60 END
+     + CASE WHEN BITAND(:(_Mask),16777216  )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[25]+KLNDR.DAYMIN[25]/60 END
+     + CASE WHEN BITAND(:(_Mask),33554432  )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[26]+KLNDR.DAYMIN[26]/60 END
+     + CASE WHEN BITAND(:(_Mask),67108864  )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[27]+KLNDR.DAYMIN[27]/60 END
+     + CASE WHEN BITAND(:(_Mask),134217728 )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[28]+KLNDR.DAYMIN[28]/60 END
+     + CASE WHEN BITAND(:(_Mask),268435456 )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[29]+KLNDR.DAYMIN[29]/60 END
+     + CASE WHEN BITAND(:(_Mask),536870912 )=0 THEN 0.00 ELSE KLNDR.DAYCHAS[30]+KLNDR.DAYMIN[30]/60 END
+     + CASE WHEN BITAND(:(_Mask),1073741824)=0 THEN 0.00 ELSE KLNDR.DAYCHAS[31]+KLNDR.DAYMIN[31]/60 END
+     )
+     from klrejim
+     inner join klndr klndr on klndr.YEARK = :(_Year)
+                 and klndr.MONTHK= :(_Month)
+                 and klndr.rejim = CASE WHEN klrejim.Rejimc=0 then klrejim.rejim else klrejim.rejimc end
+     where  klrejim.Rejim =  :(_Rejim)
+     into (_wsu);
+     Result+=_wsu;
+    } //_Loop tmp_mask_rejim
+  } //stBalanced:
+  stStandard://  -2  график нормы для расчета суммированных сверхурочных либо нормализации рабочего времени. Может совпадать с плановым, с балансным, а может быть и вовсе искусственным (при настройке "источник сведений о норме времени" = "установленная продолжительность рабочей недели")
+  {
+
+  }
+  stMask://  -3  данные из маски ручной корректировки
+  {
+
+  }
+  end;
+} //Function WT_GetHoursBwDaysEx (
+
+//------------------------------------------------------------------------------
+function GetHoursBwDatesEx(
+           _pLschet:comp;
+           HourKind: word;
+           BeginningHour,
+           MaxDailyHoursAmount: double;
+           ScheduleType: integer;
+           DateRangeStart, DateRangeEnd: Date;
+           Flags: longint;
+           _pPodr:comp=0 ;
+           _pPost:comp=0
+           ): double; cacheable;
+{ //pLschet:=_pLschet;
+  Result:=0;
+  if DateRangeStart> DateRangeEnd then exit;
+  do
+  { Dbeg:=DateRangeStart;
+    DEnd:=Last_Day(DateRangeStart);
+    wMonth :=month(DateRangeStart);
+    wYear  :=Year(DateRangeStart);
+    DEnd:=Date(Last_Day(DateRangeStart),wMonth,wYear);
+    LoadTable(_pLschet,wMonth,wYear);
+    Fill_tmp_mask_day(_pPodr,_pPost);
+    Result:=Result+GetHoursBwDaysEx(
+        HourKind
+      , BeginningHour
+      , MaxDailyHoursAmount
+      , ScheduleType
+      , Day(DateRangeStart) // DayRangeStart       : Byte,
+      , Day(Dend) //DayRangeEnd         : Byte,
+      , Flags //              : LongInt;
+      ,_pPodr //:comp=0 ;
+      ,_pPost //:comp=0
+    );
+    DateRangeStart:=Add_months(DateRangeStart,1);
+    if Day(DateRangeStart)<>1
+    { DateRangeStart:=date(1,month(DateRangeStart),year(DateRangeStart));
+    }
+  } while DateRangeStart< DateRangeEnd
+}
+end.

@@ -1,0 +1,584 @@
+/*************************************************************************************************\
+* Наименование: Интерфейс "Перечень свободных вакансий"                                           *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1083         |19/09/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Доработка   |#1139         |05/10/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Доработка   |#1357         |12/12/17|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include DepartmentsLimiter.vih       // разграничение прав доступа к подразделениям
+
+#include Query.vih
+#include GP_QueryBuilder.vih
+#include GP_MenuDynamic.vih
+#include GP_CandidateListToStaffReserve.vih
+#include GP_ManualNotes.vih
+
+#component "Z_StaffRecruiting"
+alter interface VacancyList;
+#IFNDEF _2019_12_18_
+  show(5,5,180,25);
+#Else
+  show at (,, 110, 20);
+#ENDIF
+overload
+  Procedure FillTmpTable;
+end;
+#IFNDEF _2019_12_18_
+ExtendFormats brVacancy;
+OverloadFormats srcFullNamePodr;
+#else
+create view vVacancyList
+as select StrPodrCat.*
+from
+synonym Catalogs StrPodrCat
+where
+((
+       StaffStruct.Department  == StrPodrCat.Nrec
+))
+;
+#ENDIF
+var IsRunFromInit:boolean;
+    iQBuilder:GP_QueryBuilder new;
+    UDL: IUserDepartmentsList(UserDepartmentsIterator);
+    DepAccessMarker:TPtr;
+    ManualNotesStaffStr:GP_ObjManualNotes(GP_ManualNotes) New;
+    _dataSetCounter: longint;
+   _log : string = '';
+table struct TreeStaffStruct(
+  NRec:comp,cNode:comp,IsLeaf:word,
+  cDep:comp,cStaffStruct:comp,
+  DepName:string,DepCode:string,PostName:string,WorkCond:string,
+  WorkStations  : double,
+  Workers       : double, // кол-во вакансий
+  Status        : byte, // является ли ставка замещаемой по конкурсу
+  FutureWorkers : double,
+  TaxRate:double,MinSumma:double,MaxSumma:double
+)
+with index (
+  i1=NRec(Surrogate,Unique),
+  i2=cNode+DepCode,
+  i3=cDep+IsLeaf
+);
+
+create view vVacancyList
+var cTreeNode:comp;
+from
+   UDL, ManualNotesStaffStr
+  ,TreeStaffStruct(i2)
+  ,TreeStaffStruct TreeStaffStruct2
+  ,Catalogs IerCatDep
+  ,StaffStruct StaffStructExt
+  ,KlKatego
+where((
+  cTreeNode                    == TreeStaffStruct.cNode and
+  coStaffStruct                == ManualNotesStaffStr.wTbl and
+  TreeStaffStruct.cStaffStruct == ManualNotesStaffStr.cRec and
+  TreeStaffStruct.cStaffStruct == StaffStructExt.Nrec and
+  StaffStructExt.EmpCategory   == KlKatego.Nrec
+));
+
+create view vGetTopPodr
+var
+  _catDepNrec: comp;
+as select catDep.Nrec
+from catalogs catDep, catalogs catDepParent
+where ((
+  _catDepNrec == catDep.Nrec and
+  catDep.cParent == catDepParent.Nrec
+));
+
+function GetTopPodrCode(aCatDepNrec: comp): string; cacheable;
+{
+  result := '';
+  vGetTopPodr._catDepNrec := aCatDepNrec;
+  if vGetTopPodr.getfirst catDep = tsOk
+  {
+    result := vGetTopPodr.catDep.Code;
+    if length(vGetTopPodr.catDep.Code) > 3
+      if vGetTopPodr.getfirst catDepParent = tsOk
+        if vGetTopPodr.catDepParent.SysCode != -11
+          result := GetTopPodrCode(vGetTopPodr.catDepParent.Nrec);
+  }
+}
+
+function GetTopPodrName(aCatDepNrec: comp): string; cacheable;
+{
+  result := '';
+  vGetTopPodr._catDepNrec := aCatDepNrec;
+  if vGetTopPodr.getfirst catDep = tsOk
+  {
+    result := vGetTopPodr.catDep.Name;
+    if length(vGetTopPodr.catDep.Code) > 3
+      if vGetTopPodr.getfirst catDepParent = tsOk
+        if vGetTopPodr.catDepParent.SysCode != -11
+          result := GetTopPodrName(vGetTopPodr.catDepParent.Nrec);
+  }
+}
+
+Function IsExistLogOtpusk(_cStaffStruct : comp) : string;
+{
+var _iIStafStruLongVac     : StaffStruct; //ШР
+ Result := '';
+ //logstrtofile('Zekka.log', '_cStaffStruct = ' + _cStaffStruct);
+ //logstrtofile('Zekka.log', 'dateCondition = ' + dateCondition);
+/// logstrtofile('Zekka.log', 'Appointments.StaffStr = ' + Appointments.StaffStr);
+  _loop Appointments where ((_cStaffStruct == Appointments.StaffStr))
+   {
+   // logstrtofile('Zekka.log', '_cStaffStruct_loop = ' + _cStaffStruct);
+  //    logstrtofile('Zekka.log', 'Appointments.nrec = ' + Appointments.nrec);
+  //    logstrtofile('Zekka.log', 'Appointments.StaffStr = ' + Appointments.StaffStr);
+    if _iIStafStruLongVac.GetLongVacationByDate(Appointments.nrec, dateCondition) <> 0
+     {
+    //   logstrtofile('Zekka.log', 'Result = ' + Result);
+       Result := '+' ;
+       break;
+     }
+   }
+}
+
+
+#IFNDEF _2019_12_18_
+screen srcFullNamePodr;
+  show at (,,,1);
+  table TreeStaffStruct;
+fields
+  DI.GetFulDepName(TreeStaffStruct.cDep): skip;
+<<
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end; // screen srcFullNamePodr
+#ENDIF
+
+panel pCorApp;
+#IFNDEF _2019_12_18_
+browse brVacancy;
+  show at (,2,,);
+  table SortStaffStruct;
+fields
+end;
+#ENDIF
+
+tree trVacancy (,,sci1EnTree);
+#IFNDEF _2019_12_18_
+  show at (,2,,);
+#ENDIF
+  table TreeStaffStruct;
+fields
+  TreeStaffStruct.DepName 'Подразделение',
+    ('Подразделение', hcStaff_MPodborVakans, ): [40], protect;
+  TreeStaffStruct.DepCode 'Код',
+    ('Код подразделения', hcStaff_MPodborVakans, ): [10], protect;
+  TreeStaffStruct.PostName 'Наименование должности',
+    ('Наименование должности', hcStaff_MPodborVakans, ): [30], protect;
+  KlKatego.NaiKat 'Категория',
+    ('Категория должности', hcStaff_MPodborVakans, ): [15], protect;
+  TreeStaffStruct.WorkStations 'Количество', 'ставок',
+    ('Количество ставок', hcStaff_MPodborVakans, ): [10.3], protect;
+  TreeStaffStruct.Workers 'Количество', 'вакансий',
+    ('Количество вакансий', hcStaff_MPodborVakans, ): [10.3], protect;
+  TreeStaffStruct.FutureWorkers 'Будущие', 'вакансии',
+    ('Количество вакансий через два месяца от текущей даты (только для ставок, отмеченных, как конкурсные)',
+        hcStaff_MPodborVakans, ): [10.3], protect, { font = {BackColor = if ( TreeStaffStruct.Status > 0, ColorSysGreen, 0)} };
+  TreeStaffStruct.WorkCond 'Класс', 'условий труда' : [15], protect;
+  TreeStaffStruct.TaxRate 'Тариф/оклад'
+    ('Тариф/оклад', hcStaff_MPodborVakans, ): [10.3], protect;
+  TreeStaffStruct.MinSumma 'Миним-ный', 'оклад'
+    ('Минимальный оклад', hcStaff_MPodborVakans, ): [10.3], protect;
+  TreeStaffStruct.MaxSumma 'Максим-ный', 'оклад'
+    ('Максимальный оклад', hcStaff_MPodborVakans, ): [10.3], protect;
+  ManualNotesStaffStr.NoteStr 'Примечание ручное' :[20],protect, NoDel;
+end;
+end; // panel pCorApp;
+DataStream GP_DS_VacancyList
+(
+  [DateCondition]            dateCondition;
+
+  DataSet TreeStaffStruct
+  (
+    [DepartmentName]         TreeStaffStruct.DepName;
+    [DepartmentCode]         TreeStaffStruct.DepCode;
+    [PostName]               TreeStaffStruct.PostName;
+    [CategoryName]           if(getfirst StaffStructExt = tsOk,
+                                if(getfirst KlKatego = tsOk, KlKatego.NaiKat, ''),
+                                '');
+    [WorkstationQty]         TreeStaffStruct.WorkStations;
+    [VacancyQty]             TreeStaffStruct.Workers;
+    [FutureVacancyQty]       TreeStaffStruct.FutureWorkers;
+    [WorkingConditionsClass] TreeStaffStruct.WorkCond;
+    [Salary]                 TreeStaffStruct.TaxRate;
+    [MinSalary]              TreeStaffStruct.MinSumma;
+    [MaxSalary]              TreeStaffStruct.MaxSumma;
+    [Comments]               ManualNotesStaffStr.NoteStr;
+    [Status]                 TreeStaffStruct.Status;
+    [IsLeaf]                 TreeStaffStruct.IsLeaf;
+    [Level]                  TreeLevel(trVacancy);
+   //[Deleteme]               logstrtofile('Zekka.log', '_kjkjkk ' + TreeStaffStruct.cStaffStruct); //TreeStaffStruct.cStaffStruct
+   // [LOGOTPUSK_k]            TreeStaffStruct.cStaffStruct;
+    [LOGOTPUSK]              IsExistLogOtpusk(TreeStaffStruct.cStaffStruct); //TreeStaffStruct.cStaffStruct
+  );
+)
+
+handleevent DataSet TreeStaffStruct
+  cmPreProcess:
+  {
+    _dataSetCounter := 0;
+    TreePushPos(trVacancy);
+  }
+  cmOnProcess:
+  {
+    _dataSetCounter++;
+    var isProceed: boolean;
+    isProceed := if(_dataSetCounter = 1,
+                    TreeGetFirstEx(trVacancy),
+                    TreeGetNextEx(trVacancy));
+    if isProceed
+    {
+      ContinueDataSet;
+    }
+  }
+  cmPostProcess:
+    TreePopPos(trVacancy);
+end; //handleevent
+end; //datastream
+
+function MakeTreeStaffStructBufferForNode(CatDepBuf:Type$Catalogs):type$TreeStaffStruct;
+{
+  ClearAdvRecord(result);
+  result.cDep:=CatDepBuf.NRec;
+  result.DepName:=CatDepBuf.Name;
+  result.DepCode:=CatDepBuf.Code;
+  result.WorkStations:=SortStaffStruct.WorkStations;
+  result.Workers:=SortStaffStruct.Workers;
+  result.FutureWorkers:=SortStaffStruct.FutureWorkers;
+}
+Procedure MyLog(_str: string);
+{
+ if username = 'lapushkov_dv' or username = 'petr.metelev' then
+  {
+   if _log = '' then _log :='VacancyList_'+ datetostr(cur_date,'YYYYMMDD') + '_' + timetostr(cur_time,'HHMMSS')+'.log';
+   LogStrToFile(_log,_str);
+  }
+}
+Procedure MysqlAddStr(var query_handle: longInt; add_query_str: string);
+{
+   sqlAddStr(query_handle, add_query_str);
+   MyLog('sql: ' + add_query_str);
+} //Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
+
+procedure gettaxrate(_cStaffStruct: comp; _dateCondition: date;  var _TaxRate, _MinSumma,  _MaxSumma : double);
+{
+  _TaxRate  := 0;
+  _MinSumma := 0;
+  _MaxSumma := 0;
+
+
+    var hstr : longint = 0;
+
+    MysqlAddStr(hstr, '    select                                                        ');
+    MysqlAddStr(hstr, '     coalesce(histondate.HTAXRATE,stst.TAXRATE) as TAXRATE        ');
+    MysqlAddStr(hstr, '    ,coalesce(histondate.HMINTAXRATE,stst.MINsumma) as MINTAXRATE ');
+    MysqlAddStr(hstr, '    ,coalesce(histondate.HMAXTAXRATE,stst.MAXsumma) as MAXTAXRATE ');
+    MysqlAddStr(hstr, '     from                                                         ');
+    MysqlAddStr(hstr, '      StaffStruct stst                                            ');
+    MysqlAddStr(hstr, '    outer apply ( select top 1 HTAXRATE, HMINTAXRATE, HMAXTAXRATE ');
+    MysqlAddStr(hstr, '          from HISTORYSTR hist where hist.STAFFSTR = stst.nrec and hist.dHist <= #date('+datetostr(_dateCondition,'DD,MM,YYYY')+') ');
+    MysqlAddStr(hstr, '          order by hist.dHist desc ');
+    MysqlAddStr(hstr, '       ) histondate                ');
+    MysqlAddStr(hstr, '    where stst.nrec = #comp('+String(_cStaffStruct)+') ');
+    MysqlAddStr(hstr, '    and stst.DINPUT <= #date('+datetostr(_dateCondition,'DD,MM,YYYY')+') ');
+
+SetVisualHeader('Выполнение запроса SQL');
+  var objQuery: iQuery;
+    objQuery := queryManager.createQuery(hstr);
+
+      var _ResultSet : IResultSet = objQuery.getResultSet;
+
+   if (objQuery.ErrorCode = tsOk)
+    {
+      if _ResultSet.getFirst = tsOk
+      {
+       _TaxRate   := _ResultSet.row.val('TAXRATE');
+       _MinSumma  := _ResultSet.row.val('MINTAXRATE');
+       _MaxSumma  := _ResultSet.row.val('MAXTAXRATE');
+      } // while _ResultSet.getNext = tsOk;
+    }
+    else
+    {
+     MyLog('ERROR выполнения запроса '+objQuery.ErrorCode);
+    }
+
+}
+function MakeTreeStaffStructBuffer:type$TreeStaffStruct;
+{
+  result:=MakeTreeStaffStructBufferForNode(StrPodrCat.buffer);
+  result.IsLeaf:=1;
+  result.cStaffStruct:=SortStaffStruct.cStaffStruct;
+  result.PostName:=StrCatPost.Name;
+  result.WorkCond:=SSWorkCondCat.Code;
+  result.Status:=SortStaffStruct.Status;
+var _TaxRate,  _MinSumma,  _MaxSumma: double;
+  gettaxrate(StaffStruct.nrec, dateCondition,  _TaxRate,  _MinSumma,  _MaxSumma);
+  result.TaxRate :=_TaxRate;
+  result.MinSumma:=_MinSumma;
+  result.MaxSumma:=_MaxSumma;
+}
+
+
+function AddToIerDep(CatDepBuf:Type$Catalogs):comp;
+{
+  result:=0;
+
+  //Находим ближайшего родителя в Catalogs для CatDepBuf, длина кода которого <= 3
+  while Length(CatDepBuf.Code) > 3
+  {
+    if getfirst fastfirstrow IerCatDep where((CatDepBuf.cParent == IerCatDep.NRec)) = tsok
+      CatDepBuf := Type$Catalogs(IerCatDep.Buffer);
+    else
+      break;
+  }
+  if getfirst fastfirstrow TreeStaffStruct2 where ((CatDepBuf.NRec == TreeStaffStruct2.cDep and
+                                                    0              == TreeStaffStruct2.IsLeaf)) = tsok
+  {
+    TreeStaffStruct2.WorkStations  += SortStaffStruct.WorkStations;
+    TreeStaffStruct2.Workers       += SortStaffStruct.Workers;
+    TreeStaffStruct2.FutureWorkers += SortStaffStruct.FutureWorkers;
+    update current TreeStaffStruct2;
+  } else {
+    TreeStaffStruct2.buffer        := MakeTreeStaffStructBufferForNode(CatDepBuf);
+    TreeStaffStruct2.cNode         := 0;
+    insert current TreeStaffStruct2;
+  }
+
+  result:=TreeStaffStruct2.NRec;
+}
+
+//------------------------------------------------------------------------------
+// Наполнение временной таблицы, независимо от установленных ограничений
+//------------------------------------------------------------------------------
+Procedure FillTmpTable;
+var hStrFilter:longint;
+{
+  if (IsRunFromInit) {
+    if (RunInterface(FiltrForVacancy, dateCondition, IsCompetition) = cmDefault) {
+      if day(dateCondition) = 0
+        VInter.ObjInit(Cur_Date, true, false)
+      else
+        VInter.ObjInit(dateCondition, true, false);
+    } else {
+      abort;
+      exit;
+    }
+  }
+
+  StartNewVisual(vtNumericVisual, vfTimer, 'Поиск вакансий...', 0);
+
+  var cComp: comp;
+  cComp := CoGetTune('UP.STAFF.DopCharacter');
+
+  PopAllConditionForLeave(#SortStaffStruct);
+  delete all SortStaffStruct;
+
+  delete TreeStaffStruct where((0<<=TreeStaffStruct.NRec));
+
+  var FutureWorkersDate:date;
+  FutureWorkersDate:=Add_Months(dateCondition, 2);
+  NextVisual;
+  var Q: IQuery;
+  Q:=queryManager.createQuery(SQLQuery(
+    select
+      StaffStruct.NRec as cStaffStruct,
+      StaffStruct.Post,
+      StaffStruct.Department,
+      Dep.Name as StrDept,
+      COALESCE(Post.Name,'') as StrPost,
+      StaffStruct.dInput as dateInput,
+      StaffStruct.dClose as dateClose,
+      StaffStruct.WorkStations,
+      StaffStruct.WorkStations as Workers,
+      case when AdvFeatures.NRec is not null then 1 else 0 end as Status:byte,
+      case when AdvFeatures.NRec is not null then COALESCE(App.FutureWorkers,0) else 0 end as FutureWorkers:double
+    from
+      StaffStruct
+      inner join Catalogs Dep on (StaffStruct.Department = Dep.NRec)
+      left join Catalogs Post on (StaffStruct.Post = Post.NRec)
+      left join AdvFeatures on (2 = AdvFeatures.ObjType
+                                and StaffStruct.NRec = AdvFeatures.ObjNrec
+                                and :(cComp) = AdvFeatures.Position)
+      left join (
+        select Appointments.StaffStr, sum(Appointments.Rate) as FutureWorkers
+        from
+          Appointments
+        where
+          2 > Appointments.wAddWord1 and
+          (:(FutureWorkersDate) > Appointments.DateEnd and Appointments.DateEnd <> :(ZeroDate))
+        group by Appointments.StaffStr
+      ) App on (StaffStruct.NRec = App.StaffStr)
+    where
+      StaffStruct.dInput <= :(dateCondition) and
+      (StaffStruct.dClose = :(ZeroDate) or :(dateCondition) <= StaffStruct.dClose)
+    %Filter
+  ));
+
+  hStrFilter:=0;
+  iQBuilder.DropTmpTables;
+  if (GetMarkerCount(DepAccessMarker) > 0)
+    iQBuilder.AddCriteriaFromMarker(hStrFilter,'and StaffStruct.Department',DepAccessMarker);
+  if (VInter.GetDeptCount > 0)
+    iQBuilder.AddCriteriaFromMarker(hStrFilter,'and StaffStruct.Department',VInter.GetDepartmentsMarker);
+  if (VInter.GetPostCount > 0)
+    iQBuilder.AddCriteriaFromMarker(hStrFilter,'and StaffStruct.NRec',VInter.GetPostMarker);
+  if (IsCompetition=1)
+    sqlAddStr(hStrFilter,'and AdvFeatures.NRec is not null');
+  if (hStrFilter<>0) {
+    Q.setMacro('Filter',hStrFilter);
+    sqlFreeStr(hStrFilter);
+  }
+
+  if (Q.Execute.ErrorCode<>0)
+    message('Ошибка выполнения DSQL запроса при отборе вакансий ('+string(Q.ErrorCode)+').',error)
+  else
+    sqlCopyInto(Q.getResultSet,tnSortStaffStruct,true);
+
+  StopVisual;
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Поиск вакансий...', RecordsInTable(tnSortStaffStruct));
+
+  _loop SortStaffStruct {
+    if (not NextVisual) break;
+
+    SortStaffStruct.Workers := iStaffStr.GetWorkersStaff(SortStaffStruct.cStaffStruct, dateCondition); //вакансии
+
+    if Update Current SortStaffStruct <> tsOk
+      displ('Не удалось загрузить информацию по ставке ' + SortStaffStruct.StrDept);
+
+    if (SortStaffStruct.Workers<=0) continue;
+
+    TreeStaffStruct.buffer:=MakeTreeStaffStructBuffer;
+    //Формируем дерево
+    TreeStaffStruct.cNode:=AddToIerDep(StrPodrCat.buffer);
+    insert current TreeStaffStruct;
+  }// _loop SortStaffStruct
+  TreeGetFirstEx(trVacancy);
+  ReReadRecord(tnTreeStaffStruct);
+
+  StopVisual;
+}
+
+TableEvent table TreeStaffStruct;
+cmTreeNodeType:{
+  if (TreeStaffStruct.IsLeaf=1)
+    TreeSetNodeType(trVacancy, ntfText);
+}
+cmTreeTop:{
+  cTreeNode:=0;
+}
+cmTreeUp:{
+  cTreeNode:=TreeStaffStruct.cNode;
+}
+cmTreeDown:{
+  cTreeNode:=TreeStaffStruct.NRec;
+}
+cmTreeNeedOwner:{
+  TreeJumpToRecord(trVacancy,TreeStaffStruct.cNode);
+}
+end;
+
+HandleEvent
+cmInit:{
+  //Для интерфейса фильтрации устанавливаем признак, что нужно поменять заголовок кнопки "Применить фильтр" на "Сформировать"
+  SaveMyDsk('Сформировать', 'FiltrForVacancy_ChangeButtonTitle');
+
+  DepAccessMarker:=InitMarker('',8,0,1);
+  _loop UDL InsertMarker(DepAccessMarker,UDL.Department);
+
+  SetFormat(trVacancy);
+  DisableCommand(cmAccording);
+
+  IsRunFromInit:=true;
+
+  case inherited :: handleEvent (cmInit) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  IsRunFromInit:=false;
+}
+cmDefault:{
+  if (TreeStaffStruct.IsLeaf<>1) exit;
+  if (getfirst SortStaffStruct
+      where((TreeStaffStruct.cStaffStruct==SortStaffStruct.cStaffStruct(noindex)))<>tsok) exit;
+
+  inherited :: handleEvent (cmDefault);
+}
+cmNal:{
+  if (TreeStaffStruct.IsLeaf<>1) exit;
+  if (getfirst SortStaffStruct
+      where((TreeStaffStruct.cStaffStruct==SortStaffStruct.cStaffStruct(noindex)))<>tsok) exit;
+
+  inherited :: handleEvent (cmNal);
+}
+cmDone:{
+  case inherited :: handleEvent (cmDone) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  DoneMarker(DepAccessMarker,'');
+  //Удаляем признак для интерфейса фильтрации, что нужно менять заголовок кнопки
+  ClearMyDsk('FiltrForVacancy_ChangeButtonTitle');
+}
+cmValue21:{//Список кандидатов в кадровый резерв на должность
+  if (TreeStaffStruct.IsLeaf<>1) exit;
+  if (getfirst SortStaffStruct
+      where((TreeStaffStruct.cStaffStruct==SortStaffStruct.cStaffStruct(noindex)))<>tsok) exit;
+
+  var Rep:RunUsersRep_GP_CandidateListToStaffReserve;
+  Rep.RunReportByPost(SortStaffStruct.Post);
+}
+cmPrintDoc:
+{
+  RunFReport(GP_DS_VacancyList, '', true);
+}
+end;
+end.
+
+//Добавление пункта меню "Список кандидатов в кадровый резерв на должность"
+handler with replace GP_MenuDynamic_AddItems_VacancyList on ExtensionPoint GP_MenuDynamic_AddItems
+action
+{
+  result:=true;
+
+  var MenuID:longint=0;
+  _try {
+    MenuID:=LoadMenuEx('Z_StaffRecruiting::mnuVacancyList',false,true);
+
+    AddMenuItem(MenuID,'separator',1);
+    AddMenuItemEx(MenuID,'Список кандидатов в кадровый резерв на должность',
+                         'Список кандидатов в кадровый резерв на должность','',cmValue21,0);
+
+    if (not StoreMenuHowDynamics(MenuID,'Z_StaffRecruiting::mnuVacancyList'))
+      _raise ExAddMenuItemError;
+  }
+  _except
+    on ExVip:{
+      message('Ошибка регистрации меню для интерфейса "Перечень свободных вакансий"'#13+
+              ExploreException,error);
+    }
+  _finally {
+    if (MenuID<>0) DisposeLoadMenu(MenuID);
+  }
+}
+
+//Удаление пункта меню "Список кандидатов в кадровый резерв на должность"
+handler with replace GP_MenuDynamic_DelItems_VacancyList on ExtensionPoint GP_MenuDynamic_DelItems
+action
+{
+  result:=true;
+
+  DeleteMenuHowDynamics('Z_StaffRecruiting::mnuVacancyList');
+}

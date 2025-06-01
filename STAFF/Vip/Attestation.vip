@@ -1,0 +1,684 @@
+/*************************************************************************************************\
+* Наименование: Доработка стандартного интерфейса "Список сотрудников, подлежащих аттестации"     *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#041          |07/03/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Разработка  |#047          |18/03/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Доработка   |#1200         |03/11/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include Query.vih
+#include DepartmentsLimiter.vih       // разграничение прав доступа к подразделениям
+
+#include GP_QueryBuilder.vih
+#include GP_UserFilterKlKatego.vih
+#include GP_UserFilterCatalogs.vih
+#include GP_UserFilterStoreDSK.vih
+#include GP_UserFilterList.vih
+#include GP_MenuDynamic.vih
+#include GP_DepFunc.vih
+
+#component "Z_Staff"
+//Список сотрудников, подлежащих аттестации
+//Дата окончания не может быть меньше даты начала
+alter interface Attestation;
+show(,,125,30);
+overload
+  procedure CreateTablAttTemp;
+  Function CreateOrder: comp;
+end;
+OverloadFormats StaffAttCtrl,ComFiltrEmbedded;
+ExtendFormats StaffAttCtrl_1;
+
+var cAttestationCommission:comp;
+    GP_FilterStore:GP_IUserFilterStore NoAuto;
+    GP_UserFilterList:GP_ObjUserFilterList;
+    iQBuilder:GP_QueryBuilder new;
+    UDL: IUserDepartmentsList(UserDepartmentsIterator);
+    DepAccessMarker:TPtr;
+    IsRunFromInit:boolean;
+
+#include GP_DepFunc.var
+
+Table Struct AttComission (
+    NRec      : comp,
+    Comission : string[120],
+    Date1     : date,
+    Date2     : date
+)
+    with index (
+      AttNpp = NRec(Surrogate),
+      Comm   = Comission
+);
+
+Table Struct AttFr (
+    cComission : comp,
+    NPP       : integer,     //Номер по порядку
+    Podr      : string[20],  //Код подразделения
+    PodrName  : string[255], //Наименование подразделения
+    TabNum    : string[20],  // Табельный
+    FIO       : string[80],  // ФИО
+    Position  : string[254], // Должность
+    DateAtt   : date,        //Дата аттестации (для сортировки)
+    DateAttM  : string[20]        // Месяц аттестации (для печати)
+)
+    with index (
+      Ind00 = npp,
+      Ind01 = cComission + Podr + FIO + DateAtt,
+      Ind02 = Podr + FIO + DateAtt
+);
+
+Create view
+from
+  Appointments GP_Appoint,
+  AdvFeatures GP_AdvFeatures,
+  Catalogs GP_Cat,
+  AttComission(Comm),
+  AttFr(Ind00),
+  UDL
+where((
+  AttTemp.cApoint==GP_Appoint.NRec
+  and  2==GP_AdvFeatures.ObjType
+  and  GP_Appoint.StaffStr==GP_AdvFeatures.ObjNrec
+  and  cAttestationCommission==GP_AdvFeatures.Position
+  and  Comp(GP_AdvFeatures.ValString)==GP_Cat.NRec
+  and  AttComission.NRec == AttFr.cComission
+));
+
+Create view vPers
+var
+  pPersosn:comp;
+  dateEnd :date;
+as select Persons.Nrec
+from PsnLinks,Persons,Vacations,klOtpusk
+where ((
+    pPersosn == Persons.Nrec
+and pPersosn == PsnLinks.FromPerson
+and ZeroDate << PsnLinks.RBornDate
+and dateEnd >>= PsnLinks.RBornDate
+and pPersosn == Vacations.Person
+and PsnLinks.RBornDate <<= Vacations.FACTYEARBEG
+and add_months(PsnLinks.RBornDate,36) >>=Vacations.FACTYEARBEG
+and Vacations.VacType == klOtpusk.Nrec
+
+)) ;
+
+datastream AttestationList
+(
+    table AttComission
+    (
+      [AttList_Comission] AttComission.Comission;
+      [AttList_Date1]     AttComission.Date1;
+      [AttList_Date2]     AttComission.Date2;
+
+      table AttFr
+      (
+        [AttList_npp]       AttFr.NPP;
+        [AttList_Podr]      AttFr.Podr;
+        [AttList_PodrName]  AttFr.PodrName;
+        [AttList_TabNum]    AttFr.TabNum;
+        [AttList_FIO]       AttFr.FIO;
+        [AttList_Doljnost] AttFr.Position;
+        [AttList_DateAtt] AttFr.DateAttM;
+
+      );
+    );
+)
+
+  handleEvent
+    cmPreProcess:
+      StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета', 0);
+    cmPostProcess:
+      StopVisual('', 0);
+  end;
+
+  handleEvent table AttComission
+    cmOnProcess:
+      if not NextVisual then
+        BreakProcess;
+  end;
+
+  handleEvent table AttFr
+    cmOnProcess:
+      if not NextVisual then
+        BreakProcess;
+  end;
+
+end;
+
+screen StaffAttCtrl;
+  show (, 1,, 2);
+  Fields
+    dateEnd('Конечная дата', ), noprotect;
+<<
+
+ На дату .@@@@@@@@@@@
+>>
+end;
+
+embedded ComFiltrEmbedded2 interface VInter;//упоминается исключительно для переопределения координат
+  show (, 3,75, 7);
+end;
+
+screen scExtFilter(,,sci13Esc);
+show (76,3,, 7);
+fields
+  [ExtFilterKateg] GP_UserFilterList.FilterStr(1) ('Фильтр по категориям', ): Protect,PickButton;
+  [ExtFilterCommiss] GP_UserFilterList.FilterStr(2) ('Фильтр по комиссиям', ): Protect,PickButton;
+<<
+
+`категориям`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`комиссиям` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end;
+
+browse StaffAttCtrl_1 ('',, sci1InsPM);
+show (,8,,);
+Table AttTemp;
+Fields
+  iCatFunc.GetCatalogsCode(AttTemp.cDept) 'Код СЕ ШР':[10],Protect;
+  GP_Cat.Name 'Аттестационная комиссия':[25],Protect,NoDel;
+end;
+
+//-------------------------------------
+//
+//-------------------------------------
+procedure AddCriteriaFromMarkerAsString(hStr:longint;s:string;m:TPtr);
+var i,k:longint;
+    cRec:comp;
+{
+  if (trim(s)='') exit;
+
+  k:=GetMarkerCount(m);
+  sqlAddStr(hStr,s+' in (');
+  for(i:=0;i<k;i++) {
+    GetMarker(m,i,cRec);
+    sqlAddStr(hStr,if(i=0,' ',',')+''''+String(cRec,20,0)+'''');
+  }
+  sqlAddStr(hStr,')');
+} //procedure AddCriteriaFromMarkerAsString(hStr:longint;s:string;m:TPtr);
+
+//-------------------------------------
+//
+//-------------------------------------
+procedure CreateTablAttTemp;
+{ // формирование таблицы аттестаций
+  if (IsRunFromInit) exit;
+
+  StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm,'Отбор данных...' , 0);
+
+  ReSetBounds(#AttTemp);
+  delete all AttTemp; // очищаем таблицу
+
+  //ClearMarker(PersonMarker);
+  pMarker.UnSelectAll;
+
+  if (VInter.GetPostCount() = 0)
+  {
+    VInter.SelectAllPost();
+  }
+
+  var Q: IQuery new;
+  Q:=queryManager.createQuery(SQLQuery(
+    select distinct
+      COALESCE(PlanA.dat1Max,#date(0,0,0)) as DatePrev,
+      //#47.21 АК5-АК20 - всегда 12 месяцев Appointments.cRef1 as NRec,
+      Case when COALESCE(CatCommiss.Code,'')
+           in ( //вторая группа
+             'АК5','АК6','АК7','АК8','АК9','АК10'
+            ,'АК11','АК12','АК13','АК14','АК15','АК16','АК17','АК18','АК19','АК20'
+             ) then #comp(12) else Appointments.cRef1 end as NRec,
+      Persons.NRec as PsnNRec,
+      case when :(wGetTune('FormatClockNumber'))=0 then cast(Persons.TabNmb as String) else Persons.StrTabn end as TabNum,
+      Persons.FIO as FIO,
+      Appointments.NRec as cApoint,
+      Persons.BornDate as BornYear,
+      Appointments.Department as cDept,
+      Appointments.Post as cPos,
+      COALESCE(Post.Name,'') as Position,
+      COALESCE(Klkatego.NaiKat,'') as StaffCat,
+      COALESCE(Level.Name,'') as EduLevel,
+      COALESCE(EduName.Name,'') as EduName,
+      COALESCE(EduAddr.Name,'') as EduAddr,
+      COALESCE(Speciality.Name,'') as EduCpec,
+      COALESCE(Qualification.Name,'') as EduQual,
+      COALESCE(ServL.FromDate,0) as Seniority
+    from
+      Persons
+      inner join Appointments on (Persons.AppointCur = Appointments.NRec)
+      left join Catalogs Post on (Appointments.Post = Post.NRec)
+      left join Klkatego on (Appointments.EmpCategory = Klkatego.NRec)
+      left join Education on (Persons.Education = Education.NRec)
+      left join Catalogs Level on (Education.Level = Level.NRec)
+      left join Catalogs EduName on (Education.Name = EduName.NRec)
+      left join Catalogs EduAddr on (Education.LearnAddr = EduAddr.NRec)
+      left join Catalogs Speciality on (Education.Speciality = Speciality.NRec)
+      left join Catalogs Qualification on (Education.Qualification = Qualification.Nrec)
+      left join (
+        select ServLen.Person, min(ServLen.FromDate) as FromDate
+        from ServLen
+        group by ServLen.Person
+      ) ServL on (Persons.NRec = ServL.Person)
+      left join StaffStruct on (Appointments.StaffStr = StaffStruct.NRec)
+      //комиссия
+      left join AdvFeatures on (2 = AdvFeatures.ObjType and Appointments.StaffStr = AdvFeatures.ObjNrec and
+                                :(cAttestationCommission) = AdvFeatures.Position)
+      //-- комиссии - значение
+      left outer join Catalogs CatCommiss on CatCommiss.Nrec = AdvFeatures.Position
+      // пройденные аттестации
+      left join (
+        select PlanAtt.cPers, max(PlanAtt.dat1) as dat1Max
+        from
+          PlanAtt
+        //Результат аттестации 'Z_STAFF::PERSONATT.PERSONBR.TEMPATT.RES'
+        left outer join Catalogs CatRes
+           on CatRes.Nrec = PlanAtt.cType
+        // дата приказа
+        left outer join Attestation on Attestation.NRec = PlanAtt.cRef3
+        where PlanAtt.dat1>=:(Cur_Date)
+        or  (COALESCE(Attestation.AttDate,#Date(0,0,0))<>#Date(0,0,0)
+         // здесь возможно нужно еще по результату аттестации
+            )
+        group by PlanAtt.cPers
+      ) PlanA on (Persons.NRec = PlanA.cPers)
+      //--------------------
+      //в декабре 2016 переведен на должность зам.начальника цеха
+      //и теперь он подлежит аттестации "На соответствие должности" от даты назначения на эту должность +12 мес, не взирая на предыдущие аттестации...
+      //а после первой атт-ции на соответствие +36 мес.
+      //Этот отбор должен работать только на
+      //аттестационные списки с номерами с 1 по 4.
+      //#47.21
+      //В случае, если код комиссии равен АК5-АК20, то дата следующей аттестации равна:
+      //a. Если нет аттестации , то дата приема/перемещения плюс 12 мес.
+      //b. Если есть аттестация , то дата проведения аттестации плюс 12 месяцев
+      //c. если период работы на должности больше 12 мес и нет информации
+      //   о пройденной аттестации в первом разделе, работник также попадает в список .
+        and PlanA.dat1Max >=Case when COALESCE(CatCommiss.Code,'')
+           in ('АК1', 'АК2', 'АК3','АК4'
+         //вторая группа для    #47.21
+            ,'АК5','АК6','АК7','АК8','АК9','АК10'
+            ,'АК11','АК12','АК13','АК14','АК15','АК16','АК17','АК18','АК19','АК20'
+             )
+            then Appointments.AppointDate
+            else Persons.AppDate
+            end
+    where
+      Persons.IsEmployee = 'С' and
+      (Persons.DisDate = #date(0,0,0) or Persons.DisDate >= :(dateEnd)) and
+      Appointments.cRef1 > #Comp(0) and
+      Appointments.AppointDate <= :(dateEnd) and
+      (Appointments.DismissDate = #date(0,0,0) or Appointments.DismissDate >= :(dateEnd))
+    %Filter
+  ));
+
+  var hStrFilter,m:longint;
+  hStrFilter:=0;
+  iQBuilder.DropTmpTables;
+
+  if (GetMarkerCount(DepAccessMarker) > 0)
+    iQBuilder.AddCriteriaFromMarker(hStrFilter,'and Appointments.Department',DepAccessMarker);
+
+  if (VInter.GetDeptCount > 0)
+    iQBuilder.AddCriteriaFromMarker(hStrFilter,'and Appointments.Department',VInter.GetDepartmentsMarker);
+
+  if (VInter.GetTypePost = 1) {// по каталогам
+    if (VInter.GetPostCount > 0)
+      iQBuilder.AddCriteriaFromMarker(hStrFilter,'and Appointments.Post',VInter.GetPostMarker);
+  } else {//по ШР
+    sqlAddStr(hStrFilter,'and StaffStruct.Post is not Null and Appointments.Post = StaffStruct.Post');
+    if (VInter.GetPostCount > 0)
+      iQBuilder.AddCriteriaFromMarker(hStrFilter,'and Appointments.StaffStr',VInter.GetPostMarker);
+  }
+
+  m:=GP_FilterStore.LoadMarker('mExtFilterKateg');
+  if (GetMarkerCount(m)>0)
+    iQBuilder.AddCriteriaFromMarker(hStrFilter,'and Appointments.EmpCategory',m);
+  DoneMarker(m,'');
+
+  m:=GP_FilterStore.LoadMarker('mExtFilterCommiss');
+  if (GetMarkerCount(m)>0) {
+    sqlAddStr(hStrFilter,'and AdvFeatures.ValString is not Null');
+    AddCriteriaFromMarkerAsString(hStrFilter,'and AdvFeatures.ValString',m);
+  }
+  DoneMarker(m,'');
+
+  if (hStrFilter<>0) {
+    Q.setMacro('Filter',hStrFilter);
+    sqlFreeStr(hStrFilter);
+  }
+
+  if (Q.Execute.ErrorCode<>0)
+    message('Ошибка выполнения DSQL запроса при отборе данных ('+string(Q.ErrorCode)+').',error)
+  else
+    sqlCopyInto(Q.getResultSet,tnAttTemp,true);
+  Q:=NullRef;
+  //-------------------------
+  vPers.dateEnd:=dateEnd;
+  //-------------------------
+  var d:date;
+  _loop fullcache AttTemp
+  { if (not NextVisual) break;
+
+    if (AttTemp.DatePrev=ZeroDate)
+      AttTemp.DateNext:=Add_Months(GP_Appoint.AppointDate,12)
+    else
+      AttTemp.DateNext:=Add_Months(AttTemp.DatePrev, AttTemp.NRec);//AttTemp.NRec=Appointments.cref1
+
+    d:=ZeroDate;
+    vPers.pPersosn:= AttTemp.PsnNRec;
+    if vPers.Getfirst Persons=tsok
+    {
+      vPers._loop PsnLinks
+      //    where((AttTemp.PsnNRec == PsnLinks.FromPerson and
+      //                    ZeroDate << PsnLinks.RBornDate
+      //                    and dateEnd >>= PsnLinks.RBornDate))
+      { if (trim(UpCase(iCatFunc.GetCatalogsCode(vPers.PsnLinks.LinkType))) = 'ДЕТИ')
+        { // Для мужиков проверим отпуска по уходу
+          if vPers.Persons.Sex<>'Ж'
+          { var _boVac:boolean=false;
+            vPers._Loop Vacations
+            { if vPers.getfirst KlOtpusk=tsok
+              {  case vPers.KlOtpusk.kOtpus of
+                 6,2,4:
+                 { _boVac:=true;
+                   break
+                 }
+                 end;
+              } //if vPers.getfirst KlOtpusk=tsok
+            } //vPers._Loop Vacations
+            if not _boVac then continue;
+          }//if Persons.Sex<>'Ж'
+          if (vPers.PsnLinks.RBornDate>d)
+            d:=vPers.PsnLinks.RBornDate;
+        }
+      } //vPers._loop PsnLinks
+      if d<>ZeroDate
+      { d:=Add_Months(d,48);
+        if (d>AttTemp.DateNext)
+         AttTemp.DateNext:=d;
+      }
+    } //if Getfirst Persons where((AttTemp.PsnNRec == Persons.Nrec))
+
+    if (AttTemp.DateNext>dateEnd) {
+      delete current AttTemp;
+      continue;
+    }
+
+    AttTemp.Dept:=IDepartIer.GetFulDepNameIer(AttTemp.cDept);
+    update current AttTemp;
+  }//_loop AttTemp
+
+  if (not NextVisual)
+    delete all AttTemp;
+
+  SetOrder(tiPsnFIO);
+  ReReadRecord(#AttTemp);
+
+  StopVisual;
+} //procedure CreateTablAttTemp;
+
+
+Function CreateOrder: comp;
+{
+  if (RunInterface('OrderParams', OrderNo, OrderDate, cAttType) <> cmDefault)
+  {
+    result := comp(0);
+    abort;
+    exit;
+  }
+
+  ClearBuffer(#RegimeChanges);
+  RegimeChanges.FilialNo   := 0;
+  RegimeChanges.FromDate   := OrderDate;
+  RegimeChanges.OrderNmb   := OrderNo;
+  RegimeChanges.WorkRegime := cAttType;
+  insert current RegimeChanges;
+
+  ClearBuffer(#Attestation);
+  Attestation.AttDate := OrderDate;
+  Attestation.AttNmb := OrderNo;
+  Attestation.cType := cAttType;
+#IFDEF _GP_
+  Attestation.LastUser:=String(UserId(),0,0);
+#ENDIF
+  if insert current Attestation = tsOK
+  {
+    result := Attestation.NRec;
+
+    _loop pMarker where (( 0 << pMarker.pNRec ))
+    {
+      if GetFirst AttTemp where ((pMarker.pNRec == AttTemp.PsnNRec)) = tsOK
+      {
+        AttTemp.DateNext := OrderDate;
+
+        update current AttTemp;
+      }
+
+      if GetLast PlanAtt where ((pMarker.pNRec == PlanAtt.cPers)) = tsOK
+      {
+        PlanAtt.dDop1 := OrderDate;
+        update current PlanAtt;
+      }
+
+      if GetFirst AttTemp1 where ((pMarker.pNRec == AttTemp1.PsnNRec)) = tsOK
+      {
+        ClearBuffer(#PlanAtt);
+        PlanAtt.cRef3       := result;
+        PlanAtt.cPers       := pMarker.pNRec;
+        PlanAtt.wCod        := 1;
+        PlanAtt.dat1        := OrderDate;
+        PlanAtt.cDepart     := AttTemp1.cDept;
+        PlanAtt.cRef2       := AttTemp1.cPos;
+        PlanAtt.cRef1       := AttTemp1.cApoint;
+        PlanAtt.cRecommend  := RegimeChanges.NRec;
+        If (Appointments.cref1 > 0)
+        {
+          PlanAtt.dDop1 := Add_Months(PlanAtt.dat1, Appointments.cref1);
+        }
+      }
+      insert current PlanAtt;
+    }
+  }
+  else
+  {
+    result := comp(0);
+  }
+} //Function CreateOrder: comp;
+
+
+//--------------------------------------------
+// Обработчик событий интерфейса
+//--------------------------------------------
+HandleEvent
+//---------------------
+cmInit:{
+  GP_FilterStore:=GP_IUserFilterStore(new(GP_UserFilterStoreDSK,InitDSK('Attestation_GP_')));
+
+  DepAccessMarker:=InitMarker('',8,0,1);
+  _loop UDL InsertMarker(DepAccessMarker,UDL.Department);
+
+  cAttestationCommission:=0;
+  var cCat:comp;
+  cCat:=iCatFunc.GetCatalogsNRec(83);
+  if (getfirst fastfirstrow GP_Cat
+      where((0==GP_Cat.lPr and cCat==GP_Cat.MainLink and 'Аттестационная комиссия'==GP_Cat.Name))=tsok)
+    cAttestationCommission:=GP_Cat.NRec
+  else
+    message('Не найдена характеристика "Аттестационная комиссия"!',error);
+
+  IsRunFromInit:=true;
+
+  case inherited :: handleEvent (cmInit) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  IsRunFromInit:=false;
+
+  GP_UserFilterList:=GP_ObjUserFilterList(New(GP_UserFilterList,UserFilterList(GP_FilterStore)));
+  GP_UserFilterList.Add(GP_IUserFilter(New(GP_UserFilterKlKatego,UserFilter(fnExtFilterKateg,'mExtFilterKateg'))));
+  GP_UserFilterList.Add(GP_IUserFilter(New(GP_UserFilterCatalogs,UserFilterCatalogs(fnExtFilterCommiss,'mExtFilterCommiss',
+                                                                                    83,cAttestationCommission))));
+
+  GP_UserFilterList.Load;
+}//cmInit:
+
+//---------------------
+cmDone:{
+  case inherited :: handleEvent (cmDone) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  DoneMarker(DepAccessMarker,'');
+} //cmDone:
+
+//---------------------
+cmCheckField:
+{
+  case CurField of
+  #dateBeg, #dateEnd:
+  { dateBeg:=date(1,month(dateEnd),year(dateEnd));
+  }
+  end;
+  case inherited :: handleEvent (cmCheckField) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+} //cmCheckField
+
+//---------------------
+cmPick:{
+  case inherited :: handleEvent (cmPick) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  if (GP_UserFilterList.Pick(CurField)) {
+    GP_UserFilterList.Save;
+    RedrawPanel(CurTable);
+    CreateTablAttTemp;
+  }
+} //cmPick
+
+//---------------------
+cmDelOnProtect:{
+  case inherited :: handleEvent (cmDelOnProtect) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  if (GP_UserFilterList.Del(CurField)) {
+    GP_UserFilterList.Save;
+    RedrawPanel(CurTable);
+    CreateTablAttTemp;
+  }
+} //cmDelOnProtect
+
+//---------------------
+cmValue22:{//Печать графика аттестации
+  var i:integer;
+  StartNewVisual(vtRotateVisual, vfTimer + vfBreak, 'Обработка информации', 1);
+  delete all from AttFr;
+  delete all from AttComission;
+  PushPos(#AttTemp);
+  _loop AttTemp
+  {
+    ClearBuffer(#attFr);
+    var ComissionName: String = '';
+    if GetFirst GP_Cat where ((
+      AttTemp.cApoint==GP_Appoint.NRec
+      and 2 == GP_AdvFeatures.ObjType
+      and GP_Appoint.StaffStr==GP_AdvFeatures.ObjNrec
+      and cAttestationCommission==GP_AdvFeatures.Position
+      and Comp(GP_AdvFeatures.ValString)==GP_Cat.NRec
+    )) = tsOk
+      ComissionName := GP_Cat.Name;
+
+    if (getfirst AttComission where ((ComissionName == AttComission.Comission)) ) <> tsOk
+    {
+      ClearBuffer(#AttComission);
+      AttComission.Comission := ComissionName;
+      AttComission.Date1 := DateBeg;
+      AttComission.Date2 := DateEnd;
+      insert current AttComission;
+    }
+
+    AttFr.cComission := AttComission.NRec;
+    AttFr.Podr      := oGP_DepFunc.GetDepCode(AttTemp.cDept, true);
+    AttFr.PodrName  := oGP_DepFunc.GetFullDepName(AttTemp.cDept);
+    AttFr.TabNum    := attTemp.TabNum;
+    AttFr.FIO       := attTemp.FIO;
+    AttFr.Position  := attTemp.Position;
+    AttFr.DateAtt   := attTemp.DateNext;
+    AttFr.DateAttM  := DateToStr(attTemp.DateNext, 'Month YYYY');
+    insert current AttFr;
+    if (not NextVisual)
+      break;
+  }
+  i := 1;
+  _loop AttComission ordered by Comission
+  {
+    _loop AttFr where ((AttComission.NRec == attFr.cComission)) ordered by Podr, FIO, DateAtt
+    {
+      AttFr.NPP := i;
+      update current AttFr;
+      i++;
+    }
+    if (not NextVisual)
+      break;
+  }
+  StopVisual('', 0);
+
+  RunFReport(AttestationList, '', true);
+  PopPos(#AttTemp);
+}//cmValue22
+
+end;
+
+
+end.
+
+#component "GP_Staff"
+ReceptionMenuPrintAttestation Menu
+{
+ - 'График проведения аттестации', cmValue22, 'График проведения аттестации', hcStaffreceptionmenu;
+}
+
+//Добавление пунктов меню
+handler with replace GP_MenuDynamic_AddItems_Attestation on ExtensionPoint GP_MenuDynamic_AddItems
+action
+{
+  result:=true;
+  timelog('GP_MenuDynamic_AddItems_Attestation ');
+  var MenuID:longint=0;
+  _try {
+    MenuID:=LoadMenuEx('Z_Staff::ReInitPlan',false,true);
+
+    AddSubMenuDynamic(MenuID, 'GP_Staff::ReceptionMenuPrintAttestation', 'Печать','','');
+
+    if (not StoreMenuHowDynamics(MenuID,'Z_Staff::ReInitPlan'))
+      _raise ExAddMenuItemError;
+  }
+  _except
+    on ExVip:{
+      message('Ошибка регистрации меню для интерфейса "Список сотрудников, подлежащих аттестации"'#13+
+              ExploreException,error);
+    }
+  _finally {
+    if (MenuID<>0) DisposeLoadMenu(MenuID);
+  }
+  timelog('GP_MenuDynamic_AddItems_Attestation finish');
+}
+
+//Удаление пунктов меню
+handler with replace GP_MenuDynamic_DelItems_Attestation on ExtensionPoint GP_MenuDynamic_DelItems
+action
+{
+  result:=true;
+
+  DeleteMenuHowDynamics('Z_Staff::ReInitPlan');
+}

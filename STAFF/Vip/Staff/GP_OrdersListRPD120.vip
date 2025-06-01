@@ -1,0 +1,272 @@
+/*************************************************************************************************\
+* Наименование: Погашение подотчетных сумм                                                        *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи |Дата    |Исполнитель             |Проект                             *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#3349        |08/09/18|Евдокимов М.А.          |НПО Энергомаш                      *
+\*************************************************************************************************/
+#include OrdersFiltr.vih
+#include OrdersList.vih
+#include ContainerOfOrders.vih
+#include GP_RPD_90_Helper.vih
+#include DepTree.vih
+
+#component "Z_StaffOrders"
+
+#doc
+Интерфейс фильтрации в реестре приказов. Наследник от стандартного.
+Устанавливает фильтр по РПД 120
+#end
+vipinterface GP_OrdersFiltrRPD120(OrdersFiltr);
+
+#doc
+Содержимое приказа Погашение подотчетных сумм.
+Наследник от стандартного контейнера приказа.
+Заблокировано добавление и удаление РПД в приказе.
+#end
+vipinterface GP_ContainerOfOrdersRPD120(ContainerOfOrders);
+
+#doc
+Реестр приказов Погашение подотчетных сумм. Наследник от стандартного списка приказов.
+Установлен фильтр по РПД 120, изменен заголовок окна. 120-е РПД формируется при создании приказа.
+#end
+vipinterface GP_OrdersListRPD120(OrdersList);
+
+//Реестр приказов Погашение подотчетных сумм
+interface GP_OrdersListRPD120;
+
+var
+  FO120: GP_OrdersFiltrRPD120; //Объект фильтра приказов по РПД 120
+
+procedure GP_SetDocText(Sender: comp);
+{
+  if Sender != Sender {};
+  update current TitleDoc
+  set TitleDoc.DocText := 'Погашение подотчетных сумм';
+
+  update current TmpTitleDoc
+  set TmpTitleDoc.DocText := TitleDoc.DocText;
+}
+
+//Обновляет заголовок окна интерфейса
+procedure RefreshIfcTitle;
+{
+  var sTitle: string = '';
+  cfsSetCurrentContainer(cfsGetCurrentContainerSelf);
+  cfsGetProp('GP_OrdersListRPD120', cfpTitle, sTitle);
+  cfsSetProp('GP_OrdersListRPD120', cfpTitle, Replace(sTitle, 'приказов','списков на погашение подотчетных сумм'));
+}
+
+//Подменяет контейнер РПД в приказе на наш, в котором заблокировано создание удаление РПД.
+procedure InjectContainerRPD120;
+{
+  if not NullVipRef(COO)
+  {
+    UnbindEmbeddedInterface(mdf);
+    UnbindAllEvents(COO);
+    FreeVipInterface(COO);
+  }
+  if not LoadVipRef(COO, 'GP_ContainerOfOrdersRPD120')
+  {
+    Message('Не найден интерфейс содержания документов.', Error);
+    abort;
+    exit;
+  }
+  else
+  {
+    IContainerOfOrders7(COO).SetToolbarID(curToolBar); // записать текущий тулбар в контейнер
+    BindEmbeddedInterface(mdf, COO);// связать область с реализацией
+    BindEvent(InsideReScan, COO.InsideReScan); // связать динамичные события
+    BindEvent(GP_SetDocText, COO.InsideReScan); // после изменений в РПД будем обновлять текст приказа по своему
+  }
+}
+
+//Копипаста из CreateNewOrderByParam - создание нового приказа
+//Вызывается при cmInsertRecord TmpTitleDoc
+//При создании приказа не вызывается окно выбора РПД, добавляется РПД 120
+function GP_CreateNewOrderByParam: boolean;
+{
+  if (PersNrec <> 0) and (wTypeRPD <> 0)
+    result := CreateNewOrderByParam;
+  else
+  {
+    wMy := 120; //вместо вызова интерфейса выбора РПД - прописываем жестко РПД-120. Дальше идет стандартный код.
+
+    if (m_sCurrentBarKod <> '') // создание связи с архивом
+    {
+      oArchiveFuncs.CreateLinkDocWithBarkod(m_sCurrentBarKod, TmpTitleDoc.nRec, 1800);
+      m_sCurrentBarKod := '';
+    }
+
+    var bRuki: boolean;
+    bRuki := false;
+
+    if StafUserOrder.Flag1 = '0' // только для индивидуальных
+      if not FO.FoundMarkerRPD(wMy)
+      {
+        Message('Установленный фильтр не позволяет выбирать данное РПД', Information);
+        bRuki := true;
+      }
+
+    if not bRuki
+    {
+      // вставим в физическую таблицу данные
+      ClearBuffer(tnTitleDoc);
+      CopyFieldsFromTmpToTitleDoc;
+
+      if ( boGetTune('UP.STAFF.DIFF_NMB_FOR_FILIALS') )    //если идет нумерация по филиалам
+      {
+        //Filial := 'Отдельная нумерация по филиалам';
+        set TitleDoc.DocMemo := FltDept; //для нумерации по филиалам
+      }
+
+      // обновляем тип приказа
+      if trim(TitleDoc.DocNmb) = ''
+      {
+        TitleDoc.DocNmb := UNOO.GetNmbPrWithYear(wMy, Year(TitleDoc.DocDate));
+
+        if getfirst tTypePr where ((wMy == tTypePr.CodOper)) = tsOk
+          TitleDoc.DocText := tTypePr.NOper;
+
+        update current TmpTitleDoc
+          set TmpTitleDoc.DocNmb := TitleDoc.DocNmb;
+              TmpTitleDoc.DocText := TitleDoc.DocText;
+      }
+
+      // надо вставить и в хранилище всех приказов эту запись
+      if insert current TitleDoc = tsOk
+        fnLockCurrAndMsg(false);
+      //  запускаем окно содержания приказа
+      // предварительно заполнив базово таблицу PartDoc
+      PartDoc.cDoc := TitleDoc.Nrec;
+      PartDoc.TypeOper := integer(wMy);   // hard: form T1
+      PartDoc.NRazd := 1;
+      insert current PartDoc;
+
+      /*окно и так запущено, просто не указана точка входа и  пустой скрин */
+      COO.SetRelation(TitleDoc.NRec); // установить точку входа
+      SelectFormat(mdf);
+
+      result := true;
+    }
+  }
+}
+
+tableevent table TmpTitleDoc;
+
+  cmInsertRecord:
+  {
+    //Копипаста стандартного кода обработчика события
+    if not epStaffOrder_AccessInsertDelete (cmInsertRecord, TmpTitleDoc.DocDate, PartDoc.TypeOper) {
+      abort; exit;
+    }
+
+    if insert current TmpTitleDoc = tsOk
+    {
+      cNewRecord4DocText := tmpTitleDoc.nRec;
+
+      while true
+      {
+        ClearMarker(DummyMarker);
+        if (GP_CreateNewOrderByParam)   //Вместо использования стандартной функции формирования нового приказа используем свою
+          break;
+      } //while true
+      ClearMarker(DummyMarker);
+      ReScanPanel(tnTmpTitleDoc);
+    }
+  }
+
+end;
+
+handleevent
+
+  cmFilterSave:
+  {
+    inherited::handleevent(cmFilterSave);
+    RefreshIfcTitle;
+  }
+
+  cmOnVipLoad:
+  {
+    //Подменяем стандартный интерфейс фильтрации интерфейсом фильтрации по РПД 120
+    FO := FO120;
+    if Inherited::HandleEvent(cmOnVipLoad) = heAbort Abort;
+    //Корректируем заголовок окна
+    RefreshIfcTitle;
+    //Подменяем ContainerOfOrders
+    InjectContainerRPD120;
+    //Меняем заголовки колонок списка приказов
+    SetColumnTitle(brwDoc, #TmpTitleDoc.DocNmb, '№ списка');
+    SetColumnTitle(brwDoc, #TmpTitleDoc.DocDateCopy, 'Дата списка');
+  }
+
+  cmInit:
+  {
+    //Подменяем стандартный интерфейс фильтрации интерфейсом фильтрации по РПД 120
+    FO := FO120;
+    if Inherited::HandleEvent(cmInit) = heAbort Abort;
+    //Корректируем заголовок окна
+    RefreshIfcTitle;
+    //Подменяем ContainerOfOrders
+    InjectContainerRPD120;
+    //Меняем заголовки колонок списка приказов
+    SetColumnTitle(brwDoc, #TmpTitleDoc.DocNmb, '№ списка');
+    SetColumnTitle(brwDoc, #TmpTitleDoc.DocDateCopy, 'Дата списка');
+  }
+
+end;
+
+end.
+
+//Интерфейс фильтрации в реестре приказов по РПД 120
+interface GP_OrdersFiltrRPD120;
+
+handleevent
+
+  cmOnVipLoad:
+  {
+    if Inherited::HandleEvent(cmOnVipLoad)=heAbort then Abort;
+    //Устанавливаем в качестве доступных РПД только 120ое
+    ClearMarker(MarkerAccessRPD);
+    InsertMarker(MarkerAccessRPD, 120);
+    nMAR := GetMarkerCount(MarkerAccessRPD);
+    //Устанавливаем фильтр по 120му РПД
+    ClearMarker(MarkerRPD);
+    InsertMarker(MarkerRPD, 120);
+    //Скрываем поле выбора РПД для фильтрации
+    ClearFieldState(#FilNOper, sfVisible);
+  }
+
+end;
+
+end.
+
+//Содержимое приказа Погашение подотчетных сумм
+interface GP_ContainerOfOrdersRPD120;
+
+handleevent
+  cmInsert: Stop;
+  cmDelete: Stop;
+  cmHotKeys:
+  {
+    var menuID: longint = LoadMenu('ContainerOfOrders120_Menu');
+    PutHotCommand(RunLoadMenu(menuID));
+  }
+end;
+
+end.
+
+
+ContainerOfOrders120_Menu menu
+{
+  - 'Печать списка', cmPrintDoc
+      , 'Печать списка', hcStaffReceptionMenu, 'Ctrl+P', kbCtrlP,,,,, bmpPrintGroup16;
+  -----------;
+  - 'Внешняя классификация', cmPickClass, 'Внешняя классификация'
+       ,hcGkatalM1ExtClass,'Alt+C', kbAltC, sci1Esc,,,, bmpClassifierSO;
+  - 'Внешние атрибуты', cmPickAttr,
+      'Заполнение внешних атрибутов по данной позиции', hcGkatalM1Attr
+        ,'Alt+A', kbAltA, sci1Esc,,,, bmpAttributeSO;
+}

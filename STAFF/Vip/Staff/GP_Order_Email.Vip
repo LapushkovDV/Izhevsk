@@ -1,0 +1,272 @@
+/*************************************************************************************************\
+* Наименование: Расширение интерфейса редактирования ограничений на работу с распорядительными    *
+*               действиями - отправка приказа на почту                                            *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание: см. GP_epConfirmOrder.Vip                                                           *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#000          |19/03/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#3209        |19/03/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+//разграничение по подразделениям
+#include DepartmentsLimiter.vih
+// Для отправки почты
+#include GP_EmailRun.Vih
+// приказ
+#include GP_Order_Email.Vih
+#doc
+Расширение интерфейса редактирования ограничений на работу с распорядительными
+действиями - отправка приказа на почту
+<p>#3209 - запомнить кто и когда утвердил приказ
+#end
+//*****************************************
+Interface GP_Order_Email cacheable;
+//*****************************************
+//------------------------
+// таблица со списком пользователей для отправки
+//------------------------
+Table Struct tmp_order_send
+( cUser:comp
+ ,TypeOper:word
+ ,Pa:word
+)
+with index
+( tmp_order_send01=TypeOper+cUser
+);
+Table Struct tmp_order_email
+( cUser:comp
+ ,cPersons:comp
+ ,Email:string
+ ,Fio:string[100]
+ ,Pa:word
+)
+with index
+( tmp_order_email01 =PA+Email
+ ,tmp_order_email02 =cUser
+);
+
+#include GP_EmailRun.Var
+//------------------------
+var
+ vUserAcs:UserDepartmentsLimiter;
+//#3209
+ pVA_TitleDoc_Confirm_User:comp;//'.Утвердил, Пользователь'
+ pVA_TitleDoc_Confirm_Date:comp;//'.Утвердил, Дата'
+ pUserID:comp;
+//------------------------
+ email_num_row:longint;
+//-------- Настройки
+ NPOEM_OWN_EMAIL_TYPE:word=1;//Тип отправки EMAIL
+Create view
+var
+   pTitleDoc:comp;
+From
+   TitleDoc
+  ,PartDoc
+  ,TypePr
+  ,tmp_order_send
+  ,tmp_order_email
+  ,ContDoc
+  ,ContDoc ContDoc2
+  ,Appointments NewAppoint
+  ,Persons
+where
+((   pTitleDoc == TitleDoc.Nrec
+and  TitleDoc.Nrec == PartDoc.cDoc
+and  PartDoc.TypeOper == TypePr.CodOper
+and  PartDoc.TypeOper == tmp_order_send.TypeOper
+and  PartDoc.Nrec == ContDoc.cPart
+and  PartDoc.TypeOper == ContDoc.TypeOper
+and  1 == ContDoc.SeqNmb
+and  ContDoc.cPart == ContDoc2.cPart
+and ContDoc.TypeOper == ContDoc2.TypeOper
+and ContDoc.Person == ContDoc2.Person
+and Integer(1) << ContDoc2.SeqNmb
+and ContDoc2.cStr == NewAppoint.Nrec
+and ContDoc.Person == Persons.Nrec
+
+));
+
+//*****************************************************************************
+/*
+Create view vPers
+var pPersons:comp;
+    sFio:string;
+as select COMMUNICATIONS.EMAIL
+from Persons,COMMUNICATIONS
+where ((
+    sFio == Persons.Fio
+and 'С' == Persons.IsEmployee
+and pPersons == COMMUNICATIONS.Person
+and 3 == COMMUNICATIONS.OBJTYPE
+and ''<< COMMUNICATIONS.Email(noindex)
+));
+*/
+
+Constructor Init;
+{ Result:=true;
+  //--- #3209
+  pVA_TitleDoc_Confirm_User:=ExtAttr_Create(coTitleDoc,'.Утвердил, Пользователь',cgAttrType_Str);
+  pVA_TitleDoc_Confirm_Date:=ExtAttr_Create(coTitleDoc,'.Утвердил, Дата'        ,cgAttrType_Date);
+  pUserID:=UserID();
+
+  //----- Настройки
+  NPOEM_OWN_EMAIL_TYPE:=wGetTune('NPOEM_OWN.EMAIL_TYPE');//Тип отправки EMAIL
+  delete all tmp_order_send;
+  delete all tmp_order_email;
+  SQL
+  select ServStav.cUnit //cUser
+        ,ServStav.wTblCode //TypeOper
+        ,0 // PA
+  from ServStav
+  where 1 = ServStav.FilialNo
+   and ( BITAND(ServStav.cServ,16)>0)
+  into tmp_order_send;
+  timelog('GP_Order_Email->Init отобрали в tmp_order_send '+String(RecordsInTable(#tmp_order_send)));
+
+} //Constructor Init;
+
+
+//-----------------------------------
+// права доступа
+//-----------------------------------
+Function Accessibility(_PDept:comp;_pUser:comp):boolean;cacheable;
+{ Result:=vUserAcs.Accessibility(_PDept,_pUser)<>0;
+
+}
+//-----------------------------------
+// проверить права на подразделения
+//-----------------------------------
+Function CheckDepRights:boolean;
+{ Result:=false;
+  case PartDoc.TypeOper of
+  5:
+  { _Loop ContDoc
+    { if Accessibility(ContDoc.cDopRef,tmp_order_send.cUser)
+      { Result:=true; break;
+      }
+      if getfirst ContDoc2=tsok
+        if getfirst NewAppoint=tsok
+         if Accessibility(NewAppoint.Department,tmp_order_send.cUser)
+         { Result:=true; break;
+         }
+    } //_Loop ContDoc
+  } //5
+  else
+  { _Loop ContDoc
+    { if Accessibility(ContDoc.cDopRef,tmp_order_send.cUser)
+      { Result:=true; break;
+      }
+    }
+  }
+  end;
+  timelog('GP_Order_Email->CheckRights='+String(Result));
+} //Function CheckRights:boolean;
+
+//===============================================================
+// Записать текст сообщения
+//===============================================================
+Procedure Write_Mess(w:string);
+{ email_num_row++;
+  pGP_EmailRun.Write_Text(email_num_row,w);
+} //Procedure Write_Mess(w:string);
+
+//-----------------------------------
+// отправить приказ
+//-----------------------------------
+Function SendOrder(_pTitleDoc:comp):boolean;
+var
+  isAllOk:boolean;
+{ Result:=false;
+  pTitleDoc:=_pTitleDoc;
+  timelog('GP_Order_Email->SendOrder:_pTitleDoc='+String(_pTitleDoc));
+  //--------------------
+  sSetAttrID(coTitleDoc,pTitleDoc,pVA_TitleDoc_Confirm_User,string(pUserID,0,0));
+  dSetAttrID(coTitleDoc,pTitleDoc,pVA_TitleDoc_Confirm_Date,Cur_Date);
+   //---------------------------
+
+  if getfirst TitleDoc<>tsok then exit;
+  isAllOk:=false;
+  update all tmp_order_email set pa:=0;
+  _Loop PartDoc
+  { timelog('GP_Order_Email->SendOrder:PartDoc='+String(PartDoc.Nrec));
+    _Loop tmp_order_send
+    { timelog('GP_Order_Email->SendOrder:tmp_order_send.cUser='+String(tmp_order_send.cUser));
+      if CheckDepRights
+      { isAllOk:=true;
+        if getfirst tmp_order_email
+          where (( tmp_order_send.cUser== tmp_order_email.cUser)) <>tsok
+        {
+          var lObj:longint=UserOfficeFilial(tmp_order_send.cUser);
+
+          var _mail:string='';
+          var _Fio :string=sGetTuneEx('USER.FIO',LObj,tmp_order_send.cUser);
+          //vPers.pPersons:=coGetTuneEx('USER.PERS',LObj,tmp_order_send.cUser);
+          //vPers.pPersons:=GetPersonsByUser(tmp_order_send.cUser);
+          var _pPersons:comp=GetPersonsByUser(tmp_order_send.cUser);
+          //if vPers.Getfirst COMMUNICATIONS=tsok
+          //{ _mail:=vPers.COMMUNICATIONS.EMAIL;
+          //}
+          _mail:=pGP_EmailRun.GetEmailByPers(_pPersons);
+          tmp_order_email.cUser   :=tmp_order_send.cUser;
+          tmp_order_email.cPersons:=_pPersons ;
+          tmp_order_email.Fio     :=_Fio;
+          tmp_order_email.Email   :=_mail;
+          tmp_order_email.PA      :=if(tmp_order_email.Email<>'',1,0);
+          insert current tmp_order_email;
+
+        }
+        else
+        { if tmp_order_email.Email<>''
+           update current tmp_order_email set tmp_order_email.PA:=1;
+        }
+        timelog('GP_Order_Email->SendOrder:tmp_order_email.email='
+           +tmp_order_email.Email +'/'+tmp_order_email.fio);
+        //break;
+      } //if CheckDepRights
+    } //_Loop tmp_order_send
+
+  } //_Loop PartDoc
+  if not isAllOk then exit;
+  timelog('GP_Order_Email->SendOrder ===== SEND ======= ');
+  _Loop tmp_order_email where (( 1==tmp_order_email.PA))
+  { email_num_row:=0;
+    timelog('GP_Order_Email->SendOrder:tmp_order_email.email='
+           +tmp_order_email.Email +'/'+tmp_order_email.fio);
+
+    Write_Mess('Добрый день, '+tmp_order_email.Fio);
+    Write_Mess('<p>Приказ № <b>'+TitleDoc.DOCNMB
+     +DateToStr(TitleDoc.DocDate,'</b> от <b>DD.MM.YYYY</b>')
+     +' утвержден сотрудником: '+MyGetInitial(sGetTune('USER.FIO'),True));
+    Write_Mess('Краткое содержание:<b>'+TitleDoc.DocText+'</b>');
+    _Loop PartDoc
+    { _Loop tmp_order_send where
+       (( PartDoc.TypeOper == tmp_order_send.TypeOper
+       and tmp_order_email.cUser ==tmp_order_send.cUser
+       ))
+      { if CheckDepRights
+        { Write_Mess('<p>РПД '+string(PartDoc.Typeoper)+', '+TypePr.Noper);
+          break;
+        }
+      } //_Loop tmp_order_send where
+    } //_Loop PartDoc
+    Result:=pGP_EmailRun.EmailSend
+     ( NPOEM_OWN_EMAIL_TYPE// : word ;
+       ,tmp_order_email.email // _email_addr :string ;
+       ,'УП.Утверждение приказа: № '+TitleDoc.DOCNMB
+            +DateToStr(TitleDoc.DocDate,' от DD.MM.YYYY')// _email_subject :string ;
+       ,'' //_email_text :string ;
+       ,'' //_email_attach1 :string ;
+       ,'' //_email_attach2 :string ;
+       ,'' //_email_attach3 :string ;
+       ,'' //_email_attach4 :string ;
+       ,'"INTERFACE Z_StaffOrders::OrdersList('+string(TitleDoc.Nrec,0,0)+')"' //_email_attach5 :string ;
+       ,'' //_email_addr_copy :string='';
+       ,'' //_email_addr_from :string=''
+      );
+  }  //_Loop tmp_order_email where (( 1==tmp_order_email.PA))
+  Result:=True;
+} //Function SendOrder(pTitleDoc:comp):boolean;
+
+end.

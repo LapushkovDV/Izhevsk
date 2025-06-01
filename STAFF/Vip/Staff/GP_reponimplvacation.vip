@@ -1,0 +1,683 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                "Отчет по реализации графика отпусков"                                           *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#182          |17/03/18|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_XlOutExt.vih
+#include UserReport.vih
+#include CatFunc.vih
+
+#define GPInt GP_reponimplvacation // #(GPInt)
+//#define GPNam Отчет по реализации графика отпусков // #(GPNam)
+#define GPNam Отчет по реализации отпусков
+
+Interface #(GPInt);
+
+const
+#include Excel.inc;
+end;
+
+table struct ttPFRas  // Расшифровка
+(
+  sTbNmb : string
+, sFIO   : string
+, sDept  : string
+, iTypeG : integer
+, sNameG : string
+, dBegG  : date
+, dEndG  : date
+, liDayG : integer
+, iTypeF : integer
+, sNameF : string
+, dBegF  : date
+, dEndF  : date
+, liDayF : integer
+)
+with index
+(
+  ttPFRas01 = sDept + sFIO + iTypeF + iTypeG
+);
+
+table struct ttPFOtp  // Результат расчетов
+(
+  sCode   : string,   // Код подразделения (СЕ ШР)
+  sName   : string, // Наменование подразделения (СЕ ШР)
+  liDV1   : longint,// 1 - Основных план (тип 0)
+  liDV2   : longint,// 2 - Основных факт (тип 0) 
+  liDV3   : longint,// 3 - Дополнительных план (тип 1)
+  liDV4   : longint,// 4 - Дополнительных факт (тип 1)
+  liDV5   : longint,// 5 - Административные ((тип 2) Прочие (код 21))     
+  liDV6   : longint,// 6 - Уход за детьми   ((тип 2) Прочие (DAYS = "ОЖ"))
+  liDV7   : longint,// 7 - Учебные          ((тип 2) Прочие (код 22-39))  
+  liDV8   : longint // 8 - Прочие           ((тип 2) - liDV5 - liDV6 - liDV7)
+)
+with index
+(
+  ttPFOtp01 = sCode
+);
+
+var
+  dBeg, dEnd : date;
+  iOut       : GP_XlOutExt;
+  iCatFunc   : CatalogsFunctions;
+  sFullName  : string;
+  liTDV1     ,
+  liTDV2     ,
+  liTDV3     ,
+  liTDV4     ,
+  liTDV5     ,
+  liTDV6     ,
+  liTDV7     ,
+  liTDV8     : longint;
+  lRB, lRE,
+  lCB, lCE,
+  lSB, lSE,
+  lDB, lDE,
+  lRow       : longint;
+
+Create View
+var
+  cMainLinkPodr : comp;
+//  sCodePodrV : string;  
+  cParentDep : comp;
+from
+  PlanOtpusk
+, vacations
+, synonym persons PersPlan
+, synonym persons PersFact
+, synonym KlOtpusk KlOPlan
+, synonym KlOtpusk KlOFact
+, synonym Appointments AppPlan
+, synonym Appointments AppFact
+, synonym Catalogs CatPlan
+, synonym Catalogs CatFact
+, synonym Catalogs CatGroup
+, ttPFRas
+, ttPFOtp (ttPFOtp01)
+where
+((
+//новая редакция ТЗ берем только отпуска начало которых попадает в интервал отчета
+// #182 #54 при обработке таблицы PLANOTPUSK обрабатывать ТОЛЬКО записи со значением planotpusk.WSTATUS=65535
+                  root == PlanOtpusk.nrec and ( 65535 = PlanOtpusk.WSTATUS  and (dBeg <= PlanOtpusk.PLANYEARBEG and dEnd >= PlanOtpusk.PLANYEARBEG) )
+and PlanOtpusk.VACTYPE == KlOPlan.KOTPUS
+and PlanOtpusk.Person  == PersPlan.nrec 
+and PersPlan.APPOINTCUR== AppPlan.nRec
+and AppPlan.Department == CatPlan.nRec
+//новая редакция ТЗ берем только отпуска начало которых попадает в интервал отчета
+and                 0  << vacations.person and (dBeg <= vacations.FACTYEARBEG and dEnd >= vacations.FACTYEARBEG)
+and vacations.VACTYPE  == KlOFact.nrec
+and vacations.Person   == PersFact.nrec 
+and PersFact.APPOINTCUR== AppFact.nRec
+and AppFact.Department == CatFact.nRec
+//
+and cParentDep == CatGroup.nRec
+/*
+and integer(0)    == CatGroup.LPr
+and cMainLinkPodr == CatGroup.MainLink
+and sCodePodrV    == CatGroup.Code
+*/
+))
+;
+
+//функция определения номера столбца с данными для отчета
+function WhatColVac(wPF: word; iTyp: integer; wKod: word; sDay: string): word;  cacheable;
+// wPF 0 - Plan; 1 - Fact
+{
+//   var wRes : word;
+
+  Result := 0; // 0 - Не удовлетворяет критериям отбора данных. Пропускаем
+
+  if ( wPF = 0 and iTyp = 0 ) {Result := 1} // 1 - Основных план (тип 0)
+  if ( wPF = 1 and iTyp = 0 ) {Result := 2} // 2 - Основных факт (тип 0) 
+  if ( wPF = 0 and iTyp = 1 ) {Result := 3} // 3 - Дополнительных план (тип 1)
+  if ( wPF = 1 and iTyp = 1 ) {Result := 4} // 4 - Дополнительных факт (тип 1)
+
+  if iTyp = 2
+  {
+    if ( trim(sDay) = 'ОЖ' )             { Result := 6 } else // 6 - Уход за детьми   ((тип 2) Прочие (DAYS = "ОЖ"))
+      if ( wKod = 21 )                   { Result := 5 } else // 5 - Административные ((тип 2) Прочие (код 21))
+        if ( wKod >= 22 and wKod <= 39 ) { Result := 7 } else // 7 - Учебные          ((тип 2) Прочие (код 22-39))
+                                         { Result := 8 }      // 8 - Прочие           ((тип 2) - liDV5 - liDV6 - liDV7)
+  }
+  if iTyp = 5
+  {
+    if ( trim(sDay) = 'Р' )              { Result := 6 }      // 6 - Уход за детьми   ((тип 5) Прочие (DAYS = "Р")) 
+  }
+}
+
+function sWhatTypeOtpusk(iType : integer): string; cacheable;
+{
+  Result := '';
+  case iType of
+    0: Result := 'Осн.';
+    1: Result := 'Доп.';
+    2,
+    5: Result := 'Проч.';
+  end;
+}
+
+procedure PrintRashifrovka;
+var
+  lRBr, 
+  lCBr, lCEr,
+  //lSBr,
+  lSEr,
+  lDBr, lDEr: longint;
+  lRowT:longint = 0;
+  lRowC:longint = 1;
+
+{
+  if isvalid(#ttPFRas)
+  {
+    RestartVisual('Выгружаю расшифровку', 1);
+    xlSetActiveSheet(2);
+    xlSetSheetName(2, 'Расшифровка');
+    
+    lRBr  := 4;
+    lDBr  := lDEr := lRBr + 2;
+    lCBr  := 1;
+    lCEr  := 1;
+    
+    //заголовок
+    #define repTr 2,2,2,2
+    iOut.StringValL('Расшифровка за период с '+DateToStr(dBeg,'DD.MM.YYYY')+' по '+DateToStr(dEnd,'DD.MM.YYYY'), #repTr);
+    xlSetFontSize(14,#repTr);
+    xlSetFontStyle(xlBold,#repTr);
+    
+    iOut.Header2Row('Таб. ном.',           lRBr,  lCEr,lRBr,  lCEr); lCEr++; /*01*/
+    iOut.Header2Row('ФИО',                 lRBr,  lCEr,lRBr,  lCEr); lCEr++; /*02*/
+    iOut.Header2Row('Код подр.',           lRBr,  lCEr,lRBr,  lCEr); lCEr++; /*03*/
+    iOut.HeaderIns ('График отпусков',     lRBr,  lCEr,lRBr,  lCEr, 5);
+    iOut.Header1Row('Тип отп.',            lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*04*/
+    iOut.Header1Row('Наименование отпуска',lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*05*/
+    iOut.Header1Row('Начало',              lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*06*/
+    iOut.Header1Row('Конец',               lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*07*/
+    iOut.Header1Row('Дней',                lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*08*/
+    iOut.HeaderIns ('Фактические отпуска', lRBr,  lCEr,lRBr,  lCEr, 5);
+    iOut.Header1Row('Тип отп.',            lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*09*/
+    iOut.Header1Row('Наименование отпуска',lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*10*/
+    iOut.Header1Row('Начало',              lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*11*/
+    iOut.Header1Row('Конец',               lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*12*/
+    iOut.Header1Row('Дней',                lRBr+1,lCEr,lRBr+1,lCEr); lCEr++; /*13*/
+    
+    _loop ttPFRas lRowT++;
+    lDEr += lRowT;
+
+    if (not xlCreateMatrix(lRowT,13))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      exit;
+    }
+    _loop ttPFRas ordered index ttPFRas01
+    {
+      if (not NextVisual) break;
+      lSEr := 1;
+      xlStWriteToMatrix(lRowC,lSEr++,ttPFRas.sTbNmb);
+      xlStWriteToMatrix(lRowC,lSEr++,ttPFRas.sFIO  );
+      xlStWriteToMatrix(lRowC,lSEr++,ttPFRas.sDept );
+      xlStWriteToMatrix(lRowC,lSEr++,if(ttPFRas.sNameG<>'',sWhatTypeOtpusk(ttPFRas.iTypeG),''));
+      xlStWriteToMatrix(lRowC,lSEr++,ttPFRas.sNameG );
+      xlDtWriteToMatrix(lRowC,lSEr++,ttPFRas.dBegG  );
+      xlDtWriteToMatrix(lRowC,lSEr++,ttPFRas.dEndG  );
+      xlDoWriteToMatrix(lRowC,lSEr++,if(ttPFRas.sNameG<>'',ttPFRas.liDayG,''));
+      xlStWriteToMatrix(lRowC,lSEr++,if(ttPFRas.sNameF<>'',sWhatTypeOtpusk(ttPFRas.iTypeF),''));
+      xlStWriteToMatrix(lRowC,lSEr++,ttPFRas.sNameF);
+      xlDtWriteToMatrix(lRowC,lSEr++,ttPFRas.dBegF );
+      xlDtWriteToMatrix(lRowC,lSEr++,ttPFRas.dEndF );
+      xlDoWriteToMatrix(lRowC,lSEr++,if(ttPFRas.sNameF<>'',ttPFRas.liDayF,''));
+      lRowC++;
+    }
+    //форматируем отчет
+    lSEr := 1;
+    #define FrmBlr lDBr,lSEr,lDEr,lSEr
+    xlSetNumberFormat('@',#FrmBlr);
+    xlSetColumnWidth ( 12,#FrmBlr); lSEr++; /*01*/
+    xlSetColumnWidth ( 30,#FrmBlr); lSEr++; /*02*/
+    xlSetNumberFormat('@',#FrmBlr);
+    xlSetColumnWidth (  8,#FrmBlr); lSEr++; /*03*/
+    xlSetColumnWidth (  8,#FrmBlr); lSEr++; /*04*/
+    xlSetColumnWidth ( 30,#FrmBlr); lSEr++; /*05*/
+    xlSetColumnWidth ( 10,#FrmBlr); lSEr++; /*06*/
+    xlSetColumnWidth ( 10,#FrmBlr); lSEr++; /*07*/
+    xlSetColumnWidth (  8,#FrmBlr); lSEr++; /*08*/
+    xlSetColumnWidth (  8,#FrmBlr); lSEr++; /*09*/
+    xlSetColumnWidth ( 30,#FrmBlr); lSEr++; /*10*/
+    xlSetColumnWidth ( 10,#FrmBlr); lSEr++; /*11*/
+    xlSetColumnWidth ( 10,#FrmBlr); lSEr++; /*12*/
+    xlSetColumnWidth (  8,#FrmBlr); lSEr++; /*13*/
+
+    //вставляем матрицу с данными
+    iNextVisual('Выгружаю расшифровку в Excel');
+    if (not xlWriteMatrixToExcel(lDBr,1))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+
+    xlSEtFontSize(11,lRBr,lCBr,lDEr,lCEr);
+    xlWrapText(lRBr,lCBr,lDEr,lCEr);
+    xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0,lRBr,lCBr,lDEr-1,lCEr-1);
+    xlFreeMatrix;
+  }
+}
+
+function sFPF : string; {sFPF := DateToStr(Cur_Date(),'_YYMMDD')+TimeToStr(Cur_Time(),'_HHMMSS');}
+
+!-------------------------------------------------------------------------------
+! Запуск отчета на выполнение
+!-------------------------------------------------------------------------------
+
+Procedure Run;
+var
+  lRowT:longint = 0;
+  lRowC:longint = 1;
+  bPosM:byte;
+  sCodePG
+ ,sNamePG : string;
+Begin
+  var dOtchPer  : date;
+  var isOk      : boolean;
+  var isOkUpPodr: boolean;
+  var wCol      : word;
+  var liCol     : longint;
+
+  dOtchPer := DGetTune('UP.DATOTCH');
+  if (not (ReadMyDsk(dBeg, '#(GPInt)_dBeg', false)))
+    dBeg := dOtchPer;
+  if (not (ReadMyDsk(dEnd, '#(GPInt)_dEnd', false)))
+    dEnd := Sub_Day(Add_Months(dOtchPer,1),1);
+
+  isOk := false;
+  delete all from ttPFOtp;
+
+  do{
+    if (RunDialog('GetInterval',dBeg,dEnd) = cmCancel) exit;
+    if (dBeg <= dEnd) and (dBeg <> date(0,0,0)) and (dEnd <> date(0,0,0)) {isOk := true} else {message('Задан некорректный диапазон дат.')}
+  } while not isOk;
+
+// Генерация массива данных
+  set cMainLinkPodr := iCatFunc.GetCatalogsNRec(-11);
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+  
+  RestartVisual('Идет сбор данных по плановым отпускам',1);
+  if isvalid(tnPlanOtpusk) // Цикл по плановым отпускам
+  _loop PlanOtpusk
+  {
+    if isvalid(tnKlOPlan) 
+      if isvalid(tnPersPlan)
+      if isvalid(tnAppPlan)
+        if isvalid(tnCatPlan)
+        {
+          if (not NextVisual) break;
+
+          wCol  := WhatColVac(0,KlOPlan.TypeOtp,KlOPlan.KOtpus,KlOPlan.Days);
+          liCol := round(PlanOtpusk.duration,0);
+          if wCol <> 0
+          {
+            sCodePG := sNamePG := '';
+            isOkUpPodr := false;
+            set cParentDep := AppPlan.Department;
+            if CatPlan.MainLink <> cMainLinkPodr
+              sCodePG := sNamePG := 'Б/Н'
+            else
+            do
+            {
+              if isvalid(#CatGroup)
+              {
+                if CatGroup.MainLink = cMainLinkPodr and CatGroup.nRec <> cMainLinkPodr
+                {
+                  bPosM := Pos('-',CatGroup.Code);
+                  if bPosM <> 0
+                  {
+                    set cParentDep := CatGroup.cParent;
+                    bPosM := 0;
+                  }
+                  else
+                  {
+                    isOkUpPodr := true;
+                    sCodePG := CatGroup.Code;
+                    sNamePG := CatGroup.Name;
+                  }
+                }
+                else
+                {
+                  sCodePG := sNamePG := 'Б/Н';
+                  isOkUpPodr := true;
+                }
+              }
+              else
+              {
+                sCodePG := CatPlan.Code;
+                sNamePG := CatPlan.Name;
+                isOkUpPodr := true;
+              }
+            } while not isOkUpPodr;//sCodePG = '';
+            clearbuffer(tnttPFOtp);
+            if getfirst ttPFOtp where((sCodePG == ttPFOtp.sCode)) = tsOk
+            { 
+              case wCol of
+              1: {ttPFOtp.liDV1 += liCol;}
+              2: {ttPFOtp.liDV2 += liCol;}
+              3: {ttPFOtp.liDV3 += liCol;}
+              4: {ttPFOtp.liDV4 += liCol;}
+              5: {ttPFOtp.liDV5 += liCol;}
+              6: {ttPFOtp.liDV6 += liCol;}
+              7: {ttPFOtp.liDV7 += liCol;}
+              8: {ttPFOtp.liDV8 += liCol;}
+              end;
+              update current ttPFOtp;
+            }
+            else
+            {
+              ttPFOtp.sCode   := sCodePG;
+              ttPFOtp.sName   := sNamePG;
+              case wCol of
+              1: {ttPFOtp.liDV1 := liCol;}
+              2: {ttPFOtp.liDV2 := liCol;}
+              3: {ttPFOtp.liDV3 := liCol;}
+              4: {ttPFOtp.liDV4 := liCol;}
+              5: {ttPFOtp.liDV5 := liCol;}
+              6: {ttPFOtp.liDV6 := liCol;}
+              7: {ttPFOtp.liDV7 := liCol;}
+              8: {ttPFOtp.liDV8 := liCol;}
+              end;
+              insert current ttPFOtp; 
+            }
+            //добавляем расшифровку
+            clearbuffer(#ttPFRas);
+            ttPFRas.sTbNmb := if(PersPlan.STRTABN='',PersPlan.TABNMB,PersPlan.STRTABN);
+            ttPFRas.sFIO   := PersPlan.FIO;
+            ttPFRas.sDept  := CatPlan.Code;
+            ttPFRas.iTypeG := KlOPlan.TypeOtp;
+            ttPFRas.sNameG := KlOPlan.NOTPUS;
+            ttPFRas.dBegG  := PlanOtpusk.PLANYEARBEG;
+            ttPFRas.dEndG  := PlanOtpusk.PLANYEAREND;
+            ttPFRas.liDayG := liCol;
+            insert current ttPFRas; 
+          }
+        }
+  }
+  RestartVisual('Идет сбор данных по фактическим отпускам',1);
+  if isvalid(tnvacations) // Цикл по фактическим отпускам
+  _loop vacations
+  {
+    if isvalid (tnKlOFact) 
+      if isvalid(tnPersFact)
+      if isvalid (tnAppFact)
+        if isvalid (tnCatFact)
+        {
+          if (not NextVisual) break;
+          
+          wCol  := WhatColVac(1,KlOFact.TypeOtp,KlOFact.KOtpus,KlOFact.Days);
+          liCol := round(vacations.duration,0);
+          if wCol <> 0
+          {
+            sCodePG := sNamePG := '';
+            isOkUpPodr := false;
+            set cParentDep := AppFact.Department;
+            if CatFact.MainLink <> cMainLinkPodr
+              sCodePG := sNamePG := 'Б/Н'
+            else
+            {
+              do
+              {
+                if isvalid(#CatGroup)
+                {
+                  if CatGroup.MainLink = cMainLinkPodr and CatGroup.nRec <> cMainLinkPodr
+                  {
+                    bPosM := Pos('-',CatGroup.Code);
+                    if bPosM <> 0
+                    {
+                      set cParentDep := CatGroup.cParent;
+                      bPosM := 0;
+                    }
+                    else
+                    {
+                      isOkUpPodr := true;
+                      sCodePG := CatGroup.Code;
+                      sNamePG := CatGroup.Name;
+                    }
+                  }
+                  else
+                  {
+                   sCodePG := sNamePG := 'Б/Н';
+                   isOkUpPodr := true;
+                  }
+                }
+                else
+                {
+                  sCodePG := CatFact.Code;
+                  sNamePG := CatFact.Name;
+                  isOkUpPodr := true;
+                }
+              } while not isOkUpPodr;//sCodePG = '';
+            }
+            clearbuffer(tnttPFOtp);
+            if getfirst ttPFOtp where((sCodePG == ttPFOtp.sCode)) = tsOk
+            { 
+              case wCol of
+              1: {ttPFOtp.liDV1 += liCol;}
+              2: {ttPFOtp.liDV2 += liCol;}
+              3: {ttPFOtp.liDV3 += liCol;}
+              4: {ttPFOtp.liDV4 += liCol;}
+              5: {ttPFOtp.liDV5 += liCol;}
+              6: {ttPFOtp.liDV6 += liCol;}
+              7: {ttPFOtp.liDV7 += liCol;}
+              8: {ttPFOtp.liDV8 += liCol;}
+              end;
+              update current ttPFOtp;
+            }
+            else
+            {
+              ttPFOtp.sCode   := sCodePG;
+              ttPFOtp.sName   := sNamePG;
+              case wCol of
+              1: {ttPFOtp.liDV1 := liCol;}
+              2: {ttPFOtp.liDV2 := liCol;}
+              3: {ttPFOtp.liDV3 := liCol;}
+              4: {ttPFOtp.liDV4 := liCol;}
+              5: {ttPFOtp.liDV5 := liCol;}
+              6: {ttPFOtp.liDV6 := liCol;}
+              7: {ttPFOtp.liDV7 := liCol;}
+              8: {ttPFOtp.liDV8 := liCol;}
+              end;
+              insert current ttPFOtp; 
+            }
+            //добавляем расшифровку
+            clearbuffer(#ttPFRas);
+            ttPFRas.sTbNmb := if(PersFact.STRTABN='',PersFact.TABNMB,PersFact.STRTABN);
+            ttPFRas.sFIO   := PersFact.FIO;
+            ttPFRas.sDept  := CatFact.Code;
+            ttPFRas.iTypeF := KlOFact.TypeOtp;
+            ttPFRas.sNameF := KlOFact.NOTPUS;
+            ttPFRas.dBegF  := vacations.FactYEARBEG;
+            ttPFRas.dEndF  := vacations.FactYEAREND;
+            ttPFRas.liDayF := liCol;
+            insert current ttPFRas; 
+          }
+        }
+  }
+
+//Вывод данных в отчет
+  if isvalid(tnttPFOtp)
+  {
+    RestartVisual('Выгружаю данные в отчет',1);
+    sFullName := GetDefaultUserPath + '#(GPInt)_'+sFPF+'.xlsx';
+    DeleteFileEx(sFullName);
+
+    xlCreateExcel(sFullName, TRUE);
+    xlAddSheet;
+    xlSetActiveSheet(1);
+    xlSetSheetName(1,'Отчет');
+    lRB  := 4;
+    lRow := 1;
+    lDB  := lDE := lRB + 3;
+    lCB  := 1;
+    lCE  := 1;
+    
+    //заголовок
+    #define repT 2,2,2,2
+    iOut.StringValL('#(GPNam) за период с '+DateToStr(dBeg,'DD.MM.YYYY')+' по '+DateToStr(dEnd,'DD.MM.YYYY'),#repT);
+    xlSetFontSize(14,#repT);
+    xlSetFontStyle(xlBold,#repT);
+    
+    // шапочка
+    #define FrmHd lRB,lCE,lRB,lCE
+    iOut.HeaderIns ('Подразделение',         lRB,  lCE,lRB,  lCE, 2);     /*Крышка для 01-02*/
+    iOut.Header2Row('Код',                   lRB+1,lCE,lRB+1,lCE); lCE++; /*01*/
+    iOut.Header2Row('Наименование',          lRB+1,lCE,lRB+1,lCE); lCE++; /*02*/
+    iOut.HeaderIns ('Дней отпуска',          lRB,  lCE,lRB,  lCE, 8);     /*Крышка для 03-10*/
+    iOut.HeaderIns ('Основных',              lRB+1,lCE,lRB+1,lCE, 2);     /*Крышка для 03-04*/
+    iOut.Header1Row('План',                  lRB+2,lCE,lRB+2,lCE); lCE++; /*03*/
+    iOut.Header1Row('Факт',                  lRB+2,lCE,lRB+2,lCE); lCE++; /*04*/
+    iOut.HeaderIns ('Дополнительных',        lRB+1,lCE,lRB+1,lCE, 2);     /*Крышка для 05-06*/
+    iOut.Header1Row('План',                  lRB+2,lCE,lRB+2,lCE); lCE++; /*05*/
+    iOut.Header1Row('Факт',                  lRB+2,lCE,lRB+2,lCE); lCE++; /*06*/
+    iOut.Header2Row('Отпуск б/с',            lRB+1,lCE,lRB+1,lCE); lCE++; /*07*/
+    iOut.Header2Row('По уходу за детьми',    lRB+1,lCE,lRB+1,lCE); lCE++; /*08*/
+    iOut.Header2Row('Учебных',               lRB+1,lCE,lRB+1,lCE); lCE++; /*09*/
+    iOut.Header2Row('Прочих по кол.договору',lRB+1,lCE,lRB+1,lCE); lCE++; /*10*/
+
+    _loop ttPFOtp lRowT++;
+    lDE += lRowT;
+
+    if (not xlCreateMatrix(lRowT,13))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      exit;
+    }
+    _loop ttPFOtp
+    {
+      if (not NextVisual) break;
+      lSE := 1;
+      xlStWriteToMatrix(lRowC,lSE++,ttPFOtp.sCode);
+      xlStWriteToMatrix(lRowC,lSE++,ttPFOtp.sName);
+      xlDoWriteToMatrix(lRowC,lSE++,ttPFOtp.liDV1); liTDV1 := liTDV1 + ttPFOtp.liDV1;
+      xlDoWriteToMatrix(lRowC,lSE++,ttPFOtp.liDV2); liTDV2 := liTDV2 + ttPFOtp.liDV2;
+      xlDoWriteToMatrix(lRowC,lSE++,ttPFOtp.liDV3); liTDV3 := liTDV3 + ttPFOtp.liDV3;
+      xlDoWriteToMatrix(lRowC,lSE++,ttPFOtp.liDV4); liTDV4 := liTDV4 + ttPFOtp.liDV4;
+      xlDoWriteToMatrix(lRowC,lSE++,ttPFOtp.liDV5); liTDV5 := liTDV5 + ttPFOtp.liDV5;
+      xlDoWriteToMatrix(lRowC,lSE++,ttPFOtp.liDV6); liTDV6 := liTDV6 + ttPFOtp.liDV6;
+      xlDoWriteToMatrix(lRowC,lSE++,ttPFOtp.liDV7); liTDV7 := liTDV7 + ttPFOtp.liDV7;
+      xlDoWriteToMatrix(lRowC,lSE++,ttPFOtp.liDV8); liTDV8 := liTDV8 + ttPFOtp.liDV8;
+      lRowC++;
+    }
+    //форматируем отчет
+    lSE := 1;
+    #define FrmBl lDB,lSE,lDE,lSE
+    xlSetNumberFormat('@',#FrmBl);
+    xlSetColumnWidth( 6,#FrmBl); lSE++; /*01*/
+    xlSetColumnWidth(40,#FrmBl); lSE++; /*02*/
+    xlSetColumnWidth(13,#FrmBl); lSE++; /*03*/
+    xlSetColumnWidth(13,#FrmBl); lSE++; /*04*/
+    xlSetColumnWidth(13,#FrmBl); lSE++; /*05*/
+    xlSetColumnWidth(13,#FrmBl); lSE++; /*06*/
+    xlSetColumnWidth(13,#FrmBl); lSE++; /*07*/
+    xlSetColumnWidth(13,#FrmBl); lSE++; /*08*/
+    xlSetColumnWidth(13,#FrmBl); lSE++; /*09*/
+    xlSetColumnWidth(13,#FrmBl); lSE++; /*10*/
+
+    iNextVisual('Выгружаю данные в Excel');
+    if (not xlWriteMatrixToExcel(lDB,1))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+
+    //Итоги
+    var iItC : integer;
+    #define FrmIt lDE,iItC,lDE,iItC
+    iItC :=  2; iOut.StringValR('Итого:', #FrmIt);
+    iItC :=  3; iOut.CodeVal(liTDV1,   #FrmIt);
+    iItC :=  4; iOut.CodeVal(liTDV2,   #FrmIt);
+    iItC :=  5; iOut.CodeVal(liTDV3,   #FrmIt);
+    iItC :=  6; iOut.CodeVal(liTDV4,   #FrmIt);
+    iItC :=  7; iOut.CodeVal(liTDV5,   #FrmIt);
+    iItC :=  8; iOut.CodeVal(liTDV6,   #FrmIt);
+    iItC :=  9; iOut.CodeVal(liTDV7,   #FrmIt);
+    iItC := 10; iOut.CodeVal(liTDV8,   #FrmIt);
+
+    xlSetFontSize(11,lRB,lCB,lDE,lCE); xlSetFontStyle(xlBold,lRB,lCB,lDB-1,lCE); xlSetFontStyle(xlBold,lDE,1,lDE,lCE);
+    xlWrapText(lRB,lCB,lDE,lCE);
+    xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0,lRB,lCB,lDE,lCE-1);
+    #define OtvIsp lDE+2,2,lDE+2,2
+    iOut.StringValL('Ответственный исполнитель: '+sGetTune('User.FIO'),#OtvIsp);
+    xlSetFontSize(11,#OtvIsp); xlSetFontStyle(xlBold,#OtvIsp);
+    PrintRashifrovka;
+    xlSetActiveSheet(1);
+    iOut.TitleEachPage(lRB,lDB-1,'#(GPInt)');
+    xlFreeze(lDB,1);
+    xlKillExcel;
+  }
+  else
+  {message('Нет данных для формирования отчета!')}
+  StopVisual;
+  SaveMyDsk(dBeg, '#(GPInt)_dBeg');
+  SaveMyDsk(dEnd, '#(GPInt)_dEnd');
+  
+End;
+
+handleevent
+  cmInit:
+  {
+    Run;
+    closeinterface(cmDefault);
+  }
+end;
+end.
+
+
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+
+Procedure Run;
+Begin
+  runinterface(#(GPInt));
+End;
+!-------------------------------------------------------------------------------
+! Наименование отчета в списке
+!-------------------------------------------------------------------------------
+Function GetReportName: String;
+Begin
+  GetReportName := '#(GPNam) ЭМ';
+End;
+
+!-------------------------------------------------------------------------------
+! Наименования групп, в которые входит отчет
+!-------------------------------------------------------------------------------
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Отчеты по кадровому делопроизводству';
+  End;
+End;
+
+!-------------------------------------------------------------------------------
+! Приоритет отчета - сортировка внутри группы выполняется сначала
+! по приоритету, а затем по наименованию
+!-------------------------------------------------------------------------------
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+!-------------------------------------------------------------------------------
+! ModuleID модулей, в которых будет виден отчет
+! '*' - отчет будет виден в любом модуле
+!-------------------------------------------------------------------------------
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+    2 : VisibleInModule := 'STAFFMAINMENU2';
+  end;
+end;
+
+!-------------------------------------------------------------------------------
+End.

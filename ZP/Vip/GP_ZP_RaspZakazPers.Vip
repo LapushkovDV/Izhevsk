@@ -1,0 +1,1522 @@
+/*************************************************************************************************\
+* Наименование:  Ведение заказов/проектов - Распределение ФОТ работников по заказам               *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Запуск - Настройка - Распределение ФОТ работников по заказам                     *
+*                также встроен в табель учета рабочего времени                                    *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#795          |07/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include Marker.Vih
+#include GetKau.Vih
+#include Contexts.vih
+#include Marks.vih
+#include PAFILTER.VIH   // функц-л работы с подразделениями и тек. лицевыми
+#include PmntPrms.vih   // PaymentParameters.Vih
+//------------------------------------
+#include GP_ZP_RaspZakazPers.Vih
+//------------------------------------
+
+#doc
+Распределения заказов по работникам
+#end
+//------------------------------------
+Interface GP_ZP_RaspZakazPers 'Распределение ФОТ работников по заказам' , EscClose;
+//------------------------------------
+show at (,,100,20);
+table struct tmpPercPrevMonth
+ (
+     clSch   : comp
+    ,cVplan  : comp
+    ,Percent : double
+ )
+ with index
+ (
+  ind0 = clSch
+ )
+ ;
+//------------------------------------
+// декларация сложного фильтра
+//------------------------------------
+function isFilterAnCorrect(ww_nrec:comp): boolean; forward;
+
+//-----------------------------------------
+#include GetKau.var
+//-----------------------------------------
+
+var
+//-----------------------------------------
+// объекты
+//-----------------------------------------
+  pMarkerActive : IMarker(Marker) new; // функция пометки
+  pMarkerArh    : IMarker(Marker) new; // функция пометки
+//-----------------------------------------
+// выбор лицевых счетов
+//-----------------------------------------
+  CS            : IContextSession;
+  CLSF           : CurLSFunctions;
+  PAF_One       : IPersonalAccountFilter; // Выбор работников
+#include PAFilter.var
+  PickOptions   : IPickOptions;
+  Cashier:                    word;
+
+//-----------------------------------------
+  pTmp:comp;
+  isOpenSearch:boolean;
+  FormatClockNumber:word;//wGetTune('FormatClockNumber')
+  Need_Read_Param: boolean;//Нужно читать/сохранять параметры
+  CurFilters,OldFilters:word;
+  Count_2_del:longint;
+//-----------------------------------------
+// Фильтры
+//-----------------------------------------
+   wFilter:word;
+   Marker_Count :longint;
+   wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   KauMarkerName:string;
+   Marker_Tmp :longint;
+
+   #mrkfld_(KatPodr)
+   #mrkfld_(MnPlan)
+   #mrkfld_(Persons)
+   #mrkfld_(Lschet)
+create view
+var
+  //------ Параметры ---------------
+  plsch    :comp;// ссылка на лицевой счет
+  pPersons :comp;// ссылка на карточку
+  pKatPodr :comp;// ссылка на подразделение
+  pMnPlan  :comp;// ссылка на заказ
+  dDatan   :date;// заданный период c
+  dDatok   :date;// заданный период по
+  wisArh   :word; // 0 - активная, 1 архив
+  pMnPlanIns:comp;//вставка заказа
+  pvPlanIns :comp;//группа планов
+  Procent_Ins:double;
+  sUserName :comp;
+  //----------------------------
+  dOtchPer :date;//дата начала отчетного периода
+as select GP_RaspAvans.Nrec
+  ,PAF.GetDepartmentFilterStr() (FieldName=FiltrPodr)
+  ,PAF.GetPersonalAccountFilterStr() (FieldName=FiltrPublic)
+  ,if (GP_RaspAvans.wtype = 0,'Накладные',
+       if(GP_RaspAvans.wtype = 1,'Прямые','!!НЕОПРЕДЕЛЕНО!!!!'
+       )
+      ) (FieldName=TypeZakaz)
+
+From
+  GP_RaspAvans
+ ,GP_RaspAvans GP_RaspAvans_FND
+ ,KatPodr
+ ,Lschet
+ ,Persons
+ ,MnPlan
+ ,Lschet  Lschet_F // Для поиска
+ ,Persons Persons_F // Для поиска
+ ,Lschet  Lschet_1 // костыляка  для проверки валидности
+ ,Appointments Appointments_F// Для поиска
+ ,X$USERS
+//------- фильтры
+ , KatPodr KatPodr_Flt
+ , MnPlan  MnPlan_Flt
+ , Persons Persons_Flt
+ , Lschet  Lschet_Flt
+ , ForMarks
+ //------------------
+ , MnPlan MnPlanIns
+ , vPlan vPlanIns
+ , vPlan
+ , tmpPercPrevMonth
+where ((
+    wisArh                == GP_RaspAvans.isArh
+and GP_RaspAvans.cPersons == Persons.Nrec
+and GP_RaspAvans.cLschet  == Lschet.Nrec
+and GP_RaspAvans.cKatPodr == KatPodr.Nrec
+and GP_RaspAvans.cMnPlan  == MnPlan.Nrec
+and GP_RaspAvans.cUser    == X$USERS.atl_nrec
+and GP_RaspAvans.cvPlan   == vPlan.Nrec
+and plsch                 == Lschet_F.Nrec
+and plsch ==  GP_RaspAvans_FND.cLschet
+and dDatan >>=   GP_RaspAvans_Fnd.Datan(noindex)
+and (GP_RaspAvans_Fnd.Dataok=ZeroDate or GP_RaspAvans_Fnd.Dataok>dDatan)
+
+and pPersons              == Persons_F.Nrec
+and if(Persons_F.AppointCur>0,Persons_F.AppointCur,Persons_F.AppointLast) == Appointments_F.Nrec// Для поиска
+and _cLschet == ForMarks.Choice
+and sUserName == Zar_user.OwnName
+and pvPlanIns == vPlanIns.nrec
+and pMnPlanIns == MnPlanIns.nrec
+
+//------- фильтры
+and wc_nrec == KatPodr_Flt.Nrec
+and wc_nrec == MnPlan_Flt.Nrec
+and wc_nrec == Persons_Flt.Nrec
+and wc_nrec == Lschet_Flt.Nrec
+//------------------------------
+
+  ))
+//На этой вкладке должны отображаться все записи таблицы, у которых дата окончания действия равна, или больше текущего отчетного периода
+Bounds byActive
+      wisArh                == GP_RaspAvans.isArh ordered by TableOrder
+//по тз так   and (dOtchPer<GP_RaspAvans.DatOk or GP_RaspAvans.DatOk=ZeroDate)
+
+Bounds byArh   wisArh                == GP_RaspAvans.isArh ordered by TableOrder
+//по тз так  and (dOtchPer>GP_RaspAvans.DatOk or GP_RaspAvans.DatOk=ZeroDate)
+Bounds ByKatpodr  pKatpodr == GP_RaspAvans.cKatpodr(noindex) ordered by TableOrder
+Bounds ByMnPlan   pMnPlan  == GP_RaspAvans.cMnPlan (noindex) ordered by TableOrder
+Bounds ByPersons  pPersons == GP_RaspAvans.cPersons(noindex) ordered by TableOrder
+Bounds ByLschet   pLsch    == GP_RaspAvans.cLschet (noindex) ordered by TableOrder
+condition FilterAn = // использование сложного фильтра
+  (isFilterAnCorrect(GP_RaspAvans.Nrec))
+
+; //create view
+
+Parameters
+  plsch
+#doc
+  ссылка на лицевой счет
+#end
+ ,pPersons
+#doc
+ ссылка на карточку
+#end
+ ,pKatPodr
+#doc
+ ссылка на подразделение
+#end
+ ,dDatan
+#doc
+ заданный период c
+#end
+ ,dDatok
+#doc
+ заданный период по
+#end
+ ,wisArh
+#doc
+ 0 - активная, 1 архив
+#end
+;
+
+//----------------------------
+//#include PAFilter.vpp
+//----------------------------
+//------------------------------------------------------------------------------
+//  Выбор подразделения и работников
+//------------------------------------------------------------------------------
+procedure UpdateFilter;
+{
+  // корректируем флаг фильтра по подразделениям если необходимо
+  if ( PAF.IsDepartmentFilterSet <> IsBitCTW(CurFilters,1) )
+    BitOnW(CurFilters,1);
+  // корректируем флаг фильтра по ЛС если необходимо
+  if PAF.IsPersonalAccountFilterSet <> IsBitCTW(CurFilters,2)
+    BitOnW(CurFilters,2);
+
+  //if GetBit(4, CurFilters) <> ( (Day(DateBeg) > 0) or (Day(DateEnd) > 0) )
+  //  BitOnW(CurFilters,3);;
+
+  OldFilters := CurFilters;
+
+  ReScanPanel(CurTable);
+} // procedure UpdateFilter
+
+
+procedure PodrPubPick;
+{ case CurField of
+    #FiltrPodr:
+    {
+/*
+#ifdef AdvancedDepartmentFilterExtOptions
+      IPAFilterExtOption(PAF).ChangeDepartmentFilterExtOptions(
+        true, DepartmentValidator,
+        cexozDate1, cexozDate2, PAFExtOption);
+#else //{
+#ifdef AdvancedDepartmentFilter
+      ITraditionalPersonalAccountFilterExt(PAF).ChangeDepartmentFilterExt(true, DepartmentFilterDate);
+#else
+      PAF.ChangeDepartmentFilter(true);
+#end
+#end //}
+*/
+      PAF.ChangeDepartmentFilter(true);
+      ReReadRecord(#Zar_user);
+    }
+
+    #FiltrPublic:
+    {
+      PAF.ChangePersonalAccountFilter(0);
+      ReReadRecord(#Zar_user);
+    }
+  end; // case
+  UpdateFilter;
+}
+
+procedure CalcPercentPryamyeAll;
+{
+StartNewVisual(vtRotateVisual, vfTimer , 'Просмотр реестров за предыдущий месяц', 0);
+  var _curOtchPer : date = sub_months(dgettune('UP.DATOTCH'),1);
+  var _curOtchPerAddmonth1 : date = dgettune('UP.DATOTCH');
+  delete all tmpPercPrevMonth;
+    _try
+     {
+            sql
+            select
+               t.CLSCH as clSch
+              ,t.grZak as cVplan
+              ,round(100*case when t.SUMOPLALL <> 0 then t.SUMOPL/t.SUMOPLALL else 0 end ,2) as  Percent
+            from(
+            select
+               spplban.CLSCH as CLSCH
+              ,spplban.strtabn
+              ,av.vcomp as grZak
+              ,GrZakaz.name
+              ,Sum(spplban.SUMOPL)   as  SUMOPL
+              ,ReestrAll.SUMOPL as  SUMOPLALL
+            from sbban
+            join spplban on spplban.CSBBAN = SBBAN.nrec
+            join attrnam an on an.wtable = 16060
+                              and an.name = 'Группа заказов'
+            join attrval av on av.cattrnam = an.nrec
+                           and av.crec = sbban.nrec
+            join vplan GrZakaz on GrZakaz.nrec = av.vcomp
+            left join
+                      (
+                       select
+                         spplban.CLSCH as CLSCH
+                        ,sum(spplban.SUMOPL) as  SUMOPL
+                      from sbban
+                      join spplban on spplban.CSBBAN = SBBAN.nrec
+
+                      where sbban.datan = :(_curOtchPer)//#date(01,02,2019)
+                        and sbban.PREFIX = 'R$Z'
+                        and sbban.VIDUD = 220
+
+                        group by spplban.CLSCH
+                      ) reestrAll on ReestrAll.cLsch = SpplBan.clSch
+                      join attrnam an_spplban on an_spplban.wtable = :(coSpplBan)
+                                             and an_spplban.name   = :(coAttrSpplBan_wtype_Zatraty)
+                      join attrval av_spplban on av_spplban.wtable   = an_spplban.wtable
+                                             and av_spplban.crec     = spplban.nrec
+                                             and av_spplban.cattrnam = an_spplban.nrec
+            where sbban.datan =  :(_curOtchPer)// #date(01,02,2019)
+                        and sbban.PREFIX = 'R$Z'
+                        and sbban.VIDUD = 220
+                        and Coalesce(av.vcomp,#comp(0h)) <> #comp(0h)
+                        and av_spplban.vDouble = 1 // только прямые
+            group by
+               spplban.CLSCH
+              ,spplban.strtabn
+              ,av.vcomp
+              ,GrZakaz.name
+              ,ReestrAll.SUMOPL
+            ) t
+/*
+выдедяем всех, а вот НДФл....
+            where t.grZak in ( select grzak.nrec
+                                          from vplan grzak
+                                          join attrnam an on an.wtable = 31015
+                                                           and an.name = 'Распределять аванс по ГоЗ'
+                                          join attrval av on av.cAttrnam = an.nrec
+                                                             and av.crec = grzak.nrec
+                                          where av.vdouble = 1
+                              )
+*/
+         into tmpPercPrevMonth
+        ;
+      }
+     _except else {}
+
+  var _log : string = 'avans.log';
+  LogStrToFile(_log, '-----------------------------------------------------');
+  _loop tmpPercPrevMonth
+  {
+   if (tmpPercPrevMonth.Percent < 2)
+    continue;
+   if getfirst Lschet_1  where ((tmpPercPrevMonth.cLsch == Lschet_1.nrec)) = tsOK // да  медленно, но и хрен с ним, это запускается один раз в месяц
+   {
+     LogStrToFile(_log, 'Lschet_1.nrec = ' + Lschet_1.nrec);
+     LogStrToFile(_log, 'Lschet_1.strtabn = ' + Lschet_1.strtabn);
+     LogStrToFile(_log, '');
+    if(getfirst Gp_RaspAvans where ((tmpPercPrevMonth.cLsch == Gp_RaspAvans.CLSCHET
+                                           and 0 == Gp_RaspAvans.WTYPE(noindex)
+                     and tmpPercPrevMonth.cVPlan == Gp_RaspAvans.CVPLAN(Noindex)
+                     ))
+        and ( Gp_RaspAvans.DATAN <= _curOtchPer and (Gp_RaspAvans.DATAOK = 0 or Gp_RaspAvans.DATAOK > _curOtchPer)
+            )
+       ) <> tsOK
+     {  LogStrToFile(_log, 'Point 1');
+        if getfirst Gp_RaspAvans where ((tmpPercPrevMonth.cLsch == Gp_RaspAvans.CLSCHET
+                                               and 0 == Gp_RaspAvans.isArh
+                                               and 1 == Gp_RaspAvans.WTYPE(noindex)
+                         and tmpPercPrevMonth.cVPlan == Gp_RaspAvans.CVPLAN(Noindex))) <> tsOK
+         {
+           LogStrToFile(_log, 'Point 2');
+            Insert Gp_RaspAvans set
+              Gp_RaspAvans.TABN     := Lschet_1.tabN
+             ,Gp_RaspAvans.STRTABN  := Lschet_1.STRTABN
+             ,Gp_RaspAvans.CLSCHET  := Lschet_1.nrec
+             ,Gp_RaspAvans.CPERSONS := Lschet_1.tPerson
+             ,Gp_RaspAvans.CKATPODR := Lschet_1.cex
+             ,Gp_RaspAvans.CMNPLAN  := 0h
+             ,Gp_RaspAvans.DATAN    := date(01,month(_curOtchPerAddmonth1),year(_curOtchPerAddmonth1))
+             ,Gp_RaspAvans.DATAOK   := date(15,month(_curOtchPerAddmonth1),year(_curOtchPerAddmonth1))
+             ,Gp_RaspAvans.ISARH    := 0
+             ,Gp_RaspAvans.CUSER    := UserID
+             ,Gp_RaspAvans.DINPUT   := Cur_date
+             ,Gp_RaspAvans.CVPLAN   := tmpPercPrevMonth.cVPlan
+             ,Gp_RaspAvans.WTYPE    := 1
+            ;
+         }
+         update current Gp_RaspAvans set Gp_RaspAvans.PROCENT  := tmpPercPrevMonth.Percent;
+         LogStrToFile(_log, 'Point 3');
+      }
+    }
+  }
+ stopVisual;
+ rereadrecord;
+}
+//******************************************************************************
+// Функции
+//******************************************************************************
+  //==============================================================================
+  //
+  //==============================================================================
+  Procedure MyLog(ww:string);
+  {
+    timelog(ww)
+  }
+
+
+  //------------------------------------
+  // Наименование интерфейса
+  //------------------------------------
+  Function GetInterfaceName:string;
+  { Result:=#(__InterfaceName__);
+  }
+  //------------------------------------
+  // сохранить параметры
+  //------------------------------------
+  Procedure SaveParam;
+  { SaveMyDsk(wFilter  ,GetInterfaceName+'_wFilter');
+    //-----------------------
+    DoneMarker(Marker_Lschet_A , '' );
+    DoneMarker(Marker_Persons_A, '' );
+    DoneMarker(Marker_KatPodr_A, '' );
+    DoneMarker(Marker_MnPlan_A , '' );
+    //-----------------------
+    if Need_Read_Param
+    {
+      DoneMarker(Marker_Lschet , GetInterfaceName+'_Lschet' );
+      DoneMarker(Marker_Persons, GetInterfaceName+'_Persons');
+      DoneMarker(Marker_KatPodr, GetInterfaceName+'_KatPodr');
+      DoneMarker(Marker_MnPlan , GetInterfaceName+'_MnPlan' );
+    }
+    else
+    {
+      DoneMarker(Marker_Lschet , '' );
+      DoneMarker(Marker_Persons, '' );
+      DoneMarker(Marker_KatPodr, '' );
+      DoneMarker(Marker_MnPlan , '' );
+    }
+  } //Procedure SaveParam;
+
+  //------------------------------------
+  // восстановить параметры
+  //------------------------------------
+  Procedure ReadParam;
+  { if Need_Read_Param
+    { if not ReadMyDsk(wFilter,GetInterfaceName+'_wFilter',false) wFilter:=0;
+      Marker_Lschet   :=InitMarker(GetInterfaceName+'_Lschet' , 8, 50, 10, True);
+      Marker_Persons  :=InitMarker(GetInterfaceName+'_Persons', 8, 50, 10, True);
+      Marker_KatPodr  :=InitMarker(GetInterfaceName+'_KatPodr', 8, 50, 10, True);
+      Marker_MnPlan   :=InitMarker(GetInterfaceName+'_MnPlan' , 8, 50, 10, True);
+    }
+    else
+    {
+      Marker_Lschet   :=InitMarker('' , 8, 50, 10, True);
+      Marker_Persons  :=InitMarker('', 8, 50, 10, True);
+      Marker_KatPodr  :=InitMarker('', 8, 50, 10, True);
+      Marker_MnPlan   :=InitMarker('' , 8, 50, 10, True);
+
+    }
+    Marker_Lschet_A   :=InitMarker('' , 8, 50, 10, True);
+    Marker_Persons_A  :=InitMarker('' , 8, 50, 10, True);
+    Marker_KatPodr_A  :=InitMarker('' , 8, 50, 10, True);
+    Marker_MnPlan_A   :=InitMarker('' , 8, 50, 10, True);
+  } //  Procedure ReadParam;
+
+  //------------------------------------
+  // декларация сложного фильтра
+  //------------------------------------
+  function isFilterAnCorrect(ww_nrec:comp): boolean; cacheable;
+  { Result:=true;
+    #__UNUSED__(ww_nrec)
+    if IsBitCTW(wFilter,1)
+    { if Count_Katpodr>1
+      { If not FoundMarker(Marker_Katpodr_A,GP_RaspAvans.cKatPodr)
+        { Result:=false;
+          Exit;
+        }
+      }
+    }
+    if IsBitCTW(wFilter,2)
+    { if Count_MnPlan>1
+      { If not FoundMarker(Marker_MnPlan_A,GP_RaspAvans.cMnPlan)
+        { Result:=false;
+          Exit;
+        }
+      }
+    }
+    if IsBitCTW(wFilter,3)
+    { if Count_Persons>1
+      { If not FoundMarker(Marker_Persons_A,GP_RaspAvans.cPersons)
+        { Result:=false;
+          Exit;
+        }
+      }
+    }
+    if IsBitCTW(wFilter,4)
+    { if Count_Lschet>1
+      { If not FoundMarker(Marker_Lschet_A,GP_RaspAvans.cLschet)
+        { Result:=false;
+          Exit;
+        }
+      }
+    }
+
+  }//function isFilterAnCorrect(ww_nrec:comp): boolean;
+
+  //-------------------------------------------
+  #doc
+    Проверить наличие распределения по заказам за период
+  #end
+  function FindFirstRaspZakazByPeriod(_pPerson: tNRec; _pLschet:tNRec;  _DataN: Date;  _DataOk: Date; var _pZakaz:comp;var _dProcent:double; var _vPlan:comp; var _wType : word): boolean;
+  {  Result    :=false;
+     _pZakaz   :=0;
+     _vPlan    :=0;
+     _dProcent :=0;
+     _wType    := 0;
+     MyLog('FindFirstRaspZakazByPeriod '+string(_pLschet)
+        +' , DataN='+DateToStr(_DataN,'DD.MM.YYYY')
+        +' , DataOk='+DateToStr(_DataOk,'DD.MM.YYYY')
+     );
+     if _pLschet>0
+     { if getfirst GP_RaspAvans where (( _pLschet == GP_RaspAvans.clschet
+            and 0 == GP_RaspAvans.isArh
+            and _DataOk>>=GP_RaspAvans.DataN
+            and (_DataN <=GP_RaspAvans.DataOk or GP_RaspAvans.DataOk=0)
+        ))=tsok
+       { Result:=true;
+         _pZakaz  :=GP_RaspAvans.cMnPlan;
+         _vPlan   :=GP_RaspAvans.cvPlan;
+         _dProcent:=GP_RaspAvans.Procent;
+         _wType   := GP_RaspAvans.wType;
+         MyLog('FindFirstRaspZakazByPeriod'
+              +'   _pLschet='+string(_pLschet)
+              +', _dProcent='+string(_dProcent,0,2)
+              +',   _pZakaz='+string(_pZakaz)
+              +',    _vPlan='+string(_vPlan,0,0)
+              +',    _wType='+string(_wType)
+             )
+       }
+     } //if _pLschet>0
+  } //function FindFirstRaspZakazByPeriod(_pPerson: tNRec; _pLschet:tNRec;  _DataN: Date;  _DataOk: Date; var _pZakaz:comp; _dProcent:double): boolean;
+
+  function FindNextRaspZakazByPeriod(_pPerson: tNRec; _pLschet:tNRec;  _DataN: Date;  _DataOk: Date; var _pZakaz:comp;var _dProcent:double; var _vPlan:comp; var _wType : word): boolean;
+  {  Result    :=false;
+     _pZakaz   :=0;
+     _vPlan    :=0;
+     _dProcent :=0;
+     _wType    := 0 ;
+     if _pLschet>0
+     { if getNext GP_RaspAvans where (( _pLschet == GP_RaspAvans.clschet
+            and 0 == GP_RaspAvans.isArh
+            and _DataOk>>=GP_RaspAvans.DataN
+            and (_DataN <=GP_RaspAvans.DataOk or GP_RaspAvans.DataOk=0)
+        ))=tsok
+       { Result:=true;
+         _pZakaz  :=GP_RaspAvans.cMnPlan;
+         _vPlan   :=GP_RaspAvans.cvPlan;
+         _dProcent:=GP_RaspAvans.Procent;
+         _wType   := GP_RaspAvans.wType ;
+         MyLog('FindNextRaspZakazByPeriod'
+              +'   _pLschet='+string(_pLschet)
+              +', _dProcent='+string(_dProcent,0,2)
+              +',   _pZakaz='+string(_pZakaz)
+              +',    _vPlan='+string(_vPlan,0,0)
+              +',    _wType='+string(_wType)
+             )
+
+       }
+     } //if _pLschet>0
+  } //function FindNextRaspZakazByPeriod(_pPerson: tNRec; _pLschet:tNRec;  _DataN: Date;  _DataOk: Date; var _pZakaz:comp; _dProcent:double): boolean;
+
+
+  //-------------------------------------------
+  // скопировать фильтры в данные для отборв
+  //-------------------------------------------
+  Procedure CopyToA;
+  { CopyMarker(Marker_Katpodr_A,Marker_Katpodr);
+    CopyMarker(Marker_MnPlan_A ,Marker_MnPlan );
+    CopyMarker(Marker_Persons_A,Marker_Persons);
+    CopyMarker(Marker_Lschet_A ,Marker_Lschet );
+  } //Procedure CopyToA;
+
+  //-------------------------------------------
+  // восстановить данные для задания фильтрации
+  // из данных для отбора
+  //-------------------------------------------
+  Procedure RestFromA;
+  { CopyMarker(Marker_Katpodr,Marker_Katpodr_A);
+    CopyMarker(Marker_MnPlan ,Marker_MnPlan_A );
+    CopyMarker(Marker_Persons,Marker_Persons_A);
+    CopyMarker(Marker_Lschet ,Marker_Lschet_A );
+  } //Procedure RestFromA;
+
+  //-------------------------------------------
+  #doc
+    Установить ограничения
+  #end
+  Function SetFilterBounds(_IsArch:word) : boolean;
+  { Result:=false;
+    if ConditionActiveInLeave(tcFilterAn, #GP_RaspAvans)
+    { PopConditionForLeave(tcFilterAn, #GP_RaspAvans);
+    }
+    case wIsArh of
+    0: PushBounds(tbByActive);
+    1: PushBounds(tbByArh);
+    end;
+    If BoundActive(tbByKatpodr) SubBounds(tbByKatpodr);
+    If BoundActive(tbByMnPlan ) SubBounds(tbByMnPlan );
+    If BoundActive(tbByPersons) SubBounds(tbByPersons);
+    If BoundActive(tbByLschet ) SubBounds(tbByLschet );
+    //-----------------------
+    CopyToA;
+    //-----------------------
+    ClearFuncCache; // очистим кэш функций
+    var need_FilterAn:boolean=false;
+    set wIsArh:=_IsArch;
+    if IsBitCTW(wFilter,1)
+    {  Count_Katpodr:=GetMarkerCount(Marker_Katpodr);
+       if Count_Katpodr=1
+       { GetMarker(Marker_Katpodr,0,pKatPodr);
+         AddBounds(tbByKatpodr);
+       }
+       else need_FilterAn:=true;
+    }
+    if IsBitCTW(wFilter,2)
+    {  Count_MnPlan:=GetMarkerCount(Marker_MnPlan);
+       if Count_MnPlan=1
+       { GetMarker(Marker_MnPlan,0,pMnPlan);
+         AddBounds(tbByMnPlan);
+       }
+       else need_FilterAn:=true;
+    }
+    if IsBitCTW(wFilter,3)
+    {  Count_Persons:=GetMarkerCount(Marker_Persons);
+       if Count_Persons=1
+       { GetMarker(Marker_Persons,0,pPersons);
+         AddBounds(tbByPersons);
+       }
+       else need_FilterAn:=true;
+    }
+    if IsBitCTW(wFilter,4)
+    {  Count_Lschet:=GetMarkerCount(Marker_Lschet);
+       if Count_Lschet=1
+       { GetMarker(Marker_Lschet,0,pLsch);
+         AddBounds(tbByLschet);
+       }
+       else need_FilterAn:=true;
+    }
+
+    // использование сложного фильтра
+    if need_FilterAn
+    { PushConditionForLeave(tcFilterAn, #GP_RaspAvans);
+    }
+    ReReadRecord(#GP_RaspAvans);
+    Result:=true;
+  } //Function SetFilterBounds : boolean;
+
+  //---------------------------------------
+  // Установка наименований фильтров
+  //---------------------------------------
+  Procedure SetFilterNM(_Field:longint=0);
+  { if _Field=0 or _Field=#Filtr_Katpodr
+    { #mrkfiltr_(Katpodr_Flt,Katpodr,Nrec,wc_nrec,Katpodr_Flt.Name)
+    }
+    if _Field=0 or _Field=#Filtr_MnPlan
+    { #mrkfiltr_(MnPlan_Flt,MnPlan,Nrec,wc_nrec,MnPlan_Flt.Number)
+    }
+    if _Field=0 or _Field=#Filtr_Lschet
+    { #mrkfiltr_(Lschet_Flt,Lschet,Nrec,wc_nrec,if(FormatClockNumber=0,string(Lschet_Flt.Tabn),Lschet_Flt.StrTabn))
+    }
+    if _Field=0 or _Field=#Filtr_Persons
+    { #mrkfiltr_(Persons_Flt,Persons,Nrec,wc_nrec,Persons_Flt.Fio)
+    }
+    ReScanPanel(#Katpodr_Flt);
+  } //Procedure SetFilterNM(_Field:longint)
+
+  //---------------------------------------
+  // Формирование буфера записи
+  //---------------------------------------
+  Procedure MakeBufferRaspAvans;
+  { ClearBuffer(#GP_RaspAvans);
+    GP_RaspAvans.Nrec:=0;
+    if dDatan=ZeroDate
+    dDatan:=date(1,MonthRas,YearRas);
+    GP_RaspAvans.cLschet  := plsch   ;// ссылка на лицевой счет
+    GP_RaspAvans.cPersons := pPersons;// ссылка на карточку
+    GP_RaspAvans.cKatPodr := pKatPodr;// ссылка на подразделение
+    GP_RaspAvans.Datan    := dDatan  ;// заданный период c
+    GP_RaspAvans.DataOk   := dDatok  ;// заданный период по
+    GP_RaspAvans.isArh    := wisArh  ;
+    GP_RaspAvans.cUser    := UserId();
+    GP_RaspAvans.DInput   := Cur_Date;
+    if pLsch>0
+    { if getfirst Lschet_F=tsok
+      { GP_RaspAvans.Tabn:=Lschet_F.Tabn;
+        GP_RaspAvans.StrTabn:=Lschet_F.StrTabn;
+        GP_RaspAvans.cPersons:=Lschet_F.tPerson;
+        GP_RaspAvans.cKatPodr:=Lschet_F.cex;
+      }
+    }
+    else
+    if pPersons>0 and isValid(#Persons_F)
+    { GP_RaspAvans.Tabn:=Persons_F.Tabnmb;
+      GP_RaspAvans.StrTabn:=Persons_F.StrTabn;
+      GP_RaspAvans.cKatPodr:=Persons_F.GalDep;
+      if GetFirst Appointments_F=tsok
+        GP_RaspAvans.cLschet:=Appointments_F.cAddNrec2;
+    }
+  } //Procedure MakeBufferRaspAvans;
+
+  //---------------------------------------
+  // Рассчитать процент
+  //---------------------------------------
+  Function CalcProcent(_cNrec:comp):double;
+  { Result:=0;
+    _Loop GP_RaspAvans_Fnd
+    { if  GP_RaspAvans_Fnd.NREC=_cNrec CONTINUE;
+      Result+=GP_RaspAvans_Fnd.Procent;
+    }
+
+  }
+
+  Procedure LoadInterface;
+  { dOtchPer:=dGetTune('UP.DATOTCH');
+    MyLog('LoadInterface Start');
+    if dDatan=ZeroDate
+    dDatan:=date(1,MonthRas,YearRas);
+    FormatClockNumber:=wGetTune('FormatClockNumber');
+    var CL: ContextList;
+
+    if not CL.Add(CS, 'IntInit')
+    {
+    }
+    CLSF.ReScan;
+
+    set sUserName:=UserName();
+    case FormatClockNumber of
+    0:
+    { SetFieldState  (#GP_RaspAvans.Tabn   ,sfVisible);
+      ClearFieldState(#GP_RaspAvans.StrTabn,sfVisible);
+    }
+    1:
+    { SetFieldState  (#GP_RaspAvans.StrTabn,sfVisible);
+      ClearFieldState(#GP_RaspAvans.Tabn   ,sfVisible);
+    }
+    end; //FormatClockNumber
+    if getfirst GP_RaspAvans where (( 0 == GP_RaspAvans.IsArh
+              and ZeroDate <<GP_RaspAvans.DataOk(noindex)
+              and dOtchPer >>GP_RaspAvans.DataOk(noindex)
+              )) =tsok
+    { update GP_RaspAvans where
+              (( 0 == GP_RaspAvans.IsArh
+              and ZeroDate <<GP_RaspAvans.DataOk(noindex)
+              and dOtchPer >>GP_RaspAvans.DataOk(noindex)
+                ))
+       set GP_RaspAvans.IsArh:=1;
+
+    }
+
+    //-----------------------
+    ClusterDisabledField(#wFilter,0);
+    Need_Read_Param:=true;
+    if pLsch>0 or pPersons>0 or pMnPlan>0 or pKatPodr>0
+    { Need_Read_Param:=false;
+
+    }
+    var _Title:string='';
+    ReadParam;
+    if pKatPodr>0
+    { BitOnW(wFilter,1);
+      InsertMarker(Marker_KatPodr,pKatPodr);
+      ClusterDisabledField(#wFilter,1);
+      ClearFieldOption(#Filtr_KatPodr, ofSelectable);
+      wc_nrec:=pKatPodr;
+      if getfirst KatPodr_flt=tsok
+        _Title:=_Title+' Подразд.'+Katpodr.Name;
+    }
+    if pMnPlan>0
+    { BitOnW(wFilter,2);
+      InsertMarker(Marker_MnPlan,pMnPlan);
+      ClusterDisabledField(#wFilter,2);
+      ClearFieldOption(#Filtr_MnPlan, ofSelectable);
+      wc_nrec:=pMnPlan;
+      if getfirst MnPlan_flt=tsok
+        _Title:=_Title+' Заказ.'+MnPlan.Name;
+    }
+    if pPersons>0
+    { BitOnW(wFilter,3);
+      InsertMarker(Marker_Persons,pPersons);
+      ClusterDisabledField(#wFilter,8);
+      ClearFieldOption(#Filtr_Persons, ofSelectable);
+      wc_nrec:=pPersons;
+      if getfirst Persons_flt=tsok
+        _Title:=_Title+' Сотрудник '+Persons.Fio;
+    }
+    if pLsch>0
+    { BitOnW(wFilter,4);
+      InsertMarker(Marker_Lschet,pLsch);
+      ClusterDisabledField(#wFilter,8);
+      ClearFieldOption(#Filtr_Lschet, ofSelectable);
+      wc_nrec:=pLsch;
+      if getfirst Lschet_flt=tsok
+      {  _Title:=_Title+' Л/сч.'+GetStrTabn(Lschet_flt.Tabn,Lschet_flt.StrTabn)
+      }
+      //ClearFieldOption(#Filtr_Persons, ofSelectable);
+    }
+    if _Title<>''
+    { SetTitle('Распределение по заказам:'+_Title)
+    }
+    //-----------------------
+    MyLog('LoadInterface PAF') ;
+    LoadVipRef(PAF_One, 'PersonalAccountFilter');
+    MyLog('LoadInterface PickOptions');
+    LoadVipRef(PickOptions, 'Z_LSCHET::VPICKOPTIONS');
+    MyLog('LoadInterface PickOptions');
+    Paf.InitFilter(true, true);
+
+
+    //PickOptions.SetGroup(if (PP.GetDefaultDepartment = 0, -1, PP.GetDefaultDepartment));
+    //SetFlags;
+    PickOptions.SetCashier(Cashier);
+    PickOptions.SetShowValue(true);
+    PickOptions.SetDefaultValue(0);
+    PickOptions.SetValuePrecision(2);
+    PickOptions.SetValueTitle('Процент');
+    PickOptions.SetValueDescr('Процент выплаты');
+    MyLog('LoadInterface finish');
+  } //Procedure LoadInterface;
+
+  //---------------------------------------
+  // ДеИнициализация интерфейса
+  //---------------------------------------
+  Procedure UnLoadInterface;
+  { SaveParam;
+    if Not NullVipRef(PickOptions)
+    { FreeVipInterface(PickOptions)
+
+    }
+    if Not NullVipRef(PAF_One)
+    { FreeVipInterface(PAF_One)
+
+    }
+  }
+
+//******************************************************************************
+// Форматы
+//******************************************************************************
+Window wnFilter 'Установите фильтры'  Cyan, EscClose;
+  Show at (,,50,9);
+Screen scrFilter 'Фильтры' ('Фильтры',,sci13Esc);
+Table Katpodr_Flt;
+Fields
+  wFilter :NoProtect;
+  Filtr_KatPodr : PickButton,Protect;
+  Filtr_MnPlan  : PickButton,Protect;
+  Filtr_Persons : PickButton,Protect;
+  Filtr_Lschet  : PickButton,Protect;
+Buttons
+  cmOk    ,,, 'Задать учебный год', hcAllBOk, scGalDial;
+  cmCancel,,, 'Отмена', hcAllBCancel, scGalDial;
+<<
+  `Фильтр по`
+  [.] Подразделения` .@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] Заказы       ` .@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] Работники    ` .@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] Лицевые счета` .@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ <. Продолжить .>  <.   Отмена   .>
+>>
+end; //Screen scrFilter (,,sci13Esс);
+HandleEvent
+cmInit:
+{ SetFilterNm(0);
+}
+cmOk:
+{ CloseWindowEx(wnFilter,cmDefault)
+
+}
+end;// HandleEvent
+end; //Windows wnFilter 'Установите фильтры' , Cyan, EscClose;
+
+Window wnInsertRec 'Задайте параметры добавления'
+show at (,,70,9);
+Screen scrInsert;
+Table Zar_user;
+Fields
+   vPlanIns.Name (,,sci13Esc) : Protect,PickButton;
+   MnPlanIns.Name (,,sci13Esc) : Protect,PickButton;
+   Procent_Ins :noProtect;
+   //-------------------------
+   CurFilters//Zar_User.GrupStN
+   ('Выберите фильтр для расчета',hcVshkala,sci13Esc) : noprotect;
+
+   FiltrPodr('Заданный фильтр по подразделению',hcVshkala,sci13Esc)  : protect;
+   FiltrPublic('Выберите работников для проведения расчета',hcVshkala,sci13Esc) : protect;
+ buttons
+    cmOk,default,, 'Выполнить функцию выбора шкалы',hcVshkala,sci1Esc;
+    cmCancel,,,'~О~тмена',hcVshkala,sci1Esc;
+
+<<
+ Группа заказов.@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Гос.Заказ     .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Процент       .@@@@@@@@@@@@@
+ ┌─ Фильтры по: ───────────────────────────────────────────────────┐
+ │ [.] подразделению ` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ │
+ │ [.] работникам    ` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ │
+ └─────────────────────────────────────────────────────────────────┘
+         <.~П~родолжить.>           <.Отмена.>
+>>
+end;
+HandleEvent
+cmInit:
+{ UpdateFilter;
+}
+cmOk:
+{ closeWindowEx(wnInsertRec,cmDefault)
+}
+cmPick:
+{ UpdateTable;
+  case CurField of
+  #FiltrPodr,
+  #FiltrPublic:
+  {
+    PodrPubPick; //Процедура для фильтров по подразд. и работникам
+  }
+  #vPlanIns.Name :
+  {  if (RunInterFace(GrvPlan,pvPlanIns,LongInt(0)
+         ,17//pWorkType
+         ) <> cmCancel)
+      set pvPlanIns:=pvPlanIns;
+  }
+  #MnPlanIns.Number :
+  {     if iGetKau.GetCodeKau(cgiPick, cgKau_Zakaz, pMnPlanIns)<>0 //cmCancel
+          set pMnPlanIns:=pMnPlanIns;
+  }
+  end;
+  ReScanPanel(#ZAR_USER);
+}
+end;
+end;//Window wnInsertRec
+
+
+//-------------------------------------
+TabbedSheet bottom tab_Rasp;
+//-------------------------------------
+#UNDEF brRasp
+#DECLARE brRasp (sciEditFld, wActive, Protect)
+Table GP_RaspAvans;
+RecMarker = pMarker#(wActive) { GP_RaspAvans.nRec };
+Fields
+  TypeZakaz            'Тип заказа'            ('Тип заказа'                       ,,#(sciEditFld)):[5],Protect,NoDel,NoPickButton
+                                                                               ,{font = {backcolor = if(GP_RaspAvans.wtype = 1,7,0)}};
+  GP_RaspAvans.Tabn    'Таб.№'                 ('табельный номер лицевого счета сотрудника'     ,,):[10],Protect,NoDel,PickButton;
+  GP_RaspAvans.StrTabn 'Таб.№'                 ('табельный номер лицевого счета сотрудника'     ,,):[10],Protect,NoDel,PickButton;
+  Persons.Fio          'ФИО'                   ('ФИО сотрудника                           '     ,,):[30],Protect,NoDel,PickButton;
+  KatPodr.Kod          'Код'#13'подразделения' ('код подразделения'                             ,,):[10],Protect,NoDel,PickButton;
+  KatPodr.Name         'Подразделение'         ('подразделение сотрудника'                      ,,):[10],Protect,NoDel,PickButton;
+  GP_RaspAvans.Procent 'Процент'               ('поля для ручного ввода цифрового значения (10; 15,24; 30,5 и т.д.)',,#(sciEditFld)):[6,2],#(Protect);
+  MnPlan.Number        'Код'#13'заказа'        (' аналитика <Заказ>'                            ,,):[10],Protect,NoDel,PickButton;
+  vPlan.Name           'Группа'#13'заказа'     (' аналитика <Заказ>'                            ,,):[10],Protect,NoDel,PickButton;
+  GP_RaspAvans.Datan   'Дата'#13'начала'       ('дата начала действия записи'      ,,#(sciEditFld)):[12],#(Protect);
+  GP_RaspAvans.DataOk  'Дата'#13'окончания'    ('дата окончания действия условий'  ,,#(sciEditFld)):[12],#(Protect);
+  GP_RaspAvans.isArh   'Арх.'                  :[5],[List 0 'нет','да'], Protect;
+  x$users.XU$FULLNAME  'Автор'                 ('Пользователь, создавший запись'   ,,#(sciEditFld)):[10],Protect,NoDel,NoPickButton;
+  GP_RaspAvans.DInput  'Дата'#13'ввода'        ('дата ввода'                       ,,#(sciEditFld)):[10],Protect,NoDel,NoPickButton;
+#END
+Browse brRaspActive 'Активные записи' ('Активные записи ',,sci1378Esc);
+#brRasp(sci178Esc,Active,NoProtect)
+end;
+Browse brRaspArh   'Архив' ('Архив',,sci1Esc);
+#brRasp(sci1Esc,Arh,Protect)
+end;
+end;//TabbedSheet bottom tab_Rasp;
+#UNDEF brRasp
+
+//------------------------------------
+// групповая замена полей
+//------------------------------------
+Procedure GroupChangeFields;
+var _wVar:variant;
+    _sVar:string;
+{ if wIsArh=1 exit;//в архиве не будем делать групповое изменение
+  if pMarkerActive.Count=0 exit;
+  _wVar:='';
+  _sVar:='';
+  case curfield of
+  #GP_RaspAvans.isArh:
+  { _wVar:=GP_RaspAvans.isArh;
+    _sVar:='"Признак архива"'
+  }
+  #GP_RaspAvans.Procent:
+  { _wVar:=GP_RaspAvans.Procent;
+    _sVar:='"Процент"'
+  }
+  #GP_RaspAvans.DataN:
+  { _wVar:=GP_RaspAvans.DataN;
+    _sVar:='"Дата начала"'
+  }
+  #GP_RaspAvans.DataOk:
+  { _wVar:=GP_RaspAvans.DataOk;
+    _sVar:='"Дата окончания"'
+  }
+  else exit;
+  end;
+  if message('Отмечено '+string(pMarkerActive.Count)+' записей'
+    +chr(13)+'Выполнить замену поля '+_sVar+' в них?'
+     , YesNo     )<>cmYes
+  { Exit;
+  }
+  UpdateTable;
+  PushPos(#GP_RaspAvans);
+  // две пометки - ругается
+  //SubBounds(tbRmGP_RaspAvans1);
+  //AddBounds(tbRmGP_RaspAvans2);
+  //Marker_Tmp := InitMarker('', 8, 100, 10);
+  //var jj:longint;
+  //pMarkerActive.ExportToAll(Marker_tmp);
+  //for(jj:=0;jj<GetMarKerCount(Marker_tmp);jj++)
+  //{ if GetMarker(Marker_tmp,jj,wc_nrec)
+  _Loop pMarkerActive where (( root == pMarkerActive.pNrec ))
+  {
+    if getfirst  GP_RaspAvans_FND where (( pMarkerActive.pNrec == GP_RaspAvans_FND.Nrec )) <>tsok continue;
+    MyLog('GroupChangeFields _wVar= '+string(_wVar)+','+string(GP_RaspAvans_FND.Nrec,0,0) );
+
+    case curfield of
+    #GP_RaspAvans.isArh  : GP_RaspAvans_FND.isArh  := _wVar;
+    #GP_RaspAvans.Procent: GP_RaspAvans_FND.Procent:= _wVar;
+    #GP_RaspAvans.DataN  : GP_RaspAvans_FND.DataN  := _wVar;
+    #GP_RaspAvans.DataOk : GP_RaspAvans_fND.DataOk := _wVar;
+    end;
+    update current GP_RaspAvans_FND;
+  }
+  //SubBounds(tbRmGP_RaspAvans2);
+  //AddBounds(tbRmGP_RaspAvans1);
+  //PopPos(#GP_RaspAvans);
+  ReReadRecord(#GP_RaspAvans);
+} //Procedure GroupChangeFields;
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+  TableEvent Table GP_RaspAvans;
+  //--------------------------
+  cmSetDefault:
+  { //Пока не уверен ClearBuffer(#GP_RaspAvans)
+    //MakeBufferRaspAvans;
+    exit;
+  } //cmSetDefault:
+  cmInsert:
+  { //delete all ForMarks;
+    UpdateTable;
+    if RunWindowModal(wnInsertRec)=cmDefault
+    { StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Выгрузка данных', RecordsInTable(#ForMarks));
+
+      _Loop ForMarks
+      { if not NextVisual then break;
+        pLsch:=Formarks.cPodr;
+        var _Procent:double=Procent_Ins+CalcProcent(0);
+        if _Procent>100
+        { _Procent:=Procent_Ins-(_Procent-100)
+
+        }
+        else
+        { _Procent:=Procent_Ins
+
+        }
+        if _Procent<=0 continue;
+
+        MakeBufferRaspAvans;
+        GP_RaspAvans.cLschet:=Formarks.cPodr;
+        if getfirst Lschet=tsok
+        { GP_RaspAvans.cPersons := Lschet.tPerson;
+          GP_RaspAvans.cKatPodr := Lschet.Cex;
+          GP_RaspAvans.Tabn     := Lschet.Tabn;
+          GP_RaspAvans.StrTabn  := Lschet.StrTabn;
+          GP_RaspAvans.Procent  := _Procent;
+          GP_RaspAvans.cMnPlan  := pMnPlanIns;
+          GP_RaspAvans.cvPlan   := pvPlanIns;
+
+        }
+        insert current GP_RaspAvans;
+      }
+      ReReadRecord(#GP_RaspAvans);
+      StopVisual('',0);
+    }
+    abort ;
+    exit;
+  }
+  //--------------------------
+  cmInsertRecord:
+  { if wisArh=1
+    { Message('В архивных записях изменение запрещено');
+      ReReadRecord(#GP_RaspAvans);
+      abort;
+    }
+    Insert Current GP_RaspAvans;
+  }//cmInsertRecord:
+  //--------------------------
+  cmIdle:
+  { Count_2_del:=0;
+  }
+  //--------------------------
+  cmUpdateRecord:
+  { if (wisArh=1
+    and GP_RaspAvans.isArh=1)
+    { Message('В архивных записях изменение запрещено');
+      ReReadRecord(#GP_RaspAvans);
+      SetModified(false);
+      Exit;
+    }
+    Update Current GP_RaspAvans;
+  } //cmUpdateRecord:
+
+  //--------------------------
+  cmCheckField:
+  { Case Curfield of
+    #GP_RaspAvans.isArh:
+    { if GP_RaspAvans.DataOk<>ZeroDate
+      if GP_RaspAvans.DataOk<dOtchPer and GP_RaspAvans.isArh=0
+      { message('Период записи находится в архиве!');
+        set GP_RaspAvans.isArh:=1;
+      }
+
+    }
+    #GP_RaspAvans.Procent:
+    { var wProcent:double;
+      pLsch:=GP_RaspAvans.cLschet;
+      wProcent:=CalcProcent(GP_RaspAvans.Nrec)+GP_RaspAvans.Procent;
+      if wProcent>100
+      { set GP_RaspAvans.Procent:=GP_RaspAvans.Procent-(wProcent-100);
+      }
+    }
+    #GP_RaspAvans.DataN:
+    { if GP_RaspAvans.DataOk<>Date(0,0,0)
+      { if GP_RaspAvans.DataOk<GP_RaspAvans.DataN
+        { Message('Дата окончания меньше даты начала');
+          set GP_RaspAvans.DataOk:=GP_RaspAvans.DataN
+        }
+      }
+    }
+
+    #GP_RaspAvans.DataOk:
+    { if GP_RaspAvans.DataOk<>ZeroDate
+      { if GP_RaspAvans.DataOk<GP_RaspAvans.DataN
+        { Message('Дата окончания меньше даты начала');
+          set GP_RaspAvans.DataOk:=GP_RaspAvans.DataN;
+
+        }
+        else
+        { set GP_RaspAvans.DataOk:=GP_RaspAvans.DataOk;
+        }
+        if GP_RaspAvans.DataOk<dOtchPer
+        { if Message('Дата окончания меньше даты начала отчетного периода'
+            +chr(13)+'Запись будет переведена в архив'
+            +chr(13)+'Исправить?'
+           ,YesNo )=cmYes
+          {  set GP_RaspAvans.DataOk:=Date(Last_Day(dOtchPer),Month(dOtchPer),Year(dOtchPer));
+          }
+          else
+          { GP_RaspAvans.isArh:=1;
+            update current GP_RaspAvans;
+            SetModiFied(False);
+            ReReadRecord(#GP_RaspAvans);
+          }
+        }
+      } //if GP_RaspAvans.DataOk<>ZeroDate
+    } //#GP_RaspAvans.DataOk:
+    end;
+    GroupChangeFields;
+  } //cmCheckField:
+
+  //--------------------------
+  cmDeleteRecord:
+  { if wIsArh=1
+    { Message('В архивных записях изменение запрещено');
+        abort;
+    }
+    if pMarkerActive.Count>0
+    { Count_2_del:=pMarkerActive.Count+1
+    }
+    if Count_2_del<=0
+    {
+      if Message('Удалить запись'
+      +chr(13)+if(isValid(#Persons),Persons.Fio,'')+if(GP_RaspAvans.Datan<>ZeroDate,DateToStr(GP_RaspAvans.Datan,' от DD.MM.YYYY'),'')
+        ,YesNo      )=cmYes
+      { Delete Current GP_RaspAvans;
+      }
+    } // если есть пометка добавляем без предупреждения
+    else
+    {
+      Delete Current GP_RaspAvans;
+      Count_2_del--;
+    }
+  } //cmDeleteRecord:
+  end; //TableEvent Table GP_RaspAvans
+
+  //---------------------------------
+  tableevent table Zar_User;
+  cmUpdateRecord:
+  {
+    update current Zar_User;
+  }
+  cmCheckField:
+  { //UpdateFilter;
+  }
+  end;
+
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+  HandleEvent
+    //--------------------------
+    cmInit:
+    {
+      LoadInterface;
+      SetFilterBounds(wIsArh);
+      SetFilterNM;
+    }
+    cmDone:
+    { UnLoadInterface
+    }
+    //--------------------------
+    cmOnVipLoad:
+    { LoadInterface
+    }
+    cmOnVipLoad:
+    { UnLoadInterface
+    }
+
+    //--------------------------
+    cmOpenSearch :
+    {
+      isOpenSearch:= true;
+      ProcessCommand(cmPick);
+      isOpenSearch:= false;
+    }
+
+    //--------------------------
+    cmPick:
+    {
+      case CurField of
+      #Filtr_Katpodr,
+      #Filtr_MnPlan,
+      #Filtr_Persons,
+      #Filtr_Lschet:
+      {
+      }
+      else
+      { if wIsArh=1
+        { if (CurField<>#GP_RaspAvans.isArh)
+          { Message('В архивных записях изменение запрещено');
+            exit;
+          }
+          else
+          if GP_RaspAvans.DataOk<>ZeroDate
+          { if GP_RaspAvans.DataOk<dOtchPer
+            { message('Признак архива не может быть изменен для записей прошлых периодов')
+            }
+          }
+        }//if wIsArh=1
+      }
+      end
+      Case Curfield of
+      #vPlan.Name:
+      {
+        var ccomp : comp;
+        ccomp := GP_RaspAvans.cvPlan;
+        if (RunInterFace(GrvPlan,ccomp,LongInt(0)
+           ,17//pWorkType
+           ) <> cmCancel)
+        {
+          set GP_RaspAvans.cvPlan := ccomp;
+          GroupChangeFields;
+
+        }
+      }
+      /*
+      #GP_RaspAvans.StrTabn,#GP_RaspAvans.Tabn,#Persons.Fio,#Katpodr.Kod,#Katpodr.Name:
+      { pTmp:=GP_RaspAvans.cLschet;
+        PAF_One.Change(PickOptions);
+        var PAMI: IPersonalAccountMarksIterator;
+        PAMI := PAF_One.GetMarks.GetIterator;
+        StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Выгрузка данных', PAF_One.GetMarks.GetCount);
+        var ww_first:boolean=true;
+        _try
+        {
+          if PAMI.First
+          {
+            do
+            {
+              if not NextVisual then break;
+              if ww_first
+              { set GP_RaspAvans.cLschet:=PAMI.GetPersonalAccount;
+              }
+              else
+              { MakeBufferRaspAvans;
+                set GP_RaspAvans.cLschet:=PAMI.GetPersonalAccount;
+              }
+              if getfirst Lschet=tsok
+              { set GP_RaspAvans.cPersons := Lschet.tPerson;
+                set GP_RaspAvans.cKatPodr := Lschet.Cex;
+                set GP_RaspAvans.Tabn     := Lschet.Tabn;
+                set GP_RaspAvans.StrTabn  := Lschet.StrTabn;
+                set GP_RaspAvans.Procent  := PAMI.GetValue;
+              }
+              if ww_first
+              { SetModified(true);
+                UpdateTable;
+                ww_first:=false;
+              }
+              else
+              { Insert current GP_RaspAvans;
+              }
+            }
+            while PAMI.Next;
+         }
+       }
+       _except
+         on ExUserBreak: {}
+       _finally
+         StopVisual('', 0);
+
+        ReScanPanel(#GP_RaspAvans)
+
+      }
+      */
+      #MnPlan.Number:
+      { if (QuickChoiceName <> '')  QuickChoiceName := 'qcKau_Needed';
+        pTmp:=GP_RaspAvans.cMnPlan;
+        if iGetKau.GetCodeKau(cgiPick, cgKau_Zakaz, pTmp)<>0 //cmCancel
+        { set GP_RaspAvans.cMnPlan:=pTmp;
+          if getfirst MnPlan=tsok
+            set GP_RaspAvans.cvPlan:=MnPlan.cvPlan;
+          GroupChangeFields;
+        }
+        ReScanPanel(#GP_RaspAvans)
+      }
+      #Filtr_Katpodr:
+      { KauMarkerName := iGetKau.GetMarkerName(cgKau_Katpodr);
+        StoreMarker(Marker_KatPodr,KauMarkerName);
+        If (iGetKau.GetCodeKau(cgiPickMult,cgKau_KatPodr,Comp(0)) <> 0)
+        { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+          CopyMarker(Marker_KatPodr,Marker_Tmp);
+          DoneMarker(Marker_Tmp,'');
+          SetFilterNm(#Filtr_Katpodr);
+          BitOnW(wFilter,1);
+        }
+      }
+      #Filtr_MnPlan:
+      { KauMarkerName := iGetKau.GetMarkerName(cgKau_Zakaz);
+        StoreMarker(Marker_MnPlan,KauMarkerName);
+        If (iGetKau.GetCodeKau(cgiPickMult,cgKau_Zakaz,Comp(0)) <> 0)
+        { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+          CopyMarker(Marker_MnPlan,Marker_Tmp);
+          DoneMarker(Marker_Tmp,'');
+          SetFilterNm(#Filtr_MnPlan);
+          BitOnW(wFilter,2);
+        }
+      }
+      #Filtr_Persons:
+      { KauMarkerName := iGetKau.GetMarkerName(cgKau_Persons);
+        StoreMarker(Marker_Persons,KauMarkerName);
+        If (iGetKau.GetCodeKau(cgiPickMult,cgKau_Persons,Comp(0)) <> 0)
+        { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+          CopyMarker(Marker_Persons,Marker_Tmp);
+          DoneMarker(Marker_Tmp,'');
+          SetFilterNm(#Filtr_Persons);
+          BitOnW(wFilter,3);
+        }
+      }
+      #Filtr_Lschet:
+      { PAF_One.Change(PickOptions);
+        var PAMI: IPersonalAccountMarksIterator;
+        PAMI := PAF_One.GetMarks.GetIterator;
+        StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Выгрузка данных', PAF_One.GetMarks.GetCount);
+        ClearMarker(Marker_Lschet);
+        _try
+        { if PAMI.First
+          { do
+            {
+              if not NextVisual then break;
+              InsertMarker(Marker_Lschet,PAMI.GetPersonalAccount);
+            }
+            while PAMI.Next;
+          }
+        }
+        _except
+          on ExUserBreak: {}
+        _finally
+          StopVisual('', 0);
+        SetFilterNm(#Filtr_Lschet);
+        BitOnW(wFilter,4);
+      }
+      end;
+    } //cmPick:
+
+    cmDelOnProtect:
+    {
+      Case Curfield of
+      #Filtr_Katpodr:
+      { ClearMarker(Marker_KatPodr);
+        BitOffW(wFilter,1);
+        SetFilterNm(#Filtr_Katpodr);
+      }
+      #Filtr_MnPlan:
+      { ClearMarker(Marker_MnPlan);
+        BitOffW(wFilter,2);
+        SetFilterNm(#Filtr_MnPlan);
+      }
+      #Filtr_Persons:
+      { ClearMarker(Marker_Persons);
+        BitOffW(wFilter,3);
+        SetFilterNm(#Filtr_Persons);
+      }
+      #Filtr_Lschet:
+      { ClearMarker(Marker_Lschet);
+        BitOffW(wFilter,4);
+        SetFilterNm(#Filtr_Lschet);
+      }
+      end;
+    } //cmDelOnProtect:
+
+    //--------------------------
+    cmFilterSave:
+    { UpdateTable;
+      //CopyToA; - расскоментировать при наличии проблем
+      if RunWindowModal(wnFilter)=cmDefault
+      { SetFilterBounds(wIsArh);
+      }
+      else RestFromA
+
+    }
+
+    //--------------------------
+    cmValue1: // Скопировать запись
+    { UpdateTable;
+      if wIsArh=1
+      { message('Копирование записей в архиве запрещено');
+        abort;
+      }
+      if isValid(#GP_RaspAvans)
+      { if pMarkerActive.Count>0
+        { if message('Скопировать '+string(pMarkerActive.Count)+ ' записей?',YesNo)=cmYes
+          { _Loop pMarkerActive where (( root == pMarkerActive.pNrec ))
+            {
+              if getfirst  GP_RaspAvans_FND where (( pMarkerActive.pNrec == GP_RaspAvans_FND.Nrec )) <>tsok continue;
+              GP_RaspAvans_FND.Nrec:=0;
+              GP_RaspAvans_FND.cUser:=UserId();
+              GP_RaspAvans_FND.DInput   := Cur_Date;
+              insert current GP_RaspAvans_FND;
+            }
+            ReReadRecord(#GP_RaspAvans);
+          }
+
+
+        }
+        else
+        if message('Скопировать текущую запись?',YesNo)=cmYes
+        { GP_RaspAvans.Nrec:=0;
+          GP_RaspAvans.cUser:=UserId();
+          GP_RaspAvans.DInput   := Cur_Date;
+          insert current GP_RaspAvans;
+          ReScanPanel(#GP_RaspAvans);
+
+        }
+
+      }
+    } //cmValue1
+
+    //--------------------------
+    cmPickClass:// внешние классификаторы
+    {
+      if UpdateTable
+        RunInterface('ExClassifier', coGP_RaspAvans, GP_RaspAvans.nRec);
+    }
+
+    //--------------------------
+    cmPickAttr:// внешние аттрибуты
+    {
+      if UpdateTable
+        RunInterface('Attribute', coGP_RaspAvans, GP_RaspAvans.nRec);
+    }
+
+    //--------------------------
+    cmChangeTabbedSheetFormat:
+    { UpdateTable;
+      case Target of
+      brRaspActive:
+      { SetFilterBounds(0);
+      }
+      brRaspArh:
+      { SetFilterBounds(1);
+      }
+      end;
+
+    } //cmChangeTabbedSheetFormat:
+
+
+    //--------------------------
+    cmHotKeys:
+    {
+      ProcessCommand(RunMenu('GP_ZP_RaspZakazPers_mnu'));
+
+    }
+
+    cmValue2:
+    {
+      RunInterfaceNoModal('GP_ZP::ZenSHAKKIN');
+    }
+
+    cmValue3:
+    {
+      RunInterfaceNoModal('GP_ZP::ZenSHAKKINNEW');
+    }
+
+    cmValue4:
+    {
+      CalcPercentPryamyeAll;
+    }
+
+  end;//HandleEvent
+end.//Interface GP_ZP_RaspZakazPers
+
+//меню
+GP_ZP_RaspZakazPers_mnu menu
+{
+- 'Копировать'                 , cmValue1, '', hcProc_NagrKaf, 'Alt+1',kbAlt1, scMenuCtx;
+- 'Расчет аванса'              , cmValue2, '', hcProc_NagrKaf, 'Alt+2',kbAlt2, scMenuCtx;
+//- 'Расчет аванса (сохранение)' , cmValue3, '', hcProc_NagrKaf, 'Alt+3',kbAlt3, scMenuCtx;
+ -----------;
+- 'Добавление % по "прямым" за прошлый месяц'              , cmValue4, '', hcProc_NagrKaf, 'Alt+3',kbAlt3, scMenuCtx;
+ -----------;
+- 'Фильтр на данные'     , cmFilterSave, 'Фильтр на данные', hcProc_NagrKaf, 'Alt+B',kbAltB, scMenuCtx;
+- 'Внешняя классификация', cmPickClass, 'Внешняя классификация', hcGkatalM1ExtClass, 'Alt+C', kbAltC, sci1Esc;
+- 'Внешние атрибуты'     , cmPickAttr , 'Заполнение внешних атрибутов по данной позиции', hcGkatalM1Attr, 'Alt+A', kbAltA, sci1Esc;
+
+} //GP_ZP_RaspZakazPers_mnu menu

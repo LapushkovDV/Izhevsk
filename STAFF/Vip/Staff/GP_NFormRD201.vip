@@ -1,0 +1,434 @@
+/*************************************************************************************************\
+* Наименование: Интерфейс формирования формы "Приказ о производственной практике студентов"       *
+* Контур/Модуль: Управление персоналом                                                            *
+* Пункт меню: Документы / Все приказы по персоналу                                                *
+* Примечание:                                                                                     *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#339          |14/06/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include CatFunc.vih // Функции работы с Catalogs
+#include DeptIer.vih // Функции работы с подразделениями
+#include TotalOrganizationAttributes.vih // Работа с атрибутами организации
+#include AppFuncs.vih // Функции работы с назначениями
+#include GP_Signers.vih // Библиотека для вывода подписей в отчетах
+#include History.vih
+#include GP_DepFunc.vih
+// #include GP_Log.vih
+
+interface GP_NFormRD201;
+
+  const
+    SG_CONST_REP = cgReport_KASSFRO; // код группы отчётов для выбора подписантов
+    SG_TAG_REP = 'StOrderRPD201'; // код отчёта для выбора подписантов
+  end;
+
+  // Список подразделений
+  table struct SPracticeTypes
+  (
+    cPracticeType: tNRec, // Ссылка на подразделение
+    Code: String[100], // Код подразделения
+    Name: String[255]  // Наименование подразделения
+  )
+  With index
+  (
+    SPracticeTypes01 = cPracticeType,
+    SPracticeTypes02 = Name
+  );
+
+  // Учебные заведения
+  table struct SInsts
+  (
+    cInst: tNRec,      // Ссылка на учебное заведение
+    Code: String[100], // Код учебного заведения
+    Name: String[255]  // Наименование учебного заведения
+  )
+  With index
+  (
+    SInsts01 = cInst,
+    SInsts02 = Name
+  );
+
+  // Список подразделений
+  table struct SCourses
+  (
+    cInst: tNRec, // Ссылка на учебное заведение
+    Course: Byte  // Курс
+  )
+  With index
+  (
+    SCourses01 = cInst + Course
+  );
+
+  // Список доплат
+  table struct SRaises
+  (
+    NRec: tNRec, // NRec
+    cRaiseType: tNRec, // Вид оплаты
+    VidOplP: LongInt, // Пользовательский код вида оплаты из модуля Зарплата
+    Sum: tSumma, // Сумма
+    RaiseAttr: Byte, // Тип оплаты
+    RaiseCurr: tNRec // Валюта
+  )
+  With index
+  (
+    SRaises01 = cRaiseType + VidOplP + Sum + RaiseAttr + RaiseCurr,
+    SRaises02 = VidOplP
+  );
+
+  // Количество доплат у каждого руководителя
+  table struct SRaisesCnt
+  (
+    cSRaises: tNRec, // Ссылка на SRaises
+    cMentor: tNRec, // Вид оплаты
+    RaisesCnt: Word // Количество доплат
+  )
+  With index
+  (
+    SRaisesCnt = cSRaises + cMentor
+  );
+
+  create view
+    var
+      pPartDoc: tNRec;
+    from
+      PartDoc,
+      KlVal,
+      KlVidOpl,
+      synonym Persons PersonsS,
+      synonym Persons PersonsR,
+      SInsts (SInsts02),
+      SCourses (SCourses01),
+      SPracticeTypes (SPracticeTypes02),
+      SRaises (SRaises02),
+      SRaisesCnt
+    where((
+          pPartDoc                == PartDoc.NRec
+      and PartDoc.cDoc            == TitleDoc.NRec
+      and PartDoc.NRec            == ContDoc.cPart
+      and ContDoc.Person          == Persons.NRec
+      and ContDoc.cStr            == Appointments.NRec
+      and ContDoc.NRec            == RaiseHist.cContDoc
+      and ContDoc.NRec            == GP_SpContDoc201.cContDoc
+      and GP_SpContDoc201.cPerson == PersonsS.NRec
+      and SRaises.NRec            == SRaisesCnt.cSRaises
+    ));
+
+  parameters pPartDoc;
+
+  form Frm ('form_RD201.out','GP_NFormRD201');
+
+  var
+    IsAborted: Boolean;
+    ICatFunc: CatalogsFunctions;
+    IDepartIer: DepartIer;
+    VAppFuncs: AppointmentsFunctions;
+    DateBeg: Date; // Минимальная дата начала практики
+    DateEnd: Date; // Максимальная дата окончания практики
+
+  #include TotalOrganizationAttributes.var // объявление и инициализация TOA
+  #include GP_Signers.var
+  #include History.var
+  #include GP_DepFunc.var
+  // #include GP_Log.var
+
+  procedure RaiseErr(Msg: String; IsFatal: Boolean = true);
+  begin
+    Message(Msg);
+    if IsFatal then
+      IsAborted := true;
+  end;
+
+  // Получает пользовательский код оплаты для указанной доплаты
+  function GetVidOpl(_сRaise: tNRec): LongInt;
+  var
+    VidOplS: LongInt;
+  begin
+    result := 0;
+    // Системный вид оплаты
+    VidOplS := LongInt(Substr(ICatFunc.GetCatalogsCatData(_сRaise), 1, 5));
+    if GetFirst KlVidOpl where ((VidOplS == KlVidOpl.VidOpl)) = tsOk then
+      result := KlVidOpl.VidOplP;
+  end;
+
+  // Получает символ валюты
+  function GetSimvolV(_KlVal: tNRec): String;
+  begin
+    result := '';
+    if GetFirst KlVal where ((_KlVal == KlVal.NRec)) = tsOk then
+      result := KlVal.SimvolV;
+  end;
+
+  // Получает название типа оплаты по валюте
+  function GetRaiseTypeName(_RaiseAttr: Byte; _RaiseCurr: tNRec): String;
+  begin
+    case _RaiseAttr of
+      1: result := GetSimvolV(_RaiseCurr); // валюта
+      2: result := '%'; // проценты
+      else
+        result := 'руб.'; // нац.валюта
+    end;
+  end;
+
+  // Добавляет тип практики в таблицу SPracticeTypes
+  procedure ProcesPracticeTypes(_cPracticeType: tNRec);
+  begin
+    if _cPracticeType = 0 then
+      exit;
+    if getFirst SPracticeTypes where ((_cPracticeType == SPracticeTypes.cPracticeType)) != tsOk then
+    begin
+      ClearBuffer(#SPracticeTypes);
+      SPracticeTypes.cPracticeType := _cPracticeType;
+      SPracticeTypes.Code := ICatFunc.GetCatalogsCode(_cPracticeType);
+      SPracticeTypes.Name := ICatFunc.GetCatalogsName(_cPracticeType);
+      if insert current SPracticeTypes != tsOk then
+        RaiseErr('Не удалось запись в таблицу SPracticeTypes');
+    end;
+  end;
+
+  // Добавляет учебное заведение и номер курса в таблицы SInsts и SCourses
+  procedure ProcessInst(_cInstitution: tNRec; _Course: Byte);
+  begin
+    if _cInstitution = 0 then
+      exit;
+    if getFirst SInsts where ((_cInstitution == SInsts.cInst)) != tsOk then
+    begin
+      ClearBuffer(#SInsts);
+      SInsts.cInst := _cInstitution;
+      SInsts.Code := ICatFunc.GetCatalogsCode(_cInstitution);
+      SInsts.Name := ICatFunc.GetCatalogsName(_cInstitution);
+      if insert current SInsts != tsOk then
+        RaiseErr('Не удалось запись в таблицу SInsts');
+    end;
+    if _Course = 0 then
+      exit;
+    if getFirst SCourses where ((_cInstitution == SCourses.cInst and _Course == SCourses.Course)) != tsOk then
+    begin
+      ClearBuffer(#SCourses);
+      SCourses.cInst := _cInstitution;
+      SCourses.Course := _Course;
+      if insert current SCourses != tsOk then
+        RaiseErr('Не удалось запись в таблицу SCourses');
+    end;
+  end;
+
+  // Обрабатывает доплаты
+  procedure ProcesRaise(_cPerson: tNRec; _cRaiseType: tNRec; _Sum: tSumma; _RaiseAttr: Byte; _RaiseCurr: tNRec);
+  var
+    _VidOplP: LongInt;
+  begin
+    // Добавляем оплату в список оплат, используемых в приказе
+    _VidOplP := GetVidOpl(_cRaiseType);
+    if getFirst SRaises where ((
+          _cRaiseType == SRaises.cRaiseType
+      and _VidOplP    == SRaises.VidOplP
+      and _Sum        == SRaises.Sum
+      and _RaiseAttr  == SRaises.RaiseAttr
+      and _RaiseCurr  == SRaises.RaiseCurr
+    )) != tsOk then
+    begin
+      ClearBuffer(#SRaises);
+      SRaises.NRec := RecordsInTable(#SRaises) + 1;
+      SRaises.cRaiseType := _cRaiseType;
+      SRaises.VidOplP := _VidOplP;
+      SRaises.Sum := _Sum;
+      SRaises.RaiseAttr := _RaiseAttr;
+      SRaises.RaiseCurr := _RaiseCurr;
+      if insert current SRaises != tsOk then
+      begin
+        RaiseErr('Не удалось запись в таблицу SRaises');
+        exit;
+      end;
+    end;
+    // Увеличиваем счетчик количества таких оплат у данного руководителя
+    if getFirst SRaisesCnt where ((
+          SRaises.NRec == SRaisesCnt.cSRaises
+      and _cPerson     == SRaisesCnt.cMentor
+    )) != tsOk then
+    begin
+      ClearBuffer(#SRaisesCnt);
+      SRaisesCnt.cSRaises := SRaises.NRec;
+      SRaisesCnt.cMentor := _cPerson;
+      SRaisesCnt.RaisesCnt := 1;
+      if insert current SRaisesCnt != tsOk then
+        RaiseErr('Не удалось запись в таблицу SRaisesCnt');
+    end else
+    begin
+      SRaisesCnt.RaisesCnt := SRaisesCnt.RaisesCnt + 1;
+      if update current SRaisesCnt != tsOk then
+        RaiseErr('Не удалось обновить запись в таблице SRaisesCnt');
+    end;
+  end;
+
+  // Анализ данных
+  procedure PrepareData;
+  begin
+    DateBeg := ZeroDate;
+    DateEnd := ZeroDate;
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Анализ данных...', 1);
+    _try
+      begin
+        _loop ContDoc
+        begin
+          NextVisual;
+          // Составляем список видов практики, упоминаемых в приказе
+          ProcesPracticeTypes(ContDoc.cNew3);
+          // Составляем список учебных заведений
+          ProcessInst(ContDoc.cNew7, ContDoc.wAttrDoc4);
+          _loop GP_SpContDoc201
+          begin
+            NextVisual;
+            // Ищем наименьшую дату "зачислить с"
+            if DateBeg = ZeroDate or GP_SpContDoc201.DateFrom < DateBeg then
+              DateBeg := GP_SpContDoc201.DateFrom;
+            // Ищем наибольшую дату "зачислить по"
+            if DateEnd = ZeroDate or GP_SpContDoc201.DateTo > DateEnd then
+              DateEnd := GP_SpContDoc201.DateTo;
+            // На каждого практиканта формируются все доплаты
+            _loop RaiseHist
+            begin
+              NextVisual;
+              // Составим список доплат, назначаемых в приказе
+              ProcesRaise(ContDoc.Person, RaiseHist.cRaiseType, RaiseHist.RHSum, RaiseHist.IHAttr, RaiseHist.cRef1);
+            end;
+          end;
+        end;
+      end
+    _except
+      on ExUserBreak:
+        begin
+          IsAborted := true;
+        end;
+    StopVisual('', 0);
+  end;
+
+  // Формирование потока для формы
+  procedure GenerateForm;
+  begin
+    // Выбираем группу подписантов
+    if not oGP_Signers.Init(SG_CONST_REP, SG_TAG_REP, true, TitleDoc.DocDate) then
+      exit;
+    Frm.Write(PartDoc.TypeOper); // TypeOper
+    Frm.Write(TitleDoc.NRec); // TitleDocNRec
+    Frm.Write(PartDoc.NRec); // PartDocNRec
+    
+    TOA.Bind(0); // связываем TOA с собственной организацией
+    Frm.Write(oHistory.sGetField(coKatOrg, coGetTune('MyOrg'), 'REP.KATORGNAME', DateBeg)); // OrgName
+
+    Frm.Write(Trim(TOA.GetJuridicalInfo.GetOkpoCode)); // OrgOKPO
+
+    Frm.Write(TitleDoc.DocNmb); // OrderNum
+    Frm.Write(TitleDoc.DocDate); // OrderDate
+    Frm.Write(DateBeg); // DateBeg
+    Frm.Write(DateEnd); // DateEnd
+
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчётной формы...', 1);
+    _try
+      begin
+        _loop SPracticeTypes
+        begin
+          NextVisual;
+          Frm.PutEventByID(feDoLoop, fcPracticeTypes);
+          Frm.Write(SPracticeTypes.Code); // PracticeTypeCode
+          Frm.Write(SPracticeTypes.Name); // PracticeTypeName
+        end;
+        _loop SInsts
+        begin
+          NextVisual;
+          Frm.PutEventByID(feDoLoop, fcInsts);
+          Frm.Write(SInsts.Code); // InstCode
+          Frm.Write(SInsts.Name); // InstName
+          _loop SCourses where ((SInsts.cInst == SCourses.cInst))
+          begin
+            NextVisual;
+            Frm.PutEventByID(feDoLoop, fcCourses);
+            Frm.Write(SCourses.Course); // Course
+          end;
+        end;
+        _loop SRaises
+        begin
+          NextVisual;
+          Frm.PutEventByID(feDoLoop, fcRaisesList);
+          Frm.Write(SRaises.VidOplP); // RLVidOplP
+          Frm.Write(ICatFunc.GetCatalogsName(SRaises.cRaiseType)); // RLName
+          Frm.Write(SRaises.Sum); // RLSum
+          Frm.Write(SRaises.RaiseAttr); // RLType
+          Frm.Write(GetRaiseTypeName(SRaises.RaiseAttr, SRaises.RaiseCurr)); // RLTypeName
+          _loop SRaisesCnt
+          begin
+            NextVisual;
+            Frm.PutEventByID(feDoLoop, fcRaisesByMentors);
+            Frm.Write(SRaisesCnt.cMentor); // RLMentorNRec
+            if getFirst PersonsR where ((SRaisesCnt.cMentor == PersonsR.NRec)) = tsOk then
+            begin
+              Frm.Write(GetStrTabn(PersonsR.TabNmb, PersonsR.StrTabn)); // RLMentorTabN
+              Frm.Write(PersonsR.FIO); // RLMentorFIO
+            end else
+              Frm.SkipFormat(2);
+            Frm.Write(SRaisesCnt.RaisesCnt); // RLRaisesCnt
+          end;
+        end;
+        _loop ContDoc
+        begin
+          NextVisual;
+          Frm.PutEventByID(feDoLoop, fcContDoc);
+          Frm.Write(ContDoc.Person); // CDNRec
+          Frm.Write(GetStrTabn(Persons.TabNmb, Persons.StrTabn)); // CDTabN
+          Frm.Write(Persons.FIO); // CDFIO
+          Frm.Write(ICatFunc.GetCatalogsCode(Appointments.Department)); // CDDepCode
+          Frm.Write(ICatFunc.GetCatalogsName(Appointments.Department)); // CDDepName
+          Frm.Write(oGP_DepFunc.GetFullDepName(Appointments.Department,DF_ADD_CODE)); // CDDepNameFull
+          Frm.Write(ICatFunc.GetCatalogsName(Appointments.Post)); // CDPosition
+          Frm.Write(ICatFunc.GetCatalogsName(ContDoc.cNew3)); // CDPractType
+          Frm.Write(ICatFunc.GetCatalogsName(ContDoc.cNew7)); // CDInstitution
+          Frm.Write(ContDoc.Dat1); // CDDateBeg
+          Frm.Write(ContDoc.Dat2); // CDDateEnd
+          Frm.Write(ContDoc.wAttrDoc4); // CDCourse
+          Frm.Write(ContDoc.SBottom); // CDReason
+          _loop RaiseHist
+          begin
+            NextVisual;
+            Frm.PutEventByID(feDoLoop, fcRaises);
+            Frm.Write(GetVidOpl(RaiseHist.cRaiseType)); // RaiseVidOplP
+            Frm.Write(ICatFunc.GetCatalogsName(RaiseHist.cRaiseType)); // RaiseName
+            Frm.Write(RaiseHist.RHSum); // RaiseSum
+            Frm.Write(RaiseHist.IHAttr); // RaiseType
+            Frm.Write(GetRaiseTypeName(RaiseHist.IHAttr, RaiseHist.cRef1)); // RaiseTypeName
+          end;
+          _loop GP_SpContDoc201
+          begin
+            NextVisual;
+            Frm.PutEventByID(feDoLoop, fcTrainees);
+            Frm.Write(GP_SpContDoc201.cPerson); // TrnNRec
+            Frm.Write(GetStrTabn(PersonsS.TabNmb, PersonsS.StrTabn)); // TrnTabN
+            Frm.Write(GP_SpContDoc201.FIO); // TrnFIO
+            Frm.Write(GP_SpContDoc201.DateFrom); // TrnDateBeg
+            Frm.Write(GP_SpContDoc201.DateTo); // TrnDateEnd
+            Frm.Write(ICatFunc.GetCatalogsName(GP_SpContDoc201.cSpeciality)); // Speciality
+          end;
+        end;
+      end
+    _except
+      on ExUserBreak:
+        begin
+          IsAborted := true;
+        end;
+    StopVisual('', 0);
+
+    if not IsAborted and not Frm.Error then
+      Frm.ShowFile();
+  end;
+
+  handleEvent
+    cmInit:
+      begin
+        IsAborted := false;
+        PrepareData;
+        if not IsAborted then
+          GenerateForm;
+        abort;
+      end;
+  end;
+
+end.

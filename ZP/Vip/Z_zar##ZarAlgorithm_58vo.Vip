@@ -1,0 +1,387 @@
+/*************************************************************************************************\
+* Наименование: ZarAPI алгоритм "Расчет 58 вида оплаты"                                           *
+* Контур/Модуль: Заработная плата                                                                 *
+* Пункт меню: Настройка / Заполнение каталогов / Виды оплат и скидок                              *
+* Примечание:                                                                                     *
+* Для использования нужно создать спец.алгоритм со следующим содержанием:                         *
+* ZARALG('GP_ZP::58Vo')                                                                           *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2350         |07/05/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include ZarAlg.vih
+#include GP_KPI_Alg.vih
+#component "Z_Zar"
+
+VipInterface zarAlgorithm_58Vo  implements IZarAlgorithm licensed(free);
+#doc
+Наименование: ZarAPI алгоритм "Расчет 58 вида оплаты"
+Контур/Модуль: Заработная плата
+Пункт меню: Настройка / Заполнение каталогов / Виды оплат и скидок
+Примечание:
+Для использования нужно создать спец.алгоритм со следующим содержанием:
+ZARALG('GP_ZP::58Vo')
+#2350
+#end
+Interface zarAlgorithm_58Vo cacheable;
+//----------------------------
+var
+  iGP_KPI_Alg:GP_KPI_Alg_Calc;//Расчет алгоритмов
+  PeriodBegin:date;
+	PeriodEnd  :date;
+//-----------------------
+// Накопим проценты и суммы
+//---------------------
+Table Struct Tmp_podr
+(  cPodr:comp //подразделение
+  ,cPost:comp //cAppoint  - должность
+  ,Cex  :comp //Цех
+  ,DataN:date
+  ,DatOk:date
+  ,BasePrem :tSumma // база для начисления премии
+  ,Su01     :double
+  ,Su21     :double
+  ,Su22     :double
+  ,Su23     :double
+  ,Su38     :double
+  ,Su40     :double
+  ,Proc21   :double
+  ,Proc22   :double
+  ,Proc23   :double
+  ,Proc38   :double
+  ,Proc40   :double
+  ,PA       :word
+)
+with index
+(  Tmp_podr01 = cPodr+ cPost
+  ,Tmp_podr02 = Cex+ cPost
+);
+Table Struct tmp_Doplata
+(  cDoplata:comp
+  ,Vidopl : word
+  ,VidoplP : word
+)
+with index
+( tmp_Doplata01=VidoplP
+);
+//------------------------
+create view
+var
+    pLschet:comp;
+    wMes,wYear:word;
+  as select Lschet.Nrec
+    , AppPayModelCat.NaSisOpl (FieldTitle = 'Наимен.системы оплаты')
+    from
+       Lschet
+      ,Appointments(APNTBYPERSON)
+      ,tmp_Doplata
+      ,tmp_podr
+      ,PRNARYAD
+      ,Klsisopl AppPayModelCat
+      ,lstab
+
+    where ((
+       pLschet == Lschet.Nrec
+    //---------------------
+   and lschet.nrec==lstab.clschet
+   and wYear      ==lstab.yearn
+   and wMes       ==lstab.mesn
+   //-----------------------------
+   and  wYear   == klndr.YEARK
+   and  wMes    == klndr.MONTHK
+   and  1       == klndr.rejim //1.12 Восемь часов в день сорок часов в неделю
+
+
+   //----------------------------
+   and lschet.tPerson == Appointments.Person
+   and lschet.Nrec    == Appointments.cAddNrec2(noindex)
+   and PeriodEnd      >>=Appointments.AppointDate(NoIndex)
+   and (
+         (   Appointments.lPrizn=0
+          or Appointments.lPrizn=2 // Заместительства
+          or Appointments.lPrizn=3 // Совмещение
+          or Appointments.lPrizn=Integer(100) //предыдущие
+          or Appointments.lPrizn=integer(70)  //временные
+         )
+    and  (   (Appointments.lPrizn<>2 and  (Appointments.DisMissDate=ZeroDate or Appointments.DisMissDate>=PeriodBegin ))
+          or (Appointments.lPrizn=2 and  (Appointments.DATEEND=ZeroDate or Appointments.DATEEND>=PeriodBegin ))
+         )
+   )
+   and  Appointments.PayModel    == AppPayModelCat.SisOpl
+   //-- наряды
+   and  pLschet == prnaryad.clsch
+   and  (  wYear=Year (prnaryad.DataN)
+       and wMes =Month(prnaryad.DataN)
+        )
+
+  ));
+  //-----------------------------
+  create view vPodr
+  var
+    pKatpodr :comp;
+  as select KatPodr.Nrec
+  From KatPodr,  KatPodr KatPodr_Up
+  where ((
+      pKatpodr == KatPodr.Nrec
+  AND Katpodr.cPodr == KatPodr_Up.Nrec
+  )); //create view vPodr
+
+  //--------------------------------
+  //получить подразделение для расчета
+  //--------------------------------
+  Function GetPodrCex(_pPodr:comp) :comp;
+  { Result:=_pPodr;
+    vPodr.pKatpodr:=_pPodr;
+    if vPodr.getfirst KatPodr<>tsok Exit;
+    if vPodr.KatPodr.cPodr=0 then exit;
+    if vPodr.getfirst KatPodr_UP<>tsok Exit;
+    if SubStr(vPodr.KatPodr.kod,1,3)=SubStr(vPodr.KatPodr_UP.kod,1,3)
+    { Result:=vPodr.KatPodr.cPodr;
+    }
+  } //Function GetPodrCex(_pPodr:comp) :comp;
+
+  //--------------------------------
+  // Загрузчик
+  //--------------------------------
+  Function LoadInterface:boolean;
+  { Result:=False;
+    timelog_init;
+    displ('zarAlgorithm_58Vo->LoadInterface');
+    // Найдем доплаты
+    delete all tmp_doplata;
+    //  set iVidOpl := longint(Substr(Catalogs.CatData, 1, 5));
+    //  if (GetFirst KlVidOpl where ((iVidOpl == KlVidOpl.VidOpl)) = tsOk)
+    _Try
+    { SQL Select
+       Catalogs.Nrec    as cDoplata//:comp
+      ,Klvidopl.Vidopl  as Vidopl  //:word
+      ,Klvidopl.VidoplP as VidoplP //:word
+      From Catalogs CatMain
+      inner join Catalogs on Catalogs.MainLink = CatMain.nrec
+                         and Catalogs.Lpr =0
+      inner join Klvidopl on KlVidOpl.VidOpl=Cast(SubString(Catalogs.CatData,1,5) as Longint )
+        and Klvidopl.VidoplP in (21,22,23,38,40)
+      where CatMain.sysCode = -17
+      into tmp_doplata;
+    }
+    _except
+    else
+    {
+
+    }
+    Result:=True;
+    displ('zarAlgorithm_58Vo->LoadInterface:отобрали из справочника доплат '+string(RecordsInTable(#tmp_doplata)));
+
+  } //Function LoadInterface:boolean;
+
+  //-----------------------------
+  // Расчет алгоритма
+  //-----------------------------
+  public function CalcSum(Parameter: string): double;
+  {
+    result := 0;
+
+  	PeriodBegin:=uch_datan;
+	  PeriodEnd  :=uch_datok;
+    pLschet:=uch_lsch;
+    wMes  :=month(uch_datan);
+    wYear :=year (uch_datan);
+  	if getfirst lschet<>tsok // where ((uch_lsch==lschet.nrec))=tsok
+    { exit;
+    }
+    if timelog_status>0
+    { displ('zarAlgorithm_58Vo->CalcSum:Лиц.счет '+GetStrTabn(lschet.tabn,Lschet.StrTabn));
+    }
+    //------------------ вопрос - а нужно ли
+    if UCH_SISOPL<>20
+    { exit;
+
+    }
+    //----- Установим период расчета >>>>>>>>>>>>>>>>>>>
+    iGP_KPI_Alg.SetPeriodByParam(PeriodBegin,PeriodEnd);
+    //----- Установим период расчета <<<<<<<<<<<<<<<<<<<
+
+    delete all Tmp_podr;
+    //-----------------------------
+    var _cPodr:comp=0; //подразделение
+    var _cPost:comp=0; //lschet.cAppoint  - должность
+    var _Cex  :comp=0; //Цех
+    var ii    :word;// итератор
+    var _wVo  :word;// вид оплат
+    var _Procent :double;//процент
+    var _Summa   :double;//временная для суммы
+    var _suPrem:double=0;// сумма премии
+    var _su01  :double=0;// сумма сделки
+    var _chas01  :double=0;// часы по сделке
+    var _chasgr  :double=0;//часы по графику 1 режима
+    var _chasf   :double=0;//фактические часы
+    //-----------------------------
+    //Рассчитаем базу для премий 21, 22, 23 >>>>>>>>>>>
+
+    _Loop Appointments
+    { if Appointments.PayModel<>20 then continue; // только сделка!
+      _cPodr:=GetKatPodrByCatalogs(Appointments.DepartMent);
+      _cPost:=Appointments.Post;
+      _Cex  :=GetPodrCex(_cPodr);
+      if getfirst tmp_Podr where (( //_cPodr == tmp_Podr.cPodr
+                  _Cex    == tmp_Podr.Cex
+              and _cPost  == tmp_Podr.cPost
+              ))<>tsok
+      { clearbuffer(#tmp_Podr);
+        tmp_Podr.cPodr:=_cPodr;
+        tmp_Podr.cPost:=_cPost;
+        tmp_Podr.Cex  :=GetPodrCex(_cPodr);
+        For(ii:=1;ii<=9;ii++)
+        { _wVo:=0;
+          Case ii of
+          1: _wVo:=1;//Сделка
+          2: _wVo:=11;//Сделка
+          3: _wVo:=9;//
+          4: _wVo:=224; // Индивидуальная стимулирующая надбавка рабочим
+          5: _wVo:=21;//
+          6: _wVo:=22;//
+          7: _wVo:=23;//
+          8: _wVo:=38;//
+          9: _wVo:=80;// Ежемесячная премия за результаты выполнения показателей прем
+          end;
+          if _wVo=0 then continue;
+          _Summa:=iGP_KPI_Alg.EM_NachByMF(
+              pLschet// _pLschet:comp;
+             ,_cPodr // _pPodr :comp;
+             ,_cPost // _pPost :comp;
+             ,_wVo   // _wVo:word
+             ,wMes   // _wMes:word
+             ,wYear  // _wYear:word
+             ,1      // _IE   :word //0 не учитываем, 1 учитываем все по первым 3 символам кода
+           );
+           if ii<5  tmp_Podr.BasePrem+=_Summa;
+           case _wVo of
+           1,224:
+           { _su01 +=_Summa;
+             tmp_Podr.su01:=_Summa;
+           }
+           21: tmp_Podr.su21:=_Summa;
+           22: tmp_Podr.su22:=_Summa;
+           23: tmp_Podr.su23:=_Summa;
+           38: tmp_Podr.su38:=_Summa;
+           80: tmp_Podr.su40:=_Summa;
+           end;
+        } //For(ii:=1;ii<=3;ii++)
+        insert current tmp_Podr;
+      } //if getfirst tmp_Podr where (( //_cPodr == tmp_Podr.cPodr
+      //-----------------------
+      _Loop tmp_Doplata
+      { _Summa:=0;
+        _Procent:=iGP_KPI_Alg.CalcRaiseProcent(
+                   Appointments.Nrec    // _cAppointments:comp;
+                  ,tmp_Doplata.cDoplata // _cDoplata:comp;
+                  ,1 //_Type:word;
+                  ,_summa//var _Summa:double
+                  );
+         if tmp_Podr.BasePrem>0
+         { // если факт меньше плана, то берем его
+           case tmp_Doplata.VidoplP of
+           21:
+           { _Summa:=100*tmp_Podr.Su21/tmp_Podr.BasePrem;
+             if _Summa<_Procent _Procent:=_Summa;
+             tmp_Podr.Proc21:=_Procent;
+           }
+           22:
+           { _Summa:=100*tmp_Podr.Su22/tmp_Podr.BasePrem;
+             if _Summa<_Procent _Procent:=_Summa;
+             tmp_Podr.Proc22:=_Procent;
+           }
+           23:
+           { _Summa:=100*tmp_Podr.Su23/tmp_Podr.BasePrem;
+             if _Summa<_Procent _Procent:=_Summa;
+             tmp_Podr.Proc23:=_Procent;
+           }
+           38:
+           { _Summa:=100*tmp_Podr.Su38/tmp_Podr.BasePrem;
+             if _Summa<_Procent _Procent:=_Summa;
+             tmp_Podr.Proc38:=_Procent;
+           }
+           40:
+           { _Summa:=100*tmp_Podr.Su40/tmp_Podr.BasePrem;
+             if _Summa<_Procent _Procent:=_Summa;
+             tmp_Podr.Proc40:=_Procent;
+           }
+           end;
+         }//if tmp_Podr.BasePrem>0
+      } //_Loop tmp_Doplata
+      update current tmp_Podr;
+    } //_Loop Appointments
+    //Рассчитаем базу для премий 21, 22, 23 <<<<<<<<<<<<<
+    Loadworkingtable(pLschet,wMes,wYear);
+    _chasf:=WT_GHBD(1,0,0,1,PeriodBegin,PeriodEnd);
+    //количество часов по графику с кодом №1 (5-40)
+    /*_chasgr:=BALBWDATES(
+             1//REJIM
+            ,PeriodBegin//DB
+            ,PeriodEnd//DE
+            ,1// OPT opt - опции(0 - дни, 1 - часы).
+            ); */
+    //  _chasgr:=ChaGR(wMES,wYEAR,1)-(WT_GHBD(26, 0, 100, -1, UCH_DATAN, UCH_DATOK));
+    //4308.96
+    _chasgr:=0;
+    if getfirst klNdr=tsok
+     if getfirst LsTab=tsok
+     for(ii:=1;ii<=31;ii++)
+     { if (LSTAB.DAYCHF[ii]>0 and LSTAB.DAYCHF[ii]<25)
+       or LSTAB.DAYS[ii]='В'
+       or LSTAB.DAYS[ii]='ЛЧ'
+       { if KLNDR.DAYCHAS[ii]>0
+          _chasgr+=KLNDR.DAYCHAS[ii]+KLNDR.DAYMIN[ii]/60;
+       }
+     }
+
+    //нормо-часы из нарядов
+    _Loop prnaryad
+    { _chas01+=Prnaryad.NRMTIME;
+    }
+    _Loop tmp_Podr
+    { _suPrem+=tmp_Podr.BasePrem*(tmp_Podr.Proc21+tmp_Podr.Proc22+tmp_Podr.Proc23+tmp_Podr.Proc38+tmp_Podr.Proc40)/100;
+      if timelog_status>0
+      { displ('База для премий:'+string(tmp_Podr.BasePrem,0,2)
+         +' проценты премий 21='+string(tmp_Podr.Proc21,0,2)
+          +', 22='+string(tmp_Podr.Proc22,0,2)
+          +', 23='+string(tmp_Podr.Proc23,0,2)
+          +', 38='+string(tmp_Podr.Proc38,0,2)
+          +', 40='+string(tmp_Podr.Proc40,0,2)
+          );
+
+      }
+    } //_Loop tmp_Podr
+    if timelog_status>0
+    { displ('Сумма по 1во='+string(_su01,0,2)+', премии='+string(_suPrem,0,2)
+        +', часы по нарядам='+string(_chas01)
+        +', по графику='+string(_chasgr,0,2)
+        +', факт      ='+string(_chasf,0,2)
+      );
+
+    }
+    //(Сумма ВО №1 + Сумма ВО №21 + Сумма ВО №22 + Сумма ВО №23 )/нормо-часы из нарядов
+    //  * (количество часов по графику с кодом №1 (5-40)-фактически отработанное время по табелю работника).
+    if _chas01>0
+    { Result:=(_su01+_suPrem)*(_chasgr-_chasF)/_chas01;
+      if timelog_status>0
+      { displ('итого '+string(Result,0,2));
+      }
+    }
+  }//public function CalcSum(Parameter: string): double;
+
+  //-----------------------------
+  // Наименование алгоритма
+  //-----------------------------
+  Function GetDescription: string;
+  { result := 'Доплата 58(через "Начисления и выплаты")';
+  } //function GetDescription: string;
+
+HandleEvent
+cmOnVipLoad:
+{ LoadInterface;
+
+}
+end;
+end.

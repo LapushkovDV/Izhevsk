@@ -1,0 +1,1086 @@
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+
+/*************************************************************************************************\
+  Наименование: заполнение из EXEL - файла для приказов надбавок + загрузок
+  Контур/Модуль: Управление персоналом
+  Примечание: Документы/все приказы по персоналу
+  Вид работы  |Номер           |Дата    |Исполнитель              |Проект
+  -----------------------------------------------------------------------------------------------
+  Разработка  |№SR00024479     |16/11/2020|Давтян Д.Г.            |НПО Энергомаш
+\************************************************************************************************/
+/* 20210613 - Лапушков Д.В.
+        рефакторим нафиг все. Заменяем иморт из экселя на универсальный
+        правим всякие детские болезник прогеров 0_0
+
+*/
+//#include AtlProtocol.vih
+//#include CatFunc.vih
+//#include AppFuncs.vih
+//#include PsnFuncs.vih
+//#include Query.vih
+#component "Z_StaffOrders"
+VipInterface Allowancesorder Licensed(free);
+
+Interface Allowancesorder;
+show at (,,50,5);
+table struct tTmpImport
+(
+  //для EXEL файла
+    row          : longint
+  , StrTabN      : String
+  , Kodvdop      : String
+  , Sumdop       : double
+  , VidValue     : String
+  , BegDate      : date
+  , EndDate      : date
+  , cPers        : comp
+  , VidDRaise    : integer    //wprizn2
+  , dataDRaise   : date       //draiseabort
+  , dataDRaise1  : date       //ddopdate
+  , Dsum3        : double     //dsum3
+  , err          : string
+  , raisetype    : comp
+  , ChasF        : double
+);
+
+var
+    RaiseTypeNrec
+  , RaiseNrecForDel
+  , PersonNrec
+  , _cMainLinkDoplat : comp;
+
+    boLoadZar
+  , boLoadWT : boolean = false;
+
+
+    Name_File       : String;
+
+  CS: IContextSession;
+  CL: ContextList;
+
+
+
+#include ALLOWANCESORDER_VarsTypes.vpp
+
+procedure setErr; forward;
+
+Create view
+var
+ _ListName : string;
+ _log : string = '';
+
+ _globalErr : boolean;
+
+   _cTitleDoc
+ , _cPartDoc       : comp;
+  _cTypeOper      : integer;
+as select *
+
+from
+       tTmpImport
+     , titledoc
+     , Partdoc      PDoc
+     , contdoc      Cdoc1
+     , Raise        r1
+     , Raise        RDL
+     , RaiseHist    RH
+     , Appointments App
+     , Appointments AppR
+     , persons      Per
+     , catalogs
+     , Catalogs CatDopl
+     , fortune
+     , delraise
+     , Lschet LS
+     , ContDoc
+     , RaiseHist
+     , Appointments
+     , Raise
+Where ((
+            _cTitleDoc == titledoc.nrec
+  and        _cPartDoc == PDoc.nrec
+  and        PDoc.nrec ==  Cdoc1.cpart
+  and ttmpImport.cPers == Per.nrec
+  and   Per.AppointCur == App.nrec // cAddNrec2
+  and    App.cAddNrec2 == LS.nrec
+  and tTmpImport.raisetype == CatDopl.nrec
+))
+;
+Parameters
+  _cTitleDoc
+, _cPartDoc
+;
+
+
+
+Procedure Init_WT;
+{ if boLoadWT exit;
+  boLoadWT:=true;
+  var CL: ContextList;
+  if (not CL.Add(CS, 'WorkingTable'))
+  { abort;
+    exit;
+  }
+}
+Procedure Init_Zar;
+{  if boLoadZar exit;
+   boLoadZar:=true;
+   //-----------------
+   //IntInit;
+   var CL: ContextList;
+   if (not CL.Add(CS, 'IntInit'))
+   {
+   }
+   if ( not PrVidInit(100,1) ) {}
+   Init_WT
+} //Procedure Init_Zar;
+
+
+Procedure CalcSDZ;
+{
+ StartNewVisual(vtIndicatorVisual, vfTimer, 'Расчет СДЗ', recordsintable(tntTmpImport));
+  Init_Zar;
+
+ _loop tTmpImport
+  {
+    nextvisual;
+  if getfirst per = tsOK
+  if getfirst app = tsOK
+  if getfirst LS = tsOK
+  {
+
+   Loadworkingtable(LS.Nrec,month(TitleDoc.DOCDATE),year(TitleDoc.DOCDATE));
+
+    var _dateBeg : date = to_date(01,month(TitleDoc.DOCDATE),year(TitleDoc.DOCDATE));
+    if LS.DATPOS > _dateBeg then _dateBeg := LS.DATPOS;
+
+    var _dateEnd : date = to_date(last_Day(to_date(01,month(TitleDoc.DOCDATE),year(TitleDoc.DOCDATE))),month(TitleDoc.DOCDATE),year(TitleDoc.DOCDATE));
+   if timelog_Status > 2
+    {
+      timelog('CalcSDZ: ' + per.StrTabN + ', ' +Per.Fio );
+      timelog('CalcSDZ: _dateBeg =' + _dateBeg);
+      timelog('CalcSDZ: _dateEnd =' + _dateEnd);
+     }
+
+    if _dateEnd < _dateBeg then
+     {
+      if timelog_Status > 2 then timelog('CalcSDZ: _dateEnd < _dateBeg : continue');
+      continue;
+     }
+
+   var _kolWorkDays : integer = WT_GetDaysBwDatesEx(2,-1,_dateBeg,_dateEnd, 0);
+
+   var PeriodIndex : double = Year(LS.DatPos) * 12 + Month(LS.DatPos) - 1; //индекс периода для даты приёма
+     set tTmpImport.Sumdop := Round(//tTmpImport.ChasF/8 * //сказали делить на 8 СДЗ...
+// вызываем SETSUMRAISEALL (Pascal/Money/Zarpl/RegFAlg.pas) -> Algoritm (Pascal/Money/Zarpl/Algorith.pas) ->
+// для отп. алгоритмов (пример: 29,69) расчет СДЗ в SrednOPL (Pascal/Money/Sredn/AlgBiOtp.pas) ;
+// FormBWPCard_alt (Pascal/Money/Sredn/AlgBiFun.pas), где заполняем т-цу BWPCard
+
+            SETSUMRAISEALL(    0
+                             , LS.cex
+                             , LS.Nrec      //Nrec л/с
+                             , TitleDoc.DOCDATE               //Дата проведения расчета
+                             , LS.Rejim                //Режим работы
+                             , LS.SisOpl             //Система оплаты
+                             , 5 //Вид оплаты - сказали считать как командировочные
+                             , 0 //Процент доплаты
+                             , 0    //Сумма доплаты
+                             , 0                 //Разряд
+                             , LS.Tarif              //Тариф
+                             , 0               //Код тарифа
+                             , LS.tPerson              //Ссылка на сотрудника
+                             , 0                 //Ссылка на должность
+                             , 0 //ссылка на классификатор валют
+                             , 0 //PeriodIndex // я ХЗ ЧТО ЭТО ВООБЩЕ ТАКОЕ
+                             , 0 //day(LS.DATPOS)          //сумма по предыдущим доплатам
+                             , 1 //199 - за день, 1 - ощущение, что за месяц и 299 -* вроде как тоже за день.... см файл REG_FALG.PAS признак использования алгоритма расчета
+                          )
+                          , 2     );
+
+  /*
+      Var Sum_debug : double = 0;
+          Sum_debug :=  SETSUMRAISEALL(    0
+                             , LS.cex
+                             , LS.Nrec      //Nrec л/с
+                             , TitleDoc.DOCDATE               //Дата проведения расчета
+                             , LS.Rejim                //Режим работы
+                             , LS.SisOpl             //Система оплаты
+                             , 5 //Вид оплаты - сказали считать как командировочные
+                             , 0 //Процент доплаты
+                             , 0    //Сумма доплаты
+                             , 0                 //Разряд
+                             , LS.Tarif              //Тариф
+                             , 0               //Код тарифа
+                             , LS.tPerson              //Ссылка на сотрудника
+                             , 0                 //Ссылка на должность
+                             , 0 //ссылка на классификатор валют
+                             , 0 //PeriodIndex // я ХЗ ЧТО ЭТО ВООБЩЕ ТАКОЕ
+                             , 0 //day(LS.DATPOS)          //сумма по предыдущим доплатам
+                             , 1    //199 - за день, 1 - ощущение, что за месяц и 299 -* вроде как тоже за день.... см файл REG_FALG.PAS признак использования алгоритма расчета
+                          );
+           message('1 Sum_debug = ' + Sum_debug);
+        Sum_debug :=    SETSUMRAISEALL(    0
+                             , LS.cex
+                             , LS.Nrec      //Nrec л/с
+                             , TitleDoc.DOCDATE               //Дата проведения расчета
+                             , LS.Rejim                //Режим работы
+                             , LS.SisOpl             //Система оплаты
+                             , 5 //Вид оплаты - сказали считать как командировочные
+                             , 0 //Процент доплаты
+                             , 0    //Сумма доплаты
+                             , 0                 //Разряд
+                             , LS.Tarif              //Тариф
+                             , 0               //Код тарифа
+                             , LS.tPerson              //Ссылка на сотрудника
+                             , 0                 //Ссылка на должность
+                             , 0 //ссылка на классификатор валют
+                             , 0 //PeriodIndex // я ХЗ ЧТО ЭТО ВООБЩЕ ТАКОЕ
+                             , 0 //day(LS.DATPOS)          //сумма по предыдущим доплатам
+                             , 299    //199 - за день, 1 - ощущение, что за месяц и 299 -* вроде как тоже за день.... см файл REG_FALG.PAS признак использования алгоритма расчета
+                          );
+           message('299 Sum_debug = ' + Sum_debug)
+*/
+      if timelog_Status > 2
+       {
+        timelog('CalcSDZ: SDZ = ' + tTmpImport.Sumdop);
+       }
+//      tTmpImport.Sumdop := Round(tTmpImport.Sumdop/if(WT_GetOverworkCalculationMethod(1)=2,1,8)*tTmpImport.ChasF,2); // еслои суммированный учет, то возвращает среднечасовыую
+      tTmpImport.Sumdop := Round(tTmpImport.Sumdop/8*tTmpImport.ChasF/_kolWorkDays,2); // всетаки считаем ксреднее за месяц ии делаим на колво дней
+
+      if timelog_Status > 2
+       {
+        timelog('CalcSDZ: _kolWorkDays = ' + _kolWorkDays);
+        timelog('CalcSDZ: tTmpImport.ChasF = ' + tTmpImport.ChasF);
+        timelog('CalcSDZ: tTmpImport.Sumdop = ' + tTmpImport.Sumdop);
+       }
+
+      Update Current tTmpImport;
+      setErr;
+  }
+  }
+ stopvisual;
+}
+
+#include ALLOWANCESORDER_OpenFileExcelSearchCells.vpp
+
+procedure myLog(_str: string);
+{
+  if _log = '' then _log:= GetStringParameter('Files', 'OutputFilesDirectory', 0)+'\RPD_ImportEXCEL_LOG_'+Username+'_'+datetostr(cur_date,'YYYYMMDD')+timetostr(cur_time,'HHMMSS')+'.log';
+  LogStrToFile(_log,DateToStr(Cur_date,'YYYY-MM-DD')+' ' +TimeToStr(Cur_time,'HH:MMM:SS')+ ' ' +_str);
+}
+PROCEdURE fillrecArrayByTypeTable(_log: string);
+{
+  _log := _log;
+    var _npp: byte;
+        _npp := 1;
+    SetLimit(_recArray, 0);
+    SetLimit(_recArray, 1);
+   case _cTypeOper of
+     9: {
+      _recArray[_npp].def := 'Табельный номер'           ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Код вида доплаты/надбавки' ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Сумма/процент'             ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Валюта'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'С даты'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'По дату'                   ; SetLimit(_recArray, GetLimit(_recArray) + 1);
+      }
+     10 : {
+      _recArray[_npp].def := 'Табельный номер'               ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Код вида доплаты/надбавки'     ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Вид снятия'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Валюта'                        ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Дата снятия'                   ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := '% снижения'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Снизить по дату'               ; SetLimit(_recArray, GetLimit(_recArray) + 1);
+      }
+     20 : { // список рассылки
+      _recArray[_npp].def := 'Табельный номер'           ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Код вида доплаты/надбавки' ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Сумма/процент'             ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Валюта'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'С даты'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Часы'                      ; SetLimit(_recArray, GetLimit(_recArray) + 1);
+      }
+     104:{ // список рассылки
+      _recArray[_npp].def := 'Табельный номер'           ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Код вида доплаты/надбавки' ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Сумма/процент'             ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Валюта'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'С даты'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1);
+      }
+     105:{ // список рассылки
+      _recArray[_npp].def := 'Табельный номер'           ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Код вида доплаты/надбавки' ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Сумма/процент'             ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'Валюта'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'С даты'                    ; SetLimit(_recArray, GetLimit(_recArray) + 1); _npp++;
+      _recArray[_npp].def := 'По дату'                   ; SetLimit(_recArray, GetLimit(_recArray) + 1);
+        }
+
+   end;
+
+}
+
+procedure setErr;
+{
+   tTmpImport.err := '';
+    if getfirst Per where (( 'С' == per.isemployee
+          and tTmpImport.StrTabN == Per.STRTABN (noindex)
+                           and 0 == Per.DISDATE(noindex))) = tsOK
+    {
+     tTmpImport.cPers := Per.nrec;
+    }
+    else
+     {
+      tTmpImport.err := tTmpImport.err + '|' + 'Не найден сотрудник';
+
+      If getfirst App <> tsOK
+       {
+        tTmpImport.err := tTmpImport.err + '|' + 'Не найден текущее назначение';
+       }
+       else
+        {
+          if getfirst LS <> tsOK
+           {
+            tTmpImport.err := tTmpImport.err + '|' + 'Не найден лицевой счет';
+           }
+        }
+     }
+
+   if Getfirst Catalogs where ((_cMainLinkDoplat == catalogs.mainlink(noindex)
+                          AND tTmpImport.Kodvdop == catalogs.code (noindex))) = tsOK
+    {
+     tTmpImport.raisetype := catalogs.nrec ;
+    }
+     else
+      {
+        tTmpImport.err := tTmpImport.err + '|' + 'Не найден вид доплат/единовременных выплат'
+      }
+
+   if (  ( _cTypeOper = 9
+        or _cTypeOper = 104
+        or _cTypeOper = 105
+         )
+       and tTmpImport.cPers <> 0h
+       and tTmpImport.BegDate <> 0) {
+        //проверка на дату назначения надбавки
+        if getfirst  AppR where ((tTmpImport.BegDate >>= AppR.APPOINTDATE
+                              and tTmpImport.cPers == AppR.person)) != tsOK {
+           tTmpImport.err := tTmpImport.err + '|' + 'Дата установки надбавки меньше даты приёма или последнего перевода сотрудника'
+         }
+      }
+/*
+   if (_cTypeOper = 10)
+    {
+      if tTmpImport.Dsum3 = 0       then tTmpImport.err := tTmpImport.err + '|' + '% снижения = 0';
+      if tTmpImport.dataDRaise1 = 0 then tTmpImport.err := tTmpImport.err + '|' + '"По дату" - пустое';
+    }
+*/
+   if (_cTypeOper = 9 or _cTypeOper = 20 or _cTypeOper = 104 or _cTypeOper = 105)
+    {
+      if tTmpImport.Sumdop = 0 then tTmpImport.err := tTmpImport.err + '|' + 'Сумма/процент = 0';
+      if tTmpImport.BegDate = 0 then tTmpImport.err := tTmpImport.err + '|' + '"С даты" - пустое';
+    }
+  update current tTmpImport;
+}
+
+Procedure InserttRows(_log: string; _nrow : longint);
+{
+  var _i: byte;
+  clearBuffer(tntTmpImport);
+
+  for(_i := 1; _I <= getLimit(_recArray); _i++)
+  {
+   case _cTypeOper of
+      9 : {
+          case upcase(_recArray[_i].def) of
+           Upcase('Табельный номер'          ) : tTmpImport.StrTabN  := Trim(_recArray[_i].value);
+           Upcase('Код вида доплаты/надбавки') : tTmpImport.Kodvdop  := Trim(_recArray[_i].value);
+           Upcase('Сумма/процент'            ) : tTmpImport.Sumdop   := Double(Replace(Replace(Trim(_recArray[_i].value),' ',''),',','.'));
+           Upcase('Валюта'                   ) : tTmpImport.VidValue := Trim(_recArray[_i].value);
+           Upcase('С даты'                   ) : tTmpImport.BegDate  := strtodate(replace(replace(Trim(_recArray[_i].value),' ','/'),'.','/'),'DD/MM/YYYY');
+           Upcase('По дату'                  ) : tTmpImport.EndDate  := strtodate(replace(replace(Trim(_recArray[_i].value),' ','/'),'.','/'),'DD/MM/YYYY');
+          end;
+         }
+     10 : {
+          case upcase(_recArray[_i].def) of
+           Upcase('Табельный номер'          ) : tTmpImport.StrTabN     := Trim(_recArray[_i].value);
+           Upcase('Код вида доплаты/надбавки') : tTmpImport.Kodvdop     := Trim(_recArray[_i].value);
+           Upcase('Вид снятия'               ) : tTmpImport.VidDRaise   := Word(Replace(Replace(Trim(_recArray[_i].value),' ',''),',','.'));
+           Upcase('Валюта'                   ) : tTmpImport.VidValue    := Trim(_recArray[_i].value);
+           Upcase('Дата снятия'              ) : tTmpImport.dataDRaise  := strtodate(replace(replace(Trim(_recArray[_i].value),' ','/'),'.','/'),'DD/MM/YYYY');
+//           Upcase('% снижения'               ) : tTmpImport.Dsum3       := Double(Replace(Replace(Trim(_recArray[_i].value),' ',''),',','.'));
+//           Upcase('Снизить по дату'          ) : tTmpImport.dataDRaise1 := strtodate(replace(replace(Trim(_recArray[_i].value),' ','/'),'.','/'),'DD/MM/YYYY');
+          end;
+         }
+      20 : {
+          case upcase(_recArray[_i].def) of
+           Upcase('Табельный номер'          ) : tTmpImport.StrTabN  := Trim(_recArray[_i].value);
+           Upcase('Код вида доплаты/надбавки') : tTmpImport.Kodvdop  := Trim(_recArray[_i].value);
+           Upcase('Сумма/процент'            ) : tTmpImport.Sumdop   := Double(Replace(Replace(Trim(_recArray[_i].value),' ',''),',','.'));
+           Upcase('Валюта'                   ) : tTmpImport.VidValue := Trim(_recArray[_i].value);
+           Upcase('С даты'                   ) : tTmpImport.BegDate  := strtodate(replace(replace(Trim(_recArray[_i].value),' ','/'),'.','/'),'DD/MM/YYYY');
+           Upcase('Часы'                     ) : tTmpImport.ChasF    := Double(Replace(Replace(Trim(_recArray[_i].value),' ',''),',','.'));
+          end;
+         }
+     104 : {
+          case upcase(_recArray[_i].def) of
+           Upcase('Табельный номер'          ) : tTmpImport.StrTabN  := Trim(_recArray[_i].value);
+           Upcase('Код вида доплаты/надбавки') : tTmpImport.Kodvdop  := Trim(_recArray[_i].value);
+           Upcase('Сумма/процент'            ) : tTmpImport.Sumdop   := Double(Replace(Replace(Trim(_recArray[_i].value),' ',''),',','.'));
+           Upcase('Валюта'                   ) : tTmpImport.VidValue := Trim(_recArray[_i].value);
+           Upcase('С даты'                   ) : tTmpImport.BegDate  := strtodate(Trim(_recArray[_i].value),'DD/MM/YYYY');
+          end;
+         }
+     105 : {
+          case upcase(_recArray[_i].def) of
+           Upcase('Табельный номер'          ) : tTmpImport.StrTabN  := Trim(_recArray[_i].value);
+           Upcase('Код вида доплаты/надбавки') : tTmpImport.Kodvdop  := Trim(_recArray[_i].value);
+           Upcase('Сумма/процент'            ) : tTmpImport.Sumdop   := Double(Replace(Replace(Trim(_recArray[_i].value),' ',''),',','.'));
+           Upcase('Валюта'                   ) : tTmpImport.VidValue := Trim(_recArray[_i].value);
+           Upcase('С даты'                   ) : tTmpImport.BegDate  := strtodate(replace(replace(Trim(_recArray[_i].value),' ','/'),'.','/'),'DD/MM/YYYY');
+           Upcase('По дату'                  ) : tTmpImport.EndDate  := strtodate(replace(replace(Trim(_recArray[_i].value),' ','/'),'.','/'),'DD/MM/YYYY');
+          end;
+         }
+
+   end;
+  }
+   tTmpImport.Row := _nrow;
+  Insert Current tTmpImport;
+  setErr;
+}  // tInsertSaldoMC
+
+PROCEdURE FillInsertTables(_log: string; _nrow : longint; _file : string;_bookname : string);
+{
+ InserttRows(_log,_nrow)
+}
+
+Procedure ReadExcel_RPD12();
+{
+  xlCreateExcelWithTemplate(Name_File, true);
+  if (xlIsExcelValid) then xlSetActiveWorkBookByName('1');
+
+  Delete All From tTmpImport;
+
+  StartNewVisual(vtNumericVisual, vfTimer, 'Импорт файла во времянку', 1);
+
+  var rowNo : word = 2;
+  var colNo : word = 1;
+  var sTmp  : string = '666666';
+  var dTmp  : double = 0.0;
+
+  do
+  {
+    colNo := 1;
+    xlGetCellValue(rowNo, colNo, sTmp);
+
+    if (sTmp = '') then break;
+
+    ClearBuffer(#tTmpImport);
+      tTmpImport.row         := rowNo - 1;                                                                                 //: longint
+
+      tTmpImport.StrTabN     := sTmp;                                                                                      //: String
+
+      SetVisualHeader('Строка #' + string(rowNo - 1) + ', табельный номер : ' + tTmpImport.StrTabN);
+
+      colNo := 4;
+      xlGetCellValue(rowNo, colNo, sTmp);
+      tTmpImport.Kodvdop     := sTmp;                                                                                      //: String
+
+      colNo := 3;
+      xlGetCellValue(rowNo, colNo, dTmp);
+      tTmpImport.Sumdop      := dTmp;                                                                                      //: double
+
+      colNo := 6;
+      xlGetCellValue(rowNo, colNo, sTmp);
+      tTmpImport.VidValue    := sTmp;                                                                                      //: String
+
+      colNo := 8;
+      xlGetCellValue(rowNo, colNo, sTmp);
+      tTmpImport.BegDate     := Date(word(SubStr(sTmp, 1, 2)), word(SubStr(sTmp, 4, 2)), word(SubStr(sTmp, 7, 4)));        //: date
+
+      colNo := 9;
+      xlGetCellValue(rowNo, colNo, sTmp);
+      tTmpImport.EndDate     := Date(word(SubStr(sTmp, 1, 2)), word(SubStr(sTmp, 4, 2)), word(SubStr(sTmp, 7, 4)));        //: date
+
+      if ((getFirst Per where ((tTmpImport.StrTabN == Per.StrTabN (noIndex))) and Per.Fio <> '') = tsOk) then
+      {
+        tTmpImport.cPers     := Per.nRec;                                                                                  //: comp
+        tTmpImport.raisetype := Per.AppointCur;                                                                            //: comp
+      }
+      else
+      {
+        if ((getFirst Per where ((SubStr(tTmpImport.StrTabN, 2, 5) == Per.StrTabN (noIndex))) and Per.Fio <> '') = tsOk) then
+        {
+          tTmpImport.cPers     := Per.nRec;                                                                                  //: comp
+          tTmpImport.raisetype := Per.AppointCur;                                                                            //: comp
+        }
+      }
+
+      //tTmpImport.VidDRaise   :=                                                                                          //: integer
+
+      colNo := 7;
+      xlGetCellValue(rowNo, colNo, sTmp);
+      tTmpImport.dataDRaise  := Date(word(SubStr(sTmp, 1, 2)), word(SubStr(sTmp, 4, 2)), word(SubStr(sTmp, 7, 4)));        //: date
+      //tTmpImport.dataDRaise1 := Date(word(SubStr(sTmp, 1, 2)), word(SubStr(sTmp, 4, 2)), word(SubStr(sTmp, 7, 4)));      //: date
+
+      colNo := 5;
+      xlGetCellValue(rowNo, colNo, dTmp);
+      tTmpImport.Dsum3       := dTmp;                                                                                      //: double
+
+      if (Per.DisDate >= tTmpImport.BegDate) then
+      {
+        tTmpImport.err         := 'Уволенный сотрудник';                                                                   //: string
+      }
+      //
+      //tTmpImport.ChasF       := dTmp;                                                                                    //: double
+
+    Insert Current tTmpImport;
+
+    sTmp := tTmpImport.StrTabN;
+
+    rowNo++;
+    NextVisual;
+  } while sTmp <> ''
+
+  xlkillExcel;
+
+  StopVisual;
+
+  Message('Обработано строк: ' + RecordsInTable(#tTmpImport));
+}
+
+Procedure Create_RPD12();
+{
+  var _i : word = 0;
+  if (getFirst titledoc = tsOk) then
+  {
+    if (getFirst PDoc = tsOk) then
+    {
+      _Loop tTmpImport
+      {
+        _i++;
+
+        if (tTmpImport.err <> '') then
+        {
+          Continue;
+        }
+
+        if (getFirst Appointments where ((tTmpImport.raisetype == Appointments.nRec)) = tsOk) then
+        {
+          ClearBuffer(#ContDoc);
+            ContDoc.NREC      := 0h;
+            ContDoc.CPART     := PDoc.nRec;
+            ContDoc.WREC      := _i;
+            ContDoc.NUMPART   := _i;
+            ContDoc.TYPEOPER  := 12;
+            ContDoc.PERSON    := tTmpImport.cPers;
+            ContDoc.CSTR      := Appointments.nRec;
+            ContDoc.OBJTYPE   := 1;
+            ContDoc.SEQNMB    := 1;
+            ContDoc.CDOPREF   := Appointments.Department;
+          Insert Current ContDoc;
+
+          ClearBuffer(#RaiseHist);
+            RaiseHist.NREC      := 0h;
+            RaiseHist.LASTDATE  := tTmpImport.BegDate;
+            RaiseHist.CPSN      := tTmpImport.cPers;
+            if (getFirst Raise where ((tTmpImport.cPers == Raise.Person and tTmpImport.raisetype == Raise.Appoint and tTmpImport.dataDRaise == Raise.FromDate and tTmpImport.Sumdop == Raise.Sum (noIndex))) = tsOk) then
+            {
+              RaiseHist.CRAISE  := Raise.nRec;
+            }
+            RaiseHist.DDAT2     := tTmpImport.EndDate;
+            RaiseHist.WSTATUS   := 1;
+            RaiseHist.CCONTDOC  := ContDoc.NREC;
+            RaiseHist.WPRIZN2   := if(tTmpImport.VidValue = 'проценты', 2, 0);
+            RaiseHist.RHSUM2    := tTmpImport.Dsum3;
+          Insert Current RaiseHist;
+        }
+      }
+      ReReadRecord;
+    }
+  }
+}
+
+//проверка колонок в exel
+/*
+Function CheckExel() : boolean;
+ {
+ var flag : boolean = true;
+ n := 1;
+    xlgetcellvalue(1, 1, _value1);
+    xlgetcellvalue(1, 2, _value2);
+    xlgetcellvalue(1, 3, _value3);
+    xlgetcellvalue(1, 4, _value4);
+    xlgetcellvalue(1, 5, _value5);
+    xlgetcellvalue(1, 6, _value6);
+    xlgetcellvalue(1, 7, _value7);
+
+    if (_cTypeOper = 10)  {
+    if _value1 <> 'Табельный номер' {
+           Message('Нет колонки с названием "Табельный номер" ');
+           flag := false;
+    }
+    if _value2 <> 'Код вида доплаты/надбавки' {
+           Message('Нет колонки с названием "Код вида доплаты/надбавки" ');
+           flag := false;
+    }
+    if _value3 <> 'Вид снятия' {
+           Message('Нет колонки с названием "Сумма/процент" ');
+           flag := false;
+    }
+    if _value4 <> 'Валюта' {
+           Message('Нет колонки с названием "Валюта" ');
+           flag := false;
+    }
+    if _value5 <> 'Дата снятия' {
+           Message('Нет колонки с названием "Дата снятия" ');
+           flag := false;
+    }
+    if _value6 <> '% снижения' {
+           Message('Нет колонки с названием "% снижения" ');
+           flag := false;
+    }
+    if _value7 <> 'Снизить по дату' {
+           Message('Нет колонки с названием "Cнизить по дату" ');
+           flag := false;
+    }
+
+    }
+    if (_cTypeOper = 9 or _cTypeOper = 20 or _cTypeOper = 104)  {
+    if _value1 <> 'Табельный номер' {
+           Message('Нет колонки с названием "Табельный номер" ');
+           flag := false;
+    }
+    if _value2 <> 'Код вида доплаты/надбавки' {
+           Message('Нет колонки с названием "Код вида доплаты/надбавки" ');
+           flag := false;
+    }
+    if _value3 <> 'Сумма/процент' {
+           Message('Нет колонки с названием "Сумма/процент" ');
+           flag := false;
+    }
+    if _value4 <> 'Валюта' {
+           Message('Нет колонки с названием "Валюта" ');
+           flag := false;
+    }
+    if _value5 <> 'С даты' {
+           Message('Нет колонки с названием "С даты" ');
+           flag := false;
+    }
+    if (_cTypeOper = 9) {
+    if _value6 <> 'По дату' {
+           Message('Нет колонки с названием "По дату" ');
+           flag := false;
+    }
+    }
+    }
+
+//    if _value7 <> 'Примечание (для пользователя)' {
+//           Message('Нет колонки с названием "Примечание (для пользователя)" ')
+//           flag := false;
+//    }
+
+  result := flag;
+}
+
+*/
+
+Function InsertDocSpec : boolean;
+{
+  result := false;
+  if getfirst Cdoc1 = tsOK
+   {
+    Message('В приказе уже есть сотрудники', error);
+     stop; abort; exit;
+   }
+
+ if (getfirst tTmpImport where tTmpImport.err <> '' ) = tsOK
+ {
+   message('В импортируемом файле есть ошибке. Загрузка прервана', error );
+   stop; abort; exit;
+ }
+
+  if _cTypeOper = 20
+      {
+        if (getfirst tTmpImport where tTmpImport.Sumdop = 0) = tsOK {
+              message('В импортируемом файле есть ошибке. Загрузка прервана', error );
+              stop; abort; exit;
+        }
+      }
+
+  //вставляем в contdoc and raise and raisehist
+
+      var wrec : longint = 0;
+
+    _loop tTmpImport
+     if isvalidall(tnPer)
+     {
+     //contdoc
+        wrec++;
+           clearbuffer(tnCdoc1);
+             Cdoc1.nrec    := GetNextNrec(#Cdoc1, 0);
+             Cdoc1.cpart   := _cPartDoc ;
+             Cdoc1.person  := Per.nrec      ;
+             Cdoc1.cdopref := Per.DEPARTMENT;
+             Cdoc1.CSTR    := per.appointcur;
+             Cdoc1.wrec    := wrec;
+             Cdoc1.numpart := 1;
+             Cdoc1.objtype := 1;
+             Cdoc1.seqnmb  := 1;
+            insert current cdoc1;
+         //Raise and RaiseHist
+
+         clearbuffer(tnr1);
+
+         if (_cTypeOper = 9 or _cTypeOper = 104 or _cTypeOper = 105) {
+
+            //проверка на дату назначения надбавки
+            if getfirst  AppR where ((tTmpImport.BegDate >>= AppR.APPOINTDATE
+                                     and tTmpImport.cPers == AppR.person)) != tsOK {
+               message ('Дата установки надбавки меньше даты приёма или последнего перевода сотрудника');
+               break;
+             }
+
+             r1.nrec      := GetNextNrec(#r1, 0);
+             r1.raisetype := tTmpImport.raisetype;
+             r1.sum       := tTmpImport.Sumdop;
+             r1.raiseattr := tTmpImport.VidValue;
+             r1.fromdate  := tTmpImport.BegDate;
+             r1.todate    := tTmpImport.EndDate;
+             r1.crdop     := Cdoc1.nrec;
+             r1.person    := Cdoc1.person;
+             r1.appoint   := per.appointcur;
+            insert current r1;
+
+            clearbuffer(tnRH);
+             RH.nrec       := GetNextNrec(#RH, 0);
+             RH.Craise     := r1.nrec;
+             RH.wtypeoper  := _cTypeOper;
+             RH.drec       := tTmpImport.BegDate;
+             RH.docdate    := tTmpImport.EndDate;
+             RH.craisetype := r1.raisetype;
+             RH.ihattr     := tTmpImport.VidValue;
+             RH.cpsn       := Cdoc1.person;
+             RH.ccontdoc   :=  Cdoc1.nrec;
+             RH.ddat2      := tTmpImport.EndDate;
+             RH.DOCNMB     := TitleDoc.DocNmb;
+             RH.RHSUM      := tTmpImport.Sumdop;
+            insert current RH;
+         }
+
+      if (_cTypeOper = 20) {
+            clearbuffer(tnfortune);
+             fortune.cfcont    := Cdoc1.nrec;
+             fortune.docnmb    := TitleDoc.DocNmb;
+             Fortune.DocDate   := TitleDoc.DocDate;
+             fortune.docsum    := tTmpImport.Sumdop;
+             fortune.wchoice   := 20;
+             fortune.dat1      := tTmpImport.BegDate;
+             fortune.fortattr  := tTmpImport.VidValue;
+             fortune.FILIALNO  := PDoc.WINF2;
+             fortune.cftype    := tTmpImport.raisetype;
+             fortune.fortattr := tTmpImport.VidValue;
+            insert current fortune;
+      }
+
+     if (_cTypeOper = 10)  {
+
+      clearbuffer(tndelraise)   ;
+       delraise.iraseattr     := 2;
+       delraise.wtypeinfo     := 1 ;
+       delraise.cref1         := tTmpImport.cPers;
+       delraise.cordercont1   := Cdoc1.nrec;
+       delraise.cappointments := Cdoc1.cstr;
+       delraise.craisetype    := tTmpImport.raisetype;
+
+      if getfirst RDL where (( tTmpImport.cPers == RDL.person
+                     and delraise.cappointments == RDL.appoint (noindex)
+                        and delraise.craisetype == RDL.raisetype (noindex))) = tsOK {
+        delraise.csource     := RDL.nrec;
+        delraise.cordercont2 := RDL.crdop;
+        delraise.dfromdate   := RDL.fromdate;
+      }
+
+       delraise.dsum3         := tTmpImport.Dsum3;
+       delraise.wprizn2       := tTmpImport.VidDRaise;
+       delraise.ccurrency     := tTmpImport.VidValue;
+       delraise.draiseabort   := tTmpImport.dataDRaise;
+      insert current delraise;
+     }
+   }
+  result := true;
+}
+
+
+window wintTmpImport;
+browse brtTmpImport;
+ table tTmpImport;
+fields {Font = {BackColor = if(tTmpImport.err <> '', colorError,0)}};
+ tTmpImport.StrTabN     'Табельный номер'       : [ 5], Protect, NoPickButton;
+ Per.Fio                'ФИО'                   : [10], Protect, NoPickButton;
+ CatDopl.name           'Вид доплаты'           : [ 8], Protect, NoPickButton;
+ tTmpImport.Kodvdop     'Код доплаты/надбавки'  : [ 3], Protect, NoPickButton;
+ tTmpImport.Sumdop      'Сумма доп'             : [ 4,2], Protect, NoPickButton;
+ tTmpImport.ChasF       'Часы'                  : [ 4,2], Protect, NoPickButton;
+ tTmpImport.VidValue    'Код валюты'            : [ 2], Protect, NoPickButton;
+ tTmpImport.BegDate     'С даты'                : [ 4], Protect, NoPickButton;
+ tTmpImport.EndDate     'По дату'               : [ 4], Protect, NoPickButton;
+ tTmpImport.err         'Описание ошибки'       : [10], Protect, NoPickButton;
+ tTmpImport.VidDRaise   'Вид снятия'           : [ 4], Protect, NoPickButton;
+ tTmpImport.Dsum3       '% снижения'           : [ 4,4], Protect, NoPickButton;
+ tTmpImport.dataDRaise1 'Снизить по дату'      : [ 4], Protect, NoPickButton;
+ tTmpImport.dataDRaise  'Дата снятия'          : [ 4], Protect, NoPickButton;
+
+end;
+handleevent
+CmInit: {
+   if getfirst tTmpImport = tsOK {}
+   Rereadrecord;
+ }
+cmHotKeys:{
+    PutHotCommand(RunMenu('mnuAllowancesorderImportDocs'));
+}
+cmValue1: {
+  if (_cTypeOper = 12) then
+  {
+    Create_RPD12();
+    PutCommand(cmClose);
+  }
+  else
+  {
+    if InsertDocSpec then PutCommand(cmClose);
+  }
+}
+cmValue2: {
+   CalcSDZ;
+   rereadrecord;
+}
+end;
+end;
+
+/*
+window wintTmpImport1;
+browse brtTmpImport1;
+table tTmpImport;
+ fields {Font = {BackColor = if(tTmpImport.err <> '', colorError,0)}};
+ tTmpImport.StrTabN     'Табельный номер'      : [ 5], Protect, NoPickButton;
+ Per.Fio                'ФИО'                  : [10], Protect, NoPickButton;
+ CatDopl.name           'Вид доплаты'          : [ 8], Protect, NoPickButton;
+ tTmpImport.Kodvdop     'Код доплаты/надбавки' : [ 3], Protect, NoPickButton;
+ tTmpImport.VidDRaise   'Вид снятия'           : [ 4], Protect, NoPickButton;
+ tTmpImport.VidValue    'Валюта'               : [ 2], Protect, NoPickButton;
+ tTmpImport.Dsum3       '% снижения'           : [ 4], Protect, NoPickButton;
+ tTmpImport.dataDRaise1 'Снизить по дату'      : [ 4], Protect, NoPickButton;
+ tTmpImport.err         'Описание ошибки'      : [10], Protect, NoPickButton;
+end;
+handleevent
+CmInit:
+ {
+   if getfirst tTmpImport = tsOK {}
+   Rereadrecord;
+ }
+cmHotKeys:{
+    PutHotCommand(RunMenu('mnuAllowancesorderImportDocs'));
+}
+cmValue1:
+{
+ InsertDocSpec;
+ PutCommand(cmClose)
+}
+
+end;
+end;
+
+*/
+
+Screen FileExel;
+fields
+  Name_File : protect,pickbutton;
+
+buttons
+  cmOk,,,'Загрузить файл', ,sci1Esc;
+  cmCancel,,,'Выход', ,sci1Esc;
+
+
+<<
+    Файл .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    <.~З~агрузить.>           <.~О~тмена.>
+>>
+end;
+
+
+handleevent
+
+CmInit:         //не используем
+{
+  if getfirst titledoc <> tsOK
+   {
+     Message('Не найден приказ ' + _cTitleDoc, error);
+     stop; abort; exit;
+   }
+  if getfirst PDoc <> tsOK
+   {
+     Message('Не найдена часть приказа (PartDoc) ' + _cPartDoc, error);
+     stop; abort; exit;
+   }
+
+   _cTypeOper := PDoc.typeoper;
+
+   if getfirst Catalogs where ((-17  == Catalogs.sysCode)) <> tsOK
+    {
+     Message('Не найден справочник "Виды доплат/единовременных выплат" (syscode = -17)', error);
+     stop; abort; exit;
+    }
+  _cMainLinkDoplat := Catalogs.nrec;
+
+  if getfirst Cdoc1 = tsOK
+   {
+    Message('В приказе уже есть сотрудники', error);
+     stop; abort; exit;
+   }
+}
+
+
+//проверка названий столбцов
+cmPick:
+{
+  case CurField of
+    #Name_File: {
+      Name_File := GetFileName('*.xls*','Выберите файл');
+      if Name_File != ''
+      {
+         set Name_File:=Name_File;
+      }
+      //else exit;
+    }
+  end;
+}
+
+
+  //импортируем
+cmOK:
+{
+  if (_cTypeOper = 12) then
+  {
+    ReadExcel_RPD12();
+  }
+  else
+  {
+    if _log = '' then _log:= GetStringParameter('Files', 'OutputFilesDirectory', 0)+'\RPD_ImportEXCEL_LOG_'+Username+'_'+datetostr(cur_date,'YYYYMMDD')+timetostr(cur_time,'HHMMSS')+'.log';
+    StartNewVisual(vtRotateVisual, vfTimer, 'Импорт данных', 1);
+    deletefile(_log);
+    _ListName := 'Лист1';
+    delete all tTmpImport;
+    fillrecArrayByTypeTable(_log);
+    var _isError : boolean = (not CheckFileFillValues(Name_File, _log));
+    //   CheckRawData_Import(_log);
+    stopVisual;
+    ProcessText(_log,vfRunModal Or vfNewTitle,'Протокол загрузки данных');
+
+    if (_cTypeOper = 10) then {
+      ClearFieldState(#tTmpImport.Sumdop , sfVisible);
+      ClearFieldState(#tTmpImport.BegDate, sfVisible);
+      ClearFieldState(#tTmpImport.EndDate, sfVisible);
+      ClearFieldState(#tTmpImport.ChasF  , sfVisible);
+     }
+     else {
+       ClearFieldState(#tTmpImport.VidDRaise  , sfVisible);
+       ClearFieldState(#tTmpImport.Dsum3      , sfVisible);
+       ClearFieldState(#tTmpImport.dataDRaise1, sfVisible);
+       if _cTypeOper = 20
+       {
+         if (getfirst tTmpImport where tTmpImport.ChasF <> 0) <> tsOK then {
+            ClearFieldState(#tTmpImport.ChasF  , sfVisible);
+            DisableCommand(cmValue2);
+         }
+       }
+     }
+  }
+
+
+
+/*
+  if getfirst tTmpImport = tsOK
+  if (_cTypeOper = 10)
+   then runwindowmodal(wintTmpImport1)
+   else runwindowmodal(wintTmpImport);
+*/
+  runwindowmodal(wintTmpImport);
+  CloseInterface(-1);
+/*
+    StartNewVisual(vtNumericVisual,vfTimer,'Идёт импорт', 1);
+    xlCreateExcelWithTemplate(Name_File,true);
+    if (xlIsExcelValid) xlSetActiveSheet(1);
+
+
+//проверяем название колонок
+  if (CheckExel() = false) then
+    {
+       StopVisual;
+       Abort; // завершаем импорт если есть ошибки
+       stop;
+    }
+  StrokaEx := 2;
+  delete all tTmpImport;
+  // заполняем данные времянки
+*/
+/*
+if (_cTypeOper = 10) {
+do{
+
+    nextvisual;
+    clearbuffer(tntTmpImport);
+    xlgetcellvalue(StrokaEx, 1, tTmpImport.StrTabN) ;
+    xlgetcellvalue(StrokaEx, 2, tTmpImport.Kodvdop);
+    xlgetcellvalue(StrokaEx, 3, tTmpImport.VidDRaise);
+    xlgetcellvalue(StrokaEx, 4, tTmpImport.VidValue);
+    xlgetcellvalue(StrokaEx, 5, tTmpImport.dataDRaise);
+    xlgetcellvalue(StrokaEx, 6, tTmpImport.Dsum3);
+    xlgetcellvalue(StrokaEx, 7, tTmpImport.dataDRaise1);
+    //xlgetcellvalue(StrokaEx, 7, tTmpImport.PerFio);
+    if getFirst Persons where((tTmpImport.StrTabN == Persons.strtabn (noindex))) = tsOk then set tTmpImport.cPers:= Persons.nrec;
+
+    if tTmpImport.StrTabN <>'' then insert current tTmpImport;
+    StrokaEx++;
+  }
+  while   tTmpImport.StrTabN <> '';
+  xlkillexcel;
+  StopVisual;
+  runwindowmodal(wintTmpImport1);
+}
+else {
+  do
+  {
+
+    nextvisual;
+    clearbuffer(tntTmpImport);
+    xlgetcellvalue(StrokaEx, 1, tTmpImport.StrTabN) ;
+    xlgetcellvalue(StrokaEx, 2, tTmpImport.Kodvdop);
+    xlgetcellvalue(StrokaEx, 3, tTmpImport.Sumdop);
+    xlgetcellvalue(StrokaEx, 4, tTmpImport.VidValue);
+    xlgetcellvalue(StrokaEx, 5, tTmpImport.BegDate);
+    xlgetcellvalue(StrokaEx, 6, tTmpImport.EndDate);
+
+    //xlgetcellvalue(StrokaEx, 7, tTmpImport.PerFio);
+    if getFirst Persons where((tTmpImport.PerFio == Persons.Fio (noindex) and tTmpImport.StrTabN == Persons.strtabn (noindex))) = tsOk then set tTmpImport.cPers:= Persons.nrec;
+    if tTmpImport.StrTabN <>'' then insert current tTmpImport;
+    StrokaEx++;
+  }
+  while   tTmpImport.StrTabN <> '';
+  xlkillexcel;
+  StopVisual;
+  runwindowmodal(wintTmpImport);
+}
+*/
+
+}
+end;
+end.
+
+mnuAllowancesorderImportDocs menu
+{
+  - 'Импортировать данные', cmvalue1;
+  - 'Рассчитать сумму на основе часов и СДЗ', cmValue2;
+}

@@ -1,0 +1,470 @@
+/*************************************************************************************************\
+* Наименование: Реализация класса GP_RepShrChanges "Приложение к приказу. Изменение в штатном расп*
+* Контур/Модуль: *                                                                                *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |              |06/10/17|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include XLReport.vih
+#include GP_DepartIer.vih
+#include CatFunc.vih
+#include ExtAttr.vih
+#include FeeSigners.vih
+#include PsnFuncs.vih
+#include AppFuncs.vih
+#include GP_StrFunc.vih
+#include GP_IUserFilterStore.obj
+
+#component "GP_Staff"
+
+#include GP_RepShrChanges.vih
+Interface GP_RepShrChanges;
+
+#define DoubleToStrFormat '[|-]3666666666666666.88'
+
+var
+  _departIer         : GP_DepartIer;
+  _catalogsFunctions : CatalogsFunctions;
+  _personsFunctions  : PersonsFunctions;
+  _appFunctions      : AppointmentsFunctions;
+  _extattr           : iExtAttr;
+  _feeSigners        : FeeSigners;
+  _gpStrFunc         : GP_StrFunc;
+  _xl                : XLSRepBuilder;
+
+  _reportType        : comp; //тип отчета 1 - xlt, 0 - fastreport
+  _signers           : array[0..4] of comp; //нреки сотрудников подписантов
+  _curSignerIndex    : byte;    //счетчик подписантов для вывода dataset'а
+  _strPartMarker     : TPtr;    //маркер со строками приказа для распечатки
+  _documentNumber    : string;  //номер распечатываемого документа
+  _documentDate      : date;    //дата распечатываемого документа
+  //номер и дата определяются во время заполнения временной таблицы с данными,
+  //т.к. теоретически в маркере _strPartMarker могут быть строки из разных приказов
+
+table struct tRep (
+  DepartmentCode     : string,
+  DepartmentName     : string,
+  PostName           : string,
+  CategoryCode       : string[5],
+  ChangesDate        : date,
+  QtyIn              : double,
+  QtyOut             : double,
+  PayModel           : word,
+  TaxRate            : double,
+  MinTaxRate         : double,
+  MaxTaxRate         : double,
+  AvgHours           : double,
+  TaxRatePresentation: string,
+  Base               : string,
+  WorkingConditions  : string,
+  Description        : string,
+  Greyd              : string
+) with index (
+  i01 = DepartmentCode + DepartmentName + PostName
+);
+
+create view as
+select tRep.DepartmentCode
+from tRep;
+
+create view vData
+as select strpart.nrec
+from strpart, strcont, staffstruct, historystr, klkatego, strtitle, catalogs catDep, catalogs catDepParent,TARSTAV
+where ((
+  strpart.nrec            == strcont.cpart and
+  strcont.cstr            == staffstruct.nrec and
+  staffstruct.TARIFF      == TARSTAV.nrec  and
+  strcont.chist           == historystr.nrec and
+  staffstruct.empCategory == klkatego.nrec and
+  strpart.cdoc            == strtitle.nrec and
+  strcont.cCatStr         == catDep.Nrec and
+  catDep.cParent          == catDepParent.Nrec
+)) and FoundMarker(_strPartMarker, strpart.nrec);
+;
+
+datastream dsRep
+(
+  [DocumentDate] _documentDate;
+  [DocumentNumber] _documentNumber;
+
+  table tRep
+  (
+    [DepartmentCode]        tRep.DepartmentCode;
+    [DepartmentName]        tRep.DepartmentName;
+    [PostName]              tRep.PostName;
+    [CategoryCode]          tRep.CategoryCode;
+    [ChangesDate]           tRep.ChangesDate;
+    [QtyIn]                 tRep.QtyIn;
+    [QtyOut]                tRep.QtyOut;
+    [PayModel]              tRep.PayModel;
+    [TaxRate]               tRep.TaxRate;
+    [MinTaxRate]            tRep.MinTaxRate;
+    [MaxTaxRate]            tRep.MaxTaxRate;
+    [AvgHours]              tRep.AvgHours;
+    [TaxRatePresentation]   tRep.TaxRatePresentation;
+    [Base]                  tRep.Base;
+    [WorkingConditions]     tRep.WorkingConditions;
+    [Description]           tRep.Description;
+  );
+
+  dataset FeeSigners
+  (
+    [FeeSignerFio]        _feeSigners.GetSignerFIO(1);
+    [FeeSignerFioShort]   _feeSigners.GetSignerFIO(7);
+    [FeeSignerPosition]   _feeSigners.GetSignerPosition(1);
+    [FeeSignerRole]       _feeSigners.GetSignerRole;
+    [FeeSignerTabn]       _feeSigners.GetSignerTabn;
+    [FeeSignerNumber]     _feeSigners.GetSignerNumber;
+  );
+
+  dataset Signers
+  (
+    [SignerFio]      _personsFunctions.GetFio(_signers[_curSignerIndex]);
+    [SignerFioShort] _gpStrFunc.ShortFIO(_personsFunctions.GetFio(_signers[_curSignerIndex]), 2);
+    [SignerPosition] _appFunctions.GetAppPost(_appFunctions.GetAppNrec_OnDate(_signers[_curSignerIndex], _documentDate));
+  );
+)
+
+handleevent dataset FeeSigners
+  cmPreProcess:
+  {
+    _curSignerIndex := 0;
+  }
+  cmOnProcess:
+  {
+    if _curSignerIndex = 0
+    {
+      if _feeSigners.GetSignerFirst ContinueDataset;
+    }
+    else
+    {
+      if _feeSigners.GetSignerNext ContinueDataset;
+    }
+    _curSignerIndex++;
+  }
+end;// handleevent dataset FeeSigners
+
+handleevent dataset Signers
+  cmPreProcess:
+  {
+    _curSignerIndex := -1;
+  }
+  cmOnProcess:
+  {
+    do
+    {
+      _curSignerIndex++;
+      if _curSignerIndex < count(_signers)
+        if _signers[_curSignerIndex] != 0
+          ContinueDataset;
+    }
+    while if(_curSignerIndex < count(_signers), _signers[_curSignerIndex] = 0, false);
+  }
+end; //handleevent dataset Signers
+
+end; // datastream dsRep
+
+//Возвращает первый элемент из маркера markerName в хранилище store
+function GetFirstMarkerElementFromStore(store: GP_IUserFilterStore; markerName: string): comp;
+{
+  result := comp(0);
+
+  var m: TPtr;
+  m := store.LoadMarker(markerName);
+
+  if m != 0
+  {
+    var c: comp;
+    if GetMarker(m, 0, c)
+      result := c;
+    DoneMarker(m, '');
+  }
+}
+
+//Возвращает Грейд и вгз  (_f = 1 - Грейд; _f = 2 - ВГЗ)
+function GetGrayd(_str: string;_f: word): string;
+{
+  var chek: word;
+  result := '';
+     chek := Pos('-А',_str) + Pos('-В',_str) + Pos('-С',_str);
+     if (chek <> 0)
+     {
+       if(_f = 1)
+       {
+         result := Substr(_str,1,chek-1);
+       }
+       else
+       {
+         result := Substr(_str,chek+1,1);
+       }
+     }
+}
+
+//Возвращает среднемесячное количество часов для режима работы
+function GetAvgHours(cWorkRegim: comp): double; cacheable;
+{
+  result := _catalogsFunctions.ReceiveSMH_Tuning(cWorkRegim);
+}
+
+//Возвращает double в виде строки
+function GetSumPresentation(d: double): string;
+{
+  if d != 0
+    result := doubletostr(d, #DoubleToStrFormat);
+  else
+    result := '0.00';
+}
+
+//Заполняет временную таблицу данными отчета
+procedure CreateTmpReportTable;
+{
+  delete all tRep;
+
+  vData._loop strpart
+  vData._loop strcont
+  if vData.getfirst staffstruct = tsOk
+  {
+
+    //Определение даты и номера документа
+    //TODO: оптимизировать
+    if vData.getfirst strtitle = tsOk
+    {
+      _documentNumber := vData.strtitle.docnmb;
+      _documentDate   := vData.strtitle.docdate;
+    }
+
+    clearbuffer(#tRep);
+
+    if vData.getfirst catDep = tsOk
+    {
+      tRep.DepartmentCode    := vData.catDep.Code; //_catalogsFunctions.GetCatalogsCode(vData.strcont.cCatStr); //_departIer.GetFulDepCode(vData.strcont.cCatStr, ', '#13'');
+      tRep.DepartmentName    := vData.catDep.Name; //_catalogsFunctions.GetCatalogsName(vData.strcont.cCatStr); //replace(_departIer.GetFulDepName(vData.strcont.cCatStr), '\', ', '#13'');
+      if vData.getfirst catDepParent = tsOk
+      {
+        tRep.DepartmentCode  := vData.catDepParent.Code + ', '#13 + tRep.DepartmentCode;
+        tRep.DepartmentName  := vData.catDepParent.Name + ', '#13 + tRep.DepartmentName;
+      }
+    }
+    if vData.getfirst tarstav = tsOk
+    {
+      tRep.Greyd    := vData.tarstav.NAITAR;
+    }
+    tRep.PostName          := _catalogsFunctions.GetCatalogsName(vData.staffstruct.Post);
+    tRep.CategoryCode      := if(vData.getfirst klkatego = tsOk, vData.klkatego.kod, '');
+    tRep.TaxRate           := vData.staffstruct.taxrate;
+    tRep.MinTaxRate        := vData.staffstruct.minsumma;
+    tRep.MaxTaxRate        := vData.staffstruct.maxsumma;
+    tRep.PayModel          := vData.staffstruct.paymodel;
+    tRep.AvgHours          := GetAvgHours(vData.staffstruct.workRegime);
+    tRep.WorkingConditions := _catalogsFunctions.GetCatalogsCode(vData.staffstruct.workcond);
+
+    case vData.strpart.wcodoper of
+      20: //Ввод ставки
+      {
+        tRep.ChangesDate   := vData.staffstruct.dinput;
+        tRep.QtyIn         := vData.staffstruct.workstations + vData.staffstruct.workers;
+        tRep.QtyOut        := 0;
+      }
+      21: //Исключение ставки
+      {
+        tRep.ChangesDate   := vData.strcont.dat2;
+        tRep.QtyIn         := 0;
+        tRep.QtyOut        := vData.staffstruct.workstations + vData.staffstruct.workers;
+        tRep.MaxTaxRate    := vData.staffstruct.maxsumma;
+      }
+      22: //Изменение количества ставок
+      {
+        tRep.ChangesDate   := vData.strcont.ddop;
+        tRep.QtyIn         := vData.strcont.rnum1;
+        tRep.QtyOut        := vData.staffstruct.workstations + vData.staffstruct.workers;
+      }
+      23: //Изменение атрибутов ставки
+      {
+        if(vData.getFirst historystr = tsOk)
+        {
+          tRep.ChangesDate       := vData.historystr.dhist;
+          tRep.TaxRate           := vData.historystr.htaxrate;
+          tRep.MinTaxRate        := vData.historystr.hmintaxrate;
+          tRep.MaxTaxRate        := vData.historystr.hmaxtaxrate;
+          tRep.PayModel          := vData.historystr.wpaymodel;
+          tRep.AvgHours          := GetAvgHours(vData.historystr.cWorkRegim);
+          tRep.WorkingConditions := _catalogsFunctions.GetCatalogsCode(vData.historystr.CWORKCOND);
+        }
+        tRep.QtyIn         := 0;
+        tRep.QtyOut        := 0;
+      }
+    end;
+
+    if tRep.PayModel = 30 //Оклад
+    {
+      tRep.TaxRatePresentation := GetSumPresentation(tRep.TaxRate); // 20210821 - Письмо от Салычевой   "1.	В столбце < Оклад/ часовая тарифная ставка (среднемесячный тариф). руб.) подтягивать не вилку окладов, а четко оклад по штатному расписанию (расстановке)."
+/* 20210821 1.	В столбце < Оклад/ часовая тарифная ставка (среднемесячный тариф). руб.) подтягивать не вилку окладов, а четко оклад по штатному расписанию (расстановке).
+      if (tRep.MinTaxRate != 0 or tRep.MaxTaxRate != 0)
+        tRep.TaxRatePresentation := GetSumPresentation(tRep.MinTaxRate) + ' - ' +
+                                    GetSumPresentation(tRep.MaxTaxRate);
+      else
+        tRep.TaxRatePresentation := GetSumPresentation(tRep.TaxRate);
+*/
+    }
+    else
+    {
+      tRep.TaxRatePresentation := GetSumPresentation(tRep.TaxRate * tRep.AvgHours);
+    }
+
+    tRep.Base            := vData.strcont.sbottom;
+    tRep.Description     := _extattr.sGetAttr(coStrCont, vData.strcont.nrec, 'Примечание');
+    insert current tRep;
+  }
+}
+
+//вывод отчета в excel
+procedure PrintXlsReport(isCreateXLT: boolean = false);
+{
+    var sXltFileName: string = '';
+    sXltFileName := translatePath('%startpath%\XLS_ЭМ\Staff\RepShrChanges1.xltm');
+
+    var sXlsFileName: string = '';
+    if isCreateXLT
+      sXlsFileName := _xl.CreateXLT(sXltFileName, True);
+    else
+      sXlsFileName := _xl.CreateReport(sXltFileName, True);
+
+    _xl.CreateTbls(sXlsFileName);
+
+    //Основная таблица
+    _xl.CreateTbl('Main');
+    _xl.CreateTblFld('DepartmentCode');
+    _xl.CreateTblFld('DepartmentName');
+    _xl.CreateTblFld('PostName');
+    _xl.CreateTblFld('CategoryCode');
+    _xl.CreateTblFld('ChangesDate');
+    _xl.CreateTblFld('QtyIn');
+    _xl.CreateTblFld('QtyOut');
+    _xl.CreateTblFld('TaxRate');
+    _xl.CreateTblFld('MinTaxRate');
+    _xl.CreateTblFld('MaxTaxRate');
+    _xl.CreateTblFld('PayModel');
+    _xl.CreateTblFld('AvgHours');
+    _xl.CreateTblFld('TaxRatePresentation');
+    _xl.CreateTblFld('Base');
+    _xl.CreateTblFld('WorkingConditions');
+    _xl.CreateTblFld('Description');
+    _xl.CreateTblFld('Greyd');
+    _xl.CreateTblFld('VGZ');
+
+    if not isCreateXLT
+      _loop tRep
+      {
+        _xl.ClearTblBuffer;
+        _xl.SetTblStringFldValue('DepartmentCode'     , tRep.DepartmentCode);
+        _xl.SetTblStringFldValue('DepartmentName'     , tRep.DepartmentName);
+        _xl.SetTblStringFldValue('PostName'           , tRep.PostName);
+        _xl.SetTblStringFldValue('CategoryCode'       , tRep.CategoryCode);
+        _xl.SetTblDateFldValue  ('ChangesDate'        , tRep.ChangesDate);
+        _xl.SetTblStringFldValue('QtyIn'              , if(tRep.QtyIn = 0, '', tRep.QtyIn));
+        _xl.SetTblStringFldValue('QtyOut'             , if(tRep.QtyOut = 0, '', tRep.QtyOut));
+        _xl.SetTblNumberFldValue('TaxRate'            , tRep.TaxRate);
+        _xl.SetTblNumberFldValue('MinTaxRate'         , tRep.MinTaxRate);
+        _xl.SetTblNumberFldValue('MaxTaxRate'         , tRep.MaxTaxRate);
+        _xl.SetTblNumberFldValue('PayModel'           , tRep.PayModel);
+        _xl.SetTblNumberFldValue('AvgHours'           , tRep.AvgHours);
+        _xl.SetTblStringFldValue('TaxRatePresentation', tRep.TaxRatePresentation);
+        _xl.SetTblStringFldValue('Base'               , tRep.Base);
+        _xl.SetTblStringFldValue('WorkingConditions'  , tRep.WorkingConditions);
+        _xl.SetTblStringFldValue('Description'        , tRep.Description);
+        _xl.SetTblStringFldValue('Greyd'              , GetGrayd(tRep.Greyd,1));
+        _xl.SetTblStringFldValue('VGZ'              , GetGrayd(tRep.Greyd,2));
+        _xl.InsTblRow;
+      }
+
+    _xl.PublishTbl('Main');
+
+    //Подписанты из группы подписантов
+    /*_xl.CreateTbl('FeeSigners');
+    _xl.CreateTblFld('FeeSignerFio');
+    _xl.CreateTblFld('FeeSignerPosition');
+    _xl.CreateTblFld('FeeSignerRole');
+    _xl.CreateTblFld('FeeSignerTabn');
+    _xl.CreateTblFld('FeeSignerNumber');
+    if not isCreateXLT
+      if _feeSigners.GetSignerFirst do
+      {
+        _xl.ClearTblBuffer;
+        _xl.SetTblStringFldValue('FeeSignerFio'     , _feeSigners.GetSignerFIO(1));
+        _xl.SetTblStringFldValue('FeeSignerFioShort', _gpStrFunc.ShortFIO(_feeSigners.GetSignerFIO(1), 2));
+        _xl.SetTblStringFldValue('FeeSignerPosition', _feeSigners.GetSignerPosition(1));
+        _xl.SetTblStringFldValue('FeeSignerRole'    , _feeSigners.GetSignerRole);
+        _xl.SetTblStringFldValue('FeeSignerTabn'    , _feeSigners.GetSignerTabn);
+        _xl.SetTblStringFldValue('FeeSignerNumber'  , _feeSigners.GetSignerNumber);
+        _xl.InsTblRow;
+
+      } while _feeSigners.GetSignerNext;
+    _xl.PublishTbl('FeeSigners');*/
+
+    //Подписанты обычные
+    _xl.CreateTbl('Signers');
+    _xl.CreateTblFld('SignerFio');
+    _xl.CreateTblFld('SignerFioShort');
+    _xl.CreateTblFld('SignerPosition');
+    if not isCreateXLT
+    {
+     // var i: byte = 0;
+     // for(i:=0; i < count(_signers); i++)
+     // {
+        _xl.ClearTblBuffer;
+        _xl.SetTblStringFldValue('SignerFio'     , _personsFunctions.GetFio(_signers[0]));
+        _xl.SetTblStringFldValue('SignerFioShort', _gpStrFunc.ShortFIO(_personsFunctions.GetFio(_signers[0]), 2));
+        _xl.SetTblStringFldValue('SignerPosition', _appFunctions.GetAppPost(
+                                 _appFunctions.GetAppNrec_OnDate(_signers[0], _documentDate))
+                                );
+        _xl.InsTblRow;
+     // }
+    }
+    _xl.PublishTbl('Signers');
+
+    //лист переменных
+    _xl.CreateVar(sXlsFileName);
+    _xl.SetStringVar('DocumentNumber', _documentNumber);
+    _xl.SetStringVar('DocumentDate'  , _documentDate);
+    _xl.PublishVar;
+
+
+    _xl.LoadReport(sXLSFileName);
+    _xl.DisConnectExcel;
+
+}
+
+Procedure ShowReport(store: GP_IUserFilterStore);
+{
+  //тип отчета
+  _reportType := store.LoadComp('ReportType');
+
+  //маркер с отображаемыми в отчете нреками strpart из хранилища настроек
+  _strPartMarker := store.LoadMarker('strPartMarker');
+
+  //подписанты из хранилища настроек
+  _feeSigners.InitFeeSigners(cgReport_KASSFRO);
+  _feeSigners.FindFeeSignersByNRec(store.LoadComp('FeeSignersNrec'));
+
+  //определяем нреки сотрудников - подписантов
+  var i: longint;
+  for (i := 0; i <= 4; i++)
+    _signers[i] := GetFirstMarkerElementFromStore(store, 'signer' + string(i+1));
+
+  _documentNumber := '';
+  _documentDate := 0;
+
+  CreateTmpReportTable;
+
+  case _reportType of
+    0: RunFReport(dsRep, '', true);
+    1: PrintXlsReport(false);
+  end;
+
+  DoneMarker(_strPartMarker, '');
+}
+
+End.

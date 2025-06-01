@@ -1,0 +1,438 @@
+/*************************************************************************************************\
+* Наименование:  Пересчет доп. тарифов                                                            *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание: не подключен, оставил вдруг понадобится                                             *
+* Вид работы  |Номер          |Дата    |Исполнитель              |Проект                          *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#0000          |15/01/25|Dmitrii.Lapygin          |НПО Энергомаш                   *
+\*************************************************************************************************/
+#include Contexts.vih
+#include userreport.vih
+#include PsnFuncs.vih
+#include XlReport.vih
+#include Query.vih
+
+
+#component "GP_ZP"
+
+interface GP_Dop_Tariff 'Пересчет доп. тарифов' escClose;
+show(,,38,6);
+
+table struct TmpSum28Pers (
+  cLSchet      : comp,
+  cPers        : comp,
+  StrTabN      : string[20],
+  FIO          : string[80],
+  Yearn        : word,
+  Mesn         : word,
+  Summa28      : double,
+  Summ28       : double
+) with index (
+  i01 = cLSchet+Yearn+Mesn
+);
+
+table struct TmpSumPers (
+  cLSchet      : comp,
+  cPers        : comp,
+  Yearn        : word,
+  Mesn         : word,
+  Summ       : double
+) with index (
+  i01 = cLSchet+Yearn+Mesn
+);
+
+table struct TmpPerevodPers (
+  cLSchet      : comp,
+  cPers        : comp,
+  Yearn        : word,
+  Mesn         : word,
+  Oblags       : double,
+  Sumper       : double
+) with index (
+  i01 = cLSchet+Yearn+Mesn
+);
+table struct TmpItogPers (
+  cLSchet      : comp,
+  cPers        : comp,
+  StrTabN      : string[20],
+  FIO          : string[80],
+  Yearn        : word,
+  Mesn         : word,
+  DaysB        : word,
+  DaysW        : double,
+  DaysH        : double,
+  DaysO        : double,
+  Summa28      : double,
+  Summ         : double,
+  Summ28       : double,
+  Oblags       : double,
+  Sumper       : double,
+  NewSumm      : double,
+  Delta        : double
+) with index (
+  i01 = cLSchet+Yearn+Mesn
+);
+
+
+var
+  RowNo   : longint;
+  dBeg: date;
+  dEnd: date;
+  mBeg:word;
+  yBeg:word;
+  mEnd:word;
+  yEnd:word;
+  sExcelFname:string;
+  _DaysB:byte;
+  _ItogB:byte;
+  CS: IContextSession;
+
+create view
+as select *
+from  TmpSumPers
+,     TmpSum28Pers
+,     TmpPerevodPers
+,     TmpItogPers
+;
+
+/*Procedure MyLog(_str: string);
+{
+  LogStrToFile('doptariff.txt',_str);
+} */
+
+Procedure MysqlAddStr(var query_handle: longInt; add_query_str: string);
+{
+  sqlAddStr(query_handle, add_query_str);
+  //MyLog('sql: ' + add_query_str);
+}
+
+Procedure InsTables();
+{
+  delete all from TmpSumPers;
+  delete all from TmpSum28Pers;
+  delete all from TmpPerevodPers;
+  delete all from TmpItogPers;
+
+  var qStr : longint = 0;
+  var objQuery : iQuery;
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Сбор данных', 0);
+
+  sqlFreeStr(qStr);
+
+  MysqlAddStr(qStr, '  select                                                                               ');
+  MysqlAddStr(qStr, ' so.clsch               as cLSchet                                                     ');
+  MysqlAddStr(qStr, ',pers.nrec              as cPers                                                       ');
+  MysqlAddStr(qStr, ',pers.strtabn           as StrTabN                                                     ');
+  MysqlAddStr(qStr, ',pers.fio               as FIO                                                         ');
+  MysqlAddStr(qStr, ',so.yearn               as Yearn                                                       ');
+  MysqlAddStr(qStr, ',so.mesn                as Mesn                                                        ');
+  MysqlAddStr(qStr, ',so.summa28             as Summa28                                                     ');
+  MysqlAddStr(qStr, ',sum(so.summa)          as Summ28                                                      ');
+  MysqlAddStr(qStr, 'from sumvidop so                                                                       ');
+  MysqlAddStr(qStr, 'join persons pers on so.tperson=pers.nrec                                              ');
+  MysqlAddStr(qStr, 'where so.yearn>=2020 and so.mesn>=1                                                    ');
+  MysqlAddStr(qStr, 'and  so.summa28>0                                                                      ');
+  MysqlAddStr(qStr, 'and so.vidopl in ( select distinct ko.vidopl                                           ');
+  MysqlAddStr(qStr, '                   from klvidopl ko                                                    ');
+  MysqlAddStr(qStr, '                   join klperopl kp on ko.vidopl=kp.vidopl                             ');
+  MysqlAddStr(qStr, '                   where kp.vidper in (11,12) )                                        ');
+ // MysqlAddStr(qStr, 'and pers.strtabn in (''001553'',''001899'',''003608'',''002446'')                      ');
+  MysqlAddStr(qStr, 'group by so.clsch, pers.nrec, pers.strtabn, pers.fio, so.yearn, so.mesn, so.summa28    ');
+
+  objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk ) then
+  {
+    Message('Ошибка поиска данных (TmpSum28Pers) '+ objQuery.errorCode, Error);
+    sqlFreeStr(qStr);
+    StopVisual;
+    Exit;
+  }
+  else
+  {
+    sqlCopyInto(objQuery, tnTmpSum28Pers, true);
+  }
+
+  sqlFreeStr(qStr);
+
+  MysqlAddStr(qStr, '  select                                                     ');
+  MysqlAddStr(qStr, ' so.clsch               as cLSchet                           ');
+  MysqlAddStr(qStr, ',so.tperson             as cPers                             ');
+  MysqlAddStr(qStr, ',so.yearn               as Yearn                             ');
+  MysqlAddStr(qStr, ',so.mesn                as Mesn                              ');
+  MysqlAddStr(qStr, ',sum(so.summa)          as Summ                              ');
+  MysqlAddStr(qStr, 'from sumvidop so                                             ');
+  MysqlAddStr(qStr, 'join persons pers on so.tperson=pers.nrec                    ');
+  MysqlAddStr(qStr, 'where so.yearn>=2020 and so.mesn>=1                          ');
+  MysqlAddStr(qStr, 'and so.vidopl in ( select distinct ko.vidopl                 ');
+  MysqlAddStr(qStr, '                   from klvidopl ko                          ');
+  MysqlAddStr(qStr, '                   join klperopl kp on ko.vidopl=kp.vidopl   ');
+  MysqlAddStr(qStr, '                   where kp.vidper in (11,12) )              ');
+// MysqlAddStr(qStr, 'and pers.strtabn in (''001553'',''001899'',''003608'',''002446'')                      ');
+  MysqlAddStr(qStr, 'group by so.clsch, so.tperson, so.yearn, so.mesn              ');
+
+  objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk ) then
+  {
+    Message('Ошибка поиска данных (TmpSumPers) '+ objQuery.errorCode, Error);
+    sqlFreeStr(qStr);
+    StopVisual;
+    Exit;
+  }
+  else
+  {
+    sqlCopyInto(objQuery, tnTmpSumPers, true);
+  }
+
+  sqlFreeStr(qStr);
+
+  MysqlAddStr(qStr, '  select                                                     ');
+  MysqlAddStr(qStr, ' per.clsch               as cLSchet                          ');
+  MysqlAddStr(qStr, ',per.tperson             as cPers                            ');
+  MysqlAddStr(qStr, ',per.yearn               as Yearn                            ');
+  MysqlAddStr(qStr, ',per.mesn                as Mesn                             ');
+  MysqlAddStr(qStr, ',sum(per.oblags)         as oblags                           ');
+  MysqlAddStr(qStr, ',sum(per.sumper)         as sumper                           ');
+  MysqlAddStr(qStr, 'from perevod per                                             ');
+  MysqlAddStr(qStr, 'join persons pers on per.tperson=pers.nrec                   ');
+  MysqlAddStr(qStr, 'where per.yearn>=2020 and per.mesn>=1                        ');
+  MysqlAddStr(qStr, 'and per.vidopls in ( select distinct ko.vidopl               ');
+  MysqlAddStr(qStr, '                   from klvidopl ko                          ');
+  MysqlAddStr(qStr, '                   join klperopl kp on ko.vidopl=kp.vidopl   ');
+  MysqlAddStr(qStr, '                   where kp.vidper in (11,12) )              ');
+  MysqlAddStr(qStr, 'and per.vidper in (11,12)                                     ');
+// MysqlAddStr(qStr, 'and pers.strtabn in (''001553'',''001899'',''003608'',''002446'')                      ');
+  MysqlAddStr(qStr, 'group by per.clsch, per.tperson, per.yearn, per.mesn              ');
+
+  objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk ) then
+  {
+    Message('Ошибка поиска данных (TmpPerevodPers) '+ objQuery.errorCode, Error);
+    sqlFreeStr(qStr);
+    StopVisual;
+    Exit;
+  }
+  else
+  {
+    sqlCopyInto(objQuery, tnTmpPerevodPers, true);
+  }
+
+  sqlFreeStr(qStr);
+  StopVisual;
+
+  //message('TmpSum28Pers '+recordsintable(tnTmpSum28Pers)+' TmpSumPers '+recordsintable(tnTmpSumPers)+' TmpPerevodPers '+recordsintable(tnTmpPerevodPers));
+}
+
+Procedure InsItog();
+var jj:word;
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Сбор итогов', 0);
+
+ /* _loop TmpSum28Pers
+  {
+    ClearBuffer(#TmpItogPers);
+
+    TmpItogPers.cLSchet:= TmpSum28Pers.cLSchet;
+    TmpItogPers.cPers:= TmpSum28Pers.cPers;
+    TmpItogPers.StrTabN:= TmpSum28Pers.StrTabN;
+    TmpItogPers.FIO:= TmpSum28Pers.FIO;
+    TmpItogPers.Yearn:= TmpSum28Pers.Yearn;
+    TmpItogPers.Mesn:= TmpSum28Pers.Mesn;
+    TmpItogPers.Summa28:= TmpSum28Pers.Summa28;
+    TmpItogPers.Summ28:= TmpSum28Pers.Summ28;
+    if getfirst TmpSumPers where ((TmpSum28Pers.cLSchet==TmpSumPers.cLSchet
+                                  and TmpSum28Pers.Yearn==TmpSumPers.Yearn
+                                  and TmpSum28Pers.Mesn==TmpSumPers.Mesn)) = tsOk
+    {
+      TmpItogPers.Summ:=TmpSumPers.Summ;
+    }
+    if getfirst TmpPerevodPers where ((TmpSum28Pers.cLSchet==TmpPerevodPers.cLSchet
+                                  and TmpSum28Pers.Yearn==TmpPerevodPers.Yearn
+                                  and TmpSum28Pers.Mesn==TmpPerevodPers.Mesn)) = tsOk
+    {
+      TmpItogPers.Oblags:=TmpPerevodPers.Oblags;
+      TmpItogPers.Sumper:=TmpPerevodPers.Sumper;
+    }
+    if (LoadWorkingTable(TmpSum28Pers.cLSchet, TmpSum28Pers.Mesn, TmpSum28Pers.Yearn) = 0)
+    {
+       TmpItogPers.DaysW:=WT_GetDays(dkWorking,stPlanned)+WT_GetDays(dkWorkingWeekend,stActual)+WT_GetDays(dkWorkingHoliday,stActual)+WT_GetDaysEx(dkWorkingWeekendForLeave,stActual,32)+WT_GetDaysEx(dkWorkingHolidayForLeave,stActual,32);
+       TmpItogPers.DaysH:=WT_GetDaysEx(dkWorkingForIslbrCalculations,stActual,32);
+       TmpItogPers.DaysB:=WT_GetDays(dkSpecial,stActual) ;
+       TmpItogPers.DaysO:=WT_GetDays(dkICOrdinary ,stActual) ;
+       if WT_LoadMonthlyAbsences = 0
+       {
+
+       }
+    }
+    insert current TmpItogPers;
+  }
+    */
+   _loop TmpSum28Pers
+  {
+    _ItogB:=0;
+    ClearBuffer(#TmpItogPers);
+    if (LoadWorkingTable(TmpSum28Pers.cLSchet, TmpSum28Pers.Mesn, TmpSum28Pers.Yearn) = 0)
+    {
+      if WT_LoadMonthlyAbsences = 0
+       {
+         var _AbsenceCount:longint=WT_GetAbsenceCount(atMonthly);
+         for(jj := 0; jj < _AbsenceCount; Inc(jj))
+         {
+           var _aaMark:string;
+            _aaMark:='';
+            if not WT_GetAbsenceAttribute(atMonthly, jj, aaMark, _aaMark) then continue;
+            if _aaMark='Б'
+            {
+              _DaysB:=0;
+              WT_GetAbsenceAttribute(atMonthly, jj, aaDays ,_DaysB);
+              _ItogB:=_ItogB+_DaysB;
+            }
+         }
+       }
+       if _ItogB>0
+              {
+
+                TmpItogPers.DaysB:=_ItogB;
+                TmpItogPers.DaysW:=WT_GetDays(dkWorking,stPlanned)+WT_GetDays(dkWorkingWeekend,stActual)+WT_GetDays(dkWorkingHoliday,stActual)+WT_GetDaysEx(dkWorkingWeekendForLeave,stActual,32)+WT_GetDaysEx(dkWorkingHolidayForLeave,stActual,32);
+                TmpItogPers.DaysH:=WT_GetDaysEx(dkICExtraHarmful ,stActual,32)+WT_GetDays(dkICHarmful  ,stActual);
+                TmpItogPers.DaysO:=WT_GetDays(dkICOrdinary ,stActual);
+                TmpItogPers.cLSchet:= TmpSum28Pers.cLSchet;
+                TmpItogPers.cPers:= TmpSum28Pers.cPers;
+                TmpItogPers.StrTabN:= TmpSum28Pers.StrTabN;
+                TmpItogPers.FIO:= TmpSum28Pers.FIO;
+                TmpItogPers.Yearn:= TmpSum28Pers.Yearn;
+                TmpItogPers.Mesn:= TmpSum28Pers.Mesn;
+                TmpItogPers.Summa28:= TmpSum28Pers.Summa28;
+                TmpItogPers.Summ28:= TmpSum28Pers.Summ28;
+                if getfirst TmpSumPers where ((TmpSum28Pers.cLSchet==TmpSumPers.cLSchet
+                                              and TmpSum28Pers.Yearn==TmpSumPers.Yearn
+                                              and TmpSum28Pers.Mesn==TmpSumPers.Mesn)) = tsOk
+                {
+                  TmpItogPers.Summ:=TmpSumPers.Summ;
+                }
+                if getfirst TmpPerevodPers where ((TmpSum28Pers.cLSchet==TmpPerevodPers.cLSchet
+                                              and TmpSum28Pers.Yearn==TmpPerevodPers.Yearn
+                                              and TmpSum28Pers.Mesn==TmpPerevodPers.Mesn)) = tsOk
+                {
+                  TmpItogPers.Oblags:=TmpPerevodPers.Oblags;
+                  TmpItogPers.Sumper:=TmpPerevodPers.Sumper;
+                }
+                insert current TmpItogPers;
+              }
+    }
+  }
+
+  StopVisual;
+  // message('TmpItogPers '+recordsintable(tnTmpItogPers));
+}
+
+Procedure PrintEx();
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Печать', 0);
+  sExcelFname:=TranslatePath('%ClientStartPath%')+'XLS_ЭМ\ZP\GP_Dop_Tariff.xlsx';
+  xlCreateExcelWithTemplate(sExcelFname,true);
+
+  var _k : longint = 0;
+  _k := recordsintable(tnTmpItogPers);
+  var i : longint = 0;
+
+  xlCreateMatrix(_k, 13);
+  RowNo := 0;
+
+  _loop TmpItogPers
+  {
+    xlStWriteToMatrix(++RowNo, 1, chr(39) + TmpItogPers.StrTabN  );
+    xlStWriteToMatrix(  RowNo, 2, chr(39) + TmpItogPers.fio      );
+    xlStWriteToMatrix(  RowNo, 3, chr(39) + TmpItogPers.yearn    );
+    xlStWriteToMatrix(  RowNo, 4, chr(39) + TmpItogPers.mesn     );
+    xlDoWriteToMatrix(  RowNo, 5,           TmpItogPers.Summ     );
+    xlDoWriteToMatrix(  RowNo, 6,           TmpItogPers.Summ28   );
+    xlDoWriteToMatrix(  RowNo, 7,           TmpItogPers.Summa28  );
+    xlStWriteToMatrix(  RowNo, 8,           TmpItogPers.DaysB    );
+    xlDoWriteToMatrix(  RowNo, 9,           TmpItogPers.Oblags   );
+    xlDoWriteToMatrix(  RowNo, 10,          TmpItogPers.Sumper   );
+    xlStWriteToMatrix(  RowNo, 11,          TmpItogPers.DaysW    );
+    xlStWriteToMatrix(  RowNo, 12,          TmpItogPers.DaysH    );
+    xlStWriteToMatrix(  RowNo, 13,          TmpItogPers.DaysO    );
+
+  }
+  XLWRITEMATRIXTOEXCEL(2, 1);
+  XLFREEMATRIX;
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0,
+                 1, 1, _k+1, 15);
+  xlKillExcel;
+  StopVisual;
+}
+
+screen sc1 (,,sci1EnEsc);
+  fields
+    dBeg: NoProtect;
+    dEnd: NoProtect;
+  buttons
+    cmOk, default;
+    cmCancel;
+<<
+
+ `С`.@@@@@@@@@@@@@ `По`.@@@@@@@@@@@@@
+
+ <. Продолжить .>        <. Отмена .>
+>>
+end;
+
+handleevent
+  cmInit:
+  {
+    var CL: ContextList;
+    // захват прикладных контекстов
+    if (not CL.Add(CS, 'WorkingTable'))
+    {
+      abort;
+      exit;
+    }
+
+  }
+
+  cmOk:
+  {
+    InsTables;
+    InsItog;
+    PrintEx;
+  }
+
+end;
+end.
+
+
+VipInterface UserReport_GP_Dop_Tariff Implements IUserReport;
+Interface UserReport_GP_Dop_Tariff;
+
+Procedure Run;
+Begin
+  RunInterfaceNoModal(GP_ZP::GP_Dop_Tariff);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'AAA Пересчет доп. тарифов (2025)';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  #__UNUSED__(Level)
+  GetGroupName := '';
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 0;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'menuzarp';
+  end;
+end;
+
+End.

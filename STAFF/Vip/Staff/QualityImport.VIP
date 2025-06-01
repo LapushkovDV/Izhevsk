@@ -1,0 +1,704 @@
+/*************************************************************************************************\
+* Наименование:  Разработка процедуры импорта результатов тестов из внешних систем                *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:    Управление персоналом -> Сотрудники -> Тестирование -> Результаты тестов         *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#209          |22/09/17|Валента А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+Interface iQualityImport 'Импорт результатов тестирования' EscClose, cyan;
+  Show at ( , , 120, 20);
+//*****************************************************************************
+const 
+  ccFio = 'ФИО';
+  ccTabNum = 'таб №';
+  ccDate = 'дата оценки';
+  ccRes = 'Код из справочника Учебное заведение';
+  ccOwn = 'Собственными силами предприятия';
+end;
+//*****************************************************************************
+Table struct tmpFile
+(
+  npp         : word
+, sFio        : string
+, sTabNum     : string
+, cPerson     : comp
+, cAppoint    : comp
+, cDepartment : comp
+, dDate       : date
+, sRes        : string
+, cVuz        : comp
+, dValue      : array[1..250] of double
+)
+with index
+(
+  tmpFile01 = npp(Unique)
+, tmpFile02 = cPerson
+)
+;
+//*****************************************************************************
+Table struct tmpSort
+(
+  NRec     : comp
+, dBeg     : date
+, dEnd     : date
+, dd       : double
+)
+with index
+(
+  tmpSort01 = NRec(Unique, Surrogate)
+, tmpSort02 = dBeg
+, tmpSort03 = dEnd
+)
+;
+
+//******************************************************************************
+Create View
+var
+  File_Name     : string; 
+
+  lLineFIO 
+, lLineTabNum
+, lLineDate
+, lLineRes     : word;
+
+  maxC         : word;
+  cTest        : comp;
+
+  CharacterClockNumbers : boolean;
+As Select
+ *
+from
+  Persons
+, Catalogs
+, Catalogs CatalogsMain
+, Catalogs CatalogsCom
+, Catalogs CatalogsVuz
+, SpisTest
+, DetTest
+, DetTest DetTestLast
+, PersAnsw
+, PersTest
+, CompetencePers
+, CompetencePers CompetencePersLast
+, HistCompetence
+, tmpFile
+, tmpSort
+where
+((
+    100               == CatalogsMain.SysCode
+AND -24               == CatalogsVuz.SysCode
+AND 0                 == CatalogsCom.LPr
+AND CatalogsMain.NRec == CatalogsCom.MainLink
+
+AND cTest             == SpisTest.NRec
+AND SpisTest.Nrec     == DetTest.cTest
+))
+;
+
+Parameters
+  cTest;
+
+//*****************************************************************************
+var lLineSt      : array[1..250] of word;
+var sLineSt      : array[1..250] of string;
+var nLineSt      : array[1..250] of string;
+var cLineSt      : array[1..250] of comp;
+//*****************************************************************************
+form frmErr('QualityImport.OUT', 'ERRR') with novisual;
+//******************************************************************************
+// читаем дск
+
+Procedure ReadMyParam;
+{
+  if NOT ReadMyDSK(File_Name , 'iQualityImport_FileName' , TRUE)
+    set File_Name := '';
+
+  ReReadRecord;
+}
+
+//******************************************************************************
+// сохраняем в дск
+
+Procedure SaveMyParam;
+{
+  SaveMyDSK(File_Name , 'iQualityImport_FileName' );
+}
+//*****************************************************************************
+Function GetDate(sValue : string) : date;
+{
+  if (InStr('.', sValue) <> 0)
+    result := StrToDate(sValue, 'DD.MM.YYYY');
+  else
+    result := StrToDate(sValue, 'DD/MM/YYYY');
+}
+//******************************************************************************
+// импорт документов из Excel
+
+Function OpenExcel : boolean;
+{
+
+  OpenExcel := FALSE;
+
+  if NOT xlOpenExcel(FALSE)
+    {
+      Message('Не открылся Excel');
+      Exit;
+    }
+  else
+    if NOT xlIsExcelValid
+      {
+        Message('Не инициализирован Excel');
+        xlKillExcel;
+        Exit;
+      }
+    else
+      if NOT xlSetActiveWorkBookByName(File_Name)
+        if NOT xlOpenWorkBook(File_Name)
+          {
+            Message('Не открылась книга Excel ' + File_Name);
+            xlKillExcel;
+            Exit;
+          }
+
+  OpenExcel := TRUE;
+}
+//*****************************************************************************
+//
+Procedure LoadDataXLS;
+var
+  j : longint;
+{
+  j := 0;
+  var sValue : string;  sValue  := '';
+  var i      : word;    i       := 0;
+  var bError : boolean; bError  := false;
+  
+  StartNewVisual(vtRotateVisual, vfTimer + vfConfirm, 'Идет выгрузка данных...', 1);
+
+  do
+    {
+      inc(j);
+      xlGetCellValue(1, j, sValue);
+      if (trim(sValue) = '')
+        break;
+
+      sValue := trim(sValue);
+
+      if (UpCase(sValue) = UpCase(ccFio))
+        lLineFIO := j;
+      else if (UpCase(sValue) = UpCase(ccTabNum))
+        lLineTabNum := j;
+      else if (UpCase(sValue) = UpCase(ccDate))
+        lLineDate := j;
+      else if (UpCase(sValue) = UpCase(ccRes))
+        lLineRes := j;
+      else
+      {
+        var s : string; s :=  Replace(sValue, '''', '');
+        if (GetFirst CatalogsCom where ((0                    == CatalogsCom.LPr
+                                        AND CatalogsMain.NRec == CatalogsCom.MainLink
+                                        AND s                 == CatalogsCom.Code)) = tsOk)
+        {
+          inc(i);
+          lLineSt[i] := j;
+          sLineSt[i] := s;
+          cLineSt[i] := CatalogsCom.NRec;
+          nLineSt[i] := CatalogsCom.Name;
+          maxC := i;
+        }
+        else
+        {
+          bError := true;
+          frmErr.write('В каталоге отсутствует компетенция "' + sValue + '"');
+        }
+      }
+    }
+  while(j < 255);
+
+  if (bError)
+    {
+      frmErr.write('Загрузка отменена! Скорректируйте файл.');   
+      StopVisual('', 0);
+      Exit;
+    }  
+
+  j := 1;
+
+  do
+    {
+      inc(j);
+
+      ClearBuffer(#tmpFile);
+
+      tmpFile.npp := j;
+
+      NextVisual;               
+
+      if (lLineFIO <> 0)
+        xlGetCellValue(j, lLineFIO   , tmpFile.sFio);
+      if (lLineTabNum <> 0)
+        xlGetCellValue(j, lLineTabNum, tmpFile.sTabNum);
+
+      if (Trim(tmpFile.sFio) = '' AND Trim(tmpFile.sTabNum) = '')
+        break;
+        
+      if CharacterClockNumbers
+        {
+          if (GetFirst Persons where ((tmpFile.sFio    == Persons.FIO (NoIndex)
+                                  AND  tmpFile.sTabNum == Persons.strTabn (NoIndex))) = tsOk)
+            {
+              tmpFile.cPerson     := Persons.NRec;
+              tmpFile.cAppoint    := Persons.AppointCur;
+              tmpFile.cDepartment := Persons.Department;  
+            }
+        }
+      else
+        if (GetFirst Persons where ((tmpFile.sFio             == Persons.FIO (NoIndex)
+                                AND  longint(tmpFile.sTabNum) == Persons.TabNmb (NoIndex))) <> tsOk)
+          {
+            tmpFile.cPerson     := Persons.NRec;
+            tmpFile.cAppoint    := Persons.AppointCur;
+            tmpFile.cDepartment := Persons.Department;  
+          }
+  
+      if (lLineDate <> 0)
+        {
+          var sV : string; sV := '';  
+          xlGetCellValue(j, lLineDate  , sV);
+          tmpFile.dDate := GetDate(sV);  
+        }
+ 
+      if (lLineRes <> 0)
+        { 
+          var sV : string; sV := '';  
+          xlGetCellValue(j, lLineRes  , sV);
+          if (UpCase(Trim(sV)) <> UpCase(ccOwn) AND UpCase(Trim(sV)) <> '')
+            if (GetFirst Catalogs where ((CatalogsVuz.NRec   == Catalogs.MainLink (NoIndex) 
+                                      AND sV                 == Catalogs.Code     (NoIndex))) = tsOk)
+              tmpFile.cVuz := Catalogs.NRec;
+           else
+             {
+               frmErr.write('В каталоге отсутствует вуз с кодом "' + sV + '"');    
+               bError := true;
+             } 
+        }
+
+      for(i := 1; i <= maxC; inc(i))
+        {
+          xlGetCellValue(j, lLineSt[i], tmpFile.dValue[i]);
+        }
+
+      if (insert current tmpFile = tsOk)
+        {}
+    }
+  while (true);
+
+  if (bError)
+    {  
+      delete all tmpFile;
+      frmErr.write('Загрузка отменена! Скорректируйте файл.');   
+    }
+
+  StopVisual('', 0);
+}
+//*****************************************************************************
+Function GetCompetence(cPerson : comp; cApp : comp; cSt : comp; cVuz : comp; wLevel : word) : comp;
+{
+  var cRes : comp; cRes := comp(0);
+
+  if (cPerson = comp(0) OR cSt = comp(0))
+    {  
+      result := cRes;
+      Exit;
+    }
+
+  if (GetFirst CompetencePers where ((cPerson == CompetencePers.cPers  
+                                  AND cSt     == CompetencePers.cName)) <> tsOk)
+    {
+      if (GetFirst Catalogs where ((cSt == Catalogs.NRec)) = tsOk)
+        {
+          var ss : string; ss := Catalogs.Name;
+
+          if (Catalogs.SysCode = 0)
+            {      
+              cRes := GetCompetence(cPerson, cApp, Catalogs.cParent, cVuz, 1);
+                 
+              var wLastPos : word; wLastPos := 0;
+
+              if (wLevel = 0) 
+                if (GetLast CompetencePersLast where ((cPerson  == CompetencePersLast.cPers
+                                                   AND cRes     == CompetencePersLast.cParent)) ordered by CompetencePersLast.wPos = tsOk)
+                  wLastPos := CompetencePersLast.wPos;
+
+              inc(wLastPos);
+
+              ClearBuffer(#CompetencePers) ;
+              CompetencePers.wPos       := if (wLevel = 1, 0, wLastPos);
+              CompetencePers.cName      := cSt;
+              CompetencePers.cPers      := cPerson;
+              CompetencePers.cParent    := cRes;
+              CompetencePers.cApp       := cApp;
+              CompetencePers.ResComp[1] := if (wLevel = 1, 0, cVuz);
+              if (insert current CompetencePers = tsOk)
+                cRes := CompetencePers.NRec;
+            }
+        }
+    }
+  else
+    cRes := CompetencePers.NRec;
+       
+  result := cRes;
+}
+
+//*****************************************************************************
+Procedure LoadData;
+{
+  if OpenExcel
+    {
+      LoadDataXls;
+      xlKillExcel;
+    }
+
+   StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Идет обработка данных', RecordsInTable(#tmpFile));
+
+    var bErr : boolean; bErr := false;
+   if (GetFirst tmpFile where ((comp(0) == tmpFile.cPerson)) = tsOk)
+     {
+       _LOOP tmpFile where ((comp(0) == tmpFile.cPerson))
+         if (Not NextVisual)
+           {
+             break; 
+           }   
+         else
+           {
+             frmErr.write('Строка № ' + string(tmpFile.npp) + ': отсутствует сотрудник "'+ tmpFile.sFio + '" таб.номер "' + tmpFile.sTabNum + '" !'); 
+           }
+
+       bErr := true;
+     }
+
+   if (bErr)
+     {
+       frmErr.write('Загрузка отменена! Скорректируйте файл.');   
+     }
+   else
+     {
+       _LOOP tmpFile ordered by tmpFile.Npp
+         if (Not NextVisual)
+         {
+           break; 
+         }   
+         else
+         {
+           frmErr.write('-----------------------------------------------------------------');
+           frmErr.write('  ' + tmpFile.sFio + ':'); 
+           var i : word; 
+
+           frmErr.write('  Компетенции: ');   
+
+           for (i := 1; i <= maxC; inc(i))
+             {
+               frmErr.write('      - ' + sLineSt[i] + if (tmpFile.dValue[i] = 0, ' не будет загружена так как значение = 0', ''));   
+               if (tmpFile.dValue[i] <> 0)
+                 {
+                   var cComp : comp; cComp := GetCompetence(tmpFile.cPerson, tmpFile.cAppoint, cLineSt[i], tmpFile.cVuz, 0);
+                   if (cComp <> comp(0))
+                     {
+                       if (GetFirst HistCompetence where ((cComp             == HistCompetence.cSourceRec
+                                                       AND tmpFile.dDate     == HistCompetence.dBeg     (NoIndex)
+                                                       AND tmpFile.dValue[i] == HistCompetence.doRating (NoIndex))) <> tsOk)
+                         { 
+                           ClearBuffer(#HistCompetence);
+                           HistCompetence.wPos       := 0;
+                           HistCompetence.dBeg       := tmpFile.dDate;
+                           HistCompetence.cPers      := tmpFile.cPerson;
+                           HistCompetence.cSourceRec := cComp;
+                           //HistCompetence.wWeight    := tmpFile.dValue[i];
+                           //HistCompetence.ResDate[1] := tmpFile.dDate;
+                           HistCompetence.doRating   := tmpFile.dValue[i];
+                           if (insert current HistCompetence = tsOk)
+                             {
+                               frmErr.write('          добавлено новое значение ' + string(tmpFile.dValue[i]) + ' за ' + DateToStr(tmpFile.dDate, 'DD.MM.YYYY'));   
+                             }
+                         }
+                       else
+                         {
+                           var wOld : double; wOld := HistCompetence.doRating;
+                           //set HistCompetence.wWeight    := tmpFile.dValue[i];
+                           set HistCompetence.doRating   := tmpFile.dValue[i];
+                           if (update current HistCompetence = tsOk)
+                             {
+                               frmErr.write('          изменено значение с ' + string(wOld) + ' на ' + string(tmpFile.dValue[i]) + ' за ' + DateToStr(tmpFile.dDate, 'DD.MM.YYYY'));   
+                             }
+                         }
+
+                       delete all tmpSort;
+                       insert into tmpSort (NRec, dBeg, dEnd, dd)
+                       select HistCompetence.NRec, HistCompetence.dBeg, HistCompetence.ResDate[1], HistCompetence.doRating
+                       from HistCompetence
+                       where ((cComp  == HistCompetence.cSourceRec));
+
+                       _LOOP HistCompetence where ((cComp == HistCompetence.cSourceRec))
+                         if (HistCompetence.ResDate[1] = ZeroDate)
+                           if (GetFirst tmpSort where ((HistCompetence.dBeg << tmpSort.dBeg)) = tsOk) 
+                             {
+                               set HistCompetence.ResDate[1] := Sub_Day(tmpSort.dBeg, 1); 
+                               if (update current HistCompetence = tsOk)
+                                 {} 
+                             }
+
+                        if (GetLast tmpSort ordered by tmpSort.dBeg = tsOk)
+                          update CompetencePers where ((cComp  == CompetencePers.NRec))
+                                                  set CompetencePers.doRating := tmpSort.dd;     
+                     }  
+
+                   if (cTest <> comp(-1)) 
+                     {
+                       var wLastPos : word; wLastPos := 1;
+
+                       if (GetLast DetTestLast where ((SpisTest.NRec == DetTestLast.cTest)) ordered by DetTestLast.wNmb = tsOk)
+                         wLastPos := DetTestLast.wNmb + 1;
+
+                       if (GetFirst DetTest where ((SpisTest.Nrec == DetTest.cTest
+                                               AND  nLineSt[i]    == DetTest.Name)) <> tsOk)
+                         {
+                           ClearBuffer(#DetTest);
+                           DetTest.wNmb     := wLastPos;
+                           DetTest.Name     := nLineSt[i];
+                           DetTest.cTest    := SpisTest.NRec;
+                           DetTest.LastDate := tmpFile.dDate; 
+                           DetTest.LastUser := UserName;
+                           if (insert current DetTest = tsOk)
+                             {
+                               frmErr.write('          добавлен вопрос "' + nLineSt[i] + '"для теста "' + SpisTest.sName + '"');    
+                             } 
+                         } 
+
+                       if (GetFirst PersAnsw where ((DetTest.Nrec == PersAnsw.cQuest)) <> tsOk)
+                         {
+                           ClearBuffer(#PersTest);
+                           PersTest.cTest       := SpisTest.NRec;
+                           PersTest.cPerson     := tmpFile.cPerson;
+                           PersTest.sUserName   := UserName;
+                           PersTest.UserID      := UserId;
+                           PersTest.DateTest    := tmpFile.dDate;
+                           PersTest.LastDate    := tmpFile.dDate; 
+                           PersTest.cDepartment := tmpFile.cDepartment;
+                           if (insert current PersTest = tsOk)
+                             { }
+                         }
+
+                       if (GetFirst PersAnsw where ((PersTest.NRec == PersAnsw.cPersTest
+                                                 AND DetTest.Nrec  == PersAnsw.cQuest
+                                                 AND tmpFile.dDate == PersAnsw.LastDate(NoIndex))) <> tsOk) 
+                         {
+                           ClearBuffer(#PersAnsw);
+                           PersAnsw.cQuest    := DetTest.Nrec;
+                           PersAnsw.wMark     := word(tmpFile.dValue[i]); 
+                           PersAnsw.wNmb      := DetTest.wNmb;
+                           PersAnsw.LastDate  := tmpFile.dDate;
+                           PersAnsw.cPersTest := PersTest.NRec;
+                           if (insert current PersAnsw = tsOk)
+                             {
+                               frmErr.write('          добавлен ответ "' + word(tmpFile.dValue[i]) + '"для теста "' + SpisTest.sName + '"');    
+                             } 
+                         }
+                       else
+                         {
+                           var wOld : double; wOld := PersAnsw.wMark;
+                           set PersAnsw.wMark     := word(tmpFile.dValue[i]); 
+                           if (update current PersAnsw = tsOk)
+                             {
+                               frmErr.write('          изменен ответ с ' + string(wOld) + ' на ' + string(word(tmpFile.dValue[i])) + '"для теста "' + SpisTest.sName + '"');    
+                             } 
+                         } 
+                     }
+                 }
+             } 
+         }
+     }
+
+  if (frmErr.error)
+    frmErr.AbortForm;
+  else
+    frmErr.ShowFile('Протокол импорта');
+
+  StopVisual('', 0);
+}
+
+//******************************************************************************
+Window winParam 'Параметры импорта' EscClose DoAccept;
+  Show at (,, 50, 8);
+
+screen scr ('',, sci13Esc) ;
+
+Fields
+  //------------------------------------------------------------------------------
+  File_Name     ('Путь к имортируемому документу'               , , sci13Esc) : Protect,
+  { Font = { BackColor = if(File_Name = '', ColorNeed, 0) } };
+  //------------------------------------------------------------------------------
+
+Buttons
+  cmOk    , Default, , 'Импорт'    , ,;
+  cmValue1,        , , 'Сформировать по шаблону', ,;
+  cmCancel,        , , 'Отмена'    , ,;
+<<
+  Документ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  <.  Импорт  .> <. Сформировать по шаблону .> <.  Отмена  .>
+>>
+end;
+
+//******************************************************************************
+
+HandleEvent
+cmOk:
+  {
+    if (File_Name = '')
+      {
+        Message('Не задан файл!', CancelButton);
+        SelectField(#File_Name);
+        Abort;
+        Exit;
+      }
+
+    SaveMyParam;
+
+    LoadData;
+    PutCommand(cmDefault);
+  }
+
+
+
+cmValue1:
+  {
+    var sPathName : string; sPathName := GetStringParameter('Files','OutputFilesDirectory',0);
+    set File_Name := sPathName + 'QualityImport.xls';
+
+    if (NOT ExistFile(File_Name))
+      {
+        if (not xlCreateExcel(File_Name, true))
+          {
+            message('Ошибка создания файла' + chr(13) + File_Name, Error);
+            xlKillExcel;
+            StopVisual('',0);
+            exit;
+          }
+
+        xlSetActiveSheet(1);
+        xlSetCellStringValue('ФИО' , 1, 1, 1, 1);
+        xlSetFontStyle(xlBold, 1, 1, 1, 1);
+        xlSetCellStringValue('таб №' , 1, 2, 1, 2);
+        xlSetFontStyle(xlBold, 1, 2, 1, 2);
+        xlSetCellStringValue('дата оценки' , 1, 3, 1, 3);
+        xlSetFontStyle(xlBold, 1, 3, 1, 3);
+        xlSetCellStringValue('Код из справочника. Учебное заведение' , 1, 4, 1, 4);
+        xlSetFontStyle(xlBold, 1, 4, 1, 4);
+
+        var i : word; i := 4;
+        _LOOP CatalogsCom where ((0                 == CatalogsCom.LPr
+                              AND CatalogsMain.NRec == CatalogsCom.MainLink))
+          if (trim(CatalogsCom.Code) <> '')
+          {
+            inc(i);
+            xlSetCellStringValue('''' + CatalogsCom.Code, 1, i, 1, i);
+            xlSetFontStyle(xlBold, 1, i, 1, i);
+          }
+
+        xlSaveWorkBook(1);
+        xlKillExcel;
+      }
+  }
+
+end;
+end;
+
+
+//*****************************************************************************
+
+HandleEvent
+
+cmInit :
+  {
+    if (GetFirst CatalogsMain <> tsOk)
+      {
+        Message('Отсутствует каталог компетенции!');
+        Abort;
+        Exit; 
+      }
+
+    if (cTest <> comp(-1))
+      if (GetFirst SpisTest <> tsOk)
+        {
+          Message('Ошибка позиционировании на тесте!');
+          Abort;
+          Exit; 
+        }
+
+    ReadMyParam;
+
+    CharacterClockNumbers := wGetTune('FormatClockNumber') <> 0;
+
+    RunWindowModal(winParam);
+    abort;
+  }
+
+cmPick:
+  {
+    case CurField of
+      #File_Name:
+        File_Name  := GetFileName('*.xls', 'Выберите документ для импорта');
+        end;
+
+    ReReadRecord;
+  }
+
+end;
+end.
+
+
+//******************************************************************************
+//******************************************************************************                                                 
+//******************************************************************************     
+#include UserReport.vih
+                                            
+vipinterface UserReport_iQualityImport implements IUserReport licensed(free);
+
+interface UserReport_iQualityImport;
+
+create view
+  var
+    Dummy: Byte;
+;
+
+procedure Run;
+begin
+  RunInterface(iQualityImport, comp(-1));
+end;
+
+function GetReportName: String;
+begin
+  GetReportName := 'Импорт результатов оценки персонала';
+end;
+
+function GetGroupName(Level: Word): String;
+begin
+#__UNUSED__(Level)
+  GetGroupName := 'Обучение и развитие персонала';
+end;
+
+function GetPriority: Integer;
+begin
+  GetPriority := 0;
+end;
+
+function VisibleInModule(Ind: Byte): String;
+begin
+#__UNUSED__(Ind)
+  VisibleInModule := 'StaffMainMenu';
+end;
+
+end.

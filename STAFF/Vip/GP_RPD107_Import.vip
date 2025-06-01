@@ -1,0 +1,351 @@
+/*************************************************************************************************\
+* Наименование:Разработка процедуры импорта перечня предоставленных ведомственной гостиницей услуг*
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#220          |06/06/17|Шагубаков М.Р.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#doc
+Импорт 107 приказа
+<p>#220 Разработка процедуры импорта перечня предоставленных ведомственной гостиницей услуг
+#end
+Interface GP_RPD107_Import 'Импорт гостиничных услуг' (,,sci178Ins) Cyan,DoAccept;
+show at (,,60,10);
+Var
+  cPartDoc: comp;
+  FName   : string;
+  str     :integer;
+  val     :string;
+  status  : boolean;
+
+//Таблица в памяти для импортируемых данных
+Table Struct tmp107Import (
+    NRec      : comp,
+    FIO       : string,
+    Tabn      : string,
+    cPerson   : comp,
+    cApp      : comp,
+    cPodr     : comp,
+    DotName   : string,
+    cDotName  : comp,
+    NumDog    : string,
+    SrokDog   : date,
+    KatNomer  : string,
+    KolMest   : word,
+    cSposobOpl: comp,
+    SposobOpl : string,
+    PlataMes  : decimal(31,15),
+    SumUd     : decimal(31,15),
+    SumComp   : decimal(31,15),
+    FMembers  : word,
+    FMembCh   : word,
+    dateNach  : date,
+    dateKon   : date,
+    Worker    : string,
+    Child1    : string,
+    Child2    : string,
+    cChild1   : comp,
+    cChild2   : comp
+)
+    with index (
+      AttNpp = NRec(Surrogate)
+);
+
+
+Create view as select Catalogs.Nrec
+from
+     Catalogs
+   , Catalogs CatParent
+   , Persons
+   , tmp107Import
+   , Contdoc
+   , Raise
+   , RaiseHist
+   , Appointments
+   , Catalogs SposobyOplaty
+   , GP_RaiseHistExt107, TitleDoc, PartDoc
+;
+
+Create view vSpr
+var
+  pCatParentDot:comp;
+  sCatDot:string;
+as select CatDot.Name
+from Catalogs CatDot
+where ((
+    pCatParentDot == CatDot.cParent
+and sCatDot       == CatDot.Name
+));
+
+Create view vPsnLinks
+var
+  pPersons :comp;
+  sRFio :string;
+as select PsnLinks.Nrec
+From PsnLinks
+where ((
+     pPersons == PsnLinks.FROMPERSON
+and  sRFio    == PsnLinks.RFio(noindex)
+))  ;
+
+
+Parameters cPartDoc;
+
+//----------------------------
+// Найти доплату по имени
+//----------------------------
+Function FindCatDotByName(_sName:string):comp;
+{ Result:=0;
+  vSpr.sCatDot:=_sName;
+  if vSpr.getfirst CatDot=tsok
+    Result:=vSpr.CatDot.Nrec;
+} //Function FindCatDotByName(string _sName:string):comp;
+
+//-------------------------------
+// Найти родственника
+//-------------------------------
+Function GetPsnLinks(_pPersons:comp;_sRFio:string):comp;
+{ Result:=0;
+  vPsnLinks.pPersons:=_pPersons;
+  if pos(',',_sRFio)>0
+    _sRFio:=substr(_sRFio,1,pos(',',_sRFio)-1);
+  vPsnLinks.sRFIO   :=trim(_sRFio);
+  if vPsnLinks.getfirst PsnLinks=tsok
+    Result:=vPsnLinks.PsnLinks.Nrec;
+}//Function GetPsnLinks(_pPersons:comp;_sRFio:string):comp;
+
+function OpenAndReadFile(FileName:string):boolean; //true - отсутствие ошибок
+{
+  var err:string;
+  var catSposOpl:comp;
+  var cntWB:word = 0;
+  var dDog, fioP, tabnum, SposOpl, dNach, dKon:string;
+  fioP := '';  dDog:=''; tabnum := ''; SposOpl := ''; dNach := ''; dKon := '';
+  if (getfirst CatParent where ((4001 == catparent.syscode)) )= tsOk
+    catSposOpl:= catParent.nrec;
+  else
+  {
+    message('Ошибка! Не найден каталог Способы оплаты (системный код 4001)');
+    exit;
+  }
+  xlOpenNewExcel(true);
+  xlOpenWorkBook(FileName);
+  xlSetActiveSheet(1);
+  str := 6;
+  status := true;
+  do
+  {
+    err:='';
+    val:='';
+    tabnum:='';
+    fiop:='';
+    xlGetCellValue(str, 1, val);
+    xlGetCellValue(str, 2, tabnum);
+    xlGetCellValue(str, 3, fiop);
+    timelog('GP_RPD107_Import->OpenAndReadFile:tabnum='+tabnum+',fiop='+fiop);
+    xlGetCellValue(str, 15, SposOpl);
+    if (tabnum <> '')
+    { status:=true;
+      ClearBuffer(#tmp107Import);
+      //Найдем сотрудника и спопоб пополнения
+      if (getfirst Persons where (('С' == Persons.IsEmployee and fioP == Persons.FIO and tabnum == Persons.strtabn (noindex) )) = tsOk)
+      {
+      } else
+      {
+        status := false;
+        //Проверим, есть ли Persons без С
+        if (getfirst Persons where ((fioP == Persons.FIO (noindex) and tabnum == Persons.strtabn (noindex) )) = tsOk)
+          err:='Ошибка! '+fioP+' не является сотрудником предприятия!';
+        else
+          err:='Ошибка! Не найден сотрудник '+tabnum+' '+fioP+'!';
+      }
+      //message('!'+catSposOpl+'!,!'+SposobOpl+'!');
+      if  (getfirst SposobyOplaty where ((catSposOpl == SposobyOplaty.cparent)) and UpCase(SposOpl) = UpCase(SposobyOplaty.name) ) = tsOk
+      {
+        tmp107Import.cSposobOpl:= SposobyOplaty.nrec;
+        tmp107Import.SposobOpl := SposobyOplaty.name;
+      } else
+      {
+        status := false;
+        err := err + ' Ошибка! Не найден способ оплаты по названию '+SposOpl;
+      }
+
+      if (status)
+      {
+        //Добавим строку в служебную таблицу
+        tmp107Import.tabn := tabnum;
+        tmp107Import.cPerson := Persons.nrec;
+        xlGetCellValue(str, 3,tmp107Import.FIO);
+        xlGetCellValue(str, 7,tmp107Import.DotName);
+        tmp107Import.cDotName:=FindCatDotByName(tmp107Import.DotName);
+        if  tmp107Import.DotName<>''
+        and tmp107Import.cDotName=0
+        { err:=err+' Не нашли доплату '+tmp107Import.DotName;
+        }
+        xlGetCellValue(str, 9,tmp107Import.NumDog);
+        xlGetCellValue(str, 11,dDog);
+        tmp107Import.SrokDog   := strToDate(trim(dDog),'DD.MM.YYYY');
+        xlGetCellValue(str, 10,dNach);
+        tmp107Import.DateNach   := strToDate(trim(dNach),'DD.MM.YYYY');
+
+        xlGetCellValue(str, 11,dKon);
+        tmp107Import.DateKon    := strToDate(trim(dKon),'DD.MM.YYYY');
+
+        xlGetCellValue(str, 12,tmp107Import.KatNomer);
+        xlGetCellValue(str, 13,tmp107Import.KolMest);
+
+        xlGetCellValue(str, 16,tmp107Import.PlataMes);
+        xlGetCellValue(str, 17,tmp107Import.SumUd);
+        xlGetCellValue(str, 18,tmp107Import.SumComp);
+
+        xlGetCellValue(str, 22,tmp107Import.FMembers);
+        xlGetCellValue(str, 23,tmp107Import.FMembCh);
+        /*
+        xlGetCellValue(str, 25,tmp107Import.Worker);
+        xlGetCellValue(str, 26,tmp107Import.Child1);
+        xlGetCellValue(str, 27,tmp107Import.Child2);
+        */
+        xlGetCellValue(str, 24,tmp107Import.Worker);
+        xlGetCellValue(str, 25,tmp107Import.Child1);
+        xlGetCellValue(str, 26,tmp107Import.Child2);
+        if tmp107Import.Child1<>''
+        { tmp107Import.cChild1:=GetPsnLinks(tmp107Import.cPerson,tmp107Import.Child1);
+          if tmp107Import.cChild1=0
+          { err:=err+' Нет ребенка 1 "'+tmp107Import.Child1+'"';
+          }
+        }
+        if tmp107Import.Child2<>''
+        { tmp107Import.cChild2:=GetPsnLinks(tmp107Import.cPerson,tmp107Import.Child2);
+          if tmp107Import.cChild2=0
+          { err:=err+' Нет ребенка 2 "'+tmp107Import.Child2+'"';
+          }
+        }
+//        tmp107Import. := ;
+        insert current tmp107Import;
+      } //if (status)
+      xlSetCellStringValue(err, str, 30, str, 30 );
+      xlSetColumnWidth(50, str, 30, str, 30);
+
+
+    } //if (tabnum <> '')
+
+
+    str++;
+  } while (val <> '' or tabnum<>'' or fiop<>'');
+  puttabletodbf(#tmp107Import,'tmp107Import.dbf',ptfFullTable);
+  xlGetWorkBooksCount(cntWB);
+  xlSaveWorkBook(0);
+  xlCloseWorkBook(1);
+  xlKillExcel;
+  OpenAndReadFile := status;
+}
+
+procedure LoadData; //Создание строк приказа по данным в таблице в памяти
+{
+  var npp:word;
+  npp:= 1;
+  if getfirst PartDoc where ((cPartDoc == PartDoc.nrec)) = tsOk
+    if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.nrec)) = tsOk
+    {};
+  _loop tmp107Import
+  {
+    ClearBuffer(#ContDoc);
+    ContDoc.cPart := cPartDoc;
+    ContDoc.NumPart := 1;
+    ContDoc.wrec := npp;
+    ContDoc.TypeOper := 107;
+    ContDoc.Person := tmp107Import.cPerson;
+    //Найдем назначение, действующее на дату приказа
+    if (getlast Appointments where ((ContDoc.Person == Appointments.Person and 0 == Appointments.LPrizn and TitleDoc.DocDate >>= Appointments.AppointDate)) ) = tsOk
+    {
+      ContDoc.cStr := Appointments.nrec;
+
+      ContDoc.cDopRef := Appointments.Department;
+    }
+    tmp107Import.Worker:=trim(loCase(tmp107Import.Worker));
+    if tmp107Import.Worker<>'' and tmp107Import.Worker<>'нет'
+      CONTDOC.WATTRDOC3:=1;
+    if tmp107Import.cChild1>0
+      ContDoc.cAddInf:=tmp107Import.cChild1;
+    if tmp107Import.cChild2>0
+      ContDoc.CNEW4:=tmp107Import.cChild2;
+    ContDoc.objType := 1;
+    ContDoc.SeqNmb := 1;
+    insert current ContDoc;
+
+
+    ClearBuffer(#Raise);
+    Raise.Person := tmp107Import.cPerson;
+    Raise.Sum := tmp107Import.SumComp;
+    Raise.crDop := ContDoc.nrec;
+    Raise.FromDate := tmp107Import.dateNach;
+    Raise.ToDate := tmp107Import.dateKon;
+    if tmp107Import.cDotName=0
+    { var ParentSav : comp;
+      ParentSav := coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD107');
+      if (ParentSav <> 0)
+      {
+        Raise.RaiseType := ParentSav;
+      }
+    }
+    else
+    { Raise.RaiseType :=tmp107Import.cDotName;
+    }
+    insert current Raise;
+
+    ClearBuffer(#RaiseHist);
+    RaiseHist.cPsn := tmp107Import.cPerson;
+    RaiseHist.cRaise := Raise.nrec;
+    RaiseHist.wTypeOper := 9;
+    RaiseHist.RHSum := Raise.Sum;
+    RaiseHist.cContDoc := ContDoc.nrec;
+    RaiseHist.DRec := tmp107Import.dateNach;
+    RaiseHist.DDat2:= tmp107Import.dateKon;
+    RaiseHist.cRaiseType := Raise.RaiseType;
+
+    insert current RaiseHist;
+
+    ClearBuffer(#GP_RaiseHistExt107);
+    GP_RaiseHistExt107.cRaiseH := RaiseHist.nrec;
+    GP_RaiseHistExt107.NumDog := tmp107Import.NumDog;
+    GP_RaiseHistExt107.SrokDog := tmp107Import.SrokDog;
+    GP_RaiseHistExt107.Kateg := tmp107Import.KatNomer;
+    GP_RaiseHistExt107.KolMest := tmp107Import.KolMest;
+    GP_RaiseHistExt107.cSposOpl := tmp107Import.cSposobOpl;
+    GP_RaiseHistExt107.PlataMes := tmp107Import.PlataMes;
+    GP_RaiseHistExt107.SummaMes := tmp107Import.SumUd;
+    GP_RaiseHistExt107.FMembers := tmp107Import.FMembers;
+    GP_RaiseHistExt107.FMembCh := tmp107Import.FMembCh;
+    insert current GP_RaiseHistExt107;
+
+    npp++;
+  }
+  //Обновим описание приказа
+  //update current titledoc set DocText := 'Компенсация стоимости гостиничных услуг (импорт из файла) '+Cur_Date;
+}//procedure LoadData; //Создание строк приказа по данным в таблице в памяти
+
+  HandleEvent
+    cmInit:
+    { timelog_init;
+      vSpr.pCatParentDot:=coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD107');
+      if vSpr.pCatParentDot=0
+      { if getfirst CatParent where (( -17 == CatParent.SysCode))=tsok
+          vSpr.pCatParentDot:=CatParent.Nrec;
+      }
+      //Запросим имя файла Excel для импорта
+      FName := GetFileName('*.xls;*.xlsx','Выберите файл Excel для импорта гостиничных услуг...');
+      //Откроем и проверим файл
+      if OpenAndReadFile(FName)
+      {
+        //Загрузим данные файла в приказ
+        LoadData;
+        message('Импорт завершен успешно!');
+      } else {
+        message('При проверке файла обнаружены ошибки! См. файл, колонка 23.');
+      }
+    }
+  End; //HandleEvent
+end.

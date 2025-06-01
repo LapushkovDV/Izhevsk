@@ -1,0 +1,389 @@
+/*************************************************************************************************\
+* Наименование:  Интерфейс, формирующий отчет по проводкам по квартальной/годовой премии          *
+* Контур/Модуль: Заработная плата, ФРО                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#000          |14/05/18|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include FRRecordDefinition.vih
+
+#component "GP_ZP"
+
+interface GP_PremiumReport 'Проводки по выплате квартальных/годовых премий' escClose doAccept;
+show (,,38,7);
+
+const
+  PLPOR_TIDKGAL = 10;
+end;
+
+table struct tRep (
+  Razdel      : byte,
+  Schet       : string[40],
+  MnPlanNrec  : comp,
+  KatPodrNrec : comp,
+  MnPlanNumber: string[20],
+  KatPodrKod  : string[20],
+  SumPrem     : double,
+  SumTax      : double
+) with index (
+  i01 = Schet + MnPlanNumber + KatPodrKod
+);
+
+var
+  _mode        : byte;                       //режим: 0-квартальные премии, 1-годовые премии
+  _quarter     : byte;                       //квартал за который выплачивается премия
+  _year        : word;                       //год за который выплачивается премия
+
+create view
+as select tRep.Razdel
+from tRep;
+
+DataStream dsRep
+(
+  [Mode] _mode;
+  [Quarter] _quarter;
+  [Year] _year;
+
+  table tRep
+  (
+    [Razdel]        tRep.Razdel;
+    [Schet]         tRep.Schet;
+    [MnPlanNrec]    tRep.MnPlanNrec;
+    [KatPodrNrec]   tRep.KatPodrNrec;
+    [MnPlanNumber]  tRep.MnPlanNumber;
+    [KatPodrKod]    tRep.KatPodrKod;
+    [SumPrem]       tRep.SumPrem;
+    [SumTax]        tRep.SumTax;
+  );
+)
+end;
+
+screen scParams;
+fields
+  _mode: noprotect;
+  _quarter: noprotect, spinbutton[1,1,4];
+  _year: noprotect, spinbutton[1,2000,2100];
+buttons
+  cmOk, default;
+  cmCancel;
+<<
+
+  Вид премии        Премия за
+  (.) Квартальная`  `Квартал`.@@@
+  (.) Годовая`      `Год`    .@@@@@
+
+        <. Продолжить .> <. Отмена .>
+>>
+end; //screen scParams
+
+procedure LoadData;
+{
+  var denosch6: string;
+  denosch6 := if(_mode = 0, 'КвПрем_', 'ГодПрем_') + _year + if(_mode = 0, '_' + _quarter, '');
+
+  var denosch6reserve: string;
+  denosch6reserve := if(_mode = 0, 'РезервКвПрем_', 'РезервГодПрем_') + _year + if(_mode = 0, '_' + _quarter, '');
+
+  var prefix: string;
+  prefix := if(_mode = '0', 'NPOEM_OWN.BU.RezervKvartPrem.', 'NPOEM_OWN.BU.RezervGodPrem.');
+
+  var cStZatr: comp;
+  cStZatr := coGetTune(prefix + 'Rezerv.St_Zatr');
+
+  var cStZatrNal: comp;
+  cStZatrNal   := coGetTune(prefix + 'Nalog.St_Zatr');
+
+  var cVidRezerv: comp;
+  cVidRezerv := coGetTune(prefix + 'Rezerv.VidRezerva');
+
+  var cVidRezervNal: comp;
+  cVidRezervNal := coGetTune(prefix + 'Nalog.VidRezerva');
+
+  StartNewVisual(vtIndicatorVisual, vfTimer, 'Формирование отчета', 3);
+
+  delete all tRep;
+
+  //Рвздел 1. Прямые затраты
+  sql
+  select 0 as Razdel,
+         o.Schet + Case when o.SubSchet = '' then '' else '.' end + o.SubSchet as Schet,
+         o.MnPlanNrec,
+         o.KatPodrNrec,
+         coalesce(MnPlan.Number, '') as MnPlanNumber,
+         coalesce(KatPodr.Kod, '') as KatPodrKod,
+         sum(o.SumPrem) as SumPrem,
+         sum(o.SumTax) as SumTax
+  from (select Oborot.DbSchetO as Schet,
+               Oborot.SubOsSch as SubSchet,
+               Oborot.KauOs[1] as MnPlanNrec,
+               Oborot.KodSpO   as KatPodrNrec,
+               Oborot.SumOb    as SumPrem,
+               0               as SumTax
+        from PlPor
+        join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+        where PlPor.TiDkGal = 10 and
+              PlPor.Denosch6 = :(denosch6) and
+              Oborot.DbSchetO <> '96' and
+              Oborot.KrSchetK = '70' and
+              Oborot.SumOb > 0
+
+        union all
+
+        select Oborot.DbSchetO,
+               Oborot.SubOsSch,
+               Oborot.KauOs[1],
+               Oborot.KodSpO,
+               0,
+               Oborot.SumOb
+        from PlPor
+        join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+        where PlPor.TiDkGal = 10 and
+              PlPor.Denosch6 = :(denosch6) and
+              Oborot.DbSchetO <> '96' and
+              Oborot.KrSchetK = '69' and
+              Oborot.SumOb > 0
+       ) o
+  left join MnPlan on MnPlan.Nrec = o.MnPlanNrec
+  left join KatPodr on KatPodr.Nrec = o.KatPodrNrec
+  group by Schet, SubSchet, MnPlanNrec, KatPodrNrec, MnPlan.Number, KatPodr.Kod
+  into tRep ByName;
+
+  NextVisual;
+
+  //Раздел 2. Премия из резерва
+  sql
+  select 1 as Razdel,
+         o.Schet + Case when o.SubSchet = '' then '' else '.' end + o.SubSchet as Schet,
+         o.MnPlanNrec,
+         o.KatPodrNrec,
+         coalesce(MnPlan.Number, '') as MnPlanNumber,
+         coalesce(KatPodr.Kod, '') as KatPodrKod,
+         sum(o.SumPrem) as SumPrem,
+         sum(o.SumTax) as SumTax
+  from (select coalesce(tReserve.Schet, '') as Schet,
+               coalesce(tReserve.SubSchet, '') as SubSchet,
+               coalesce(tReserve.MnPlanNrec, #comp(0)) as MnPlanNrec,
+               Oborot.KodSpO   as KatPodrNrec,
+               Oborot.SumOb    as SumPrem,
+               0               as SumTax
+        from PlPor
+        join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+        //<-- для определения счета затрат и заказа по которому прошел резерв по сотруднику (на проводке Д96К70 нет заказа)
+        left join (select Oborot.KauKs[2] as PersonsNrec,
+                          max(coalesce(MnPlan.Nrec, #comp(0))) as MnPlanNrec,
+                          max(Oborot.DbSchetO) as Schet,
+                          max(Oborot.SubOsSch) as SubSchet
+                   from PlPor
+                   join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+                   left join MnPlan
+                     on MnPlan.Nrec = case when Oborot.TblOs[1] = 7 then Oborot.KauOs[1] else Oborot.KauKs[6] end
+                   where PlPor.TiDkGal = 10 and
+                         PlPor.Denosch6 = :(denosch6reserve) and
+                         Oborot.KrSchetK = '96' and
+                         Oborot.KauKs[5] = :(cVidRezerv)
+                   group by Oborot.KauKs[2]
+                  ) tReserve on tReserve.PersonsNrec = Oborot.KauOs[2]
+        //-->
+        where PlPor.TiDkGal = 10 and
+              PlPor.Denosch6 = :(denosch6) and
+              Oborot.DbSchetO = '96' and
+              Oborot.KrSchetK = '70' and
+              Oborot.SumOb > 0
+
+        union all
+
+        select coalesce(tReserve.Schet, '') as Schet,
+               coalesce(tReserve.SubSchet, '') as SubSchet,
+               coalesce(tReserve.MnPlanNrec, #comp(0)) as MnPlanNrec,
+               Oborot.KodSpO,
+               0,
+               Oborot.SumOb
+        from PlPor
+        join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+        //<-- для определения счета затрат и заказа по которому прошел резерв по сотруднику (на проводке Д96К70 нет заказа)
+        left join (select Oborot.KauKs[2] as PersonsNrec,
+                          max(coalesce(MnPlan.Nrec, #comp(0))) as MnPlanNrec,
+                          max(Oborot.DbSchetO) as Schet,
+                          max(Oborot.SubOsSch) as SubSchet
+                   from PlPor
+                   join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+                   left join MnPlan
+                     on MnPlan.Nrec = case when Oborot.TblOs[1] = 7 then Oborot.KauOs[1] else Oborot.KauKs[6] end
+                   where PlPor.TiDkGal = 10 and
+                         PlPor.Denosch6 = :(denosch6reserve) and
+                         Oborot.KrSchetK = '96' and
+                         Oborot.KauKs[5] = :(cVidRezervNal)
+                   group by Oborot.KauKs[2]
+                  ) tReserve on tReserve.PersonsNrec = Oborot.KauOs[2]
+        //-->
+        where PlPor.TiDkGal = 10 and
+              PlPor.Denosch6 = :(denosch6) and
+              Oborot.DbSchetO = '96' and
+              Oborot.KrSchetK = '69' and
+              Oborot.SumOb > 0
+       ) o
+  left join MnPlan on MnPlan.Nrec = o.MnPlanNrec
+  left join KatPodr on KatPodr.Nrec = o.KatPodrNrec
+  group by Schet, SubSchet, MnPlanNrec, KatPodrNrec, MnPlan.Number, KatPodr.Kod
+  into tRep ByName;
+
+  NextVisual;
+
+  //Раздел 3. Сторно резерва
+  sql
+  select 2 as Razdel,
+         o.Schet + Case when o.SubSchet = '' then '' else '.' end + o.SubSchet as Schet,
+         o.MnPlanNrec,
+         o.KatPodrNrec,
+         coalesce(MnPlan.Number, '') as MnPlanNumber,
+         coalesce(KatPodr.Kod, '') as KatPodrKod,
+         sum(o.SumPrem) as SumPrem,
+         sum(o.SumTax) as SumTax
+  from (select Oborot.DbSchetO as Schet,
+               Oborot.SubOsSch as SubSchet,
+               Oborot.KauOs[1] as MnPlanNrec,
+               Oborot.KodSpO   as KatPodrNrec,
+               Oborot.SumOb    as SumPrem,
+               0               as SumTax
+        from PlPor
+        join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+        where PlPor.TiDkGal = 10 and
+              PlPor.Denosch6 = :(denosch6) and
+              Oborot.KrSchetK = '96' and
+              Oborot.KauOs[2] = :(cStZatr) and
+              Oborot.SumOb < 0
+
+        union all
+
+        select Oborot.DbSchetO,
+               Oborot.SubOsSch,
+               Oborot.KauOs[1],
+               Oborot.KodSpO,
+               0,
+               Oborot.SumOb
+        from PlPor
+        join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+        where PlPor.TiDkGal = 10 and
+              PlPor.Denosch6 = :(denosch6) and
+              Oborot.KrSchetK = '96' and
+              Oborot.KauOs[2] = :(cStZatrNal) and
+              Oborot.SumOb < 0
+       ) o
+  left join MnPlan on MnPlan.Nrec = o.MnPlanNrec
+  left join KatPodr on KatPodr.Nrec = o.KatPodrNrec
+  group by Schet, SubSchet, MnPlanNrec, KatPodrNrec, MnPlan.Number, KatPodr.Kod
+  into tRep ByName;
+
+  //Раздел 4. Отнесено на 91.01
+  sql
+  select 3 as Razdel,
+         o.Schet + Case when o.SubSchet = '' then '' else '.' end + o.SubSchet as Schet,
+         o.MnPlanNrec,
+         o.KatPodrNrec,
+         coalesce(MnPlan.Number, '') as MnPlanNumber,
+         coalesce(KatPodr.Kod, '') as KatPodrKod,
+         sum(o.SumPrem) as SumPrem,
+         sum(o.SumTax) as SumTax
+  from (select tReserve.Schet      as Schet,
+               tReserve.SubSchet   as SubSchet,
+               tReserve.MnPlanNrec as MnPlanNrec,
+               Oborot.KodSpO       as KatPodrNrec,
+               Oborot.SumOb        as SumPrem,
+               0                   as SumTax
+        from PlPor
+        join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+        //<-- для определения счета затрат и заказа по которому прошел резерв по сотруднику (на проводке Д96К70 нет заказа)
+        left join (select Oborot.KauKs[2] as PersonsNrec,
+                          max(coalesce(MnPlan.Nrec, #comp(0))) as MnPlanNrec,
+                          max(Oborot.DbSchetO) as Schet,
+                          max(Oborot.SubOsSch) as SubSchet
+                   from PlPor
+                   join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+                   left join MnPlan
+                     on MnPlan.Nrec = case when Oborot.TblOs[1] = 7 then Oborot.KauOs[1] else Oborot.KauKs[6] end
+                   where PlPor.TiDkGal = 10 and
+                         PlPor.Denosch6 = :(denosch6reserve) and
+                         Oborot.KrSchetK = '96' and
+                         Oborot.KauKs[5] = :(cVidRezerv)
+                   group by Oborot.KauKs[2]
+                  ) tReserve on tReserve.PersonsNrec = Oborot.KauOs[2]
+        //-->
+        where PlPor.TiDkGal   = 10 and
+              PlPor.Denosch6  = :(denosch6) and
+              Oborot.DbSchetO = '96' and
+              Oborot.KauOs[5] = :(cVidRezerv) and
+              Oborot.KrSchetK = '91'
+
+        union all
+
+        select tReserve.Schet,
+               tReserve.SubSchet,
+               tReserve.MnPlanNrec,
+               Oborot.KodSpO,
+               0,
+               Oborot.SumOb
+        from PlPor
+        join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+        //<-- для определения счета затрат и заказа по которому прошел резерв по сотруднику (на проводке Д96К70 нет заказа)
+        left join (select Oborot.KauKs[2] as PersonsNrec,
+                          max(coalesce(MnPlan.Nrec, #comp(0))) as MnPlanNrec,
+                          max(Oborot.DbSchetO) as Schet,
+                          max(Oborot.SubOsSch) as SubSchet
+                   from PlPor
+                   join Oborot on Oborot.TiDk = PlPor.TiDk and Oborot.cSoprDoc = PlPor.Nrec
+                   left join MnPlan
+                     on MnPlan.Nrec = case when Oborot.TblOs[1] = 7 then Oborot.KauOs[1] else Oborot.KauKs[6] end
+                   where PlPor.TiDkGal = 10 and
+                         PlPor.Denosch6 = :(denosch6reserve) and
+                         Oborot.KrSchetK = '96' and
+                         Oborot.KauKs[5] = :(cVidRezervNal)
+                   group by Oborot.KauKs[2]
+                  ) tReserve on tReserve.PersonsNrec = Oborot.KauOs[2]
+        //-->
+        where PlPor.TiDkGal   = 10 and
+              PlPor.Denosch6  = :(denosch6) and
+              Oborot.DbSchetO = '96' and
+              Oborot.KauOs[5] = :(cVidRezervNal) and
+              Oborot.KrSchetK = '91'
+       ) o
+  left join MnPlan on MnPlan.Nrec = o.MnPlanNrec
+  left join KatPodr on KatPodr.Nrec = o.KatPodrNrec
+  group by Schet, SubSchet, MnPlanNrec, KatPodrNrec, MnPlan.Number, KatPodr.Kod
+  into tRep ByName;
+
+  NextVisual;
+  StopVisual('', 0);
+}
+
+procedure ShowReport;
+{
+  RunFReport(dsRep, '', true);
+}
+
+handleevent
+
+cmOk:
+{
+  LoadData;
+  ShowReport;
+}
+
+cmInit:
+{
+  if not ReadMyDsk(_mode,    'GP_PremiumReport_mode',    false) _mode    := 0;
+  if not ReadMyDsk(_quarter, 'GP_PremiumReport_quarter', false) _quarter := 1;
+  if not ReadMyDsk(_year,    'GP_PremiumReport_year',    false) _year    := Year(Cur_Date);
+}
+
+cmDone:
+{
+  SaveMyDsk(_mode,    'GP_PremiumReport_mode');
+  SaveMyDsk(_quarter, 'GP_PremiumReport_quarter');
+  SaveMyDsk(_year,    'GP_PremiumReport_year');
+}
+
+end;
+
+end.

@@ -1,0 +1,3444 @@
+/*************************************************************************************************\
+* Наименование: Ведомости премирования  - Спецификация                                            *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#195          |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#776          |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#781          |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#783          |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include marker.vih // описание объекта и объявление интерфейса
+                    // marker c реализацией по умолчанию
+
+#include Query.vih
+#Include GetKau.Vih
+
+#include CatFunc.Vih
+#include GP_VisibleHidden.vih //KBU
+#include GP_Protector.Vih
+#include GP_KPI_Alg.Vih
+#include GP_QueryBuilder.vih
+#include GP_Field_Flt.vih
+//-----------------------
+#include GP_KPI_RaiseEdit.Vih
+#include GP_KPI_Doc_RaiseEdit_Sp.Vih
+
+#doc
+Ведомости премирования  - Спецификация
+#end
+Interface GP_KPI_Doc_RaiseEdit_Sp 'Ведомости премирования  - Спецификация'    ('', hcNoContext,) EscClose;
+  Show at (,,,30);
+//----------------------------------------
+#include ShowKau.Vpp
+//----------------------------------------
+// Forward
+//----------------------------------------
+Procedure MySetTabbedSheetVisible(ww_format:longint;ww_Visible:boolean; ww_comment:string='');Forward;
+Function MyGetFormatByNumTabS(wNum_Format:word): longint;Forward;
+Function MyGetBrowSpByNpp(_wNpp:longint):longint;Forward;
+Function MyGetFieldSpByNpp  (_wNpp:longint):longint;Forward;
+Function MyGetFieldSpByNppDO(_wNpp:longint):longint;Forward;
+Procedure onSetTabbedShiits(_wNPP_RAISE:word);Forward;
+Function CanEditTbl:boolean;Forward;
+Function ReCalcSp(_NumFld:word) :boolean;Forward;
+function isFilterAnCorrect(ww_nrec:comp; ww_npp:Word ): boolean; cacheable;forward;
+//----------------------------------------
+// для отображения закладок
+Table Struct tmp_KPI_RAISE
+(    Npp : Word
+   , cGp_KPI_RAISE :comp
+   , Name  :string
+   , Code  :string[30]
+   , cDoplata:comp
+ //дополнительные поля
+   , fArrName   : Array [1..GP_KPI_Doc_Max_FLD_SP] of string   "Массив наименований полей спецификации"
+   , fArrType   : Array [1..GP_KPI_Doc_Max_FLD_SP] of Word     "Тип полей спецификации"
+   , fArrKodGr  : Array [1..GP_KPI_Doc_Max_FLD_SP] of Longint  "Аналитика полей спецификации"
+   , fArrAlg    : Array [1..GP_KPI_Doc_Max_FLD_SP] of tNrec    "Алгоритмы полей спецификации"
+   , fArrAlgChk : Array [1..GP_KPI_Doc_Max_FLD_SP] of tNrec    "Алгоритмы полей спецификации - контроль"
+   , fArrOpt    : Array [1..GP_KPI_Doc_Max_FLD_SP] of Word     "Опции полей спецификации"
+   , fArrLen    : Array [1..GP_KPI_Doc_Max_FLD_SP] of Word     "Ширина полей полей спецификации"
+   , fArrRazr   : Array [1..GP_KPI_Doc_Max_FLD_SP] of Word     "Разрядность полей полей спецификации"
+   , fArrIT     : Array [1..GP_KPI_Doc_Max_FLD_SP] of Word     "NPP в итогах"
+   , fRazdel    : Array [1..GP_KPI_Doc_Max_FLD_SP] of Word     "Раздел для печати"
+   , fSub       : Array [1..GP_KPI_Doc_Max_FLD_SP] of Word     "ПП раздела для печати"
+   , First_Column    : word //первая видимая колонка
+   , Last_Column     : word //последняя видимая колонка
+   , fRep01    : Array [1..GP_KPI_Doc_Max_FLD_SP] of Word     "Колонка в отчете 01"
+   , fRep02    : Array [1..GP_KPI_Doc_Max_FLD_SP] of Word     "Колонка в отчете 02"
+)
+with index
+(  tmp_KPI_RAISE01 = cGp_KPI_RAISE
+  ,tmp_KPI_RAISE02 = Name
+  ,tmp_KPI_RAISE03 = Code
+  ,tmp_KPI_RAISE04 = NPP
+
+);
+
+Table Struct tmp_div
+( datan:date
+ ,datok:date
+ ,Chasf:double
+ ,Chasf_All:double
+);
+
+//----------------------------------------
+#Include GetKau.Var
+//----------------------------------------
+var
+//----------------------------------------
+// объекты
+//----------------------------------------
+  iQBuilder:GP_QueryBuilder new;
+  iGP_VisibleHidden   : GP_VisibleHidden;    // скрыть/показать поля
+  DataProtector       : IGP_Protector2;      // защита полей от модификации
+  iCatFunc            : CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+  iGP_KPI_Alg         : GP_KPI_Alg_Calc New;     // алгоритм расчета
+  //pMarkerFlt:IMarker(Marker) new;
+//----------------------------------------
+//  Настройки
+  NPOEM_OWN_Raise_SPEC_CAN_DEL:boolean;//Разрешить удаление спецификации в ведомостях на премии
+//----------------------------------------
+  fCurMainFormat:longint;
+  sArrFieldSpMask :Array[1..GP_KPI_Doc_Max_FLD_SP] of string; //массив масок ввода
+  boFindSpec      :boolean; //признак успеха позиционирования на спецификацию
+  boNoVisual      :boolean; //не перерисовывать экраны
+  isOpenSearch    :boolean;
+  boImmediately_SP:boolean;//True обновлять s SetFieldValue
+//-----------------------------------------
+// Фильтры
+//-----------------------------------------
+   Marker_Count :longint;
+   isFilterRun  :boolean;
+   wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   Marker_Tmp :tptr;
+
+   #mrkfld_(Persons)
+   #mrkfld_(KlKatego)
+   #mrkfld_(Post)
+   #mrkfld_(KatPodr)
+
+   pFlt_Persons :comp;
+   pFlt_KlKatego:comp;
+   pFlt_Post    :comp;
+   pFlt_KatPodr :comp;
+//------------------------------------------------------------------------------
+Create View
+Var
+  wIntMode : word;
+  cTopRec  : comp;
+  cGetRec  : comp;
+  cPickTmp : comp;  // Для выбора в cmPick
+  wNPP_RAISE : word; // номер текущей закладки премии
+  wNPP_RAISE_Prev : word; // номер текущей закладки премии
+  fCurFormat_Raise :TPtr; // формат текущей закладки премии
+  isProtect  :boolean; //признак защиты окна
+  pLschet_Cur:comp;//текущая позиция
+  EMPT_FLD:string='-';
+As Select GP_KPI_Doc_SP.Nrec
+//---------------------------------
+  , word(GP_KPI_Doc.HARRCOMP[1]) (FieldName=Rez_Kv_Mes ,FieldTitle='Квартальный резерв - месяц')
+  , word(GP_KPI_Doc.HARRCOMP[2]) (FieldName=Rez_Kv_Year,FieldTitle='Квартальный резерв - год')
+  , word(GP_KPI_Doc.HARRCOMP[3]) (FieldName=Rez_YP_Year,FieldTitle='Годовой резерв - год')
+  , word(GP_KPI_Doc.HARRCOMP[4]) (FieldName=Rez_Option ,FieldTitle='Резерв - опции')
+//---------------------------------
+ , if(wNPP_RAISE=11,GetStrTabn(tmp_kpi_Doc_Val.Tabn,tmp_kpi_Doc_Val.StrTabn)
+     ,GetStrTabn(GP_KPI_Doc_Sp.Tabn,GP_KPI_Doc_Sp.StrTabn)) (FieldName=TabnBr,FieldTitle='Таб.номер')
+ , if(FoundMarker(Marker_tmp,tmp_flt_field.nrec),chr(251),'') (FieldName=Picked_Flt)
+//---------------------------------
+ , GetFieldValS(3,01) (FieldName=FieldSp01,FieldTitle='Поле 01')
+ , GetFieldValS(3,02) (FieldName=FieldSp02,FieldTitle='Поле 02')
+ , GetFieldValS(3,03) (FieldName=FieldSp03,FieldTitle='Поле 03')
+ , GetFieldValS(3,04) (FieldName=FieldSp04,FieldTitle='Поле 04')
+ , GetFieldValS(3,05) (FieldName=FieldSp05,FieldTitle='Поле 05')
+ , GetFieldValS(3,06) (FieldName=FieldSp06,FieldTitle='Поле 06')
+ , GetFieldValS(3,07) (FieldName=FieldSp07,FieldTitle='Поле 07')
+ , GetFieldValS(3,08) (FieldName=FieldSp08,FieldTitle='Поле 08')
+ , GetFieldValS(3,09) (FieldName=FieldSp09,FieldTitle='Поле 09')
+ , GetFieldValS(3,10) (FieldName=FieldSp10,FieldTitle='Поле 10')
+ , GetFieldValS(3,11) (FieldName=FieldSp11,FieldTitle='Поле 11')
+ , GetFieldValS(3,12) (FieldName=FieldSp12,FieldTitle='Поле 12')
+ , GetFieldValS(3,13) (FieldName=FieldSp13,FieldTitle='Поле 13')
+ , GetFieldValS(3,14) (FieldName=FieldSp14,FieldTitle='Поле 14')
+ , GetFieldValS(3,15) (FieldName=FieldSp15,FieldTitle='Поле 15')
+ , GetFieldValS(3,16) (FieldName=FieldSp16,FieldTitle='Поле 16')
+ , GetFieldValS(3,17) (FieldName=FieldSp17,FieldTitle='Поле 17')
+ , GetFieldValS(3,18) (FieldName=FieldSp18,FieldTitle='Поле 18')
+ , GetFieldValS(3,19) (FieldName=FieldSp19,FieldTitle='Поле 19')
+ , GetFieldValS(3,20) (FieldName=FieldSp20,FieldTitle='Поле 20')
+//------------------------------
+ , Double(GetFieldValS(3,01)) (FieldName=doFieldSp01,FieldTitle='Поле 01')
+ , Double(GetFieldValS(3,02)) (FieldName=doFieldSp02,FieldTitle='Поле 02')
+ , Double(GetFieldValS(3,03)) (FieldName=doFieldSp03,FieldTitle='Поле 03')
+ , Double(GetFieldValS(3,04)) (FieldName=doFieldSp04,FieldTitle='Поле 04')
+ , Double(GetFieldValS(3,05)) (FieldName=doFieldSp05,FieldTitle='Поле 05')
+ , Double(GetFieldValS(3,06)) (FieldName=doFieldSp06,FieldTitle='Поле 06')
+ , Double(GetFieldValS(3,07)) (FieldName=doFieldSp07,FieldTitle='Поле 07')
+ , Double(GetFieldValS(3,08)) (FieldName=doFieldSp08,FieldTitle='Поле 08')
+ , Double(GetFieldValS(3,09)) (FieldName=doFieldSp09,FieldTitle='Поле 09')
+ , Double(GetFieldValS(3,10)) (FieldName=doFieldSp10,FieldTitle='Поле 10')
+ , Double(GetFieldValS(3,11)) (FieldName=doFieldSp11,FieldTitle='Поле 11')
+ , Double(GetFieldValS(3,12)) (FieldName=doFieldSp12,FieldTitle='Поле 12')
+ , Double(GetFieldValS(3,13)) (FieldName=doFieldSp13,FieldTitle='Поле 13')
+ , Double(GetFieldValS(3,14)) (FieldName=doFieldSp14,FieldTitle='Поле 14')
+ , Double(GetFieldValS(3,15)) (FieldName=doFieldSp15,FieldTitle='Поле 15')
+ , Double(GetFieldValS(3,16)) (FieldName=doFieldSp16,FieldTitle='Поле 16')
+ , Double(GetFieldValS(3,17)) (FieldName=doFieldSp17,FieldTitle='Поле 17')
+ , Double(GetFieldValS(3,18)) (FieldName=doFieldSp18,FieldTitle='Поле 18')
+ , Double(GetFieldValS(3,19)) (FieldName=doFieldSp19,FieldTitle='Поле 19')
+ , Double(GetFieldValS(3,20)) (FieldName=doFieldSp20,FieldTitle='Поле 20')
+ , tmp_div.*
+From
+  GP_KPI_Doc_SP(GP_DOC_SP02)
+, GP_KPI_DOC_SP GP_KPI_DOC_SP_0
+, GP_KPI_Doc
+, GP_TypeDocs
+, tmp_KPI_RAISE
+, tmp_KPI_RAISE tmp_KPI_RAISE_F
+, tmp_kpi_Doc_Val(tmp_val01)//GP_KPI_RaiseEdit.Vih
+, tmp_div
+, Catalogs CatRaise
+//---------------
+, KatPodr KatPodr_SP_M
+, KlKatego KlKatego_M
+, Catalogs CatPost_M
+//---------------
+, KatPodr KatPodr_SP_IT
+, KlKatego KlKatego_IT
+, Catalogs CatPost_IT
+
+, Appointments
+, StaffStruct
+//--------- поля
+, GP_KPI_Fields(GP_KPI_Fields02)
+, KatKau
+, Catalogs CatSys
+, X$Files
+, SpKau
+//--------------------------
+, GP_KPI_GroupPers_SP
+, GP_KPI_GroupPers
+, GP_KPI_DocSumFond
+, GP_KPI_Fond
+, GP_KPI_Doc_Z
+//------- фильтры
+ , tmp_flt_field
+ , Persons  Persons_Flt
+ , KlKatego KlKatego_Flt
+ , Catalogs Catalogs_Flt
+ , KatPodr  KatPodr_Flt
+
+Where
+((
+      cTopRec              ==  GP_KPI_Doc.NRec
+and  GP_KPI_Doc.wType      ==  GP_TypeDocs.wType
+//-------------------------
+and wNPP_RAISE          == tmp_KPI_RAISE.NPP
+and cTopRec             == GP_KPI_DOC_SP.cGP_KPI_DOC
+and if(tmp_KPI_RAISE.NPP=11,0,tmp_KPI_RAISE.cGP_KPI_Raise) == GP_KPI_DOC_SP.cGP_KPI_RAISE
+and tmp_KPI_RAISE.cDoplata      == CatRaise.Nrec
+//---------------
+and cTopRec                 == GP_KPI_Doc_Z.cGP_KPI_Doc
+and GP_KPI_Doc_Z.cSys_Mbf   == Sys_Mbf.Nrec
+//-------------------------
+and GP_KPI_DOC_SP.cKatPodr == Katpodr_Sp_M.Nrec
+//and GP_KPI_DOC_SP.cPersons == Persons.Nrec
+//and GP_KPI_DOC_SP.cLschet  == Lschet.Nrec
+and GP_KPI_Doc_SP.cKlKatego== KlKatego_M.Nrec
+and GP_KPI_Doc_SP.cPost    == CatPost_M.Nrec
+and GP_KPI_Doc_SP.cAppointments == Appointments.Nrec
+and Appointments.StaffStr       == StaffStruct.nrec
+//------------
+and if(tmp_KPI_RAISE.NPP<11,0,GP_KPI_DOC.wType)  == GP_KPI_Fields.wType
+and tmp_KPI_RAISE.cGP_KPI_Raise   == GP_KPI_Fields.cDoc
+and GP_KPI_Fields.KodGroup        == KATKAU.KODGROUP
+and GP_KPI_Fields.KodGroup        == CatSys.SysCode
+and GP_KPI_Fields.KodGroup        == x$Files.xf$code
+and GP_KPI_Fields.KodGroup        == SpKau.KodGrKau
+//---------------------------
+
+and tmp_kpi_Doc_Val.cKatPodr  == KatPodr_SP_It.Nrec
+and tmp_kpi_Doc_Val.cKlKatego == KlKatego_It.Nrec
+and tmp_kpi_Doc_Val.cPost     == CatPost_It.Nrec
+
+//---------------------------
+and cTopRec                 == GP_KPI_DOC_SP_0.cGP_KPI_DOC
+and 0                       == GP_KPI_DOC_SP_0.cGP_KPI_RAISE
+and tmp_kpi_Doc_Val.Tabn    == GP_KPI_DOC_SP_0.Tabn
+and tmp_kpi_Doc_Val.StrTabn == GP_KPI_DOC_SP_0.StrTabn
+and tmp_kpi_Doc_Val.cLschet == GP_KPI_DOC_SP_0.cLschet(noindex)
+and tmp_kpi_Doc_Val.cKatPodr== GP_KPI_DOC_SP_0.cKatPodr(noindex)
+//----- Распределение по фондам
+and GP_KPI_Doc_SP.cKlKatego       == GP_KPI_GroupPers_SP.cKlKatego
+and GP_KPI_GroupPers_SP.cGroupPers== GP_KPI_GroupPers.Nrec
+and GP_KPI_GroupPers_SP.cGroupPers== GP_KPI_Fond.cGroupPers
+//and TMP_KPI_RAISe.cDoplata         == GP_KPI_Fond.cKPI_RAISe(noindex)
+and TMP_KPI_RAISe.cGp_KPI_RAISE    == GP_KPI_Fond.cKPI_RAISe(noindex)
+and GP_KPI_Doc.wType              == GP_KPI_DocSumFond.wType
+and cTopRec                       == GP_KPI_DocSumFond.cDoc
+and GP_KPI_Fond.Nrec              == GP_KPI_DocSumFond.cGP_KPI_Fond
+//------- фильтры
+and wc_nrec ==  Persons_Flt.nrec
+and wc_nrec ==  Klkatego_Flt.nrec
+and wc_nrec ==  Catalogs_Flt.nrec
+and wc_nrec ==  KatPodr_Flt.nrec
+
+))
+//bounds byItog           tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[00] == GP_KPI_DOC_SP.Nrec
+//bounds byItogLschet     tmp_kpi_Doc_Val.cLschet == Lschet.Nrec
+//bounds byItogPersons    tmp_kpi_Doc_Val.cPersons == Persons.Nrec
+//bounds byItogKatPodr_Sp tmp_kpi_Doc_Val.cKatPodr == KatPodr_SP.Nrec
+//bounds byItogKlKatego   tmp_kpi_Doc_Val.cKlKatego == KlKatego.Nrec
+//bounds byItogPost       tmp_kpi_Doc_Val.cPost     == CatPost.Nrec
+
+//---------- фильтры
+bounds byFltPersons     pFlt_Persons  == GP_KPI_Doc_Sp.cPersons (noindex)  Ordered by TableOrder
+bounds byFltKlKatego    pFlt_KlKatego == GP_KPI_Doc_Sp.cKlKatego(noindex) Ordered by TableOrder
+bounds byFltPost        pFlt_Post     == GP_KPI_Doc_Sp.cPost    (noindex) Ordered by TableOrder
+bounds byFltKatPodr     pFlt_KatPodr  == GP_KPI_Doc_Sp.cKatPodr    (noindex) Ordered by TableOrder
+//--- фильтры 11 окна
+bounds byFltPersons11   pFlt_Persons  == tmp_kpi_Doc_Val.cPersons (noindex) Ordered by TableOrder
+bounds byFltKlKatego11  pFlt_KlKatego == tmp_kpi_Doc_Val.cKlKatego(noindex) Ordered by TableOrder
+bounds byFltPost11      pFlt_Post     == tmp_kpi_Doc_Val.cPost    (noindex) Ordered by TableOrder
+bounds byFltKatPodr11   pFlt_KatPodr  == tmp_kpi_Doc_Val.cKatPodr    (noindex) Ordered by TableOrder
+
+//--------------------------
+condition FilterAn = // использование сложного фильтра
+  (isFilterAnCorrect(GP_KPI_DOC_SP.Nrec,wNPP_RAISE))
+condition FilterAn11 = // использование сложного фильтра
+  (isFilterAnCorrect(tmp_kpi_Doc_Val.cLschet,wNPP_RAISE))
+;
+//------------------------------------
+Create view vLschet
+var
+  pLschet:comp;
+as select Lschet.Nrec
+From Lschet
+where (( pLschet == Lschet.Nrec ));
+
+//------------------------------------
+Create view vPrvidopl
+as select PrVidopl.Nrec
+from Prvidopl ,SYS_MBF
+where ((
+     0 == SYS_MBF.Choice
+and  SYS_MBF.Nrec == Prvidopl.MNREC
+))
+
+;//Create view vPrvidopl
+
+
+//------------------------------------
+Create view vSpKau
+var
+  pSpKau:comp;
+as select SpKau.name
+From SpKau
+where ((
+   pSpKau == Spkau.nrec
+)); //Create view vSpKau
+
+
+Parameters
+  wIntMode   // режим запуска (cgiNo, cgiPick, ...) см.GLOCONST.INC
+#doc  
+   режим запуска (cgiNo, cgiPick, ...) см.GLOCONST.INC
+#end   
+, cTopRec    
+#doc
+ ссылка на "Ведомость"
+#end 
+, cGetRec    
+#doc
+ выбранная запись
+#end 
+;
+
+
+//------------------------------------------------------------------------------
+// процедуры и ф-ции
+//------------------------------------------------------------------------------
+
+
+//==============================================================================
+//                                 FIELDS
+//******************************************************************************
+//------------------------------------------------------------------------------
+Function GetCurrType : longint;
+{
+  Result := -1;
+  if (not isValid(#GP_KPI_DOC) )
+  { Exit; }
+  Result := GP_KPI_DOC.wType;
+}
+  //-----------------------------
+  // Цвет полей
+  //-----------------------------
+  #GP_KPI_Doc_Color_SP_Func
+
+//-------------------------------------
+// InitParam успешно отработал при поиске спецификации
+//-------------------------------------
+Function GetFindSpec :boolean;
+{ Result:=boFindSpec;
+
+}
+//******************************************************************************
+
+
+//==============================================================================
+//                               TREEFIELDS
+//******************************************************************************
+
+
+//==============================================================================
+//        ОПИСАНИЕ СТАНДАРТНЫХ МЕТОДОВ ИНТЕРФЕЙСА (СЕКЦИЯ 1)
+//******************************************************************************
+//------------------------------------------------------------------------------
+Function GetIName : string;
+{ Result := #(__InterfaceName__);
+}
+//------------------------------------------------------------------------------
+Function GetIHead : string;
+{ Result := 'Ведомости премирования - спецификация';
+}
+//------------------------------------------------------------------------------
+Function GetIHotKey : string;
+{ Result := #mAddCurComponentName('HotI_'+GetIName);
+}
+//------------------------------------------------------------------------------
+Function GetCurRec : comp;
+{ Result :=  GP_KPI_DOC_Sp.NRec;
+}
+//******************************************************************************
+  //------------------------------------
+  // сохранить параметры
+  //------------------------------------
+  Procedure SaveParam;
+  { //-----------------------
+    DoneMarker(Marker_Persons_A, '' );
+    DoneMarker(Marker_Post_A, '' );
+    DoneMarker(Marker_KlKatego_A, '' );
+    DoneMarker(Marker_KatPodr_A, '' );
+    //-----------------------
+    DoneMarker(Marker_Persons, '' );
+    DoneMarker(Marker_Post, '' );
+    DoneMarker(Marker_KlKatego, '' );
+    DoneMarker(Marker_KatPodr, '' );
+  } //Procedure SaveParam;
+
+  //------------------------------------
+  // восстановить параметры
+  //------------------------------------
+  Procedure ReadParam;
+  {
+    Marker_Persons  :=InitMarker('' , 8, 50, 10, True);
+    Marker_Post     :=InitMarker('' , 8, 50, 10, True);
+    Marker_KlKatego :=InitMarker('' , 8, 50, 10, True);
+    Marker_KatPodr  :=InitMarker('' , 8, 50, 10, True);
+
+    Marker_Persons_A  :=InitMarker('' , 8, 50, 10, True);
+    Marker_Post_A     :=InitMarker('' , 8, 50, 10, True);
+    Marker_KlKatego_A :=InitMarker('' , 8, 50, 10, True);
+    Marker_KatPodr_A  :=InitMarker('' , 8, 50, 10, True);
+
+  } //  Procedure ReadParam;
+
+  //------------------------------------
+  // декларация сложного фильтра
+  //------------------------------------
+  function isFilterAnCorrect(ww_nrec:comp; ww_npp:Word ): boolean; cacheable;
+  { #__UNUSED__(ww_nrec,ww_npp)
+    Result:=true;
+    if wNPP_RAISE=11
+    { if Count_Persons>1
+      { If not FoundMarker(Marker_Persons_A,tmp_kpi_Doc_Val.cPersons)
+        { Result:=false;
+          Exit;
+        }
+      }
+      if Count_Post>1
+      { If not FoundMarker(Marker_Post_A,tmp_kpi_Doc_Val.cPost)
+        { Result:=false;
+          Exit;
+        }
+      }
+      if Count_KlKatego>1
+      { If not FoundMarker(Marker_KlKatego_A,tmp_kpi_Doc_Val.cKlKatego)
+        { Result:=false;
+          Exit;
+        }
+      }
+      if Count_KatPodr>1
+      { If not FoundMarker(Marker_KatPodr_A,tmp_kpi_Doc_Val.cKatPodr)
+        { Result:=false;
+          Exit;
+        }
+      }
+
+    } // ELSE wNPP_RAISE
+    else
+    { if Count_Persons>1
+      { If not FoundMarker(Marker_Persons_A,GP_KPI_DOC_SP.cPersons)
+        { Result:=false;
+          Exit;
+        }
+      }
+      if Count_Post>1
+      { If not FoundMarker(Marker_Post_A,GP_KPI_DOC_SP.cPost)
+        { Result:=false;
+          Exit;
+        }
+      }
+      if Count_KlKatego>1
+      { If not FoundMarker(Marker_KlKatego_A,GP_KPI_DOC_SP.cKlKatego)
+        { Result:=false;
+          Exit;
+        }
+      }
+      if Count_KatPodr>1
+      { If not FoundMarker(Marker_KatPodr_A,GP_KPI_DOC_SP.cKatPodr)
+        { Result:=false;
+          Exit;
+        }
+      }
+    } //else wNPP_RAISE
+
+  }//function isFilterAnCorrect(ww_nrec:comp): boolean;
+
+    //-------------------------------------------
+  // скопировать фильтры в данные для отборв
+  //-------------------------------------------
+  Procedure CopyToA;
+  { CopyMarker(Marker_Persons_A ,Marker_Persons);
+    CopyMarker(Marker_Post_A    ,Marker_Post);
+    CopyMarker(Marker_KlKatego_A,Marker_KlKatego);
+    CopyMarker(Marker_KatPodr_A ,Marker_KatPodr);
+  } //Procedure CopyToA;
+
+  //-------------------------------------------
+  // восстановить данные для задания фильтрации
+  // из данных для отбора
+  //-------------------------------------------
+  Procedure RestFromA;
+  { CopyMarker(Marker_Persons ,Marker_Persons_A );
+    CopyMarker(Marker_Post    ,Marker_Post_A    );
+    CopyMarker(Marker_KlKatego,Marker_KlKatego_A);
+    CopyMarker(Marker_KatPodr ,Marker_KatPodr_A);
+  } //Procedure RestFromA;
+
+  //-------------------------------------------
+  #doc
+    Установить ограничения
+  #end
+  Function SetFilterBounds(_IsArch:word) : boolean;
+  var wNeed_Filt:word;
+  { #__UNUSED__(_IsArch)
+    Result:=false;
+    isFilterRun:=True;
+    wNeed_Filt:=0;
+    //-----------------------
+    CopyToA;
+    //-----------------------
+    ClearFuncCache; // очистим кэш функций
+    var need_FilterAn:boolean=false;
+    //-------------------------------
+
+    Count_Persons:=GetMarkerCount(Marker_Persons);
+    GetMarker(Marker_Persons,0,pFlt_Persons);
+    if Count_Persons>0
+    { BitOnW(wNeed_Filt,if(wNPP_Raise=11,2,1));
+      if Count_Persons=1   BitOnW(wNeed_Filt,if(wNPP_Raise=11,4,3))
+      else                 need_FilterAn:=true;
+    }
+    //---------------------
+    Count_Post:=GetMarkerCount(Marker_Post);
+    GetMarker(Marker_Post,0,pFlt_Post);
+    if Count_Post>0
+    { if Count_Post=1 BitOnW(wNeed_Filt,if(wNPP_Raise=11,6,5))
+      else            need_FilterAn:=true;
+    }
+    //---------------------
+    Count_KlKatego:=GetMarkerCount(Marker_KlKatego);
+    GetMarker(Marker_KlKatego,0,pFlt_KlKatego);
+    if Count_KlKatego>0
+    { if Count_KlKatego=1   BitOnW(wNeed_Filt,if(wNPP_Raise=11,8,7))
+      else                  need_FilterAn:=true;
+    }
+    //---------------------
+    Count_KatPodr:=GetMarkerCount(Marker_KatPodr);
+    GetMarker(Marker_KatPodr,0,pFlt_KatPodr);
+    if Count_KatPodr>0
+    { if Count_KatPodr=1   BitOnW(wNeed_Filt,if(wNPP_Raise=11,10,9))
+      else                 need_FilterAn:=true;
+    }
+    //----------------------------------
+    if need_FilterAn
+    { BitOnW(wNeed_Filt,if(wNPP_Raise=11,2,1));
+    }
+    if IsbitCtW(wNeed_Filt,1)
+    { if not ConditionActiveInLeave(tcFilterAn, #GP_KPI_DOC_SP)
+      { PushConditionForLeave(tcFilterAn, #GP_KPI_DOC_SP);
+      }
+    }
+    else
+    { if ConditionActiveInLeave(tcFilterAn, #GP_KPI_DOC_SP)
+      { PopConditionForLeave(tcFilterAn, #GP_KPI_DOC_SP);
+      }
+    }
+    if IsbitCtW(wNeed_Filt,2)
+    { if not ConditionActiveInLeave(tcFilterAn11, #tmp_kpi_Doc_Val)
+      { PushConditionForLeave(tcFilterAn11,    #tmp_kpi_Doc_Val);
+      }
+    }
+    else
+    { if ConditionActiveInLeave(tcFilterAn11, #tmp_kpi_Doc_Val)
+      { PopConditionForLeave(tcFilterAn11,    #tmp_kpi_Doc_Val);
+      }
+    }
+    //------------------
+    if IsbitCtW(wNeed_Filt,3)
+    { If not BoundActive(tbByfltPersons  ) AddBounds(tbByfltPersons );
+    }
+    else
+    { If BoundActive(tbByfltPersons  ) SubBounds(tbByfltPersons );
+    }
+    if IsbitCtW(wNeed_Filt,4)
+    { If BoundActive(tbByfltPersons11  ) AddBounds(tbByfltPersons11 );
+    }
+    else
+    { If BoundActive(tbByfltPersons11  ) SubBounds(tbByfltPersons11 );
+    }
+    //------------------
+    if IsbitCtW(wNeed_Filt,5)
+    { If not BoundActive(tbByfltPost  ) AddBounds(tbByfltPost );
+    }
+    else
+    { If BoundActive(tbByfltPost  ) SubBounds(tbByfltPost );
+    }
+    if IsbitCtW(wNeed_Filt,6)
+    { If BoundActive(tbByfltPost11  ) AddBounds(tbByfltPost11 );
+    }
+    else
+    { If BoundActive(tbByfltPost11  ) SubBounds(tbByfltPost11 );
+    }
+    //------------------
+    if IsbitCtW(wNeed_Filt,7)
+    { If not BoundActive(tbByfltKlKatego  ) AddBounds(tbByfltKlKatego );
+    }
+    else
+    { If BoundActive(tbByfltKlKatego     ) SubBounds(tbByfltKlKatego );
+    }
+    if IsbitCtW(wNeed_Filt,8)
+    { If BoundActive(tbByfltKlKatego11  ) AddBounds(tbByfltKlKatego11 );
+    }
+    else
+    { If BoundActive(tbByfltKlKatego11  ) SubBounds(tbByfltKlKatego11 );
+    }
+    //------------------
+    if IsbitCtW(wNeed_Filt,9)
+    { If not BoundActive(tbByfltKatPodr ) AddBounds(tbByfltKatPodr  );
+    }
+    else
+    { If BoundActive(tbByfltKatPodr      ) SubBounds(tbByfltKatPodr  );
+    }
+    if IsbitCtW(wNeed_Filt,10)
+    { If BoundActive(tbByfltKatPodr11  ) AddBounds(tbByfltKatPodr11 );
+    }
+    else
+    { If BoundActive(tbByfltKatPodr11  ) SubBounds(tbByfltKatPodr11 );
+    }
+    //------------------
+    if wNPP_Raise=11
+    { ReReadRecord(#tmp_kpi_Doc_Val);
+    }
+    else
+    { ReReadRecord(#GP_KPI_Doc_SP);
+    }
+    Result:=true;
+    isFilterRun:=False;
+
+  } //Function SetFilterBounds : boolean;
+
+  //---------------------------------------
+  // Установка наименований фильтров
+  //---------------------------------------
+  Procedure SetFilterNM(_Field:longint=0);
+  { if _Field=0 or _Field=#Filtr_Persons
+    { #mrkfiltr_(Persons_Flt,Persons,Nrec,wc_nrec,Persons_Flt.Fio)
+    }
+    if _Field=0 or _Field=#Filtr_Post
+    { #mrkfiltr_(Catalogs_Flt,Post,Nrec,wc_nrec,Catalogs_Flt.Name)
+    }
+    if _Field=0 or _Field=#Filtr_KlKatego
+    { #mrkfiltr_(KlKatego_Flt,KlKatego,Nrec,wc_nrec,KlKatego_Flt.Kod)
+    }
+    if _Field=0 or _Field=#Filtr_KatPodr
+    { #mrkfiltr_(KatPodr_Flt,KatPodr,Nrec,wc_nrec,KatPodr_Flt.Kod)
+    }
+    ReScanPanel(#Catalogs_Flt);
+  } //Procedure SetFilterNM(_Field:longint)
+
+
+
+
+//-------------------------------------------------
+// Получить значения фильтров
+//-------------------------------------------------
+Function GetFilterName(_Field:Longint) :boolean;
+var pTopRec  : comp;
+var hStrFilter:tptr;
+{ delete all tmp_flt_field;
+  Result:=False;
+  timelog('GP_KPI_Doc_RaiseEdit_Sp->GetFilterName');
+
+  Marker_Tmp  :=InitMarker('' , 8, 50, 10, True);
+  pTopRec:=cTopRec;
+  var Q: IQuery;
+  hStrFilter:=0;
+  if (QuickChoiceName <> '')  QuickChoiceName := 'qcByName';
+
+  _Try
+  { case _Field of
+    #Filtr_Persons:
+    { CopyMarker(Marker_tmp,Marker_Persons);
+      timelog('GP_KPI_Doc_RaiseEdit_Sp->GetFilterName #Filtr_Persons');
+      /*
+      sql
+      select distinct Persons.Nrec as NRec, Persons.Fio as sName, Persons.StrTabn as sCode
+      from  GP_KPI_Doc_SP
+      left outer join Persons on Persons.Nrec = GP_KPI_Doc_SP.cPersons
+      where :(pTopRec)=GP_KPI_Doc_SP.cGP_KPI_Doc
+      into tmp_flt_field;
+      */
+      Q:=queryManager.createQuery(SQLQuery(
+       select distinct Persons.Nrec as NRec, Persons.Fio as sName, Persons.StrTabn as sCode
+       from  GP_KPI_Doc_SP
+       left outer join Persons on Persons.Nrec = GP_KPI_Doc_SP.cPersons
+       where :(pTopRec)=GP_KPI_Doc_SP.cGP_KPI_Doc
+            %Filter
+      ));
+    }
+    #Filtr_Post:
+    { CopyMarker(Marker_tmp,Marker_Post);
+      timelog('GP_KPI_Doc_RaiseEdit_Sp->GetFilterName #Filtr_Post');
+      Q:=queryManager.createQuery(SQLQuery(
+      select distinct Catalogs.Nrec as NRec,catalogs.name as sName, Catalogs.Code as sCode
+      from  GP_KPI_Doc_SP
+      left outer join Catalogs on Catalogs.Nrec = GP_KPI_Doc_SP.cPost
+      where :(pTopRec)=GP_KPI_Doc_SP.cGP_KPI_Doc
+            %Filter
+      ));
+    }
+    #Filtr_KlKatego:
+    { CopyMarker(Marker_tmp,Marker_KlKatego);
+      timelog('GP_KPI_Doc_RaiseEdit_Sp->GetFilterName #Filtr_KlKatego');
+      if (QuickChoiceName <> '')  QuickChoiceName := 'qcByCode';
+
+      Q:=queryManager.createQuery(SQLQuery(
+      select distinct KlKatego.Nrec as NRec,KlKatego.NAIKAT as sName, Cast(KlKatego.Kod as String) as sCode
+      from  GP_KPI_Doc_SP
+      left outer join KlKatego on KlKatego.Nrec = GP_KPI_Doc_SP.cKlKatego
+      where :(pTopRec)=GP_KPI_Doc_SP.cGP_KPI_Doc
+            %Filter
+      ));
+      if (QuickChoiceName <> '')  QuickChoiceName := 'qcByCode';
+    }
+    #Filtr_KatPodr:
+    { CopyMarker(Marker_tmp,Marker_KatPodr);
+      timelog('GP_KPI_Doc_RaiseEdit_Sp->GetFilterName #Filtr_KlKatego');
+      Q:=queryManager.createQuery(SQLQuery(
+      select distinct KatPodr.Nrec as NRec,KatPodr.Name as sName, KatPodr.Kod as sCode
+      from  GP_KPI_Doc_SP
+      left outer join KatPodr on KatPodr.Nrec = GP_KPI_Doc_SP.cKatPodr
+      where :(pTopRec)=GP_KPI_Doc_SP.cGP_KPI_Doc
+            %Filter
+      ));
+      if (QuickChoiceName <> '')  QuickChoiceName := 'qcByCode';
+    }
+    end;
+    if Count_Persons>0 and _Field<>#Filtr_Persons
+      sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker('and GP_KPI_Doc_SP.cPersons',Marker_Persons));
+    if Count_Post>0 and _Field<>#Filtr_Post
+      sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker('and GP_KPI_Doc_SP.cPost',Marker_Post));
+    if Count_KlKatego>0 and _Field<>#Filtr_KlKatego
+      sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker('and GP_KPI_Doc_SP.cKlKatego',Marker_KlKatego));
+    if Count_KatPodr>0 and _Field<>#Filtr_KatPodr
+      sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker('and GP_KPI_Doc_SP.cKatPodr',Marker_KatPodr));
+    if (hStrFilter<>0) {
+      Q.setMacro('Filter',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+
+    if (Q.Execute.ErrorCode<>0)
+       message('Ошибка выполнения DSQL запроса при отборе значений ('+string(Q.ErrorCode)+').',error)
+     else
+       sqlCopyInto(Q.getResultSet,TNtmp_flt_field,true);
+
+
+  }
+  _Except
+  else
+  { timelog('Ошибка выборки! '+ExploreException);
+  }
+  timelog('GP_KPI_Doc_RaiseEdit_Sp->GetFilterName выбрали '+RecordsInTable(tntmp_flt_field));
+   var _cgi:word;
+  _cgi:=if(QuickChoiceName <> '',cgiPick,cgiPickMult);
+  if QuickChoiceName <> ''
+  { ClearMarker(Marker_tmp);
+  }
+  if RunInterface(GP_Field_Flt,_cgi,comp(0),Marker_tmp,'Код','Наименование')<>cmCancel
+  { Result:=true;
+    case _Field of
+    #Filtr_Persons : CopyMarker(Marker_Persons,Marker_tmp);
+    #Filtr_Post    : CopyMarker(Marker_Post,Marker_tmp);
+    #Filtr_KlKatego: CopyMarker(Marker_KlKatego,Marker_tmp);
+    #Filtr_KatPodr : CopyMarker(Marker_KatPodr ,Marker_tmp);
+    end;
+    SetFilterNm(_Field );
+    SetFilterBounds(0);
+  }
+} //Function GetFilterName
+
+
+//------------------------------------------------
+// Получить значение аналитики
+//------------------------------------------------
+Function GetAnaliticName(_KodGroup:word;_cKau:comp):string; Cacheable;
+{ Result:='';
+  if _KodGroup>10000
+  { vSpkau.pSpKau:=_cKau;
+    if vSpKau.getfirst spkau=tsok
+      Result:=vSpKau.Spkau.name;
+  }
+  else
+  { Result:=#ShowKau(_KodGroup,_cKau);
+  }
+} //Function GetAnaliticName(_KodGroup:word;_cKau:comp):string; Cacheable;
+
+
+
+//-------------------------------------------------
+// Получить первую позицию спецификации
+//-------------------------------------------------
+Function GetFirstSP:boolean;
+{ Result:=false;
+  if wNPP_RAISE=11
+    Result:=GetFirst tmp_Kpi_Doc_Val=tsok
+  else
+    Result:=GetFirst GP_Kpi_Doc_Sp=tsok;
+  timelog('GP_KPI_Doc_RaiseEdit_Sp->GetFirstSP='+string(result));
+}//Function GetFirstSP:boolean;
+
+//-------------------------------------------------
+// Получить следующую позицию спецификации
+//-------------------------------------------------
+Function GetNextSP:boolean;
+{
+  Result:=false;
+  if wNPP_RAISE=11
+    Result:=GetNext tmp_Kpi_Doc_Val=tsok
+  else
+    Result:=GetNext GP_Kpi_Doc_Sp=tsok;
+  timelog('GP_KPI_Doc_RaiseEdit_Sp->GetNextSP='+string(result));
+}//Function GetNextSP:boolean;
+
+//-------------------------------------------------
+// Установить раздел
+//-------------------------------------------------
+Function SetRazdel(nRazdel:word): boolean;
+{ Result:=false;
+  if GetFirst tmp_KPI_RAISE_F where (( nRazdel == tmp_KPI_RAISE_F.NPP ))<>tsok Exit;
+  onSetTabbedShiits(nRazdel);
+  Result:=true;
+  timelog('GP_KPI_Doc_RaiseEdit_Sp->SetRazdel='+string(result));
+}//Function SetRazdel(nRazdel:word): boolean;
+
+//-------------------------------------------------
+#doc
+ Получить раздел
+#end
+Function GetRazdel: word;
+{ Result:=wNPP_RAISE;
+}//Function SetRazdel(nRazdel:word): boolean;
+
+//-------------------------------------------------
+//получить наименование раздела
+//-------------------------------------------------
+Function GetRazdelName:string;
+{ Result:='';
+  Result:=tmp_KPI_RAISE.Name;
+  timelog('GP_KPI_Doc_RaiseEdit_Sp->GetRazdelName='+string(result));
+
+} //Function GetRazdelName:string;
+
+//-------------------------------------------------
+//Получить наименование поля
+//-------------------------------------------------
+Function GetFieldTitle(wNpp:word):string;
+{ Result:='';
+  if not isBitCTW(tmp_KPI_RAISE.fArrOpt[wNpp],3)
+    Result:=tmp_KPI_RAISE.fArrName[wNpp];
+}//Function GetFieldTitle(wNpp:word):string;
+
+//-------------------------------------------------
+#doc
+Получить наименование поля
+#end
+Function GetFieldParam(wNpp:word;_Param:word):word;
+{ Result:=0;
+  if wNpp<1 or wNpp>GP_KPI_Doc_Max_FLD_SP exit;
+  case _Param of
+  1: Result:=tmp_KPI_RAISE.fArrOpt [wNpp];
+  2: Result:=tmp_KPI_RAISE.fArrLen [wNpp];
+  3: Result:=tmp_KPI_RAISE.fArrRazr[wNpp];
+  4: Result:=tmp_KPI_RAISE.fArrIT  [wNpp];
+  5: Result:=tmp_KPI_RAISE.fRazdel [wNpp];
+  6: Result:=tmp_KPI_RAISE.fSub    [wNpp];
+  //--- колонки в отчетах
+  101: Result:=tmp_KPI_RAISE.fRep01[wNpp];
+  102: Result:=tmp_KPI_RAISE.fRep02[wNpp];
+  end;
+
+}
+//-------------------------------------------------
+// Получить наименование строки
+//-------------------------------------------------
+Function GetNameSP:string;
+{ Result:='';
+  if wNpp_Raise=11
+    Result:=tmp_kpi_Doc_Val.Fio+', '+TabnBr+', подр.'+Katpodr_Sp_IT.Kod;
+  else
+    Result:=GP_kpi_Doc_SP.Fio+', '+TabnBr+', подр.'+Katpodr_Sp_M.Kod;
+}//Function GetNameSP:string;
+
+
+//==============================================================================
+//                                 PRIVATE
+//******************************************************************************
+#declare  GP_KPI_DOC_Link_Fields (wNpp)
+    Left outer Join GP_KPI_Fields GP_KPI_Fields#(wNpp)
+                  on  GP_KPI_Fields#(wNpp).wType= 0
+                  and GP_KPI_Fields#(wNpp).cDoc = GP_KPI_DOC_SP.cGP_KPI_RAISE
+                  and GP_KPI_Fields#(wNpp).Npp_It  = #(wNpp)
+#end
+#declare  GP_KPI_DOC_SP_Nrec (wNpp)
+//ограничение на вручную редактируемые поля - поле может быть только на одной закладке!
+  , Max(CASE WHEN COALESCE(GP_KPI_Fields#(wNpp).Npp_It,0)=0 THEN #comp(0)
+     ELSE GP_KPI_DOC_SP.Nrec END) as cGP_KPI_DOC_SP_#(wNpp)
+#end
+#declare  GP_KPI_DOC_SP_Value (wNpp)
+  , Max(CASE WHEN COALESCE(GP_KPI_Fields#(wNpp).Npp_It,0)=0 THEN ''''
+     ELSE CASE  GP_KPI_Fields#(wNpp).Npp
+       WHEN 01 THEN GP_KPI_Doc_SP.FARRVALUE[01]
+       WHEN 02 THEN GP_KPI_Doc_SP.FARRVALUE[02]
+       WHEN 03 THEN GP_KPI_Doc_SP.FARRVALUE[03]
+       WHEN 04 THEN GP_KPI_Doc_SP.FARRVALUE[04]
+       WHEN 05 THEN GP_KPI_Doc_SP.FARRVALUE[05]
+       WHEN 06 THEN GP_KPI_Doc_SP.FARRVALUE[06]
+       WHEN 07 THEN GP_KPI_Doc_SP.FARRVALUE[07]
+       WHEN 08 THEN GP_KPI_Doc_SP.FARRVALUE[08]
+       WHEN 09 THEN GP_KPI_Doc_SP.FARRVALUE[09]
+       WHEN 10 THEN GP_KPI_Doc_SP.FARRVALUE[10]
+       WHEN 11 THEN GP_KPI_Doc_SP.FARRVALUE[11]
+       WHEN 12 THEN GP_KPI_Doc_SP.FARRVALUE[12]
+       WHEN 13 THEN GP_KPI_Doc_SP.FARRVALUE[13]
+       WHEN 14 THEN GP_KPI_Doc_SP.FARRVALUE[14]
+       WHEN 15 THEN GP_KPI_Doc_SP.FARRVALUE[15]
+       WHEN 16 THEN GP_KPI_Doc_SP.FARRVALUE[16]
+       WHEN 17 THEN GP_KPI_Doc_SP.FARRVALUE[17]
+       WHEN 18 THEN GP_KPI_Doc_SP.FARRVALUE[18]
+       WHEN 19 THEN GP_KPI_Doc_SP.FARRVALUE[19]
+       WHEN 20 THEN GP_KPI_Doc_SP.FARRVALUE[20]
+       END
+    END)  as Val_#(wNpp)
+#end
+//******************************************************************************
+  SQL QUERY SqlTmp_VAL =
+    SELECT DISTINCT
+       #Comp(0) as Nrec //Nrec
+      ,GP_KPI_DOC.Nrec as cGP_KPI_DOC //cGP_KPI_DOC
+      ,GP_KPI_DOC.wType as wType //wType
+      ,Max(GP_KPI_DOC_SP.Tabn) as Tabn  //Tabn     :longint
+      ,Max(GP_KPI_DOC_SP.StrTabn) as StrTabn //StrTabn  :string[20]
+      ,Max(GP_KPI_DOC_SP.cKatPodr) as cKatPodr //cKatPodr
+      ,GP_KPI_DOC_SP.cLschet  as cLschet //cLschet  :comp
+      ,Max(GP_KPI_DOC_SP.cKlKatego) as cKlKatego//cKlKatego
+      ,Max(GP_KPI_DOC_SP.cPost)  as cPost //cPost
+      ,Max(GP_KPI_DOC_SP.cPersons)  as cPersons //cPersons
+      ,Max(GP_KPI_DOC_SP.Fio) as Fio //Fio
+      ,Max(GP_KPI_DOC_SP.Nrec) as cGP_KPI_DOC_SP_00
+      #GP_KPI_DOC_SP_Nrec(01)
+      #GP_KPI_DOC_SP_Nrec(02)
+      #GP_KPI_DOC_SP_Nrec(03)
+      #GP_KPI_DOC_SP_Nrec(04)
+      #GP_KPI_DOC_SP_Nrec(05)
+      #GP_KPI_DOC_SP_Nrec(06)
+      #GP_KPI_DOC_SP_Nrec(07)
+      #GP_KPI_DOC_SP_Nrec(08)
+      #GP_KPI_DOC_SP_Nrec(09)
+      #GP_KPI_DOC_SP_Nrec(10)
+      #GP_KPI_DOC_SP_Nrec(11)
+      #GP_KPI_DOC_SP_Nrec(12)
+      #GP_KPI_DOC_SP_Nrec(13)
+      #GP_KPI_DOC_SP_Nrec(14)
+      #GP_KPI_DOC_SP_Nrec(15)
+      #GP_KPI_DOC_SP_Nrec(16)
+      #GP_KPI_DOC_SP_Nrec(17)
+      #GP_KPI_DOC_SP_Nrec(18)
+      #GP_KPI_DOC_SP_Nrec(19)
+      #GP_KPI_DOC_SP_Nrec(20)
+      //----------
+      #GP_KPI_DOC_SP_VAlUE(01)
+      #GP_KPI_DOC_SP_VAlUE(02)
+      #GP_KPI_DOC_SP_VAlUE(03)
+      #GP_KPI_DOC_SP_VAlUE(04)
+      #GP_KPI_DOC_SP_VAlUE(05)
+      #GP_KPI_DOC_SP_VAlUE(06)
+      #GP_KPI_DOC_SP_VAlUE(07)
+      #GP_KPI_DOC_SP_VAlUE(08)
+      #GP_KPI_DOC_SP_VAlUE(09)
+      #GP_KPI_DOC_SP_VAlUE(10)
+      #GP_KPI_DOC_SP_VAlUE(11)
+      #GP_KPI_DOC_SP_VAlUE(12)
+      #GP_KPI_DOC_SP_VAlUE(13)
+      #GP_KPI_DOC_SP_VAlUE(14)
+      #GP_KPI_DOC_SP_VAlUE(15)
+      #GP_KPI_DOC_SP_VAlUE(16)
+      #GP_KPI_DOC_SP_VAlUE(17)
+      #GP_KPI_DOC_SP_VAlUE(18)
+      #GP_KPI_DOC_SP_VAlUE(19)
+      #GP_KPI_DOC_SP_VAlUE(20)
+
+   From GP_KPI_DOC
+    Inner join GP_KPI_DOC_SP on GP_KPI_DOC_SP.cGp_KPI_Doc = GP_KPI_DOC.Nrec
+                    and GP_KPI_DOC_SP.cGP_KPI_RAISE>#Comp(0)
+    //Left Outer Join Lschet on Lschet.Nrec = GP_KPI_DOC_SP.cLschet
+    //Left Outer Join Persons on Persons.Nrec = GP_KPI_DOC_SP.cPersons
+    Inner join GP_KPI_RAISE on GP_KPI_RAISE.Nrec = GP_KPI_DOC_SP.cGP_KPI_RAISE
+    #GP_KPI_DOC_Link_Fields(01)
+    #GP_KPI_DOC_Link_Fields(02)
+    #GP_KPI_DOC_Link_Fields(03)
+    #GP_KPI_DOC_Link_Fields(04)
+    #GP_KPI_DOC_Link_Fields(05)
+    #GP_KPI_DOC_Link_Fields(06)
+    #GP_KPI_DOC_Link_Fields(07)
+    #GP_KPI_DOC_Link_Fields(08)
+    #GP_KPI_DOC_Link_Fields(09)
+    #GP_KPI_DOC_Link_Fields(10)
+    #GP_KPI_DOC_Link_Fields(11)
+    #GP_KPI_DOC_Link_Fields(12)
+    #GP_KPI_DOC_Link_Fields(13)
+    #GP_KPI_DOC_Link_Fields(14)
+    #GP_KPI_DOC_Link_Fields(15)
+    #GP_KPI_DOC_Link_Fields(16)
+    #GP_KPI_DOC_Link_Fields(17)
+    #GP_KPI_DOC_Link_Fields(18)
+    #GP_KPI_DOC_Link_Fields(19)
+    #GP_KPI_DOC_Link_Fields(20)
+    Where (:PDoc = GP_KPI_DOC.Nrec )
+    Group by
+       GP_KPI_DOC.Nrec
+      ,GP_KPI_DOC.wType
+      ,GP_KPI_DOC_SP.cLschet
+      //Иначе не две записи
+      ,GP_KPI_DOC_SP.cKatPodr
+      ,GP_KPI_DOC_SP.cPost
+   ;
+  //**************************************************
+  SQL QUERY SqlTmp_VAL102 =
+    SELECT DISTINCT
+       GP_KPI_DOC_SP.Nrec      as Nrec //Nrec
+      ,GP_KPI_DOC.Nrec         as cGP_KPI_DOC //cGP_KPI_DOC
+      ,GP_KPI_DOC.wType        as wType //wType
+      ,GP_KPI_DOC_SP.Tabn      as Tabn  //Tabn     :longint
+      ,GP_KPI_DOC_SP.StrTabn   as StrTabn //StrTabn  :string[20]
+      ,GP_KPI_DOC_SP.cKatPodr  as cKatPodr //cKatPodr
+      ,GP_KPI_DOC_SP.cLschet   as cLschet //cLschet  :comp
+      ,GP_KPI_DOC_SP.cKlKatego as cKlKatego//cKlKatego
+      ,GP_KPI_DOC_SP.cPost     as cPost //cPost
+      ,GP_KPI_DOC_SP.cPersons  as cPersons //cPersons
+      ,GP_KPI_DOC_SP.Fio  as Fio //Fio
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_00
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_01
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_02
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_03
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_04
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_05
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_06
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_07
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_08
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_09
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_10
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_11
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_12
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_13
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_14
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_15
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_16
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_17
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_18
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_19
+      ,GP_KPI_DOC_SP.Nrec as cGP_KPI_DOC_SP_20
+      //----------
+      ,GP_KPI_Doc_SP.FARRVALUE[01]
+      ,GP_KPI_Doc_SP.FARRVALUE[02]
+      ,GP_KPI_Doc_SP.FARRVALUE[03]
+      ,GP_KPI_Doc_SP.FARRVALUE[04]
+      ,GP_KPI_Doc_SP.FARRVALUE[05]
+      ,GP_KPI_Doc_SP.FARRVALUE[06]
+      ,GP_KPI_Doc_SP.FARRVALUE[07]
+      ,GP_KPI_Doc_SP.FARRVALUE[08]
+      ,GP_KPI_Doc_SP.FARRVALUE[09]
+      ,GP_KPI_Doc_SP.FARRVALUE[10]
+      ,GP_KPI_Doc_SP.FARRVALUE[11]
+      ,GP_KPI_Doc_SP.FARRVALUE[12]
+      ,GP_KPI_Doc_SP.FARRVALUE[13]
+      ,GP_KPI_Doc_SP.FARRVALUE[14]
+      ,GP_KPI_Doc_SP.FARRVALUE[15]
+      ,GP_KPI_Doc_SP.FARRVALUE[16]
+      ,GP_KPI_Doc_SP.FARRVALUE[17]
+      ,GP_KPI_Doc_SP.FARRVALUE[18]
+      ,GP_KPI_Doc_SP.FARRVALUE[19]
+      ,GP_KPI_Doc_SP.FARRVALUE[20]
+   From GP_KPI_DOC
+    Inner join GP_KPI_DOC_SP on GP_KPI_DOC_SP.cGp_KPI_Doc = GP_KPI_DOC.Nrec
+                    and GP_KPI_DOC_SP.cGP_KPI_RAISE=#Comp(0)
+    Where (:PDoc = GP_KPI_DOC.Nrec )
+   ;
+
+Function Fill_Tmp_Val:boolean;
+var ii:word;
+{ Result:=false;
+  delete all tmp_kpi_Doc_Val;
+  var stmt : tptr;
+  var ExecuteErrorCode : longint=0;
+  var _Pdoc :comp;
+  _Pdoc:=Gp_KPI_DOC.Nrec;
+  //-- наполним
+  //StartNewVisual(vtNumericVisual, vfTimer+ vfThread , 'Расчет итогов', 0);
+  StartNewVisual(vtNumericVisual, vfTimer , 'Расчет итогов', 0);
+  _Try
+  { stmt :=0;
+    stmt := sqlAllocStmt;
+    if Gp_KPI_DOC.wType=102 or Gp_KPI_DOC.wType=103
+    { ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_Val102);
+    }
+    else
+    { ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_Val);
+    }
+    Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_Val:ExecuteErrorCode 001='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'PDoc',   comp(_pDoc));
+      ExecuteErrorCode:=SqlExecute(stmt);
+      Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_Val:ExecuteErrorCode 004='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#TMP_KPI_DOC_VAL);
+          Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_Val:ExecuteErrorCode 005='+string(ExecuteErrorCode)
+              +', отобрали '+String(RecordsInTable(#TMP_KPI_DOC_VAL)));
+      }
+    }
+    //ExecuteErrorCode := q.Execute.ErrorCode;
+  } // try
+  _finally
+  {
+     if (ExecuteErrorCode <> 0)
+        Message ('Ошибка при выполнении SQL-сценария (Вставка записей в Итогм): код = ' + String(ExecuteErrorCode));
+     else
+        Result:=True;
+   } // _finally
+   NextVisual;
+   var _Nrec:comp=0;
+   //нужно будет сверить итоги по ведомости
+   var _itsu:double=0;
+   var _boItog:boolean=false;
+   _Loop fullcache tmp_Kpi_Doc_Val ordered by index tmp_val01
+   { _Nrec++;
+     tmp_Kpi_Doc_Val.Nrec:=_Nrec;
+     NextVisual;
+     update current tmp_Kpi_Doc_Val;
+     if GP_KPI_DOC.wType=101
+     { RecalcSP(0);
+       for(ii:=1;ii<=GP_KPI_Doc_Max_FLD_SP;ii++)
+       { if IsBitCTW(TMP_KPI_Raise.fArrOpt[ii],2)
+         { _itsu:=_itsu+Double('0'+tmp_Kpi_Doc_Val.Val[ii]);
+           _boItog:=true;
+         }
+       }
+
+     } //if GP_KPI_Type_DOC.wType=101
+     else
+     { if getfirst GP_KPI_DOC_SP_0=tsok
+       { for(ii:=1;ii<=GP_KPI_Doc_Max_FLD_SP;ii++)
+         { tmp_Kpi_Doc_Val.Val[ii]:=GP_KPI_DOC_SP_0.FARRVALUE[ii];
+         }
+         update current tmp_Kpi_Doc_Val;
+       }
+     } //if GP_KPI_Type_DOC.wType=101
+     update current tmp_Kpi_Doc_Val;
+  } //_Loop fullcache tmp_Kpi_Doc_Val ordered by index tmp_val01
+  NextVisual;
+  //PushBounds(tbbyItog);
+
+  //PushBounds(tbbyItogLschet);
+  /*
+  PushBounds(tbbyItogKatpodr_SP);
+  PushBounds(tbbyItogKlKatego);
+  PushBounds(tbbyItogPost);
+  */
+  NextVisual;
+  StopVisual('',0);
+  if VisualizationActive
+    StopVisual('',0);
+  Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_Val:FINISH');
+  //проверим итоговую сумму по ведомости
+  if _boItog
+  if not boNoVisual //только в визуальном режиме.
+  { if abs(GP_KPI_DOC.Summa-_itSu)>0.005
+    /* Попросили без сообщения
+    if message('Сумма в шапке ведомости '+string(GP_KPI_DOC.Summa,0,2)
+     +chr(13) +'не соотв. сумме по спецификации '+string(_itSu,0,2)
+     +chr(13)+' Исправим сумму в шапке?',YesNo )=cmYes
+    */
+    { update current GP_KPI_DOC set GP_KPI_DOC.Summa:=_itSu;
+      Event_ReReadContainer;
+    }
+  } //_boItog
+} //Procedure Fill_Tmp_Val;
+
+//------------------------------------------------------------------------------
+Procedure onSetTabbedShiits(_wNPP_RAISE:word);
+var jj:word;
+{
+  Timelog('GP_KPI_Doc_RaiseEdit_Sp->onSetTabbedShiits:_wNPP_RAISE='+string(_wNPP_RAISE)+', cTopRec='+string(cTopRec));
+
+  pLschet_Cur:=0;
+  pLschet_Cur:=GP_KPI_DOC_SP.cLschet;
+  wNPP_RAISE_Prev:=wNpp_Raise;
+  set wNpp_Raise:=_wNPP_RAISE;
+  if getfirst TMP_KPI_Raise=tsok {}
+  ReReadRecord(#GP_KPI_DOC_SP);
+  for(jj:=1;jj<=GP_KPI_Doc_Max_FLD_SP;jj++)
+  { sArrFieldSpMask[jj]:='';
+    case TMP_KPI_Raise.fArrType[jj] of
+    2: sArrFieldSpMask[jj]:='99/99/9999';
+    3: sArrFieldSpMask[jj]:='99:99';
+    end;
+  } //for(jj:=1;jj<=GP_KPI_Doc_Max_FLD_SP;jj++)
+  //надо обновить
+  if wNpp_Raise=11
+  { Fill_Tmp_Val;
+    Timelog('GP_KPI_Doc_RaiseEdit_Sp->onSetTabbedShiits:After Fill_Tmp_Val');
+
+    if pLschet_Cur>0
+    { if getfirst tmp_Kpi_Doc_Val
+         where (( pLschet_Cur == tmp_Kpi_Doc_Val.cLschet ))<>tsok
+      { if GetFirst tmp_Kpi_Doc_Val=tsok {}
+      }
+    }
+    Timelog('GP_KPI_Doc_RaiseEdit_Sp->onSetTabbedShiits:end if wNpp_Raise=11 '+', cTopRec='+string(cTopRec));
+    ReScanPanel(#tmp_Kpi_Doc_Val);
+  } //if TMP_KPI_Raise.wNPP=11
+  else
+  { if wNpp_Raise_Prev=11
+    { PushBounds(tnGP_KPI_DOC_SP);
+      //PushBounds(tnLschet);
+      //PushBounds(tnKatpodr_SP);
+      //PushBounds(tnPersons);
+      //PushBounds(tnKlKatego);
+      //PushBounds(tnCatPost);
+    }
+    if pLschet_Cur>0
+    { if getfirst GP_KPI_DOC_SP
+         where (( cTopRec     == GP_KPI_DOC_SP.cGP_KPI_DOC
+        and tmp_KPI_RAISE.cGP_KPI_Raise == GP_KPI_DOC_SP.cGP_KPI_RAISE
+        and pLschet_Cur == GP_KPI_DOC_SP.cLschet(noindex) ))<>tsok
+      { if GetFirst GP_KPI_DOC_SP=tsok {}
+      }
+    }
+    ReScanPanel(#GP_KPI_DOC_SP);
+  } //else if TMP_KPI_Raise.wNPP=11
+  SetFilterBounds(0);
+} //Procedure onSetTabbedShiits;
+
+//******************************************************************************
+  SQL QUERY SqlTmp_KPI_Raise =
+    SELECT DISTINCT
+      0 as NPP
+      , GP_KPI_RAISE.nrec AS cGp_KPI_RAISE
+      , GP_KPI_RAISE.Name as NAME
+      , GP_KPI_RAISE.code as Code
+      , GP_KPI_RAISE.cDoplata as cDoplata
+    From GP_KPI_DOC
+    Inner join GP_KPI_DOC_SP on GP_KPI_DOC_SP.cGp_KPI_Doc = GP_KPI_DOC.Nrec
+    Inner join GP_KPI_RAISE on GP_KPI_RAISE.Nrec = GP_KPI_DOC_SP.cGP_KPI_RAISE
+    Where (:PDoc = GP_KPI_DOC.Nrec )
+   ;
+
+
+
+//-------------------------------
+// Заполнить таблицу с типами премий и подготовить форматы
+//-------------------------------
+Function FillTmp_KPI_Raise(_pDoc:comp) :boolean;
+{ ResetBounds(#Tmp_KPI_Raise);
+  Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:_pDoc='+string(_pDoc));
+  var _Format_name :string='';
+  var _Field_name  :string='';
+  var _Field_title :string='';
+  var _Field_nameDo:string='';
+  var _boTitle3row :boolean=false;
+  var jj:word=0;
+  var _wErr:Longint;// код ошибки установки свойств
+  Delete all  Tmp_KPI_Raise;
+  var stmt:tptr;
+  var ExecuteErrorCode : longint;
+  var ww_str:string='';
+  Result:=False;
+  _try
+  {
+      // вставка в Tmp_KPI_Raise
+      stmt :=0;
+      stmt := sqlAllocStmt;
+      ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_KPI_Raise);
+      Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:ExecuteErrorCode 001='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { sqlBindParamByName(stmt,'PDoc',   comp(_pDoc));
+        ExecuteErrorCode:=SqlExecute(stmt);
+        Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:ExecuteErrorCode 004='+string(ExecuteErrorCode));
+        if ExecuteErrorCode=0
+        { ExecuteErrorCode:=SqlFetchIntoByName(stmt,#TMP_KPI_Raise);
+          Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:ExecuteErrorCode 005='+string(ExecuteErrorCode)
+              +', отобрали '+String(RecordsInTable(#TMP_KPI_Raise)));
+        }
+      }
+      //ExecuteErrorCode := q.Execute.ErrorCode;
+   } // try
+   _finally
+   {
+     if (ExecuteErrorCode <> 0)
+        Message ('Ошибка при выполнении SQL-сценария (Вставка записей в TMP_KPI_RAISe): код = ' + String(ExecuteErrorCode));
+     else
+        Result:=True;
+   } // _finally
+   // Скроем лишние закладки
+   var _wNpp :word=0;
+   var _wNpp1:word=0;
+   //константы для конфигуратора и так далее
+   //#include Wincomm.inc
+   if getfirst Gp_TypeDocs=tsok{};
+   case GP_KPI_DOC.wType of
+   101:
+   { insert into TMP_KPI_Raise set
+              TMP_KPI_Raise.NPP:=11
+             ,TMP_KPI_Raise.Name='Расчет итогов'
+             ,TMP_KPI_Raise.cGp_KPI_RAISE:=Gp_TypeDocs.Nrec;
+   }
+   102:
+   { insert into TMP_KPI_Raise set
+              TMP_KPI_Raise.NPP:=11
+             ,TMP_KPI_Raise.Name='Резерв'
+             ,TMP_KPI_Raise.cGp_KPI_RAISE:=Gp_TypeDocs.Nrec;
+   }
+   103:
+   { insert into TMP_KPI_Raise set
+              TMP_KPI_Raise.NPP:=11
+             ,TMP_KPI_Raise.Name='Резерв'
+             ,TMP_KPI_Raise.cGp_KPI_RAISE:=Gp_TypeDocs.Nrec;
+   }
+   end;
+   Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:===Формируем поля=== '+Gp_TypeDocs.Name);
+   _Loop fullcache TMP_KPI_Raise ordered by index TMP_KPI_Raise03
+   { if TMP_KPI_Raise.Npp=0
+     { _wNpp1++;
+       update current TMP_KPI_Raise set TMP_KPI_Raise.Npp:=_wNpp1;
+       _wNpp:=_wNpp1;
+
+     }
+     else
+     { _wNpp:=11;
+     }
+     _boTitle3row :=false;
+
+     MySetTabbedSheetVisible(MyGetFormatByNumTabS(_wNpp),True, string(_wNpp));
+     _Format_name:='c_BRPREMR'+LpadCh(string(_wNpp),'0',2)+'_';
+     if Timelog_Status>0
+     { Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:TMP_KPI_Raise.Npp='+string(TMP_KPI_Raise.Npp)+','+TMP_KPI_Raise.Name);
+     }
+     cfsSetProp('FGPREM'+LpadCh(string(_wNpp),'0',2),'Title',TMP_KPI_Raise.Name);
+     _Loop FullCache GP_KPI_Fields
+     { //дополнительные поля
+       if GP_KPI_Fields.NPP>0 and GP_KPI_Fields.NPP<=GP_KPI_Doc_Max_FLD_SP
+       { TMP_KPI_Raise.fArrName  [GP_KPI_Fields.NPP]:=GP_KPI_Fields.Name;
+         TMP_KPI_Raise.fArrType  [GP_KPI_Fields.NPP]:=GP_KPI_Fields.wTypeFld       ;//"Тип полей спецификации"
+         TMP_KPI_Raise.fArrKodGr [GP_KPI_Fields.NPP]:=GP_KPI_Fields.KodGroup       ;//Word_x20  "Аналитика полей спецификации"
+         TMP_KPI_Raise.fArrAlg   [GP_KPI_Fields.NPP]:=GP_KPI_Fields.cGP_KPI_Alg    ;//Word_x20  "Алгоритмы полей спецификации"
+         TMP_KPI_Raise.fArrAlgChk[GP_KPI_Fields.NPP]:=GP_KPI_Fields.cGP_KPI_Alg_Chk;//Word_x20  "Алгоритмы полей спецификации"
+         TMP_KPI_Raise.fArrOpt   [GP_KPI_Fields.NPP]:=GP_KPI_Fields.Option         ;//Word_x20  "Опции полей спецификации"
+         TMP_KPI_Raise.fArrLen   [GP_KPI_Fields.NPP]:=GP_KPI_Fields.Len            ;//Word_x20  "Ширина полей полей спецификации"
+         TMP_KPI_Raise.fArrRazr  [GP_KPI_Fields.NPP]:=GP_KPI_Fields.Razr           ;//Word_x20  "Разрядность полей полей спецификации"
+         TMP_KPI_Raise.fArrIT    [GP_KPI_Fields.NPP]:=GP_KPI_Fields.NPP_IT         ;//
+         TMP_KPI_Raise.fRazdel   [GP_KPI_Fields.NPP]:=GP_KPI_Fields.Razdel         ;// "Раздел для печати"
+         TMP_KPI_Raise.fSub      [GP_KPI_Fields.NPP]:=GP_KPI_Fields.Sub            ;// "ПП раздела для печати"
+         TMP_KPI_Raise.fRep01    [GP_KPI_Fields.NPP]:=GP_KPI_Fields.Rep_FLD_N[1]   ;// "колонка в отчете 01"
+         TMP_KPI_Raise.fRep02    [GP_KPI_Fields.NPP]:=GP_KPI_Fields.Rep_FLD_N[2]   ;// "колонка в отчете 02"
+         TMP_KPI_Raise.First_Column:=100; //просто что то нужно поставить
+         _Field_name  :=_Format_name+if(TMP_KPI_Raise.fArrType [GP_KPI_Fields.NPP]=1,'do','')
+             +'FIELDSP'+LpadCh(string(GP_KPI_Fields.NPP),'0',2)
+             +'_Поле_' +LpadCh(string(GP_KPI_Fields.NPP),'0',2);
+         //Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:_Field_name='+_Field_name);
+
+         if TMP_KPI_Raise.fArrLen  [GP_KPI_Fields.NPP]=0
+           TMP_KPI_Raise.fArrLen  [GP_KPI_Fields.NPP]:=10;
+         _Field_title:=GroupWrapStrWithNewRow(GP_KPI_Fields.Name,1
+                 ,if(TMP_KPI_Raise.fArrLen[GP_KPI_Fields.NPP]>7,TMP_KPI_Raise.fArrLen[GP_KPI_Fields.NPP]-3,10) //
+                 ,3);
+         // Добавим точку если заголовок 1 колонки 2 строки, а не 3
+         // почему то пробел не раздвигает заголовок
+         if not _boTitle3row
+         { if TMP_KPI_Raise.fArrName [GP_KPI_Fields.NPP]=''
+            or (TMP_KPI_Raise.fArrOpt  [GP_KPI_Fields.NPP] and 4)>0
+           {
+           }
+           else
+           { var _n:word=1;
+             var _s:string;
+             _n:=1;
+             if Timelog_Status>0
+             { Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:_Field_Title 1='+_Field_Title);
+             }
+             do
+             { _s:=ParseWord(_Field_title,_n, chr(13) );
+               if _s='' break;
+               if _s=' ' _Field_title:=_Field_title+' .' ;
+               _n++;
+             }
+             while true;// trim(ParseWord(_Field_title,_n, chr(13) ))<>''  _n++;
+             while _n<=3
+             { _Field_title:=_Field_title+if(_n<=3,chr(13),'')+'.  ';
+               _n++;
+             }
+             if Timelog_Status>0
+             { Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:_Field_Title 2='+_Field_Title);
+               Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:_n='+string(_n));
+             }
+             _boTitle3row:=true;
+           }
+         } //if not _boTitle3row
+         cfsSetProp(_Field_name,cfpTitle,_Field_title);
+         cfsSetProp(_Field_name,cfpHelpLine,GP_KPI_Fields.Name);
+         cfsSetProp(_Field_name,'DefaultWidth',TMP_KPI_Raise.fArrLen  [GP_KPI_Fields.NPP]);
+         if IsBitCTW(TMP_KPI_Raise.fArrOpt[GP_KPI_Fields.NPP],2) // Итоги
+         { cfsSetProp(_Field_name,cfpFontBold,True);
+           cfsSetProp(_Field_name,cfpFontBackColor,ColorSysSilver );
+         }
+         else
+         { cfsSetProp(_Field_name,cfpFontBold,false);
+           cfsSetProp(_Field_name,cfpFontBackColor,0 );
+         }
+         //cfsSetProp(_Field_name,'Point'       ,GP_KPI_Fields.Razr);
+         cfsSetProp(_Field_name,'Strings'     ,'');
+         ww_str:='';
+         //cfsSetProp(_Field_name,'TextAlign'       ,if(TMP_KPI_Raise.fArrType[GP_KPI_Fields.NPP]=1,taRight,taLeft));
+         // установить формат
+         case TMP_KPI_Raise.fArrType[GP_KPI_Fields.NPP] of
+         1:
+         { //'\3p[|-]366`666`666`666`666.888'
+           ww_str:='\'+string(TMP_KPI_Raise.fArrRazr[GP_KPI_Fields.NPP])+'p[|-]366`666`666`666`666'
+                  +if(TMP_KPI_Raise.fArrRazr[GP_KPI_Fields.NPP]<>0,'.'+PadCh('','8',TMP_KPI_Raise.fArrRazr[GP_KPI_Fields.NPP] ),'');
+         }
+         2: ww_str:='DD/MM/YYYY';
+         3: ww_str:='HH:MM:SS';
+         else ww_str:='';
+         end;
+         _wErr:=cfsSetProp(_Field_name,cfpPassiveFormat,ww_str);
+         //timelog('GP_KPI_Doc_RaiseEdit_Sp->Устанавливаем формат для поля '+GP_KPI_Fields.Name+', '+ww_str+', wErr='+string(_wErr));
+
+         if (not CanEditTbl)
+         or (TMP_KPI_Raise.fArrOpt  [GP_KPI_Fields.NPP] and 1)=0
+         { cfsSetProp(_Field_name,'Protect'          ,true);
+           cfsSetProp(_Field_name,'ButtonType'       ,0);
+         }
+         else
+         { case TMP_KPI_Raise.fArrType[GP_KPI_Fields.NPP] of
+           4,5,6,7:
+           { if (TMP_KPI_Raise.fArrOpt  [GP_KPI_Fields.NPP] and 1)>0
+             { cfsSetProp(_Field_name,'ButtonType'       ,inPickButton);
+               cfsSetProp(_Field_name,'DefaultPickButton'       ,true);
+             }
+             cfsSetProp(_Field_name,'Protect'          ,true);
+           }
+           else
+           { cfsSetProp(_Field_name,'Protect'  ,False);
+           }
+           end;
+           if TMP_KPI_Raise.fArrType[GP_KPI_Fields.NPP]=7 //переключатель
+           { var ArName: array[1..1] of string;
+             var ArCode: array[1..1] of longint;
+             SetLimit(ArName, 0);
+             SetLimit(ArCode, 0);
+             _Loop SpKau
+             { //ArCode[Count(ArCode)+1] :=longint(SpKau.Code);
+               ArCode[Count(ArCode)+1] :=longint(SpKau.Code);
+               ArName[Count(ArName)+1] :=SpKau.Name;
+             }
+             SetEnumList(MyGetBrowSpByNpp(_wNpp),MyGetFieldSpByNpp  (GP_KPI_Fields.NPP), ArName, ArCode);
+
+           }
+         }
+         SetColumnWidth(MyGetBrowSpByNpp(_wNpp),MyGetFieldSpByNpp  (GP_KPI_Fields.NPP),TMP_KPI_Raise.fArrLen  [GP_KPI_Fields.NPP]);
+         SetColumnWidth(MyGetBrowSpByNpp(_wNpp),MyGetFieldSpByNppDo(GP_KPI_Fields.NPP),TMP_KPI_Raise.fArrLen  [GP_KPI_Fields.NPP]);
+       } //if GP_KPI_Fields.NPP>0 and GP_KPI_Fields<=GP_KPI_Doc_Max_FLD_SP
+       // перенес ниже Update Current TMP_KPI_Raise;
+     } //_Loop FullCache GP_KPI_Fields
+     Update Current TMP_KPI_Raise;
+     if Timelog_Status>0
+     { Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:TMP_KPI_Raise.Npp='+string(TMP_KPI_Raise.Npp)+','+TMP_KPI_Raise.Name+' Finish ');
+     }
+
+     //------------------------------------------
+     //скроем лишние поля
+     if Timelog_Status>0
+     { Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:скроем лишние поля');
+     }
+     for(jj:=1;jj<=GP_KPI_Doc_Max_FLD_SP;jj++)
+     { _Field_name  :=_Format_name+'FIELDSP'+LpadCh(string(jj),'0',2)+'_Поле_'+LpadCh(string(jj),'0',2);
+       _Field_nameDo:=_Format_name+'doFIELDSP'+LpadCh(string(jj),'0',2)+'_Поле_'+LpadCh(string(jj),'0',2);
+       cfsSetProp(_Field_name  ,'Visible'  ,False);
+       cfsSetProp(_Field_nameDo,'Visible'  ,False);
+       if  TMP_KPI_Raise.fArrName [jj]=''
+       or (TMP_KPI_Raise.fArrOpt  [jj] and 4)>0
+       {
+       }
+       else
+       { if TMP_KPI_Raise.fArrType[jj]=1
+         { cfsSetProp(_Field_nameDo,'Visible'  ,True);
+
+         }
+         else
+         { cfsSetProp(_Field_name,'Visible'  ,True);
+         }
+         if TMP_KPI_Raise.First_Column<jj
+             TMP_KPI_Raise.First_Column:=jj;
+         if TMP_KPI_Raise.Last_Column<jj
+             TMP_KPI_Raise.Last_Column:=jj;
+         update current TMP_KPI_Raise;
+       }
+     } //for(jj:=1;jj<=GP_KPI_Doc_Max_FLD_SP;jj++)
+     if Timelog_Status>0
+     { Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:закончили настройку форматов');
+     }
+   } //_Loop fullcache TMP_KPI_Raise ordered by index TMP_KPI_Raise03
+   while _wNpp1<10
+   { _wNpp1++;
+     MySetTabbedSheetVisible(MyGetFormatByNumTabS(_wNpp1),False, string(_wNpp1));
+   }
+   _wNpp:=11;
+   MySetTabbedSheetVisible(MyGetFormatByNumTabS(_wNpp),true, string(_wNpp));
+   //--------------------------
+   SetBounds(#Tmp_KPI_Raise);
+   //--------------------------
+
+   set wNPP_RAISE:=1; // Всегда есть
+   SelectFormat(MyGetFormatByNumTabS(wNPP_RAISE));
+   onSetTabbedShiits(1);
+   Timelog('GP_KPI_Doc_RaiseEdit_Sp->FillTmp_KPI_Raise:finish');
+} //Function FillTmp_KPI_Raise(_pDoc:comp) :boolean;
+
+procedure SetEditMode(Value: boolean);
+{
+  DataProtector.SetProtected(not Value);
+
+  if Value
+    cfsSetProp(cfsGetCurrentContainerSelf, cfpPalette, wpBlueWindow);
+  else
+  //----------------------------
+  {  cfsSetProp(cfsGetCurrentContainerSelf, cfpPalette, wpCyanWindow);
+    //   cfsSetProp('i_SCABITADDINFO_sPaidCategory'  , cfpPickButton, true);
+    //   cfsSetProp('i_SCABITADDINFO_sListenCategory', cfpPickButton, true);
+#UNDEF GP_KPI_DOC_RAISE_SP_PICK
+#DECLARE GP_KPI_DOC_RAISE_SP_PICK (wNum)
+    cfsSetProp('i_SCRPREM#(wNum)_filtr_KatPodr'  , cfpPickButton, true);
+    cfsSetProp('i_SCRPREM#(wNum)_filtr_Persons'  , cfpPickButton, true);
+    cfsSetProp('i_SCRPREM#(wNum)_filtr_Post'     , cfpPickButton, true);
+    cfsSetProp('i_SCRPREM#(wNum)_filtr_KlKatego' , cfpPickButton, true);
+#END
+#GP_KPI_DOC_RAISE_SP_PICK(01)
+#GP_KPI_DOC_RAISE_SP_PICK(02)
+#GP_KPI_DOC_RAISE_SP_PICK(03)
+#GP_KPI_DOC_RAISE_SP_PICK(04)
+#GP_KPI_DOC_RAISE_SP_PICK(05)
+#GP_KPI_DOC_RAISE_SP_PICK(06)
+#GP_KPI_DOC_RAISE_SP_PICK(07)
+#GP_KPI_DOC_RAISE_SP_PICK(08)
+#GP_KPI_DOC_RAISE_SP_PICK(09)
+#GP_KPI_DOC_RAISE_SP_PICK(10)
+
+  }
+  //----------------------------
+  isProtect:=not Value;
+  ReScanPanel(#GP_KPI_Doc_SP);
+} //Procedure SetEditMode(_isEdit:boolean);
+
+//===============================================
+// Получить значение полей - строка
+//===============================================
+Function GetFieldValS(wTp:word; wwNum:word) : string;
+var _vDouble:double;
+{ Result:='';
+  //------------ Надо пересчитывать - в InitParam
+
+  case wTp of
+  03: // Спецификация
+  {
+    if wwNum=0 or wwNum>GP_KPI_Doc_Max_FLD_SP exit;
+    if(wNPP_Raise=11)
+    and ((GP_KPI_DOC.wtype<>102 and GP_KPI_DOC.wtype<>103) or (not boNoVisual))
+       Result:=tmp_kpi_Doc_Val.Val[wwNum]
+    else
+       Result:=GP_KPI_Doc_SP.FARRVALUE[wwNum];
+
+    case TMP_KPI_Raise.fArrType[wwNum] of //'Тип поля' : [5]
+    1: //число
+    { if length(Result)=0 Result:='0';
+      _vDouble:=0;
+      _vDouble:=double(Result);
+      //if _vDouble=0 Result:='0';
+      Result:=string(Round(_vDouble,TMP_KPI_Raise.fArrRazr[wwNum]),0,TMP_KPI_Raise.fArrRazr[wwNum]);
+    }
+    4:// 'аналитика'
+    { var _wKodGr:longint=TMP_KPI_Raise.fArrKodGr[wwNum];
+      var _cKau  :comp=0;
+      _cKau:=comp(Result);
+      //Result:=ShowKau(_wKodGr,_cKau);
+      Result:=GetAnaliticName(_wKodGr,_cKau);
+    }
+    5:// 'кадр.справочники'
+    { var _wKodGr:longint=TMP_KPI_Raise.fArrKodGr[wwNum];
+      var _cKau  :comp=0;
+      _cKau:=comp(Result);
+      Result:=iCatFunc.GetCatalogsName(_cKau);
+    }
+    6:// 'таблица' //пока нет
+    { var _wKodGr:longint=TMP_KPI_Raise.fArrKodGr[wwNum];
+      var _cKau  :comp=0;
+      _cKau:=comp(Result);
+      Result:='' ;
+    }
+    7:{
+      if Result='' Result:=0;
+    }
+    end;
+
+  }
+  end;//03 Спецификация
+} //Function GetFieldValS(wTp:word; wwNum:word) : Variant;
+
+//===============================================
+// Получить значение полей
+//===============================================
+Function GetFieldVal(wTp:word; wwNum:word) : Variant;
+{ Result:='';
+  if boNoVisual
+  { if wNpp_Raise=11
+    and (GP_KPI_DOC.wtype<>102 and GP_KPI_DOC.wtype<>103)
+    { var ww_nrec:comp;
+      ww_nrec:=tmp_Kpi_Doc_Val.Nrec;
+      // не перечитывается!
+      ReReadRecord(#tmp_Kpi_Doc_Val);
+      //if getfirst tmp_Kpi_Doc_Val where (( ww_nrec==tmp_Kpi_Doc_Val.Nrec ))=tsok {}
+    }
+    else
+    // если не сразу обновляем, то и перечитывать не нужно
+    { if (boImmediately_SP)
+        ReReadRecord(#GP_KPI_Doc_SP);
+    }
+  }
+  //timelog('GetFieldValS '+string(wwNum)+', '+string(boNoVisual) );
+
+  case wTp of
+  03: // Спецификация
+  {
+    if wwNum=0 or wwNum>GP_KPI_Doc_Max_FLD_SP exit;
+    case TMP_KPI_Raise.fArrType[wwNum] of //'Тип поля' : [5]
+    /*
+    1://'число'
+     if TMP_KPI_Raise.fArrRazr[wwNum]=0
+     {  Result:=longint(0);
+        Result:=longint(GP_KPI_Doc_SP.FARRVALUE[wwNum])
+     }
+     else
+     { Result:=double(0);
+       Result:=double(GP_KPI_Doc_SP.FARRVALUE[wwNum]);
+     }*/
+    2://'дата'
+      if(wNPP_Raise=11)
+        Result:=StrToDate(tmp_kpi_Doc_Val.Val[wwNum],'DD/MM/YYYY')
+      else
+       Result:=StrToDate(GP_KPI_Doc_SP.FARRVALUE[wwNum],'DD/MM/YYYY');
+    3:// 'время'
+       if(wNPP_Raise=11)
+         Result:=StrToTime(tmp_kpi_Doc_Val.Val[wwNum],'HH:MM:SS:SSS')
+       else
+         Result:=StrToTime(GP_KPI_Doc_SP.FARRVALUE[wwNum],'HH:MM:SS:SSS');
+    //7:// 'Переключатель' ], Protect;
+    // Result:=longint(GP_KPI_Doc_SP.FARRVALUE[wwNum]);
+    else
+    { Result:=GetFieldVals(wTp,wwNum);
+    }
+    end;
+
+  } //03 Спецификация
+  4:// Строка
+  { case wwNum of
+    1: Result:=KatPodr_Sp_M.Kod; // Код подразделения, красная - ушел с должности
+    2: Result:=TabnBr        ; // Таб. номер
+    3: if(wNPP_Raise=11)
+       then     Result:=tmp_kpi_Doc_Val.Fio
+       else     Result:=GP_KPI_Doc_SP.FIo   ; // Фамилия Имя Отчество сотрудника
+    4: Result:=KlKatego_M.KOD  ; // Категория
+    5: Result:=CatPost_M.Name  ; // Должность
+    6: Result:=if(IsValidAll(#GP_KPI_GroupPers),GP_KPI_GroupPers.Name,'Кат.'+string(KlKatego_M.KOD));
+    7: if(wNPP_Raise=11)
+       then     Result:=string(tmp_kpi_Doc_Val.cPersons)
+       else     Result:=string(GP_KPI_Doc_SP.cPersons)   ; // Фамилия Имя Отчество сотрудника
+    end;
+  }
+  end;
+} //Function GetFieldVal(wTp:word; wwNum:word) : Variant;
+
+//-------------------------------------------
+// Распределение суммы по фондам
+//-------------------------------------------
+Function CheckFond(_SuNew:double; _SuOld:double):double;
+var isAllOk:boolean;
+{ Result:=0;
+  timelog('CheckFond '+string(_SuNew,0,2)+'/'+string(_SuOld,0,2));
+  var isChange:boolean=false;
+
+  if GP_KPI_Doc.wType<>101 then exit;// Для высшего звена - нет
+  isAllOk:=true;
+  _Loop GP_KPI_GroupPers_SP
+  { timelog('CheckFond->GP_KPI_GroupPers_SP.cGroupPers='+string(GP_KPI_GroupPers_SP.cGroupPers));
+    if getfirst GP_KPI_Fond<>tsok then continue;
+    timelog('CheckFond->GP_KPI_Fond.Name='+GP_KPI_Fond.Name);
+    if getfirst GP_KPI_DocSumFond<>tsok
+    { insert into GP_KPI_DOCSUMFOND set
+           GP_KPI_DOCSUMFOND.wType:=GP_KPI_Doc.wType
+          ,GP_KPI_DOCSUMFOND.CDOC :=GP_KPI_Doc.Nrec
+          ,GP_KPI_DOCSUMFOND.CGP_KPI_FOND:=GP_KPI_Fond.Nrec
+          ,GP_KPI_DOCSUMFOND.SUMMA  :=0
+          ,GP_KPI_DOCSUMFOND.Rasp   :=_SuNew;
+          ;
+       isChange:=true;
+    }
+    else
+    { update current GP_KPI_DOCSUMFOND set
+        GP_KPI_DOCSUMFOND.Rasp:=Round(GP_KPI_DOCSUMFOND.Rasp+_SuNew-_SuOld,2);
+      isChange:=true;
+    }
+    if not isAllOk then break;
+  } //_Loop GP_KPI_GroupPers_SP
+  timelog('CheckFond finish');
+  if isChange  Event_ReReadContainer;
+} //Function CheckFond(_SuNew:double; _SuOld:double):double;
+
+//===============================================
+// Установить значение полей - строка 0
+//===============================================
+Function SetFieldVal(wTp:word; wwNum:word; _Value: Variant;_ClearManual:boolean=false):boolean ;
+var ii:word;
+    _sValue:string;
+    _vDouble:double;
+    _botmp :boolean;
+{ Result:=False;
+if isProtect then exit;
+  _botmp:=wNpp_Raise=11 and GP_KPI_DOC.wtype<>102 and GP_KPI_DOC.wtype<>103;
+  Timelog('GP_KPI_Doc_RaiseEdit_Sp->SetFieldVal:wwNum='+string(wwNum)+',wNPP_RAISE='+string(wNPP_RAISE)+', boTmp='+string(_boTmp) );
+
+  case wTp of
+  03: // Спецификация
+  {
+    //в премиях нужно пересчитать еще и фонды!
+    if wNpp_Raise<>11
+    if IsBitCTW(TMP_KPI_Raise.fArrOpt[wwNum],2) // итоги
+    or IsBitCTW(TMP_KPI_Raise.fArrOpt[wwNum],5)
+    { var _ValuePrev:Variant;
+      _ValuePrev:=GetFieldVal(wTp,wwNum);
+      if not boNoVisual
+      if Double(_ValuePrev)<>Double(_Value)
+      { if IsBitCTW(TMP_KPI_Raise.fArrOpt[wwNum],2)
+        { set GP_KPI_DOC.Summa:=GP_KPI_DOC.Summa+Double(_Value)-Double(_ValuePrev);
+          update current GP_KPI_DOC;
+        }
+        if IsBitCTW(TMP_KPI_Raise.fArrOpt[wwNum],5)
+        {
+/* 20211009
+письмо от Козлова Л.П.
+Дмитрий нужно исключить возможность снятия сумм из столбца <СУММА ИЗ ФОНДА> и ее попадания в экономию. Вопрос согласован и подтвержден Маляровым С.А.
+Для всех категорий.
+        CheckFond(if(Double(_Value) >= 0,Double(_Value),0),Double(_ValuePrev));
+Пётр 16.11.2021 попробуем в ведомости запретить отрицательные суммы.
+*/
+          CheckFond(Double(_Value),Double(_ValuePrev));
+         }
+        Event_ReReadContainer;
+      }
+    };
+    _sValue:=string(_Value);
+    if wwNum=0 or wwNum>GP_KPI_Doc_Max_FLD_SP exit;
+    case TMP_KPI_Raise.fArrType[wwNum] of //'Тип поля' : [5]
+    //0:// 'строка'
+    1://'число'
+    { if _sValue='' _sValue:='0';
+      _vDouble:=0;
+      _vDouble:=double(_sValue);
+      //if _vDouble=0 Result:='0';
+      _sValue:=string(Round(_vDouble,TMP_KPI_Raise.fArrRazr[wwNum]),0,TMP_KPI_Raise.fArrRazr[wwNum]);
+
+    }
+    2://'дата'
+    {   if VType(_Value)=VT_DATE
+          _sValue:=DateToStr(_Value,'YYYY-MM-DD');
+        else
+          _sValue:=String(_Value);
+    }
+    3:// 'время'
+    { if VType(_Value)=VT_DATE
+        _sValue:=TimeToStr(_Value,'HH:MM:SS:SSS');
+      else
+        _sValue:=String(_Value);
+    }
+    4:// 'аналитика'
+    { var _vComp:comp;
+      _vComp:=comp(_sValue);
+      if _vComp=0
+      { if TMP_KPI_Raise.fArrKodGr[wwNum]>10000
+        { if getfirst Spkau where (( TMP_KPI_Raise.fArrKodGr[wwNum] == Spkau.KodGrKau
+             and _sValue == Spkau.Name            )) =Tsok
+          { _sValue:=String(SpKau.Nrec);
+          }
+          else
+          if getfirst Spkau where (( TMP_KPI_Raise.fArrKodGr[wwNum] == Spkau.KodGrKau
+             and _sValue == Spkau.Code            )) =Tsok
+          { _sValue:=String(SpKau.Nrec);
+          }
+        }
+      }
+    }
+    //5:// 'кадр.справочники'
+    //6:// 'таблица' //пока нет
+    //7:// 'Переключатель' ], Protect;
+    end;
+    //if(wNPP_Raise=11)    and (GP_KPI_DOC.wtype<>102 and GP_KPI_DOC.wtype<>103)
+    if _botmp
+       set tmp_kpi_Doc_Val.Val[wwNum]:=_sValue;
+    else
+    { set GP_KPI_Doc_SP.FARRVALUE[wwNum]:=_sValue;
+      if timelog_status>0
+      { timelog('GP_KPI_Doc_SP.FARRVALUE[wwNum]='+GP_KPI_Doc_SP.FARRVALUE[wwNum]+', GP_KPI_Doc_SP.Nrec='+string(GP_KPI_Doc_SP.Nrec,0,0));
+      }
+    }
+
+    //при общей установке нельзя! только при ручном изменении
+    //BitOnW(GP_KPI_Doc_SP.Option[wwNum],3);
+    //if(wNPP_Raise=11)    and (GP_KPI_DOC.wtype<>102 and GP_KPI_DOC.wtype<>103)
+    if _botmp
+    { timelog(' if(wNPP_Raise=11)  ' );
+      if tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[wwNum]>0
+      // только если редактируется
+      if IsBitCtW(Tmp_KPI_RAISE.fArrOpt[wwNum],1)
+      { timelog(' if tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[wwNum]>0  ' );
+        if getfirst GP_KPI_DOC_SP where
+         (( tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[wwNum] == GP_KPI_DOC_SP.Nrec))=tsok
+        { //Нужно найти поле, которое попало в это поле
+          if getfirst tmp_KPI_RAISE_F where (( GP_KPI_DOC_SP.cGP_KPI_RAISE == tmp_KPI_RAISE_F.cGP_KPI_RAISE ))=tsok
+          { for(ii:=1;ii<=GP_KPI_Doc_Max_FLD_SP;ii++)
+            { if tmp_KPI_RAISE_F.fArrIT[ii]=wwNum
+              {  GP_KPI_Doc_SP.FARRVALUE[ii]:=tmp_kpi_Doc_Val.Val[wwNum];
+                 BitOnW(GP_KPI_Doc_SP.Option[ii],3);
+                 update current GP_KPI_DOC_SP;
+                 var _wNpp_Raise:word;
+                 _wNpp_Raise:=wNpp_Raise;
+                 PushPos(#tmp_KPI_RAISE);
+                 wNpp_Raise:=tmp_KPI_RAISE_F.NPP;
+                 if getfirst tmp_KPI_RAISE=tsok {}
+                 // заодно пересчитаем всю позицию
+                 if getfirst GP_KPI_DOC_SP where
+                     (( tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[wwNum] == GP_KPI_DOC_SP.Nrec))=tsok
+                 { ReCalcSP(ii);
+                 }
+                 wNpp_Raise:=_wNpp_Raise;
+                 PopPos(#tmp_KPI_RAISE);
+                 break;
+              }
+            } //for(ii:=1;ii<=GP_KPI_Doc_Max_FLD_SP;ii++)
+          }//if getfirst tmp_KPI_RAISE_F where (( GP_KPI_DOC_SP.cGP_KPI_RAISE == tmp_KPI_RAISE_F.cGP_KPI_RAISE ))=tsok
+        } //if getfirst GP_KPI_DOC_SP where
+      } //if tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[wwNum]>0
+      if getfirst GP_KPI_DOC_SP_0<>0
+      { timelog(' if getfirst GP_KPI_DOC_SP_0<>0  ' );
+        ClearBuffer(#GP_KPI_DOC_SP_0);
+        GP_KPI_Doc_SP_0.wType:=GP_KPI_Doc.wType ;
+        GP_KPI_Doc_SP_0.cGP_KPI_DOC :=GP_KPI_Doc.Nrec;
+        GP_KPI_Doc_SP_0.cGP_KPI_RAISE:=0;
+        GP_KPI_Doc_SP_0.Tabn     :=tmp_kpi_Doc_Val.Tabn;
+        GP_KPI_Doc_SP_0.Fio      :=tmp_kpi_Doc_Val.Fio;
+        GP_KPI_Doc_SP_0.StrTabn  :=tmp_kpi_Doc_Val.StrTabn;
+        GP_KPI_Doc_SP_0.cKatPodr :=tmp_kpi_Doc_Val.cKatPodr;
+        GP_KPI_Doc_SP_0.cLschet  :=tmp_kpi_Doc_Val.cLschet;
+        GP_KPI_Doc_SP_0.cKlKatego:=tmp_kpi_Doc_Val.cKlKatego;
+        GP_KPI_Doc_SP_0.cPersons :=tmp_kpi_Doc_Val.cPersons;
+
+
+        for(ii:=1;ii<=GP_KPI_Doc_Max_FLD_SP;ii++)
+        { GP_KPI_DOC_SP_0.FARRVALUE[ii]:=tmp_Kpi_Doc_Val.Val[ii];
+        }
+        Insert current GP_KPI_DOC_SP_0;
+      }
+      else
+      { timelog(' else if getfirst GP_KPI_DOC_SP_0<>0  ' );
+        if tmp_kpi_Doc_Val.Val[wwNum]<>GP_KPI_DOC_SP_0.FARRVALUE[wwNum]
+        { GP_KPI_DOC_SP_0.FARRVALUE[wwNum]:=tmp_kpi_Doc_Val.Val[wwNum];
+          update current GP_KPI_DOC_SP_0;
+        }
+
+      }
+
+    }//if(wNPP_Raise=11)
+    else
+    { if _ClearManual
+      { BitOffW(GP_KPI_Doc_SP.Option[wwNum],3);
+      }
+    } //else if(wNPP_Raise=11)
+    //if(wNPP_Raise=11)    and (GP_KPI_DOC.wtype<>102 and GP_KPI_DOC.wtype<>103)
+    if _botmp
+      update current tmp_kpi_Doc_Val;
+    else
+    { if GP_KPI_Doc_SP.cKlKatego=0
+      { if getfirst appointments=tsok
+          if getfirst staffstruct=tsok
+          { GP_KPI_Doc_SP.cKlKatego:=StaffStruct.EmpCategory;
+            if appointments.EmpCategory=0 and StaffStruct.EmpCategory<>0
+            { appointments.EmpCategory:=StaffStruct.EmpCategory;
+              update current appointments;
+            }
+          }
+      } //if GP_KPI_Doc_SP.cKlKatego=0
+      if boImmediately_SP
+        update current GP_KPI_Doc_SP;
+    }
+  }
+  end;//03 Спецификация
+  Result:=True;
+  Timelog('GP_KPI_Doc_RaiseEdit_Sp->SetFieldVal:wwNum='+string(wwNum)+' Finish');
+
+} //Function SetFieldVal(wTp:word; wwNum:word) ;
+
+//-------------------------------------
+#doc
+ Установить режим обновления спецификации
+#end
+Procedure SetUpdateMode(_Immediately_SP:boolean);
+{ boImmediately_SP:=_Immediately_SP;
+}
+//-------------------------------------
+#doc
+ Сохранить спецификация
+#end
+Function Update_SP:longint;
+{ Result:=Update current GP_KPI_DOC_SP;
+  if Timelog_status>0
+    timelog('GP_KPI_DOC_RaiseEditSp->Update_SP GP_KPI_DOC_SP.Nrec='+String(GP_KPI_DOC_SP.Nrec,0,0)+',Result='+string(Result));
+}
+
+
+//===============================================
+// Получить наименование ссылочных полей
+//===============================================
+Function GetFldTypeName:string;
+{ Result:='';
+  case GP_KPI_Fields.wTypeFld  of //'Тип поля' : [5]
+  //  0 'строка'
+  //       ,1 'число'
+  //       ,2 'дата'
+  //       ,3 'время'
+  4,7:// 'аналитика'
+  { Result:=if(isValid(#KatKau),KatKau.Name,'')
+  }
+  5:// 'кадр.справочники'
+  { Result:=if(isValid(#CatSys),CatSys.Name,'');
+  }
+  6:// 'таблица'
+  { Result:=if(isValid(#x$Files),x$Files.xf$Name,'');
+  }
+
+  //      ,7 'Переключатель' ], Protect;
+  end;
+
+} //Function GetFldTypeName:string;
+
+
+//-------------------------------------------
+// Пересчитать строку со спецификаций
+//-------------------------------------------
+Function ReCalcSp(_NumFld:word) :boolean;
+var ii:word;
+    _Value,_ValuePrev:string;
+    boChange:boolean;
+    boNeed  :boolean;
+{
+  timelog('ReCalcSp _NumFld='+string(_NumFld));
+
+  Result:=false;
+  boChange:=false;
+  for(ii:=_NumFld+1;ii<=GP_KPI_Doc_Max_FLD_SP;ii++)
+  { if  TMP_KPI_Raise.fArrAlg[ii]=0 continue;
+    _Value:='';
+    _ValuePrev:='';
+    boNeed:=true;
+    timelog('ReCalcSp '+string(ii));
+    if wNpp_Raise=11
+    { boNeed:=true;
+      if tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[ii]>0
+      { if getfirst GP_KPI_DOC_SP where
+         (( tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[ii] == GP_KPI_DOC_SP.Nrec))=tsok
+           boNeed:=(not IsBitCTW(GP_KPI_DOC_SP.Option[ii],3));
+      }
+    }
+    else
+    { boNeed:=(not IsBitCTW(GP_KPI_DOC_SP.Option[ii],3));
+    }
+
+    if  boNeed //изменялось вручную
+    { _Value:=iGP_KPI_Alg.CalcSpec(
+              if(wNpp_Raise=11,100,GP_KPI_DOC.wType)
+             ,GP_KPI_DOC.Nrec
+             ,if(wNpp_Raise=11,tmp_kpi_Doc_Val.Nrec,GP_KPI_DOC_SP.Nrec)
+             ,TMP_KPI_Raise.fArrAlg[ii],false);
+      _ValuePrev:=GetFieldValS(3,ii);
+      timelog('ReCalcSp after calc '+string(ii)+', _Value='+_Value+', _ValuePrev='+_ValuePrev);
+
+      if iGP_KPI_Alg.GetLastError=''
+      { if _ValuePrev<>_Value
+        { SetFieldVal(3,ii,_Value);
+          boChange:=true;
+        }
+
+      }
+
+    } //if  TMP_KPI_Raise.fArrAlg[ii]<>0
+  } //for(ii:=1;ii<=GP_KPI_Doc_Max_FLD_SP;ii++)
+  Result:=true;
+  timelog('ReCalcSp _NumFld='+string(_NumFld)+' FINISH');
+} //Function ReCalcSp :boolean;
+
+
+
+//-------------------------------------------
+// Запустить выбор
+//-------------------------------------------
+Function MyPickFld(_field:longint;_NumFld:word;_ValSet:string=''):boolean;
+{ #__UNUSED__(_field,_NumFld,_ValSet)
+  var _Value,_ValuePrev:string='';
+  var cTmp:comp=0;
+  var _Ost:double=0;
+  var ii:word=0;
+  Result:=true;
+  if _NumFld>0
+  { _Value:=GP_KPI_Doc_SP.FARRVALUE[_NumFld];
+    case TMP_KPI_Raise.fArrType[_NumFld] of //'Тип поля' : [5]
+    4:
+    { cTmp:=Comp(_Value);
+      if (QuickChoiceName <> '')  QuickChoiceName := 'qcKau_Needed_Name';
+      if iGetKau.GetCodeKau(cgiPick,word(TMP_KPI_Raise.fArrKodGr[_NumFld]),cTmp)<>0
+      { _Value:=string(cTmp)
+      }
+    }
+    5:
+    { cTmp:=Comp(_Value);
+      if (QuickChoiceName <> '')  QuickChoiceName := 'qcKau_Needed_Name';
+      if RunInterface('PickCatalog2',TMP_KPI_Raise.fArrKodGr[_NumFld],cTmp,0)<>cmCancel
+      { _Value:=string(cTmp);
+      }
+    }
+    else
+    {  if _ValSet<>''
+         _Value:=_ValSet;
+       else
+         _Value:=ExprFieldValue;
+
+    }
+    end;
+    // контроль значений поля
+    if TMP_KPI_Raise.fArrAlgChk[_NumFld]>0
+    { var _Value_Chk:string='';
+      //IF(DOUBLE(0+3.00)<DOUBLE(1.31),1,IF(DOUBLE(0+3.00)>DOUBLE(2),1,0))
+      _Value_Chk:=iGP_KPI_Alg.CalcSpec(
+              if(wNpp_Raise=11,100,GP_KPI_DOC.wType)
+             ,GP_KPI_DOC.Nrec
+             ,if(wNpp_Raise=11,tmp_kpi_Doc_Val.Nrec,GP_KPI_DOC_SP.Nrec)
+             ,TMP_KPI_Raise.fArrAlgChk[_NumFld],false,_Value);
+      if _Value_Chk<>''
+      { message('Ошибка контроля значения поля!'
+         +chr(13)+_Value_Chk);
+        ReScanPanel(#GP_KPI_DOC_SP);
+        Result:=false;
+        exit;
+      }
+    }
+    if wNpp_Raise<>11 or GP_KPI_DOC.wType<>101
+    { BitOnW(GP_KPI_DOC_SP.Option[_NumFld],3);
+      set GP_KPI_Doc_SP.Option[_NumFld]:=GP_KPI_Doc_SP.Option[_NumFld];
+      SetFieldVal(3,_NumFld,_Value);
+      if IsBitCTW(TMP_KPI_Raise.fArrOpt[_NumFld],6) // сбросить следующего поля
+      and _NumFld<GP_KPI_Doc_Max_FLD_SP
+      { BitOffW(GP_KPI_DOC_SP.Option[_NumFld+1],3);
+        set GP_KPI_Doc_SP.Option[_NumFld]:=GP_KPI_Doc_SP.Option[_NumFld];
+       update current GP_KPI_Doc_SP;
+      }
+    }
+    else
+    {
+      if tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[_NumFld]>0
+      { if getfirst GP_KPI_DOC_SP where
+         (( tmp_kpi_Doc_Val.cGP_KPI_DOC_SP[_NumFld] == GP_KPI_DOC_SP.Nrec))=tsok
+         { if getfirst tmp_KPI_RAISE_F where (( GP_KPI_DOC_SP.cGP_KPI_RAISE == tmp_KPI_RAISE_F.cGP_KPI_RAISE ))=tsok
+           { for(ii:=1;ii<=GP_KPI_Doc_Max_FLD_SP;ii++)
+             { if tmp_KPI_RAISE_F.fArrIT[ii]=_NumFld
+               { BitOnW(GP_KPI_DOC_SP.Option[ii],3);
+                 update current GP_KPI_DOC_SP;
+                 break;
+               }
+             }
+           }
+         } //if getfirst GP_KPI_DOC_SP where
+      } //if wNpp_Raise<>11 or GP_KPI_DOC.wType<>101
+    } //if wNpp_Raise<>11 or GP_KPI_DOC.wType<>101
+    ReCalcSp(_NumFld);
+  }//if _NumFld>0
+} //Procedure MyPickFld(_field:longint;_NumFld:word);
+
+
+//-------------------------------------------
+// Проверим на наличие записей в реестрах
+//-------------------------------------------
+Function CheckReestr_ZP :boolean;
+{ Result:=false;
+  _Loop fullcache GP_KPI_Doc_Z
+  { if getfirst sys_mbf<>tsok
+    { delete current GP_KPI_Doc_Z;
+      continue;
+    }
+    Result:=true;
+  } //Function CheckReestr_ZP :boolean;
+} //Function CheckReestr_ZP :boolean;
+
+
+//-----------------------------------------
+// вставить запись для разбивки
+//-----------------------------------------
+Procedure Ins_Tmp_Div;
+{ timelog('Ins_Tmp_Div' );
+  ClearBuffer(#tmp_div);
+  tmp_div.Chasf:=1;
+  tmp_div.Chasf_All:=1;
+  tmp_div.DATAN  :=vPrvidopl.Sys_Mbf.Datan;//│Дата начала   выплат
+  tmp_div.DATOK  :=vPrvidopl.Sys_Mbf.Datok;//│Дата окон-ния выплат
+  timelog('Ins_Tmp_Div 01' );
+  if getfirst Appointments=tsok
+  { if Appointments.AppointDate>tmp_div.DATAN
+    { if Appointments.AppointDate>vPrvidopl.Sys_Mbf.Datok
+        tmp_div.DATAN:=vPrvidopl.Sys_Mbf.Datok
+      else
+        tmp_div.DATAN:=Appointments.AppointDate;
+    }
+    if Appointments.DisMissDate<>ZeroDate
+    if Appointments.DisMissDate<vPrvidopl.Sys_Mbf.Datok
+    { if Appointments.DisMissDate<tmp_div.DATAN
+         tmp_div.DATOK:=tmp_div.DATAN
+      else
+        tmp_div.DATOK:=Appointments.DisMissDate
+    }
+  } //if getfirst Appointments=tsok
+  timelog('Ins_Tmp_Div 02' );
+  insert current tmp_div;
+} //Procedure Ins_Tmp_Div;
+
+//-------------------------------------------
+// Сформировать зарплатные ведомости
+//-------------------------------------------
+Function Make_Zar_Ved(_wTP:word=0) : boolean;
+var ii,jj:word;
+    _NPP :word;
+    _DM_IT:array[1..1] of word;
+    _kol_IT:word;
+    _column_Proc:word;
+{ var _wNpp_Raise:word;
+  _wNpp_Raise:=wNpp_Raise;
+
+  // Надо перевесить ограничения, иначе все уйдет на одного чела
+  if _wNpp_Raise=11
+  { onSetTabbedShiits(1);
+  }
+  if CheckReestr_ZP
+  { if _wtp=0
+    { message('По документу уже созданы ведомости в зарплате!'
+      +chr(13)+'Формирование не возможно'
+      +chr(13)+'Сначала удалите ведомости в ЗП - Операции - Начисления и выплаты'
+     );
+      Exit;
+    }
+    else
+    { result:=true;
+      Displ('По документу '+GP_KPI_DOC.DocNumber+' уже созданы ведомости в зарплате!');
+      exit;
+    }
+  }
+  timelog('Make_Zar_Ved - START');
+  StartNewVisual(vtNumericVisual, vfTimer,
+     'Формирование меж расчетных выплат'
+    +chr(13)+'Ведомость '+GP_KPI_DOC.DocNumber , 0);
+  var _MnRec:longint;
+  //---------------- чтобы наверняка, иногда возникают случаи что привязка не совпадает
+  PushBounds(tnGP_KPI_DOC_SP);
+  //PushBounds(tnLschet);
+  //PushBounds(tnKatpodr_SP_M);
+  //PushBounds(tnKlKatego_M);
+  //PushBounds(tnCatPost_M);
+  //---------------- чтобы наверняка
+  For(_NPP:=1;_NPP<=10;_NPP++)
+  { //onSetTabbedShiits(tmp_KPI_Raise.Npp);
+    timelog('Make_Zar_Ved _NPP='+string(_NPP));
+
+    set wNpp_Raise:=_Npp;
+    NextVisual;
+    if getfirst  tmp_KPI_Raise<>tsok continue;
+    if getfirst  CatRaise<>tsok continue;
+    if getfirst GP_KPI_DOC_SP<>tsok continue;
+    if tmp_KPI_Raise.Npp=11 continue;
+    SetLimit(_DM_IT,0);
+    _kol_IT:=0;
+    _column_Proc:=0;
+    FOR(II:=1;ii<GP_KPI_Doc_Max_FLD_SP;ii++)
+    { //итоговые колонки
+      if IsBitCTW(tmp_KPI_Raise.fArrOpt[ii],2)
+      {  //break;
+         _kol_IT++;
+         _DM_IT[_kol_IT]:=ii;
+
+      }
+      //процент в зарплату
+      if IsBitCTW(tmp_KPI_Raise.fArrOpt[ii],7)
+      { _column_Proc:=ii;
+      }
+    }//FOR(II:=1;ii<GP_KPI_Doc_Max_FLD_SP;ii++)
+    timelog('Make_Zar_Ved - _NPP='+string(_NPP)+', _kol_IT='+string(_kol_IT)+', '+tmp_KPI_Raise.Name );
+    if _kol_IT=0 then continue;
+
+    _MnRec:=1;
+    if vPrVidopl.GetLast sys_mbf=0
+      _MnRec:=vPrvidopl.sys_mbf.MnRec;
+    vPrvidopl.ClearBuffer(vPrvidopl.tnsys_Mbf);
+    vPrvidopl.sys_mbf.MnRec:=_MnRec;
+    vPrvidopl.sys_Mbf.cex  :=GP_KPI_DOC.cKatPodr;
+    if getfirst KatPodr_SP_M where
+          (( GP_KPI_DOC.cKatPodr == KatPodr_SP_M.Nrec )) = tsok {}
+    vPrvidopl.sys_Mbf.NMNEM :='Мотивация.'+SubStr(KatPodr_SP_M.Kod,1,3)+' '+tmp_KPI_Raise.Name;
+    vPrvidopl.sys_Mbf.NMPODR:=KatPodr_SP_M.Name+'('+SubStr(KatPodr_SP_M.Kod,1,3)+')';
+    vPrvidopl.sys_Mbf.DATAN:=date(1,GP_KPI_DOC.wMonth,GP_KPI_DOC.wYear );
+    vPrvidopl.sys_Mbf.DATOK:=date(Last_Day(vPrvidopl.sys_Mbf.DATAN),GP_KPI_DOC.wMonth,GP_KPI_DOC.wYear );
+    vPrvidopl.insert current sys_Mbf;
+    //----------------
+    ClearBuffer(#GP_KPI_Doc_Z);
+    GP_KPI_Doc_Z.cGP_KPI_Doc    :=GP_KPI_Doc.Nrec  ;// "Ведомость премирования"
+    GP_KPI_Doc_Z.cSys_Mbf       :=vPrvidopl.sys_Mbf.Nrec ;//    "Ведомости в зарплате"
+    GP_KPI_Doc_Z.cGP_KPI_Raise  :=tmp_KPI_Raise.cGP_KPI_Raise ;// "ссылка на премию"
+    GP_KPI_Doc_Z.cDoplata       :=tmp_KPI_Raise.cDoplata     ;//     "ссылка на доплату"
+    GP_KPI_Doc_Z.cKatPodr       :=GP_KPI_Doc.cKatPodr    ;//      "Подразделение"
+    //---------------------------------- sys_mbf
+    GP_KPI_Doc_Z.NMNEM          :=vPrvidopl.sys_Mbf.NMNEM ;// "Наименование(sys_mbf)"
+    GP_KPI_Doc_Z.NMPODR         :=vPrvidopl.sys_Mbf.NMPODR;// "Подразделение(sys_mbf)"
+    GP_KPI_Doc_Z.DATAN          :=vPrvidopl.sys_Mbf.DATAN ;// "Дата начала(sys_mbf)"
+    GP_KPI_Doc_Z.DATOK          :=vPrvidopl.sys_Mbf.DATOK ;// "Дата окончания(sys_mbf)"
+    //---------------------------------- GP_KPI_Doc
+    GP_KPI_Doc_Z.DocNumber      :=GP_KPI_Doc.DocNumber    ;// "Номер ведомости"
+    GP_KPI_Doc_Z.DocDate        :=GP_KPI_Doc.DocDate      ;// "Дата ведомости"
+    GP_KPI_Doc_Z.DocCreate      :=GP_KPI_Doc.DocCreate    ;// "Дата создания"
+    GP_KPI_Doc_Z.wMonth         :=GP_KPI_Doc.wMonth       ;// "Месяц"
+    GP_KPI_Doc_Z.wKvartal       :=GP_KPI_Doc.wKvartal     ;// "Квартал"
+    GP_KPI_Doc_Z.wYear          :=GP_KPI_Doc.wYear        ;// "Год"
+    GP_KPI_Doc_Z.wYearKvartal   :=GP_KPI_Doc.wYearKvartal ;// "Год квартала"
+    GP_KPI_Doc_Z.wType          :=GP_KPI_Doc.wType        ;// "Тип документа 0 - премии, 1 фонды"
+    Insert current GP_KPI_Doc_Z;
+    timelog('Make_Zar_Ved - создали запись ' );
+
+    var ItSu:double=0;
+    _Loop fullcache GP_KPI_DOC_SP
+    {
+      NextVisual;
+      if timelog_status>0 timelog('Make_Zar_Ved - GP_KPI_DOC_SP.FIO= '+GP_KPI_DOC_SP.FIO);
+      set vLschet.pLschet:=GP_KPI_DOC_SP.cLschet;
+      if vLschet.getfirst Lschet<>tsok continue;
+      if timelog_status>0 timelog('Make_Zar_Ved - 0002');
+      //if getfirst lschet=tsok {}
+      delete all tmp_div;
+      if vLschet.Lschet.DatPos<vPrvidopl.sys_Mbf.DATAN
+      { Ins_Tmp_Div;
+        if timelog_status>0 timelog('Make_Zar_Ved - NODiff');
+      }
+      else
+      { var _plschet:comp=GP_KPI_DOC_SP.cLschet;
+        var _wMonth:word=GP_KPI_DOC.wMonth;
+        var _wYear :word=GP_KPI_DOC.wYear;
+        var _sPodrKod:string;
+        _sPodrKod:=SubStr(Katpodr_Sp_M.kod,1,3);
+        //----------------------
+        if timelog_status>0 timelog('Make_Zar_Ved - Diff');
+        SQL select
+         Nachisl.DataN as datan
+        ,Nachisl.datok as datok
+        ,sum(Nachisl.CHASF) as Chasf1
+        ,0.00 as Chasf_All//,sum(Nachisl.CHASF) over()  as Chasf2
+        From Nachisl
+        inner join KatPodr on KatPodr.Nrec = Nachisl.cexoz
+         and  SubString(KatPodr.Kod,1,3) = :(_sPodrKod)
+        where Nachisl.cLsch = :(_pLschet)
+        and Nachisl.MesV  =:(_wMonth)
+        and Nachisl.YearV =:(_wYear)
+        and Nachisl.VidoplS=7// оклад
+        and Nachisl.cAppoint =:(GP_KPI_DOC_SP.cPost)
+        Group by Nachisl.DataN,Nachisl.datok
+        into tmp_div;
+        //----------------------
+        if RecordsInTable(#tmp_div)<1
+        { delete all tmp_div;
+          Ins_Tmp_Div;
+        }
+        else
+        { var _chasf:double=0;
+          _Loop Tmp_Div _chasf+=Tmp_Div.Chasf;
+          update all Tmp_Div set Tmp_Div.Chasf_All:=_chasf;
+        }
+      } //else if vLschet.Lschet.DatPos<vPrvidopl.sys_Mbf.DATAN
+      _Loop tmp_div
+      { if timelog_status>0 timelog('Make_Zar_Ved - PrVidopl START');
+
+        vPrvidopl.clearbuffer(vPrvidopl.tnPrVidopl);
+        vPrvidopl.Prvidopl.TABN   :=vLschet.Lschet.Tabn           ;//│Табельный номер
+        vPrvidopl.Prvidopl.STRTABN:=vLschet.Lschet.StrTabn           ;//│Табельный номер
+        vPrvidopl.Prvidopl.CEX    :=GP_KPI_DOC_SP.cKatPodr;//│Цех
+        vPrvidopl.Prvidopl.CEXOZ  :=GP_KPI_DOC_SP.cKatPodr;//│Цех отнесения затрат
+        vPrvidopl.Prvidopl.CPODR  :=0;//              │Код вышестоящ.подразд
+        vPrvidopl.Prvidopl.CPODROZ:=GP_KPI_DOC_SP.cKatPodr;//│Код вышест.подразд ОЗ
+        vPrvidopl.Prvidopl.MNREC  :=vPrvidopl.Sys_mbf.nrec;//│Код файла перечня,Oborot
+        vPrvidopl.Prvidopl.POMETKA:=''                    ;//│R - подоходный был рассчитан
+        vPrvidopl.Prvidopl.VIDOPL :=longint(Substr(CatRaise.CatData, 1, 5));//│Вид оплаты
+        vPrvidopl.Prvidopl.MES    :=GP_KPI_DOC.wMonth     ;//│Месяц за который нач
+        vPrvidopl.Prvidopl.DATAN  :=tmp_div.DATAN;//│Дата начала   выплат
+        vPrvidopl.Prvidopl.DATOK  :=tmp_div.DATOK;//│Дата окон-ния выплат
+        if _column_Proc>0
+           vPrvidopl.Prvidopl.PROC   :=double(GetFieldVals(3,_column_Proc))   ;//│% оплаты/допл/премии
+        For(jj:=1;jj<=_kol_IT;jj++)
+        { vPrvidopl.Prvidopl.SUMMA  :=double(GetFieldVals(3,_DM_IT[jj]))*tmp_div.chasf/tmp_div.chasf_all;//│Оплата готовой суммой
+          vPrvidopl.sys_Mbf.SUMMANC+=vPrvidopl.Prvidopl.SUMMA;
+
+        } //For(jj:=1;jj<_kol_IT;jj++)
+        vPrvidopl.PRVIDOPL.SUMMAR:=vPrvidopl.Prvidopl.SUMMA;
+        if timelog_Status>0 timelog('Make_Zar_Ved - Prvidopl 001 ' );
+
+        //vPrvidopl.Prvidopl.SUMMAVAL             │Валюта и подоходный 3процента
+        //vPrvidopl.Prvidopl.PODNAL               │Сумма подоход.налога
+        //vPrvidopl.Prvidopl.PENSNAL              │Сумма удерж. в пенс.
+        //vPrvidopl.Prvidopl.SOCSTR               │Сумма удерж. в соц.страх
+        //vPrvidopl.Prvidopl.PROFNAL              │Сумма удерж. в проф.
+        //vPrvidopl.Prvidopl.SUMUD                │Выплачено c уд.налог
+        vPrvidopl.Prvidopl.CSCHETD  :=vLschet.Lschet.CSCHETD; //│дебет. счет
+        vPrvidopl.Prvidopl.CSUBSCHD :=vLschet.Lschet.CSUBSCHD;//│Субсчет дебет. счета
+        //timelog('Make_Zar_Ved - Prvidopl 002 ' );
+        For(jj:=1;jj<=6;jj++)
+        { vPrvidopl.Prvidopl.CKAUD[jj]:=vLschet.Lschet.CKAUD[jj];//│КАУ дебет. счета[1]
+          vPrvidopl.Prvidopl.TBLD [jj]:=vLschet.Lschet.TBLD[jj];//│таблицы КАУ дебет. счета[2]
+        }
+        if timelog_Status>0 timelog('Make_Zar_Ved - Prvidopl 003 ' );
+        //CSCHETK              │кредит. счет
+        //CSUBSCHK             │Субсчет кредит. счета
+        //CKAUK[1]             │КАУ кредит. счета[1]
+        // TBLK[1]              │таблицы КАУ кредит. счета[1]
+        vPrvidopl.Prvidopl.CLSCH     :=GP_KPI_DOC_SP.cLschet;//Lschet.Nrec   ;//│Код работника из ЛСЧ
+        vPrvidopl.Prvidopl.TPERSON   :=GP_KPI_DOC_SP.cPersons;//Lschet.tPerson;//│Код работника из ФЛ
+        vPrvidopl.Prvidopl.VIDUD     :=0;//│Код  вида  удержаний
+        vPrvidopl.Prvidopl.CHASF     :=0;//│Количество часов
+        vPrvidopl.Prvidopl.KOLDN     :=0;//│Количество дней
+        //vPrvidopl.Prvidopl.KTY       :=0;//│Коэф.трудового участия
+        //vPrvidopl.Prvidopl.SUMKTY    :=0;//│Начислено c КТУ
+        vPrvidopl.Prvidopl.CHGRAF    :=0;//│Кол-во часов по граф.
+        vPrvidopl.Prvidopl.CHWORK    :=0;//│Отраб. часы
+        vPrvidopl.Prvidopl.CHOICE    :=0;//│Номер-начислен или уде
+        vPrvidopl.Prvidopl.NODOC     :=GP_KPI_DOC.DocNumber;//│Ссылка на договор подряда
+        vPrvidopl.Prvidopl.NOVED     :=''             ;//│Номер платежной ведомости
+        vPrvidopl.Prvidopl.DATAF     :=Cur_Date        ;//│Дата формирования ведомости
+        vPrvidopl.Prvidopl.CHOZOPER  :=vLschet.Lschet.cHozoper;//│Ссылка на ТХО
+        vPrvidopl.Prvidopl.PARAM     :=vLschet.Lschet.Param   ;//│Параметр выбора для алг-ма ТХО
+        if timelog_Status>0 timelog('Make_Zar_Ved - Prvidopl 004 ' );
+        //vPrvidopl.Prvidopl.SUMMAR               │Начальная сумма
+        //vPrvidopl.Prvidopl.SUMMA1               │Резерв 1
+        //vPrvidopl.Prvidopl.SUMMA2               │Резерв 2
+        //vPrvidopl.Prvidopl.SUMMA3               │Оклад(тариф) или матпомощь
+        //vPrvidopl.Prvidopl.SUMMA4               │Резерв 4
+        //vPrvidopl.Prvidopl.SUMMA5               │Резерв 5
+        //vPrvidopl.Prvidopl.SUMMA6               │SUMMA6
+        //vPrvidopl.Prvidopl.BRIGADE              │Бригада
+        vPrvidopl.Prvidopl.KATEG    :=KlKatego_M.kod;// vLschet.Lschet.Kateg   ;//│Категория
+        vPrvidopl.Prvidopl.CAPPOINT :=GP_KPI_DOC_SP.cPost ;//vLschet.Lschet.cAppoint;//│Должность
+        //vPrvidopl.Prvidopl.OLDCLSCH             │Ссылка на доп. аналитики
+        vPrvidopl.Prvidopl.STRTABN  :=vLschet.Lschet.StrTabn;//│строковый табельный номер
+        vPrvidopl.Prvidopl.CREATED  :=_CurDateTime  ;//│Дата и время создания записи
+        vPrvidopl.Prvidopl.FIO      :=GP_KPI_DOC_SP.Fio   ;//│Фамилия, имя, отчество работни
+        //KAUEXTR[1]           │Дополнительные КАУ[1]
+        //TBLEXTR[1]           │Таблица для доп. КАУ[2]
+        vPrvidopl.Insert current Prvidopl;
+
+      } //_Loop tmp_div
+      if timelog_Status>0 timelog('Make_Zar_Ved - Prvidopl 005 ' );
+    } //_Loop fullcache GP_KPI_DOC_SP
+    vPrvidopl.update current sys_Mbf;
+  } //For(_NPP:=1;_NPP<=10;_NPP++)
+  timelog('Make_Zar_Ved Forms Finish');
+  //------------------
+  if _wtp=0
+  { onSetTabbedShiits(_wNpp_Raise);
+    ReScanPanel(#GP_KPI_DOC_SP);
+  }
+  timelog('Make_Zar_Ved Forms Finish 002');
+  StopVisual('',0);
+  if _wTP=0
+  { Message('Формирование ведомостей закончено');
+  }
+  Result:=true;
+  timelog('Make_Zar_Ved - FINISH');
+
+} //Function Make_Zar_Ved : boolean;
+
+//------------------------------------
+// Цвет строк
+//------------------------------------
+Function GetColorPrem:longint;
+{ Result:=ColorSysBlack;
+  if wNPP_RAISE=11 Exit;
+  if(isValid(tnAppointments))
+  { if  (Appointments.DisMissDate<>ZeroDate
+     and Appointments.DisMissDate<Date(1,GP_KPI_DOC.wMonth,GP_KPI_DOC.wYear))
+    {   Result:=ColorSysRed;
+    }
+    else
+    if  (Appointments.AppointDate>=date(1,GP_KPI_DOC.wMonth, GP_KPI_DOC.wYear))
+       Result:=ColorSysMaroon;
+
+  }
+  Else Result:=ColorSysRed;
+} //Function GetColorPrem:longint;
+
+//==============================================================================
+// ФОРМАТЫ ОСНОВНОГО ОКНА ИНТЕРФЕЙСА
+//------------------------------------------------------------------------------
+
+Panel pnMain;
+//Table GP_KPI_DOC_SP;
+//***************************************************************
+Tabbedsheet top tsSpec;
+
+#UNDEF GP_KPI_DOC_FG
+#DEFINE _GP_KP_DOC_SP_VAR02_
+#DECLARE GP_KPI_DOC_FG (wTable,wNum,IT)
+FormatsGroup fgPrem#(wNum) 'Премия #(wNum)';
+Screen scrPrem#(wNum) (,,sci13Esc);
+Show at (,,,2) fixed_y ;
+//Show at (,,63,2) fixed_y ;
+Table Catalogs_flt;
+Fields
+ Filtr_KatPodr   ('Отобрать по подразделениям',,):PickButton,Protect,QuickChoice;
+ Filtr_Persons   ('Отобрать по сотрудникам'   ,,):PickButton,Protect,QuickChoice;
+ Filtr_Post      ('Отобрать по должности'     ,,):PickButton,Protect,QuickChoice;
+ Filtr_KlKatego  ('Отобрать по категории'     ,,):PickButton,Protect,QuickChoice;
+//П-ние.@@@@@@ Сот-ки.@@@@@@@@@@@@ Должн. .@@@@@@@@@@ К-ия.@@@@@
+<<
+Подразделение.@@@@@@@@@@@@@@@@@ Сотрудники.@@@@@@@@@@@@ Должность .@@@@@@@@@@ К-ия.@@@@@@@@@@@@@@@
+>>
+end;
+Browse brPremP#(wNum) (,,sci1478Esc)  ;
+Show at (,3,63,) fixed_x;// alwaysShowhScroll;// alwaysShowhScroll;//excelColumns,,manualHScroll
+//Show at (,3,63,)  alwaysShowhScroll;//excelColumns,,manualHScroll
+Table #(wTable);
+Fields
+  {Font={Color=GetColorPrem }};
+  KatPodr_Sp#(IT).Kod 'Код'#13'подраз-'#13'деления' ('Код подразделения, красная - ушел с должности') :[8],Protect,NoDel, noAutoSize;
+  TabnBr         'Таб.'#13'номер' ('Таб. номер'):[10],Protect,NoDel, browseText 'Кол-во', noAutoSize ;
+  //Persons.Fio
+  #(wTable).Fio   'Фамилия'#13'Имя Отчество'#13'сотрудника'
+    ('ФИО:Красный-ушел с должности до нач.тек.месяца,Бордовый-назначен в тек. месяце')
+       :[23],Protect,NoDel,noAutoSize,browseCount(' ');
+  KlKatego#(IT).KOD   'Кате-'#13'гория'    :[7],Protect,NoDel ,noAutoSize;
+  CatPost#(IT).Name   'Должность'          :[30],Protect,NoDel,noAutoSize;
+  EMPT_FLD       ''#13''   :[15],Protect,NoDel, noAutoSize; //чтобы была полоса прокрутки
+end;
+/*
+Screen scrPremR#(wNum) (,,sci1478Esc);
+Show at (64,,,2) fixed_y;
+<<
+ `Расчет премии`
+>>
+end;
+*/
+Browse brPremR#(wNum) (,,sci1478Esc)  ;
+Show at (64,3,,);//  alwaysShowhScroll ;//excelColumns, ,manualHScroll
+Table #(wTable);
+Fields
+  FieldSp01   'Поле 01' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,01)}},{InputMask = sArrFieldSpMask[01]},QuickChoice;
+  doFieldSp01 'Поле 01' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,01)}},{InputMask = sArrFieldSpMask[01]},browseSum(' ');
+  FieldSp02   'Поле 02' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,02)}},{InputMask = sArrFieldSpMask[02]},QuickChoice;
+  doFieldSp02 'Поле 02' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,02)}},{InputMask = sArrFieldSpMask[02]},browseSum(' ');
+  FieldSp03   'Поле 03' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,03)}},{InputMask = sArrFieldSpMask[03]},QuickChoice;
+  doFieldSp03 'Поле 03' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,03)}},{InputMask = sArrFieldSpMask[03]},browseSum(' ');
+  FieldSp04   'Поле 04' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,04)}},{InputMask = sArrFieldSpMask[04]},QuickChoice;
+  doFieldSp04 'Поле 04' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,04)}},{InputMask = sArrFieldSpMask[04]},browseSum(' ');
+  FieldSp05   'Поле 05' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,05)}},{InputMask = sArrFieldSpMask[05]},QuickChoice;
+  doFieldSp05 'Поле 05' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,05)}},{InputMask = sArrFieldSpMask[05]},browseSum(' ');
+  FieldSp06   'Поле 06' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,06)}},{InputMask = sArrFieldSpMask[06]},QuickChoice;
+  doFieldSp06 'Поле 06' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,06)}},{InputMask = sArrFieldSpMask[06]},browseSum(' ');
+  FieldSp07   'Поле 07' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,07)}},{InputMask = sArrFieldSpMask[07]},QuickChoice;
+  doFieldSp07 'Поле 07' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,07)}},{InputMask = sArrFieldSpMask[07]},browseSum(' ');
+  FieldSp08   'Поле 08' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,08)}},{InputMask = sArrFieldSpMask[08]},QuickChoice;
+  doFieldSp08 'Поле 08' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,08)}},{InputMask = sArrFieldSpMask[08]},browseSum(' ');
+  FieldSp09   'Поле 09' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,09)}},{InputMask = sArrFieldSpMask[09]},QuickChoice;
+  doFieldSp09 'Поле 09' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,09)}},{InputMask = sArrFieldSpMask[09]},browseSum(' ');
+  FieldSp10   'Поле 10' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,10)}},{InputMask = sArrFieldSpMask[10]},QuickChoice;
+  doFieldSp10 'Поле 10' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,10)}},{InputMask = sArrFieldSpMask[10]},browseSum(' ');
+  FieldSp11   'Поле 11' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,11)}},{InputMask = sArrFieldSpMask[11]},QuickChoice;
+  doFieldSp11 'Поле 11' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,11)}},{InputMask = sArrFieldSpMask[11]},browseSum(' ');
+  FieldSp12   'Поле 12' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,12)}},{InputMask = sArrFieldSpMask[12]},QuickChoice;
+  doFieldSp12 'Поле 12' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,12)}},{InputMask = sArrFieldSpMask[12]},browseSum(' ');
+  FieldSp13   'Поле 13' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,13)}},{InputMask = sArrFieldSpMask[13]},QuickChoice;
+  doFieldSp13 'Поле 13' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,13)}},{InputMask = sArrFieldSpMask[13]},browseSum(' ');
+  FieldSp14   'Поле 14' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,14)}},{InputMask = sArrFieldSpMask[14]},QuickChoice;
+  doFieldSp14 'Поле 14' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,14)}},{InputMask = sArrFieldSpMask[14]},browseSum(' ');
+  FieldSp15   'Поле 15' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,15)}},{InputMask = sArrFieldSpMask[15]},QuickChoice;
+  doFieldSp15 'Поле 15' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,15)}},{InputMask = sArrFieldSpMask[15]},browseSum(' ');
+  FieldSp16   'Поле 16' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,16)}},{InputMask = sArrFieldSpMask[16]},QuickChoice;
+  doFieldSp16 'Поле 16' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,16)}},{InputMask = sArrFieldSpMask[16]},browseSum(' ');
+  FieldSp17   'Поле 17' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,17)}},{InputMask = sArrFieldSpMask[17]},QuickChoice;
+  doFieldSp17 'Поле 17' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,17)}},{InputMask = sArrFieldSpMask[17]},browseSum(' ');
+  FieldSp18   'Поле 18' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,18)}},{InputMask = sArrFieldSpMask[18]},QuickChoice;
+  doFieldSp18 'Поле 18' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,18)}},{InputMask = sArrFieldSpMask[18]},browseSum(' ');
+  FieldSp19   'Поле 19' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,19)}},{InputMask = sArrFieldSpMask[19]},QuickChoice;
+  doFieldSp19 'Поле 19' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,19)}},{InputMask = sArrFieldSpMask[19]},browseSum(' ');
+  FieldSp20   'Поле 20' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,20)}},{InputMask = sArrFieldSpMask[20]},QuickChoice;
+  doFieldSp20 'Поле 20' :[10],Protect,noDel,noAutoSize,{Font={Color=GetColorSp(0,20)}},{InputMask = sArrFieldSpMask[20]},browseSum(' ');
+  // иногда пропадает полоса прокрутки на FontSize=11 .
+  EMPT_FLD       ''#13''   :[40],Protect,NoDel; //чтобы была полоса прокрутки
+  EMPT_FLD       ''#13''   :[40],Protect,NoDel; //чтобы была полоса прокрутки
+end;// Browse brPremR#(wNum)
+end;//FormatsGroup Prem01 'Премия 01'
+#end
+
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,01,_M)
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,02,_M)
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,03,_M)
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,04,_M)
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,05,_M)
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,06,_M)
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,07,_M)
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,08,_M)
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,09,_M)
+#GP_KPI_DOC_FG(GP_KPI_DOC_SP,10,_M)
+#GP_KPI_DOC_FG(tmp_kpi_doc_val,11,_IT)
+end;//tabbedSheet Top tbPrem;
+end;//pnMain
+
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+
+
+//==============================================================================
+//                                 PRIVATE
+//******************************************************************************
+
+//------------------------------------------------------------------------------
+Function MySetAllBounds : boolean;
+{
+  Result := False;
+
+  Result := True;
+} //Function MySetAllBounds : boolean;
+
+//----------------------------------
+//вызвать при изменении позиции
+//----------------------------------
+Procedure PositionChanged;
+{
+
+} //Procedure PositionChanged;
+
+//----------------------------------
+//вызвать при изменении записи родительского контейнера
+//----------------------------------
+Procedure OnUpdateRecord;
+{ Event_ReReadContainer;
+
+} //Procedure PositionChanged;
+
+
+//------------------------------------------------------------------------------
+Function MyGetNumByFormat(lFormat:longint): longint;
+{ Result:=0;
+//CurTabInWindow(wiEditCurriculumInformation)
+  case lFormat of
+  fgPrem01               :Result:=01; //
+  fgPrem02               :Result:=02; //
+  fgPrem03               :Result:=03; //
+  fgPrem04               :Result:=04; //
+  fgPrem05               :Result:=05; //
+  fgPrem06               :Result:=06; //
+  fgPrem07               :Result:=07; //
+  fgPrem08               :Result:=08; //
+  fgPrem09               :Result:=08; //
+  fgPrem10               :Result:=10; //
+  fgPrem11               :Result:=11; //
+  end;
+} //Function MyGetFormatByNum(wNum_Format:word): longint;
+
+//------------------------------------------------------------------------------
+Function MyGetFormatByNumTabS(wNum_Format:word): longint;
+{   Result:=fgPrem01;
+  case wNum_Format of
+  01: Result:=fgPrem01        ;
+  02: Result:=fgPrem02        ;
+  03: Result:=fgPrem03        ;
+  04: Result:=fgPrem04        ;
+  05: Result:=fgPrem05        ;
+  06: Result:=fgPrem06        ;
+  07: Result:=fgPrem07        ;
+  08: Result:=fgPrem08        ;
+  09: Result:=fgPrem09        ;
+  10: Result:=fgPrem10        ;
+  11: Result:=fgPrem11        ;
+  end;
+
+} //Function MyGetFormatByNum(wNum_Format:word): longint;
+
+//------------------------------------------------------------------------------
+Function MyGetBrowSpByNpp(_wNpp:longint):longint;
+{ Result:=brPremR01;
+  case _wNPP of
+  01: Result:=brPremR01        ;
+  02: Result:=brPremR02        ;
+  03: Result:=brPremR03        ;
+  04: Result:=brPremR04        ;
+  05: Result:=brPremR05        ;
+  06: Result:=brPremR06        ;
+  07: Result:=brPremR07        ;
+  08: Result:=brPremR08        ;
+  09: Result:=brPremR09        ;
+  10: Result:=brPremR10        ;
+  11: Result:=brPremR11        ;
+  end;
+
+}
+//------------------------------------------------------------------------------
+Function MyGetFieldSpByNpp(_wNpp:longint):longint;
+{ case _wNpp of
+  01 :Result:=#FieldSP01;
+  02 :Result:=#FieldSP02;
+  03 :Result:=#FieldSP03;
+  04 :Result:=#FieldSP04;
+  05 :Result:=#FieldSP05;
+  06 :Result:=#FieldSP06;
+  07 :Result:=#FieldSP07;
+  08 :Result:=#FieldSP08;
+  09 :Result:=#FieldSP09;
+  10 :Result:=#FieldSP10;
+  11 :Result:=#FieldSP11;
+  12 :Result:=#FieldSP12;
+  13 :Result:=#FieldSP13;
+  14 :Result:=#FieldSP14;
+  15 :Result:=#FieldSP15;
+  16 :Result:=#FieldSP16;
+  17 :Result:=#FieldSP17;
+  18 :Result:=#FieldSP18;
+  19 :Result:=#FieldSP19;
+  20 :Result:=#FieldSP20;
+  end;
+}//Function GetFieldSpByNpp(_wNpp:longint);
+
+Function MyGetFieldSpByNppDo(_wNpp:longint):longint;
+{ case _wNpp of
+  01 :Result:=#doFieldSP01;
+  02 :Result:=#doFieldSP02;
+  03 :Result:=#doFieldSP03;
+  04 :Result:=#doFieldSP04;
+  05 :Result:=#doFieldSP05;
+  06 :Result:=#doFieldSP06;
+  07 :Result:=#doFieldSP07;
+  08 :Result:=#doFieldSP08;
+  09 :Result:=#doFieldSP09;
+  10 :Result:=#doFieldSP10;
+  11 :Result:=#doFieldSP11;
+  12 :Result:=#doFieldSP12;
+  13 :Result:=#doFieldSP13;
+  14 :Result:=#doFieldSP14;
+  15 :Result:=#doFieldSP15;
+  16 :Result:=#doFieldSP16;
+  17 :Result:=#doFieldSP17;
+  18 :Result:=#doFieldSP18;
+  19 :Result:=#doFieldSP19;
+  20 :Result:=#doFieldSP20;
+  end;
+}//Function GetFieldSpByNpp(_wNpp:longint);
+
+Function MyGetNppByFieldSp(_Field:longint):word;
+{ Result:=0 ;
+  case _Field of
+  #doFieldSP01,#FieldSP01: Result:=01;
+  #doFieldSP02,#FieldSP02: Result:=02;
+  #doFieldSP03,#FieldSP03: Result:=03;
+  #doFieldSP04,#FieldSP04: Result:=04;
+  #doFieldSP05,#FieldSP05: Result:=05;
+  #doFieldSP06,#FieldSP06: Result:=06;
+  #doFieldSP07,#FieldSP07: Result:=07;
+  #doFieldSP08,#FieldSP08: Result:=08;
+  #doFieldSP09,#FieldSP09: Result:=09;
+  #doFieldSP10,#FieldSP10: Result:=10;
+  #doFieldSP11,#FieldSP11: Result:=11;
+  #doFieldSP12,#FieldSP12: Result:=12;
+  #doFieldSP13,#FieldSP13: Result:=13;
+  #doFieldSP14,#FieldSP14: Result:=14;
+  #doFieldSP15,#FieldSP15: Result:=15;
+  #doFieldSP16,#FieldSP16: Result:=16;
+  #doFieldSP17,#FieldSP17: Result:=17;
+  #doFieldSP18,#FieldSP18: Result:=18;
+  #doFieldSP19,#FieldSP19: Result:=19;
+  #doFieldSP20,#FieldSP20: Result:=20;
+  end;
+}//Function GetFieldSpByNpp(_wNpp:longint);
+
+
+Function CanEditTbl:boolean;
+{ Result:=(wIntMode and cgiNotEdit)=0;
+}
+
+
+//------------------------------------------------------------------------------
+Function MySetAllFormats : boolean;
+//var wNum_Format:word;
+{
+  Result := False;
+  fCurMainFormat := 0;
+  ReReadRecord(#GP_KPI_Doc);
+  ReReadRecord(#GP_KPI_Doc_SP);
+  fCurMainFormat:=fgPrem01;
+  SetFormat(fCurMainFormat);
+  #mMySelecTableCommand(cmSetDefault   , CanEditTbl)
+  #mMySelecTableCommand(cmInsert       , CanEditTbl)
+  #mMySelecTableCommand(cmAddNewRec    , CanEditTbl)
+  #mMySelecTableCommand(cmDelete       , CanEditTbl and NPOEM_OWN_Raise_SPEC_CAN_DEL)
+  #mMySelecTableCommand(cmRecalcAllSums, CanEditTbl)
+  // ToggleFieldProtected(#U_CURR_GIA_WORK.wAddFld[2],True);
+  ReScanPanel(#GP_KPI_DOC_SP);
+  ReScanPanel(CurTable);
+  Result := True;
+} //Function MySetAllFormats : boolean;
+
+//================================
+// включение / отключение закладок
+//================================
+Procedure MySetTabbedSheetVisible(ww_format:longint;ww_Visible:boolean; ww_comment:string='');
+{ #__UNUSED__(ww_format,ww_Visible,ww_comment)
+    if ww_Visible
+    {  if not GetTabbedSheetVisible(ww_format)
+       {  SetTabbedSheetVisible(ww_format, True);
+       }
+    }
+    else
+    {  if GetTabbedSheetVisible(ww_format)
+       { SetTabbedSheetVisible(ww_format, false);
+       }
+    }
+} //Procedure MySetTabbedSheetVisible(ww_format:longint;ww_Visible:boolean);
+
+//------------------------------------
+// Запретить/разрешить удаление
+//------------------------------------
+Procedure EnableDisableDelete(_Enable:boolean);
+{ if _Enable and NPOEM_OWN_Raise_SPEC_CAN_DEL
+  { EnableCommand(cmDelete);
+    EnableCommand(cmDeleteRecord);
+  }
+  else
+  { DisableCommand(cmDelete);
+    DisableCommand(cmDeleteRecord);
+  }
+} //Function EnableDisableDelete(_Enable:boolean);
+
+
+//==============================================================================
+//                                 PUBLIC
+//******************************************************************************
+//------------------------------------------------------------------------------
+Procedure ReReadCurAndSubTables;
+{
+  //MyCheckGeneration;
+  ReReadRecord(#GP_KPI_Doc);
+  ReReadRecord(#GP_KPI_Doc_SP);
+}
+//------------------------------------------------------------------------------
+Procedure ReReadAllTables;
+{
+  ReReadCurAndSubTables;
+  if (isValid(#GP_KPI_Doc) )
+    Event_ReReadContainer;
+}
+//------------------------------------------------------------------------------
+Procedure CloseAllOpenedWindow;
+{ //MyCloseWindowViewTypeEd;
+  //CloseWindow(wiEditCurr_Course);
+}
+//******************************************************************************
+
+
+//==============================================================================
+//        ОПИСАНИЕ СТАНДАРТНЫХ МЕТОДОВ ИНТЕРФЕЙСА (СЕКЦИЯ 2)
+//******************************************************************************
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+Function InitGlobal : boolean;
+{
+  Result := False;
+  //if (not InitParam(wIntMode, cTopRec, cGetRec) ) exit;
+  fCurMainFormat:=fgPrem01;
+  boImmediately_SP:=true;
+  EMPT_FLD:=LpadCH('-',' ',20);
+  //  Настройки
+  NPOEM_OWN_Raise_SPEC_CAN_DEL:=boGetTune('NPOEM_OWN.Raise.SPEC_CAN_DEL');//Разрешить удаление спецификации в ведомостях на премии
+
+  Result := True
+}
+
+Constructor Init;
+{
+  Result := False;
+  ReadParam;
+  //pMarkerFlt.AutoSave := False;
+  //pMarkerFlt.LoadAuto := True;
+  //pMarkerFlt.StoreName := 'GP_KPI_Doc_SP_FLT';
+  //pMarkerFlt.Caption   := (' Отмечено [%d] ');
+  InitGlobal;
+  Result := True;
+} //Constructor Init;
+
+//------------------------------------------------------------------------------
+Destructor  Done;
+{ SaveParam;
+} //Destructor  Done;
+
+//------------------------------------------------------------------------------
+Function InitParam(
+  _wIntMode  : word;
+  _cTopRec   : comp;
+  _cGetRec   : comp=0;
+  _Format    : longint=0; // включить определенные форматы
+  _NoVisual  : boolean=false //не перерисовывать экраны
+) : boolean;
+{
+  boNoVisual:=_NoVisual;
+
+  Timelog('GP_KPI_Doc_RaiseEdit_Sp->InitParam:_cTopRec='+string(_cTopRec,0,0)
+   +',_cGetRec='+string(_cGetRec,0,0)
+   +',boNoVisual='+string(boNoVisual)
+   +',_Format='+string(_Format)
+   );
+  //---------------------
+  if NullVipRef(DataProtector)
+  { LoadVipRef(DataProtector, 'GP_Protector');
+    DataProtector.LinkToExt(cfsGetCurrentContainerSelf, 'GP_KPI_Doc_RaiseEdit_Sp', true);
+    DataProtector.ProtectedStatusCtx := sci1Esc;
+    DataProtector.AutoPalette := true;
+  } //if NullVipRef(DataProtector)
+
+  Result := False;
+  if cTopRec>0
+  { SaveMyDsk(MyGetNumByFormat(GetCurrentFormat()),'GP_KPI_Doc_RaiseEdit_Sp_Num_Format')
+  }
+  CloseAllOpenedWindow;
+  if cTopRec<>_cTopRec or
+    wIntMode<> _wIntMode  // вдруг режим поменялся
+  { Set cTopRec   := _cTopRec  ;
+    if Getfirst GP_KPI_DOC<>tsok
+    { timelog('Не нашли запись в GP_KPI_DOC '+string(cTopRec,0,0) )
+
+    }
+    //-- ЧТОБЫ принудительно пересканировать весь документ запустим с добавкой
+    IF (_wIntMode AND 32768)>0 _wIntMode:=_wIntMode-32768;
+    Set wIntMode  := _wIntMode ;
+    FillTmp_KPI_Raise(_cTopRec);
+    if not  boNoVisual
+    {
+      ClearMarker(Marker_Persons);
+      ClearMarker(Marker_Post);
+      ClearMarker(Marker_KlKatego);
+      SetFilterNm(0);
+    }
+  } //if cTopRec<>_cTopRec or
+  ReReadRecord(#GP_KPI_DOC);
+  MySetAllFormats;
+  Timelog('GP_KPI_Doc_RaiseEdit_Sp->InitParam:002');
+
+  //------------------------------------------------
+  if not  boNoVisual
+  { SetEditMode(CanEditTbl);
+    // установка ограничений
+    MySetAllBounds;
+    // установка форматов
+    MySetAllFormats;
+    if (GP_KPI_DOC.wtype<>104 and (wIntMode and cgiSingleEdit)=0)
+    or (wIntMode and cgiNotEdit )>0
+    { DisableCommand(cmInsert);
+      DisableCommand(cmEdit);
+      DisableCommand(cmAddNewRec);
+      DisableCommand(cmInsertRecord);
+      DisableCommand(cmSetDefault);
+      DisableCommand(cmDelete);
+      DisableCommand(cmDeleteRecord);
+    } //
+    else
+    { EnableCommand(cmInsert);
+      EnableCommand(cmEdit);
+      EnableCommand(cmAddNewRec);
+      EnableCommand(cmInsertRecord);
+      EnableCommand(cmSetDefault);
+      if NPOEM_OWN_Raise_SPEC_CAN_DEL
+      { EnableCommand(cmDelete);
+        EnableCommand(cmDeleteRecord);
+      }
+      else
+      { DisableCommand(cmDelete);
+        DisableCommand(cmDeleteRecord);
+      }
+    } //
+    ReReadCurAndSubTables;
+  } //if not  boNoVisual
+
+
+  //-------------------------------------------
+  // позиционирование
+  // попробуем найти строку спецификации
+  boFindSpec:=False;
+  if _cGetRec=0
+  { Set cGetRec   := _cGetRec;
+    if getfirst GP_KPI_Doc_Sp=tsok {}
+  }
+  else
+  if cGetRec<>_cGetRec
+  { Set cGetRec   := _cGetRec;
+    //-----------------------------
+
+    if cGetRec<>0
+    if _Format =11
+    { set wNPP_RAISE:=11;
+      if getfirst TMP_KPI_RAISE=tsok
+      {
+
+      }
+      if getfirst tmp_kpi_Doc_Val where ((cGetRec == tmp_kpi_Doc_Val.Nrec ))<>tsok
+      { timelog('Не нашли запись в tmp_kpi_Doc_Val '+string(cGetRec,0,0) )
+
+      }
+
+    } //if _Format
+    else
+    {
+      if getfirst GP_KPI_DOC_SP_0 where ((cGetRec == GP_KPI_DOC_SP_0.Nrec ))=tsok
+      { var _pRaise:comp=GP_KPI_Doc_Sp_0.cGP_KPI_RAISE;
+        // поскольку есть связь Tmp_KPI_RAISe->GP_KPI_Doc_Sp то придется делать двойной поиск
+        //PushPos(#GP_KPI_Doc_Sp);
+        if GP_KPI_Doc_Sp_0.cGP_KPI_RAISE=0
+        { set wNPP_RAISE:=11;
+        }
+        else
+        if getfirst Tmp_KPI_RAISe_F where (( _pRaise  == Tmp_KPI_RAISe_F.cGp_KPI_RAISE ))= tsok
+        { set wNPP_RAISE:=Tmp_KPI_RAISe_F.Npp;
+        }
+        if True
+        { if not boNoVisual
+          { SelectFormat(MyGetFormatByNumTabS(Tmp_KPI_RAISe_F.Npp));
+            onSetTabbedShiits(Tmp_KPI_RAISe_F.Npp);
+          }
+          else
+          { if getfirst Tmp_KPI_RAISe=tsok {}
+          }
+          /*
+          if getfirst GP_KPI_Doc_Sp where ((cGetRec == GP_KPI_Doc_Sp.Nrec ))=tsok
+          { timelog('GP_KPI_Doc_RaiseEdit_SP->нашли спец.');
+          } */
+          boFindSpec:=True;
+        }
+        timelog('Закладка ='+string(wNPP_RAISE));
+        if getfirst GP_KPI_Doc_Sp where ((cGetRec == GP_KPI_Doc_Sp.Nrec ))=tsok {}
+        //PopPos(#GP_KPI_Doc_Sp);
+        //перечитаем на всякий случай
+        ReReadRecord(#GP_KPI_Doc_SP);
+        timelog('GP_KPI_Doc_RaiseEdit_SP->нашли спец.'+string(GP_KPI_Doc_SP.Nrec,0,0));
+      } //if getfirst GP_KPI_Doc_Sp
+    } //else if _Format =11
+
+  } //if cGetRec<>_cGetRec
+  if not boNoVisual
+  { // По умолчанию откроем первую закладку.
+    SelectFormat(MyGetFormatByNumTabS(wNPP_RAISE));
+    //onSetTabbedShiits(wNPP_RAISE);
+  }
+  else
+  // попробуем без перечитывания
+  if False
+  { if wNpp_Raise=11
+    { ReReadRecord(#tmp_Kpi_Doc_Val);
+    }
+    else
+    { ReReadRecord(#GP_KPI_Doc_SP);
+    }
+  }
+  Timelog('GP_KPI_Doc_RaiseEdit_Sp->InitParam:003 wNPP_RAISE='+string(wNPP_RAISE));
+
+  Result := True;
+}
+//******************************************************************************
+
+//******************************************************************************
+// HandleEvent таблиц
+//******************************************************************************
+TableEvent table GP_KPI_Doc;
+cmSetDefault:
+{ exit;
+}
+cmInsert:exit;
+end;//TableEvent table GP_KPI_Doc
+
+
+TableEvent table GP_KPI_Doc_SP;
+cmSetDefault:
+{ if isProtect
+  {     stop;exit;;
+
+  }
+  ClearBuffer(#GP_KPI_Doc_SP);
+  GP_KPI_Doc_SP.wType:=GP_KPI_Doc.wType ;
+  GP_KPI_Doc_SP.cGP_KPI_DOC :=GP_KPI_Doc.Nrec;
+  GP_KPI_Doc_SP.cGP_KPI_RAISE:=TMP_KPI_RAISE.cGp_KPI_RAISE
+}
+cmInsertRecord:
+{ if isProtect
+  { ReReadRecord(#GP_KPI_Doc_SP);
+        stop;exit;;
+  }
+
+   Insert Current GP_KPI_Doc;
+}
+cmUpdateRecord:
+{ if isProtect
+  { ReReadRecord(#GP_KPI_Doc_SP);
+    Message('Изменение записи запрещено' );
+    stop;exit;;
+  }
+
+  Update Current GP_KPI_Doc_SP;
+}
+cmDeleteRecord:
+{ if isProtect
+  { ReReadRecord(#GP_KPI_Doc_SP);
+    Message('Изменение записи запрещено' );
+    stop;exit;;
+  }
+  if Message('Удалить запись?',YesNo)<>cmYes
+  {     stop;exit;;
+  }
+
+  delete Current GP_KPI_Doc_SP;
+  message('Не забудьте пересчитать ведомость!')
+}
+cmPositionChanged:
+{ PositionChanged;
+}
+cmManualHScrollFirst:
+{ case curfield of
+  #KatPodr_Sp_M.Kod,
+  #TabnBr        ,
+  //#Persons.Fio   ,
+  #GP_KPI_DOC_SP.Fio   ,
+  #CatPost_M.Name  ,
+  #KlKatego_M.KOD :
+  { SelectField(#KatPodr_Sp_M.Kod)
+  }
+  else
+  { var jj:word=MyGetNppByFieldSp(CurField);
+    if jj>0
+    if TMP_KPI_Raise.fArrType[jj]=1
+    { SelectField(MyGetFieldSpByNppDo(TMP_KPI_Raise.First_Column) ) //#doFieldSp01);
+    }
+    { SelectField(MyGetFieldSpByNpp(TMP_KPI_Raise.First_Column) ) //#doFieldSp01);
+    }
+
+  }
+  end;
+}
+cmManualHScrollLast:
+{
+  case curfield of
+  #KatPodr_Sp_M.Kod,
+  #TabnBr     ,
+  //#Persons.Fio,
+  #GP_KPI_DOC_SP.Fio,
+  #CatPost_M.Name,
+  #KlKatego_M.KOD :
+  { SelectField(#KlKatego_M.KOD)
+  }
+  else
+  { var jj:word=MyGetNppByFieldSp(CurField);
+    if jj>0
+    if TMP_KPI_Raise.fArrType[jj]=1
+    { SelectField(MyGetFieldSpByNppDo(TMP_KPI_Raise.Last_Column) ) //#doFieldSp01);
+    }
+    { SelectField(MyGetFieldSpByNpp(TMP_KPI_Raise.Last_Column) ) //#doFieldSp01);
+    }
+
+  }
+  end;
+
+}
+cmManualHScrollNext:
+{ case curfield of
+  #KatPodr_Sp_M.Kod: SelectField(#TabnBr);
+  #TabnBr        : SelectField(#GP_KPI_DOC_SP.Fio);// SelectField(#Persons.Fio);
+  //#Persons.Fio   : SelectField(#CatPost.Name);
+  #CatPost_M.Name  : SelectField(#KlKatego_M.KOD);
+  #KlKatego_M.KOD  : {}
+  else
+  { var jj:word=MyGetNppByFieldSp(CurField);
+    if jj>0
+    if TMP_KPI_Raise.fArrType[jj]=1
+    { SelectField(MyGetFieldSpByNppDo(MyGetNppByFieldSp(CurField)+1)) //#doFieldSp01);
+    }
+    else
+    { SelectField(MyGetFieldSpByNpp(MyGetNppByFieldSp(CurField)+1)) //#doFieldSp01);
+    }
+
+  }
+  end;
+
+}
+cmManualHScrollPageNext:
+{ case curfield of
+  #KatPodr_Sp_M.Kod: SelectField(#TabnBr);
+  #TabnBr        : SelectField(#GP_KPI_DOC_SP.Fio);//#Persons.Fio);
+  #GP_KPI_DOC_SP.Fio   : SelectField(#CatPost_M.Name);
+  #CatPost_M.Name  : SelectField(#KlKatego_M.KOD);
+  #KlKatego_M.KOD  : {}
+  else
+  { var ww_column:integer;
+    ww_column:=MyGetNppByFieldSp(CurField)+4;
+    if ww_column>TMP_KPI_Raise.Last_Column
+      ww_column:=TMP_KPI_Raise.Last_Column;
+    var jj:word=MyGetNppByFieldSp(CurField);
+    if jj>0
+    if TMP_KPI_Raise.fArrType[jj]=1
+    { SelectField(MyGetFieldSpByNppDo(ww_column) ) //#doFieldSp01);
+    }
+    else
+    { SelectField(MyGetFieldSpByNpp(ww_column) ) //#doFieldSp01);
+    }
+
+  }
+  end;
+
+}
+cmManualHScrollPagePrev:
+{ case curfield of
+  #KatPodr_Sp_M.Kod: SelectField(#KatPodr_Sp_M.Kod);
+  #TabnBr        : SelectField(#KatPodr_Sp_M.Kod);
+  #GP_KPI_DOC_SP.Fio   : SelectField(#TabnBr);
+  #CatPost_M.Name  : SelectField(#GP_KPI_DOC_SP.Fio);//#Persons.Fio);
+  #KlKatego_M.KOD  : SelectField(#CatPost_M.Name);
+  else
+  { var ww_column:integer;
+    ww_column:=MyGetNppByFieldSp(CurField)-4;
+    if ww_column<TMP_KPI_Raise.First_Column
+      ww_column:=TMP_KPI_Raise.First_Column;
+    var jj:word=MyGetNppByFieldSp(CurField);
+    if jj>0
+    if TMP_KPI_Raise.fArrType[jj]=1
+    { SelectField(MyGetFieldSpByNppDo(ww_column) ) //#doFieldSp01);
+    }
+    else
+    { SelectField(MyGetFieldSpByNpp(ww_column) ) //#doFieldSp01);
+    }
+
+  }
+  end;
+
+
+}
+cmManualHScrollPrev:
+{ case curfield of
+  #KatPodr_Sp_M.Kod: SelectField(#KatPodr_Sp_M.Kod);
+  #TabnBr        : SelectField(#KatPodr_Sp_M.Kod);
+  #GP_KPI_DOC_SP.Fio   : SelectField(#TabnBr);
+  #CatPost_M.Name  : SelectField(#GP_KPI_DOC_SP.Fio); //#Persons.Fio);
+  #KlKatego_M.KOD  : SelectField(#CatPost_M.Name);
+  else
+  { var ww_column:integer;
+    ww_column:=MyGetNppByFieldSp(CurField)-1;
+    if ww_column<TMP_KPI_Raise.First_Column
+      ww_column:=TMP_KPI_Raise.First_Column;
+    var jj:word=MyGetNppByFieldSp(CurField);
+    if jj>0
+    if TMP_KPI_Raise.fArrType[jj]=1
+    { SelectField(MyGetFieldSpByNppDo(ww_column) ) //#doFieldSp01);
+    }
+    else
+    { SelectField(MyGetFieldSpByNpp(ww_column) ) //#doFieldSp01);
+    }
+
+  }
+  end;
+}
+end;
+
+
+//==============================================================================
+//                                MAIN HANDLE
+//------------------------------------------------------------------------------
+HandleEvent
+//--------------------------------------
+
+//---------------------------------------------------
+cmDefault :
+{ cGetRec:=GP_KPI_Doc_Sp.Nrec
+}
+
+cmEdit :
+{
+  //RunThisWindow(wiEditCurr_Course  , '');
+}
+
+//---------------------------------------------------
+cmBuhCalculator : // Сервис видов учебной деятельности
+{
+}
+//---------------------------------------------------
+cmRestoreDoc :
+{
+  //if (not CheckEditRec)
+  //{ Abort; Exit; }
+}
+//---------------------------------------------------
+cmPick:
+{
+  case CurField of
+  //----------------------
+  #Filtr_KatPodr,#Filtr_KlKatego,#Filtr_Persons,#Filtr_Post: GetFilterName(CurField);
+  //----------------------
+  #FieldSp01 : MyPickFld(CurField,01);
+  #FieldSp02 : MyPickFld(CurField,02);
+  #FieldSp03 : MyPickFld(CurField,03);
+  #FieldSp04 : MyPickFld(CurField,04);
+  #FieldSp05 : MyPickFld(CurField,05);
+  #FieldSp06 : MyPickFld(CurField,06);
+  #FieldSp07 : MyPickFld(CurField,07);
+  #FieldSp08 : MyPickFld(CurField,08);
+  #FieldSp09 : MyPickFld(CurField,09);
+  #FieldSp10 : MyPickFld(CurField,10);
+  #FieldSp11 : MyPickFld(CurField,11);
+  #FieldSp12 : MyPickFld(CurField,12);
+  #FieldSp13 : MyPickFld(CurField,13);
+  #FieldSp14 : MyPickFld(CurField,14);
+  #FieldSp15 : MyPickFld(CurField,15);
+  #FieldSp16 : MyPickFld(CurField,16);
+  #FieldSp17 : MyPickFld(CurField,17);
+  #FieldSp18 : MyPickFld(CurField,18);
+  #FieldSp19 : MyPickFld(CurField,19);
+  #FieldSp20 : MyPickFld(CurField,20);
+  end;
+}
+cmOpenSearch :
+{
+      isOpenSearch:= true;
+      ProcessCommand(cmPick);
+      isOpenSearch:= false;
+}
+
+//----------------------
+cmDelOnProtect :
+{ case CurField of
+  //----------------------
+  #Filtr_KlKatego:
+  { ClearMarker(Marker_KlKatego);
+    SetFilterNm(#Filtr_KlKatego);
+    SetFilterBounds(0);
+  }
+  //----------------------
+  #Filtr_Persons:
+  { ClearMarker(Marker_Persons);
+    SetFilterNm(#Filtr_Persons);
+    SetFilterBounds(0);
+  }
+  //----------------------
+  #Filtr_Post:
+  { ClearMarker(Marker_Post);
+    SetFilterNm(#Filtr_Post);
+    SetFilterBounds(0);
+  }
+  //----------------------
+  #Filtr_KatPodr:
+  { ClearMarker(Marker_KatPodr);
+    SetFilterNm(#Filtr_KatPodr);
+    SetFilterBounds(0);
+  }
+  end;
+}
+
+//----------------------
+cmExprFieldChanged :
+{ case CurField of
+  #FieldSp01 : MyPickFld(CurField,01);
+  #FieldSp02 : MyPickFld(CurField,02);
+  #FieldSp03 : MyPickFld(CurField,03);
+  #FieldSp04 : MyPickFld(CurField,04);
+  #FieldSp05 : MyPickFld(CurField,05);
+  #FieldSp06 : MyPickFld(CurField,06);
+  #FieldSp07 : MyPickFld(CurField,07);
+  #FieldSp08 : MyPickFld(CurField,08);
+  #FieldSp09 : MyPickFld(CurField,09);
+  #FieldSp10 : MyPickFld(CurField,10);
+  #FieldSp11 : MyPickFld(CurField,11);
+  #FieldSp12 : MyPickFld(CurField,12);
+  #FieldSp13 : MyPickFld(CurField,13);
+  #FieldSp14 : MyPickFld(CurField,14);
+  #FieldSp15 : MyPickFld(CurField,15);
+  #FieldSp16 : MyPickFld(CurField,16);
+  #FieldSp17 : MyPickFld(CurField,17);
+  #FieldSp18 : MyPickFld(CurField,18);
+  #FieldSp19 : MyPickFld(CurField,19);
+  #FieldSp20 : MyPickFld(CurField,20);
+  //-----------------
+  #doFieldSp01 : MyPickFld(CurField,01);
+  #doFieldSp02 : MyPickFld(CurField,02);
+  #doFieldSp03 : MyPickFld(CurField,03);
+  #doFieldSp04 : MyPickFld(CurField,04);
+  #doFieldSp05 : MyPickFld(CurField,05);
+  #doFieldSp06 : MyPickFld(CurField,06);
+  #doFieldSp07 : MyPickFld(CurField,07);
+  #doFieldSp08 : MyPickFld(CurField,08);
+  #doFieldSp09 : MyPickFld(CurField,09);
+  #doFieldSp10 : MyPickFld(CurField,10);
+  #doFieldSp11 : MyPickFld(CurField,11);
+  #doFieldSp12 : MyPickFld(CurField,12);
+  #doFieldSp13 : MyPickFld(CurField,13);
+  #doFieldSp14 : MyPickFld(CurField,14);
+  #doFieldSp15 : MyPickFld(CurField,15);
+  #doFieldSp16 : MyPickFld(CurField,16);
+  #doFieldSp17 : MyPickFld(CurField,17);
+  #doFieldSp18 : MyPickFld(CurField,18);
+  #doFieldSp19 : MyPickFld(CurField,19);
+  #doFieldSp20 : MyPickFld(CurField,20);
+
+  end;
+}
+//---------------------------------------------------
+cmValue21://Расчет итогов
+{ PushPos(#Tmp_kpi_doc_val);
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm,
+          'Ждите, идет перерасчет', RecordsInTable(#Tmp_kpi_doc_val));
+  _Loop Tmp_kpi_doc_val
+  { if not nextvisual break;
+    RecalcSp(0);
+    update current Tmp_kpi_doc_val;
+  }
+  StopVisual('',0);
+  PopPos(#Tmp_kpi_doc_val);
+  ReScanPanel(#Tmp_kpi_doc_val);
+}
+cmValue23:
+{ if message('Обнулить колонку?',YesNo)<>cmYes Exit;
+
+  StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Обнуление колонки...', 1);
+  PushPos(#GP_KPI_DOC_SP);
+  var _wNpp:word=MyGetNppByFieldSp(CurField);
+  if _wNpp<>0
+  _Loop GP_KPI_DOC_SP
+  { if not NextVisual then break;
+    if not MyPickFld(CurField,_wNpp,'0.00') break;
+  }
+  StopVisual('',0);
+  PopPos(#GP_KPI_DOC_SP);
+  ReScanPanel(#GP_KPI_DOC_SP);
+}
+//---------------------------------------------------
+cmPickAttr:
+{     //if UpdateTable
+      case CurTable of
+      #GP_KPI_Doc_SP: RunInterface('Attribute', coGP_KPI_Doc_SP, GP_KPI_Doc_SP.nRec);
+      end;
+
+
+}
+cmHotKeys:
+{  if wNPP_Raise=11
+   { if (GP_KPI_DOC.wType=102 or GP_KPI_DOC.wType=103)
+     { ProcessCommand(RunMenu('HotI_GP_KPI_Doc_RaiseEdit_Sp_103_11'));
+     }
+   }
+   else
+   { var MenuID : longint=0;
+     MenuID := LoadMenu('GP_STAFF::HotI_GP_KPI_Doc_RaiseEdit_Sp',true);
+     var _wNpp:word=MyGetNppByFieldSp(CurField);
+     if _wNpp>0
+     if IsBitCTW(tmp_KPI_RAISE.fArrOpt[_wNpp],1) // редактирование
+     if tmp_KPI_RAISE.fArrType[_wNpp]=1 //только для числовых
+     { AddMenuItemEx(MenuID,'Обнулить колонку "'
+       + tmp_KPI_RAISE.fArrName[_wNpp]+ '"', 'Обнулить колонку',hcNoContext, cmValue23, kbCtrlEnter);
+     }
+     ProcessCommand(RunLoadMenu(MenuID));
+   }
+   Exit;
+}
+cmChangeTabbedSheetFormat:
+{ var fTargetFormat:longint;
+  fTargetFormat:=Target;
+  //UpdateTable;
+  fCurMainFormat:=fTargetFormat;
+  // будет установлен wNpp_Raise и перерисованы панели
+  onSetTabbedShiits(MyGetNumByFormat(fTargetFormat));
+
+}
+end; // HandleEvent
+End. // Interface
+
+//------------------------------------------------------------------------------
+HotI_GP_KPI_Doc_RaiseEdit_Sp Menu
+{
+---------;
+-'Внешние атрибуты', cmPickAttr, 'Внешние атрибуты', hcGkatalM1Attr, 'Alt+A', kbAltA, sci1Esc;
+---------;
+
+}
+//------------------------------------------------------------------------------
+HotI_GP_KPI_Doc_RaiseEdit_Sp_103_11 Menu
+{
+-'Рассчитать', cmValue21, 'Рассчитать', hcGkatalM1Attr, '', kbAltC, sci1Esc;
+---------;
+-'Внешние атрибуты', cmPickAttr, 'Внешние атрибуты', hcGkatalM1Attr, 'Alt+A', kbAltA, sci1Esc;
+---------;
+
+}

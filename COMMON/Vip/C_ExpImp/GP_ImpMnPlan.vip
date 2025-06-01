@@ -1,0 +1,1166 @@
+/*************************************************************************************************\
+* Наименование: Импорт Заявок по инструменту из Excel в Галактику (MNPLAN)                        *
+* Контур/Модуль:                                                                                  *
+* Примечание:  запуск:  \Сервис \Утилиты \Запуск внешнего интерфейса                              *
+*                                                                                                 *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата      |Исполнитель              |Проект                         *
+* ---------------------------------------------------------------------------------------------   *
+* Разработка  |#3947         |30/01/2019|Шунин А.Г.               |НПО Энергомаш                  *
+\*************************************************************************************************/
+// component "C_EXPIMP"
+#include objintpl.vin
+#include ImpDefine.vih
+#include oCalcMnPlan.vih
+Interface GP_ImpMnPlan 'Заявок по инструменту из Excel' gray dialog;
+
+type TmnPlan = record as table mnPlan;
+
+const
+wZak = 01; wZakO=1; wZakN='Заказчик';// Заказчик Kod, обязательность, Наименование в Excel
+wMC  = 02; wMCO=2; wMCN='НоменклатураАртикул';// МЦ:  Kod, обязательность, Наименование в Excel
+wKol = 03; wKolO=1; wKolN='Количество';
+wTIP = 04; wTIPO=0; wTIPN='ТипИнструмента';
+wZN = 05; wZNo = 1 ;wZNN ='ВнутреннийЗаказНомер';
+wZD = 06; wZDo = 1 ;wZDN ='ВнутреннийЗаказДата' ;
+wCN = 07; wCNo = 1 ;wCNN ='НомерЦеховойЗаявки'  ;
+// wOtv = 07; wOtvo = 1 ;wOtvN ='ОтветственныйИсполнитель'  ;
+
+end;
+
+type TspData= record
+  cMC : comp;
+  cPodr: comp;
+  cBoss: comp;
+  cTip : comp;
+  sTip : string;
+  cOtv : comp;
+  Kol: double;
+  DZak: Date;
+  NZak:string[20];
+  NZakCeh:string[50];
+end; //TxlData record
+var spData:TspData;
+
+Table struct mtAList
+(
+wTable:word, // код таблицы для атрибута, если < 100, то код поля для импорта, например wZak
+bob: word, // 0 - не обязательное, 1- обязательное порядок чтения
+Name: string[80], // Наименование атрибута 
+Col: longInt, // колонка
+COut: longInt, // колонка куда выдавать старое значение
+cAttrnam:comp, // ссылка на Атрибут
+ATTRTYPE: word,
+rObject : word,
+// M: boolean,
+NameList: string// варианты наименований в Excel
+)
+with index (
+ i0 = Col , idx2 = bOb (Desc)
+)
+;
+
+var gldt            : GlobData;
+var GetN            : Util_GetName;
+Var  pCalcMnPlan  : oCalcMnPlan;
+
+var
+// mnCPODR: comp;
+p_spKAUNAME: string;
+cTIPZayavki: comp;//Тип заявки по умолчанию
+ refImpDef : C_EXPIMP::ImpDefine;
+//refImpDef : ImpDefine;    // функции для импорта
+
+lLine0, Counter, MaxLine, MaxCol, npp : longint;
+sFileName, nm_file: string;
+
+lBarkod     : longint;
+
+sMCKOD      : string;
+
+gError: word;
+sTune, sTuneOK,sError: String;
+
+sValue : string;
+Str, StrKod, StrName: string;
+dd, dValue: double;
+cc, cValue: comp;
+wFlagDop: word;
+NeedUpDateMC: word;
+
+DCol: longint; // смещение для вывода старых значений
+
+
+create view jView
+var
+  iSetPl: SetupMnf;
+
+  pMnPlan0,cShablon, cWorkStatus: comp;
+  pWorkType: word = 29;
+as select KatMC.nRec
+from
+Katpodr,
+ KatMC, mtAList, AttrNam, ExImLogE
+ , KatNotes
+ , MnPlan        , SPMNPLAN          , SpMnPl        , ValSpMnP          , MNANAL        , SOPRHOZ
+ , MnPlan MnPlan0, SPMNPLAN SPMNPLAN0, SpMnPl SpMnPl0, ValSpMnP ValSpMnP0, MNANAL MNANAL0, SOPRHOZ SOPRHOZ0
+ , SPMNPLAN SPMNPLAN_NUM (SPMNPLAN03)
+ ,spKAU
+where
+((
+   sMCKOD == KatMC.BARKOD
+
+   and 0 == ExImLogE.cLogR
+
+//and  pMnPlan0 == MnPlan0.nRec
+and  29 == MnPlan0.TYPEPLAN   // 000B000000006128h
+and 'ШАБЛОН' == MnPlan0.number and (cShablon = MnPlan0.cWayAccou)
+and  MnPlan0.nRec ==  SPMNPLAN0.cMnPlan
+                  and SPMNPLAN0.nRec == SpMnPl0.cSpMnPlan
+                                    and SpMnPl0.NRec == ValSpMnP0.cSpMnPl
+and MnPlan0.CSLOJ == MNANAL0.CSLOJ
+and        Comp(0)== MNANAL0.CBLOCK
+and  MnPlan0.nRec == MNANAL0.FLDAN1
+
+and         1207 == SOPRHOZ0.TIPDOC
+and MnPlan0.nRec == SOPRHOZ0.CSOPRDOC
+
+and cShablon == WAYACCOU.nrec
+and 
+  cWorkStatus == KatNotes.nrec // 0 == KatNotes.STATUS  and 1200 == KatNotes.VIDDOC and 'Оформлено инициатором'  == KatNotes.name
+
+and 10248 ==   spKAU.KODGRKAU
+and p_spKAUNAME == spKAU.NAME
+
+and  MnPlan.nRec == SPMNPLAN_NUM.cMnPlan
+
+))
+;
+
+
+screen scrImp;
+Show at (,,,13);
+fields
+WAYACCOU.Name :NoProtect, PickButton;
+KatNotes.name :NoProtect, PickButton;
+nm_file:NoProtect, PickButton;
+wFlagDop:NoProtect;
+
+buttons
+      cmColTune; cmImport;
+<<
+  Шаблон  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  Статус заявки.@@@@@@@@@@@@@@@@@@@@@@@@@
+  Импорт Атрибутов МЦ
+  Файл Excel.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Обработка:`
+ [.] Добавлять/Менять Данные в ERP`
+ [.] -- не используется -- резерв --`
+ [.] Пропускать пустые ячейки. "Пусто = неопределено"`
+ [.] Менять значения даже если одиннаково (для КОРПО)`
+ [.] Добавлять атрибут Производителя в МЦ, если он не заполнен`
+
+    <. Проверить соответствие полей .>              <. Запустить Импорт .>
+
+  версия 0.2 ( Отв. Исполнитель)
+>>
+end;
+Browse brAttr;
+Show at (,14,,);
+table mtAList;
+fields
+  mtAList.Col  '№ Колонки в Excel':[3], Protect;
+  mtAList.Name 'Наименование атрибута':[30], Protect;
+    mtAList.NameList 'Имена колонок':[30], Protect;
+end;
+
+procedure xlOut1(pCol:longint;pStr: string);
+{
+  xlSetCellStringValue(pStr,Counter,MaxCol+pCol,Counter,MaxCol+pCol);
+}//  procedure xlOut1
+
+var LineError: word;
+procedure xlOutE(pCol:longint;pStr: string);
+{
+  LineError++;
+  xlSetCellStringValue(pStr,Counter,MaxCol+pCol,Counter,MaxCol+pCol);
+}//  procedure xlOutE
+
+var stMnPlan, stMnPlanLast : TMnPlan;
+var lspNum : string;
+Procedure AddMnPlan;
+{
+var Rez:integer;
+
+//  Message('AddMnPlan ');
+   ClearAdvRecord ( stMnPlan );
+   stMnPlan.TypePlan := pWorkType;
+   stMnPlan.cWayAccou := cShablon;
+   iSetPl := gldt.GetSetupMnf;
+   iSetPl.ResetAllWayValue();
+   iSetPl.InitAll ( stMnPlan.cWayAccou );
+   //SetDefStMnPlan ( stMnPlan );
+//   stMnPlan.LastTime := Cur_Time;
+//   stMnPlan.LastDate := Cur_Date;
+//   stMnPlan.LastUser := UserName;
+//   stMNPLAN.Nrec     := 0;
+//   stMNPLAN.cMnplan  := 0;
+   stMnPlan.cStatus  := cWorkStatus;
+   stMNPLAN.wKodGr1  := getn.GetManualKodGrKAUWay(stMnplan.cWayAccou,1);
+   stMNPLAN.wKodGr2  := getn.GetManualKodGrKAUWay(stMnplan.cWayAccou,2);
+   stMNPLAN.wKodGr3  := getn.GetManualKodGrKAUWay(stMnplan.cWayAccou,3);
+   stMNPLAN.wKodGr4  := getn.GetManualKodGrKAUWay(stMnplan.cWayAccou,4);
+   stMNPLAN.wKodGr5  := getn.GetManualKodGrKAUWay(stMnplan.cWayAccou,5);
+   stMNPLAN.cRoleAn1 := iSetPl.GetKatRoleNRec(1);
+   stMNPLAN.cRoleAn2 := iSetPl.GetKatRoleNRec(2);
+   stMNPLAN.cRoleAn3 := iSetPl.GetKatRoleNRec(3);
+   stMNPLAN.cRoleAn4 := iSetPl.GetKatRoleNRec(4);
+   stMNPLAN.cRoleAn5 := iSetPl.GetKatRoleNRec(5);
+   stMNPLAN.cAnVal1:= spData.cPodr;// coGetTune('NPOEM_OWN.CLAIMPODR.cPODR');//Подразделение-инициатор
+   stMNPLAN.cAnVal2:= spData.cBoss;// coGetTune('NPOEM_OWN.CLAIMPODR.cMAIN');//Руководитель Подразделения-инициатора
+   stMNPLAN.cAnVal5:= cTIPZayavki; // coGetTune('NPOEM_OWN.CLAIMPODR.TIPZ');//Тип заявки по умолчанию
+
+
+   stMNPLAN.Name     := 'Инструмент.' +  spData.NZakCeh +	'.' + spData.sTip; // Назначение  iSetPl.GetNameForDocSetup ( stMNPLAN );
+//   stMNPLAN.Number   := GetLastNumMnPlan ( stMnPlan.TypePlan, stMnPlan.cWayAccou );
+   stMNPLAN.NUMBER := spData.NZak;
+   //
+   stMnPlan.cSloj    := iSetPl.GetLinkGr;
+   stMnPlan.cMnPlan  := 0;
+   stMnPlan.Descr  := sGetTune ( 'User.Descr' );
+   stMnPlan.DesGr  := sGetTune ( 'User.DesGr' );
+   stMnPlan.StatemDate := spData.DZak ; // Cur_Date;
+
+ Rez:=BeginConcurrentTransaction(trNoLock);
+ if (Rez=tsok)
+ {// делаем
+
+   if stMnPlanLast = stMnPlan
+   {
+     // Текущий MnPlan
+     lspNum := NextNumStr(lspNum);
+//    xogStrTOFILE('#lspNum.txt','1 if stMnPlanLast = stMnPlan ' + lspNum);
+   }
+   else
+   {
+//Message(' AddMnPlan if stMnPlanLast <> stMnPlan ');
+           if Getfirst MnPlan where ((      stMnPlan.TypePlan == MnPlan.TYPEPLAN
+                                        and stMnPlan.Descr  == MnPlan.DESCR
+                                        and stMnPlan.StatemDate == MnPlan.STATEMDATE
+                                        and (
+                                               stMnPlan.cStatus = MnPlan.cStatus
+                                           and stMNPLAN.Name = MnPlan.Name
+                                           and stMNPLAN.NUMBER = MnPlan.NUMBER
+                                           and stMNPLAN.cAnVal1 = MNPLAN.cAnVal1
+                                        )
+              )) = tsOK
+           {
+            // Уже есть такой MnPlan
+              lspNum := '00001';
+              if getLast SPMNPLAN_NUM = tsOK
+              {
+                lspNum := SPMNPLAN_NUM.NUMBER;
+                lspNum := NextNumStr(lspNum);
+              }
+//    xogStrTOFILE('#lspNum.txt','2 Exist MnPlan ' + lspNum);
+           }
+           else
+           {
+             // Новый MnPlan
+             lspNum := '00001';
+     LogStrTOFILE('#lspNum.txt','3 NEW MnPlan ' + lspNum);
+
+             MnPlan.buffer := type$MnPlan ( stMnPlan );
+             if insert current MnPlan <> tsOK
+               LineError++
+             else
+             {
+            //создание записей в ObjParam, SpObjPar для правильной работы алг. с условие запуска "Создание документа"
+            //Procedure prValidateObjParam;
+              var wTypeEd :word = 0;
+              var ccOtpEd :comp = 0;
+              var i: byte; i := 0;
+              for (i:=1;i<=7;i:=i+1)
+              {
+                pCalcMnPlan.ReadValFldDocument ( MnPlan.NRec, word(i), wTypeEd, ccOtpEd );
+              }
+
+                doSetAttr ( coMnPlan, MnPlan.nrec, sGetTune('NPOEM_OWN.MZAK.CP_DAYU'),doGetTune('NPOEM_OWN.MZAK.CP_DAYUVAL') );
+                MNANAL.Buffer := MNANAL0.Buffer;
+                MNANAL.nRec := Comp(0);
+                MNANAL.FLDAN1 := MnPlan.nRec;
+                if insert current MNANAL <> tsOK
+                 LineError++
+                else
+                {
+                  xlOut1( 6, String(MNANAL.nrec,0,0));
+
+                  SOPRHOZ.buffer := SOPRHOZ0.buffer;
+                  SOPRHOZ.nRec := comp(0);
+                  SOPRHOZ.NODOC := mnPlan.NUMBER;
+                  SOPRHOZ.DESCR := mnPlan.DESCR ;
+                  SOPRHOZ.DESGR := mnPlan.DESGR ;
+                  SOPRHOZ.DATOB := mnPlan.STATEMDATE;
+                  if Insert current SOPRHOZ <> tsOK
+                   LineError++
+                  else
+                  {
+                    xlOut1( 7, String(SOPRHOZ.nrec,0,0));
+                  }
+
+                }
+
+
+             }
+           }
+   } // else if stMnPlanLast = stMnPlan
+   xlOut1( 2, String(MnPlan.nRec,0,0));
+
+  LogStrTOFILE('#lspNum.txt','5 insert spMnPlan ' + lspNum);
+
+     // спецификация
+     SPMNPLAN.Buffer :=  SPMNPLAN0.Buffer;
+     SPMNPLAN.nRec := Comp(0);
+     SPMNPLAN.cMnPlan := MnPlan.nRec;
+     SPMNPLAN.CSTATUS := MnPlan.CSTATUS;
+
+      SPMNPLAN.NUMSORT := 1;
+      SPMNPLAN.TYPEIZD := 1;
+      SPMNPLAN.CIZD	:= 	spData.CMC;
+      SPMNPLAN.CANVAL1 := MNPLAN.cAnVal1;
+      SPMNPLAN.NUMBER := lspNum;
+      SPMNPLAN.CANVAL3 := spData.cOtv;
+
+     if Insert current SPMNPLAN <> tsOK
+       LineError++
+     else
+     {
+       xlOut1( 3, String(SPMNPLAN.nrec,0,0));
+
+       SPMNPL.Buffer := SPMNPL0.Buffer;
+       SPMNPL.nRec      := Comp(0);
+       SPMNPL.cMnPlan   := MnPlan.nRec;
+       SPMNPL.CSPMNPLAN := SPMNPLAN.nrec;
+       SPMNPL.CANVAL1   := MNPLAN.cAnVal1;
+       SPMNPL.CMNANAL := MNANAL.nRec;
+       SPMNPL.CSTATUS := SPMNPLAN.CSTATUS;
+       SPMNPL.NUMBER  := SPMNPLAN.NUMBER;
+       SPMNPL.CANVAL3 := SPMNPLAN.CANVAL3;
+
+       if Insert current SPMNPL <> tsOK
+         LineError++
+       else
+       {
+         xlOut1( 4, String(SPMNPL.nRec,0,0));
+         VALSPMNP.Buffer := VALSPMNP0.Buffer;
+         VALSPMNP.nRec    := Comp(0);
+         VALSPMNP.CSPMNPL := SPMNPL.nRec;
+         VALSPMNP.KOL  :=  spData.Kol;
+
+         if Insert current VALSPMNP <> tsOK
+           LineError++
+         else
+         xlOut1( 5, String(VALSPMNP.nRec,0,0));
+
+       }
+
+     }
+
+
+
+   stMnPlanLast := stMnPlan;
+} // Делаем
+
+  if (Rez=tsok) and (LineError = 0)
+  {//Запись в БД
+   Rez:=EndTransaction;
+      if (Rez<>tsOK)
+      {
+        message('Ошибка завершения транзакции - '+string(Rez),error);
+        LineError++;
+      }
+   //   result:=Rez=tsok;
+  }
+  else
+  {//Откат
+      Rez:=AbortTransaction;
+      if (Rez<>tsOK)
+        message('Ошибка отката транзакции - '+string(Rez),error);
+  }
+
+/*
+   if ( GetLast snMnPlanDelete where (( pWorkType == snMnPlanDelete.TypePlan ))
+                                   ordered by snMnPlanDelete.NumSort = tsOK )
+     {
+      stMnPlanGlob.Numsort := ( snMnPlanDelete.NumSort + 1 );
+     };
+       */
+
+}// Procedure AddMnPlan;
+
+// wZak = 001; wZakO=1; wZakN
+Procedure AddField(pKod,pOb: word;pS,pS2: string);
+{
+  insert mtAList set mtAList.Name := pS, mtAList.NameList := ';'+ UpCase(if(pS2='',pS,pS2) )+';' , mtAList.cAttrnam := comp(0), mtAList.wTable := pKod, mtAList.bOb := pOb;
+}
+//  Procedure AddField(pKod,pOb: word;pS,pS2: string);
+
+
+Procedure AddAttr(pS,pS2: string);
+{
+  if getfirst Attrnam where (( coKatMC == Attrnam.WTABLE and pS==Attrnam.NAME)) = tsOK
+  {
+    insert into mtAList set mtAList.Name := pS, mtAList.NameList := ';'+ UpCase(if(pS2='',pS,pS2) )+';' , mtAList.cAttrnam := Attrnam.nRec, 
+    mtAList.ATTRTYPE := Attrnam.ATTRTYPE, mtAList.rObject := AttrNam.rObject; 
+  }
+  else
+  {
+    insert into mtAList set mtAList.Name := pS, mtAList.NameList := ';'+ pS+';'+ UpCase(pS)+';';
+    sError := sError + ''#13+ pS;
+    gError++;
+  }
+}
+
+var wDataCount: word = 0;
+function ReadColNumByNamesOK: boolean;
+Var
+   lCol:longint;
+   wOK: word = 0;
+   wGlobO: word = 0;
+{
+
+  lBarkod := 0; wGlobO := 0;
+
+  _LOOP mtAList {mtAList.Col := 0; Update current mtAList; if mtAList.bOb > 0 wGlobO++}
+
+  lLine0 := 1; lCol:=0; str := '';  
+    while (lCol <= MaxCol) and (lLine0 < 50)// по Колонкам lLine0 строки ищем заголовок
+    do
+    {
+      lCol++;
+      xlgetcellvalue(lLine0, lCol, str);
+      str := trim( str );
+      str := Replace(str,''#13,' ');
+      str := Replace(str,''#10,' ');
+      str := Replace(str,'  ',' ');      str := Replace(str,'  ',' ');      str := Replace(str,'  ',' ');
+//            Case str of
+/* 'ТМЦ / Услуга':{}
+
+'"Номенклатурный номер"',
+'Номенклатурный номер',
+'НоменклатураАртикул': lBarkod    :=lCol;    */
+           // else
+            {
+               _LOOP mtAList
+                 if mtAList.NAME = str {wOK++;mtAList.Col := lCol; Update current mtAList}
+                 else
+                 if Instr(';'+UpCase(str)+';',mtAList.NAMEList)>0 {wOK++;mtAList.Col := lCol; Update current mtAList}
+
+               //   if wOK = 0 message(str + ''#13 + ';'+UpCase(str)+';');
+            }
+       //     end; // Case
+
+      if lCol = MaxCol
+      if wOK = 0
+      {
+        lLine0++; lCol:=0;
+        continue;
+      }
+
+    }// while lCol <= MaxCol // по Колонкам lLine0 строки
+
+    gError :=0;  wDataCount := 0;
+    sTuneOK := sTune := sError := '';
+    _LOOP mtAList
+    {
+      sTune := sTune + ''#13+ mtAList.NAME + '= ' + mtAList.Col;
+      if mtAList.Col = 0
+      {
+        sError := sError + ''#13+ mtAList.NAME;
+        gError++;
+      }
+      else
+      {
+        sTuneOK := sTuneOK + ''#13+ mtAList.NAME + '= ' + mtAList.Col;
+        wDataCount++;
+      }
+
+    }
+
+
+    if gError > 0
+    {
+       message ( 'Ошибка формата файла. Не найдена колонка' + sError );
+       ReadColNumByNamesOK := False;
+    }
+    else
+    ReadColNumByNamesOK := true;
+
+    DCol := 8; // тут 3 - первая свободная ячейка лога справа от таблицы. см.
+    _LOOP mtAList
+    if mtAList.Col > 0
+    {  mtAList.cOut := DCol++;
+       UpDate current mtAList;
+    }
+  ReScanPanel(#mtAList);
+}// function ReadColNumByNamesOK: boolean;
+
+function FindMn0: boolean;
+{
+  result := false;
+  if Getfirst MnPlan0 = tsok
+  if Getfirst SPMNPLAN0 = tsok
+  if Getfirst SpMnPl0 = tsOK
+  if Getfirst MNANAL0 = tsOK
+  if Getfirst SOPRHOZ0 = tsOK
+  {
+     result := True;
+     pMnPlan0 := MnPlan0.nRec;
+  }
+
+  if not result
+  {
+
+    Message('Не найден Документ MnPlan0 для копирования при импорте'#13+
+            'создайте 1 документ с одной позицией с количеством =10'#13+ WAYACCOU.Name +'с номером= ШАБЛОН');
+  }
+}
+HandleEvent
+
+cmINIT:
+{
+  ClearAdvRecord ( stMnPlan );
+  ClearAdvRecord ( stMnPlanLast );
+
+  cTIPZayavki :=  coGetTune('NPOEM_OWN.CLAIMPODR.TIPZ');//Тип заявки по умолчанию
+  if cTIPZayavki = comp(0)
+  if Getfirst SPKAU where (( 10161 == SPKAU.KodGRKAU and (SPKAU.NAME = 'Плановая') )) = tsOK
+  {
+    cTIPZayavki := spKAU.nRec;
+  }
+
+
+  pMnPlan0 := comp(0);
+  if ( Not GetVipRef ( pCalcMnPlan,'iCalcMnPlan') )
+      {
+      Message('Системная ошибка !!!'+
+              'Не загружен интерфейс <' + 'iCalcMnPlan' +'>',Information);
+      exit;
+      }
+  if ( not LoadVipRef ( gldt,'GlobDataSource') )
+   {
+    Message('Системная ошибка !!!'+
+            'Не загружен интерфейс <' + 'GlobDataSource' +'>',Information);
+    exit;
+   };
+
+    if (nullVipRef(iSetPl))
+      iSetPl  := gldt.GetSetupMnf();
+    if (nullVipRef(GetN))
+      GetN    := gldt.uGetName();
+
+   pWorkType := 29;
+   cShablon := coGetTune ( 'NPOEM_OWN.CLAIMPODR.CSHABLON' );
+   If GetFirst WayAccou Where ((cShablon == WayAccou.nrec)) <> tsOk
+    {
+     Message ( 'Не найден шаблон "Заявки подразделений"!', Error );
+     Abort; Exit;
+    }
+   cWorkStatus :=  0001000000000155h; // 281474976710968; //
+   cWorkStatus :=  281474976710968; // Черновик
+
+   FindMn0;
+
+/*  if getfirst fastfirstrow SPWAYAC where ((cShablon == SPWAYAC.CWAYACMAIN and word(32) == SPWAYAC.CODE  )) =tsok
+  {
+      cWorkStatus:=SPWAYAC.cvalres[2];
+  }
+*/
+
+  lLine0 := 1;
+  if not ReadMyDsk(nm_file  , 'GP_ImpMnPlan_nm_file', false) nm_file := '';
+  if not ReadMyDsk(wFlagDop , 'GP_ImpMnPlan_Flags'  , false) wFlagDop:= 111b;
+  gError:= 0; sError := '';
+
+  AddField(wZak, wZakO, wZakN,'');
+  AddField(wMC, wMCO, wMCN,'');
+  AddField(wKol, wKol, wKolN,'');
+  AddField(wTIP,wTIPO, wTIPN,'');
+  AddField(wZN ,wZNo , wZNN ,'');
+  AddField(wZD ,wZDo , wZDN ,'');
+  AddField(wCN ,wCNo , wCNN ,'');
+
+  if sError <> ''
+  {
+    if gError = 1 if Yes<>Message('Продолжить??'#13'Не найден атрибут к МЦ:'#13 + sError) CloseInterface(cmCancel);
+    if gError > 1 if Yes<>Message('Продолжить??'#13'Не найдены атрибуты к МЦ:'#13 + sError) CloseInterface(cmCancel);
+  }
+}// cmInit
+cmColTune:
+{
+  if nm_file <> '' then sFileName := nm_file
+  else
+  {
+    sFileName := 'GP_Saldo.xlsx';
+    sFileName := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' + sFileName ;
+  }
+
+  if (not ExistFile(sFileName))
+  { message('Не файла "'+sFileName+'"',error);
+    exit;
+  }
+
+
+    if (not xlOpenNewExcel(false))
+    {
+      message('Ошибка запуска Excel', Error);
+      if not xlKillExcel
+        message('Ошибка закрытия Excel', Error);
+      exit;
+    }
+
+    if (not xlOpenWorkBook(sFileName))
+    {
+      Message('Ошибка открытия книги: "' + sFileName + '"');
+      xlKillExcel;
+      Exit;
+    }
+
+  if (xlIsExcelValid) xlSetActiveSheetByName('1');
+
+  xlGetUsedRange(0,0,MaxLine,MaxCol);
+  Counter:=lLine0;
+  if ReadColNumByNamesOK
+        message ( 'Найдены колонки:'
+            +''#13'Ном.№ = '                  + lBarkod + sTune );
+  xlkillExcel;
+} // cmColTune
+
+cmImport:
+{
+  SaveMyDsk(nm_file    , 'GP_ImpMnPlan_nm_file');
+  SaveMyDsk(wFlagDop   , 'GP_ImpMnPlan_Flags'  );
+
+  if nm_file <> '' then sFileName := nm_file
+  else
+  {
+    sFileName := 'GP_ImpMnPlan.xlsx';
+    sFileName := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' + sFileName ;
+  }
+
+  if (not ExistFile(sFileName))
+  { message('Не найден шаблон файла "'+sFileName+'"',error);
+    exit;
+  }
+
+  if (not xlCreateExcelWithTemplate(sFileName,true))
+  { message('Ошибка создания нового файла в Excel"'+sFileName+'".',error);
+    exit;
+  }
+
+  if (xlIsExcelValid) xlSetActiveSheetByName('1');
+
+  xlGetUsedRange(0,0,MaxLine,MaxCol);
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Импорт из Excel ...', MaxLine);
+
+// Читаем заголовок и находим номера колонок по названию полей
+
+Var boOk: boolean = ReadColNumByNamesOK;
+if not boOk
+  if wDataCount > 0
+    boOk := Message('Можно загрузить данные только из '+String(wDataCount)+' колонок'+sTuneOK+''#13'Продолжить?',YESNO) = YES;
+
+if boOk
+{
+//  jView.PutTableToDBF (#mtAList,'mtAList.xls',0);
+
+  Counter:=lLine0;
+
+// Заголовки для протокола
+  xlOut1( 1, 'Статус');
+  xlOut1( 2, 'mnPlan.nRec');
+  xlOut1( 3, 'spMnPlan.nRec');
+  xlOut1( 4, 'SpMnPl.nRec');
+  xlOut1( 5, 'VALSPMNP.nRec');
+  xlOut1( 6, 'MNANAL.nRec');
+  xlOut1( 7, 'SoprHoz.nRec');
+  _Loop mtAList
+     if mtAList.Col > 0
+        xlOut1( mtAList.cOut, mtAList.Name);
+
+while counter < MaxLine
+do
+{
+  Counter++;
+
+  ClearAdvRecord(spData);
+
+  LineError := 0; // Наличие ошибки в строке
+  NeedUpDateMC := 0; // признак изменения значения
+
+  if Counter mod 3 = 0
+    if not nextvisual break;
+
+    _Loop mtAList ordered by index idx2
+    if mtAList.Col > 0
+    {
+      xlgetcellvalue(Counter, mtAList.Col, Str);
+      Str := Trim(Str);
+
+      if Str = ''
+      if mtAList.bOb > 0
+      {
+         xlOutE(1 , 'Пустое Обязательное поле') ;
+         xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+         break;
+      }
+      else
+      {
+        Case mtAList.wTable of
+        wTIP:
+        {
+            spData.cTip := coGetAttr(coKatMC, spData.cMC, 'Производитель');
+            if spData.cTip = 0
+            {
+               xlOutE(1 , 'в МЦ тоже нет производителя') ;
+               xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+               break;
+            }
+            spData.sTip :=  sGetAttr(coKatMC, spData.cMC, 'Производитель');
+        }
+        else
+        if (wFlagDop and 100b) > 0 continue;
+        end;
+      }
+
+      if mtAList.wTable < 100
+      {
+        Case mtAList.wTable of
+        wMC:
+        {
+          sMCKOD := Str;
+          if sMCKOD = ''
+          {  xlOutE(1 , 'Нет Баркода') ;
+             xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+             break;
+          }
+
+          if getfirst KATMC <> tsOK
+          {
+            sMCKOD := LPADCH(sMCKOD,'0',10);
+            if getfirst KATMC <> tsOK
+            {
+              xlOutE(1 , 'Не найдена МЦ ' + sMCKOD);
+              xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+              break;
+            }
+          }
+          spData.cMC := KatMC.nrec;
+
+        }// wMC
+        wZak:
+        {
+          // Message('wZak = ' + Str + ''#13'Counter=' + Counter);
+          Var pKod : string = Trim(Substr(Str,1,3));
+          Var pName : string = Trim(Substr(Str,4,255));
+            if getfirst Katpodr where ((  pKod == Katpodr.KOD and pName == Katpodr.Name)) = tsOK
+            {
+              spData.CPODR := Katpodr.nRec;
+            }
+            else
+            {
+//                 if  ' Механосборочный цех'
+                //pName := ' '+pName;
+                if pKod = '545'
+                if getfirst Katpodr where ((  pKod == Katpodr.KOD)) = tsOK
+                {
+                  spData.CPODR := Katpodr.nRec;
+                }
+                else
+                { xlOutE(1 , 'Не найдено подразделение ' + pKod + pName);
+                  xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+                  break;
+                }
+            }
+
+        }// wZak
+        wZD: // 18.01.2018 20:04:30
+        {
+          Var pDate: Date = date(substr(Str,1,2),substr(Str,4,2),substr(Str,7,4));
+          spData.DZak := pDate;
+        }// wZD
+        wKol:
+        {
+           Str := Replace(Str,',','.');
+           spData.Kol := Double(Str);
+           if spData.Kol < 1
+           { xlOutE(1 , 'Не верное количество' + Str);
+             xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+             break;
+           }
+        }
+        wTIP:
+        {
+          p_spKAUNAME := Str;
+          if Getfirst spKau <> tsOK
+          {
+           // MAP
+            if p_spKAUNAME ='ТМ ИНКРОМ'     then p_spKAUNAME := 'ТМ "Инкром"';
+            if p_spKAUNAME ='ОАО "КЗТС"'    then p_spKAUNAME := 'КЗТС';
+            if p_spKAUNAME ='Завод Микрон'  then p_spKAUNAME := 'Микрон';
+            if p_spKAUNAME ='SIMTEK'        then p_spKAUNAME := 'Simitek';
+
+             if Getfirst spKau <> tsOK
+             { xlOut1(mtAList.COUT , 'Производитель не найден' + if(p_spKAUNAME <> Str, Str + ' / '+p_spKAUNAME, Str ) );
+               xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+//               break;
+             }
+          }
+
+
+          {
+            spData.cTip := spKau.nRec;
+            spData.sTip := p_spKAUNAME; // если не найден spKau.Name;
+
+            Var cMCKAU: comp = coGetAttr(coKatMC, spData.cMC, 'Производитель');
+            if spData.cTip <> cMCKAU
+            {
+              if cMCKAU = 0
+              if (wFlagDop and 10000b) > 0
+              {
+                if spData.cMC <> comp(0)
+                coSetAttr(coKatMC, spData.cMC, 'Производитель',spKau.nRec, spKau.Name);
+              }
+              else
+              {
+                xlOut1( mtAList.cOut, 'в МЦ Производитель = ' + sGetAttr(coKatMC, spData.cMC, 'Производитель'));
+                xlSetBackColor( 65535 , Counter, mtAList.Col, Counter, mtAList.Col);
+              }
+            }
+          }
+        }
+        wZN:
+        {
+          spData.NZak := Str;
+        }
+        wCN: //  = 07; wCNo = 1 ;wCNN ='НомерЦеховойЗаявки'  ;
+        {
+          spData.NZakCeh := Str;
+        }
+
+
+        end;
+
+
+      }
+      else // if mtAList.wTable < 100
+      Case mtAList.ATTRTYPE of
+      0:// строка
+       {
+         sValue := sGetAttr(coKatmc, Katmc.nRec,mtAList.NAME);
+         if sValue <> Str  or  ((wFlagDop and 1000b) > 0 )
+         {
+           xlOut1( mtAList.cOut, sValue);
+
+           if (wFlagDop and 1b) > 0
+           sSetAttr(coKatmc, Katmc.nRec, mtAList.NAME, Str);
+           xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+
+           if sValue <> Str NeedUpDateMC++;
+         }
+       }
+      1: // число
+       {
+         Str := Replace(Str, ',','.');
+         dd := double(Str);
+         dValue := doGetAttr(coKatmc, Katmc.nRec,mtAList.NAME);
+         if dValue <> dd  or  ((wFlagDop and 1000b) > 0 )
+         {
+           if (wFlagDop and 1b) > 0
+           doSetAttr(coKatmc, Katmc.nRec, mtAList.NAME, dd);
+
+           if dValue <> dd
+           {
+             xlOut1( mtAList.cOut, dd);
+             xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+             NeedUpDateMC++;
+           }
+         }
+       }
+      2: // Дата
+       {}
+      3: // Время
+       {}
+      4: // мемо-поле
+       {}
+      5: // ссылка
+       {
+         StrKod := StrName := '';
+         StrKod := ExtractDelimitedWord(Str, 1, ' ');
+         StrName := Trim(SubStr( Str, Length(StrKod)+1, 255));
+LogStrToFile('#_TEST_.txt', 'StrKod =' + StrKod  + ' StrName =' + StrName);
+
+
+         cc := refImpDef.GetKauID(mtAList.ROBJECT,StrName, StrKod);
+
+         if cc = comp(0) Delete ExImLogE Where((0 == ExImLogE.cLogR and UserId == ExImLogE.ATL_OWNER (noindex) )); // побочный продукт refImpDef
+
+         if cc = comp(0) cc := refImpDef.GetKauID(mtAList.ROBJECT, Str, '');
+
+LogStrToFile('#_TEST_.txt', 'KodKAU=' + mtAList.ROBJECT  + ' Str='+Str+' cc =' + string(cc,0,0) );
+
+
+         if cc = comp(0)
+         {
+            Delete ExImLogE Where((0 == ExImLogE.cLogR and UserId == ExImLogE.ATL_OWNER (noindex) )); // побочный продукт refImpDef
+            xlOutE( mtAList.cOut, 'Не найдено в справочнике значение=' + str);
+         }
+         else
+         {
+           cValue := coGetAttr(coKatmc, Katmc.nRec,mtAList.NAME);
+           if cValue <> cc  or  ((wFlagDop and 1000b) > 0 )
+           {
+              if (wFlagDop and 1b) > 0
+              coSetAttr(coKatmc, Katmc.nRec, mtAList.NAME, cc, Str);
+
+              if cValue <> cc
+              {
+                sValue := sGetAttr(coKatmc, Katmc.nRec,mtAList.NAME); //  sGetAttr(1411,KATMC.nRec,'Ответственный исполнитель')
+                xlOut1( mtAList.cOut, sValue);
+                xlSetBackColor( 49407 , Counter, mtAList.Col, Counter, mtAList.Col);
+                NeedUpDateMC++;
+              }
+           }
+         }
+       }
+      end; // Case
+
+    }
+
+    if LineError = 0
+    {
+      if (wFlagDop and 1b) > 0
+      {
+        spData.cOtv := coGetAttr(1411,spData.CMC,'Ответственный исполнитель');
+        AddMnPlan;
+        if LineError = 0
+          xlOut1(1,'Загружено')
+        else
+        {
+          xlOut1(1,'Ошибка при добавлении данных');
+          break;
+        }
+
+      }
+      else
+      xlOut1(1,'ОК');
+    }
+
+
+} // while counter < MaxLine do
+}// if ReadColNumByNamesOK
+
+xlkillExcel;
+StopVisual('',0);
+
+} // cmImport:
+
+cmPick:
+{ case CurField of
+  #nm_file:
+  { var ww_str:string=GetFileName('*.xls;*.xlsx','Выберите файл c данными по Задолженности');
+    if ww_str<>''
+    {
+       set nm_file:=ww_str;
+    }
+  }
+  #WayAccou.Name:
+  {
+      var pr_varcTemplate    : comp = cShablon;
+      var pr_wTypePlan       : word = pWorkType;
+
+      if ( RunInterface('M_MNPLAN::NastrPl', pr_wTypePlan, pr_varcTemplate, word(1)) <> cmCancel)
+        if (GetFirst WayAccou where ((pr_varcTemplate == WayAccou.NRec)) = tsOk)
+        {
+          if (pr_wTypePlan != 0)
+            if(WayAccou.TypeObj != pr_wTypePlan)
+            {
+              Message('Ошибка! Выбран шаблон для другого типа документа!', Error) ;
+              exit;
+            }
+
+          cShablon := WayAccou.nRec;
+          FindMn0;
+        }
+
+  }
+  end;
+
+} // cmPick:
+cmDone:
+{
+  if ( Not NullVipRef ( pCalcMnPlan ) ) FreeVipInterface(pCalcMnPlan);
+  if ( Not nullVipRef (iSetPl)) FreeVipInterface(iSetPl);
+  if ( Not nullVipRef (GetN)  ) FreeVipInterface(GetN);
+}
+
+end; // HandleEvent
+End. // interface
+
+
+
+#include UserReport.vih
+
+VipInterface UserReport_GP_KATPRICE_DM Implements IUserReport;
+
+Interface UserReport_GP_KATPRICE_DM;
+
+create view;
+
+procedure Run;
+begin
+RunInterface('GP_ImpMnPlan');
+end;
+!-------------------------------------------------------------------------------
+// Наименование отчета в списке
+function GetReportName: String;
+begin
+  GetReportName := 'Заявок по инструменту из Excel';
+end;
+function GetGroupName (Level : Word) : String;
+begin
+#__UNUSED__(level)
+  GetGroupName := '';
+end;
+function GetPriority : Integer;
+begin
+  GetPriority := -100;
+end;
+function VisibleInModule(Ind : Byte) : String;
+begin
+#__UNUSED__(Ind)
+  VisibleInModule := '*';
+end;
+end.
+  /*
+// 'Select * from SPMNPLAN where nrec =  3096224745268761;'
+
+//
+Select * from SPMNPLAN where nrec =  000B000000162619h;
+Select * from SPMNPL where nrec =  000B00000015A1A4h;
+Select * from VALSPMNP where nrec =  000B00000015B4D5h;
+// 'Select * from '+ X$FILES.XF$NAME + ' where nrec =  '+ string(X$JOURNAL.TABLENREC,0,0) + ';'
+
+
+Select * from SPMNPLAN where nrec =  000B00000016261Ah;
+Select * from SPMNPL where nrec =  000B00000015A1A5h;
+Select * from VALSPMNP where nrec =  000B00000015B4D6h;
+sql Select * from SPMNPLAN where nrec =  #Comp(000B00000016261Ah) to dbf f:\SPMNPLAN.xls;
+sql Select * from SPMNPL   where nrec =  #Comp(000B00000015A1A5h) to dbf f:\SPMNPL.xls;
+sql Select * from VALSPMNP where nrec =  #Comp(000B00000015B4D6h) to dbf f:\VALSPMNP.xls;
+*/
+/*
+WKOLAN	25
+VALSPMNP.KOL := ;
+  var wKolAn_, wKau_ : word; wKolAn_ := iSetPl.GetSysNumnVid(iSetPl.GetCurVid())
+    wKolAn_ := iSetPl.GetSysNumnVid(iSetPl.GetCurVid());
+
+wKolAn_ := iSetPl.GetSysNumnVid(iSetPl.GetCurVid());
+       _LOOP SpMnPl where(( CurSpMnplanNRec == SpMnPl.cSpMnPlan and
+                             wKolAn_         == SpMnPl.wKolAn       ))
+
+SpMnPl.NRec == ValSpMnP.cSpMnPl
+*/
+/*
+Ошибка 5
+Дублированное значение при уникальном ключе
+в таблице T$SPMNPL.
+Уникальный индекс T$SPMNPL0 таблица N11071
+ Продолжить редактирование ?
+
+ */
+
+
+// 'Select * from MNANAL where nrec =  000B00000004C4FCh;'
+
+
+// Select * from SPMNPL where nrec =  000B00000015A1ADh or nrec = 000B00000015A1ACh;
+// sql Select * from SPMNPL where nrec =  #comp(000B00000015A1ACh) or nrec =  #comp(000B00000015A1ADh) to dbf f:\xxx.xls;
+// Помощь ядл журнала
+// 'sql Select * from '+ X$FILES.XF$NAME + ' where nrec =  #comp('+ string(X$JOURNAL.TABLENREC,0,0) + ');'
+
+// 'sql Select * from SPMNPL where nrec =  #comp(000B00000015A1AFh) OR NREC = #COMP(000B00000015A1AEh);'
+
+/*
+ ┌──────────────────────┬──────────────┬──────────────┬──────────────────────┬──────────────────┬──────────────────────┬──────────────────────┬──────────────────────┬──────────┬────────────┬─────────────┬──────────────────────┬──────────────────────┬──────────────────────┬───────────┬──────────────────────┬──────────────────────┬──────────────────────┬──────────────────────┬──────────────────────┬──────────────────────┬──────────────────────┬──────────────────────┬──────────────────────┬──────────────────────┐
+ │ NREC                 │ ATL_LASTDATE │ ATL_LASTTIME │ ATL_LASTUSER         │ ATL_ORIGINOFFICE │ ATL_OWNER            │ ATL_BRANCH           │ LASTUSER             │ LASTTIME │ LASTDATE   │ FILIALNO    │ CSLOJ                │ HASHCODE             │ CBLOCK               │ LASTBLOCK │ FLDAN1               │ FLDAN2               │ FLDAN3               │ FLDAN4               │ FLDAN5               │ FLDAN6               │ FLDAN7               │ FLDAN8               │ FLDAN9               │ FLDAN10              │
+ ├──────────────────────┼──────────────┼──────────────┼──────────────────────┼──────────────────┼──────────────────────┼──────────────────────┼──────────────────────┼──────────┼────────────┼─────────────┼──────────────────────┼──────────────────────┼──────────────────────┼───────────┼──────────────────────┼──────────────────────┼──────────────────────┼──────────────────────┼──────────────────────┼──────────────────────┼──────────────────────┼──────────────────────┼──────────────────────┼──────────────────────┤
+ │    000B00000004C4FDh │ 30/01/2019   │ 20:52        │    000A000000000072h │               11 │    000A000000000072h │    0000000000000000h │                      │ 00:00    │ ДД/ММ/ГГГГ │           0 │    000B00000000002Bh │    0000000000000000h │    0000000000000000h │         0 │    000B000000006126h │    0000000000000000h │    0000000000000000h │    0000000000000000h │    0000000000000000h │    0000000000000000h │    0000000000000000h │    0000000000000000h │    0000000000000000h │    0000000000000000h │
+ └──────────────────────┴──────────────┴──────────────┴──────────────────────┴──────────────────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────┴────────────┴─────────────┴──────────────────────┴──────────────────────┴──────────────────────┴───────────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────────────────┘
+*/
+// EVENTS
+//    done  30.01.2019  21:44:02  EVENTS  000B00000023A775h
+// 30.01.2019  23:31:08           000B00000023A96Bh
+// - 000B00000023DB24h
+
+// stend_4  000B0000001DD830h
+/*
+sql
+select  MnPlan.number, SPMNPLAN.Number, SPSETAN.NAME, A1.VSTRING
+from SPMNPLAN
+inner join MNPLAN on SPMNPLAN.cMNPLAN = MNPLAN.nRec
+inner join SPSETAN on SPSETAN.KODGRKAU  = 10027 and SPMNPLAN.CANVAL3 = SPSETAN.CKAU
+inner join SPMNPL on SPMNPLAN.nrec = SPMNPL.CSPMNPLAN
+inner join katmc on SPMNPLAN.CIZD = katmc.nrec
+left join ATTRNAM on 1411 = ATTRNAM.WTABLE and 'Ответственный исполнитель' = ATTRNAM.NAME
+left join AttrVal A1 on  ATTRNAM.WTABLE = A1.WTABLE and ATTRNAM.nRec = A1.CATTRNAM and KatMC.nRec = A1.CREC
+where
+    MNPLAN.cAnVal5 = #comp(3096224743817614) 
+and MnPlan.TypePlan = 29 
+and MnPlan.cWayAccou = #comp(4611946092306072754)
+and SPMNPLAN.WKODGR3 = 3
+and SPMNPLAN.CMNPLAN = #comp(000B00000000616Dh)
+and (A1.VCOMP is null or A1.VCOMP <> SPSETAN.CKAU)
+;
+
+
+
+
+
+sql
+Update SPMNPLAN
+set SPMNPLAN.CANVAL3 = Case when A1.VCOMP is null then COMP(0) else SPSETAN.CKAU end
+from SPMNPLAN
+inner join MNPLAN on SPMNPLAN.cMNPLAN = MNPLAN.nRec
+inner join SPSETAN on SPSETAN.KODGRKAU  = 10027 and SPMNPLAN.CANVAL3 = SPSETAN.CKAU
+inner join SPMNPL on SPMNPLAN.nrec = SPMNPL.CSPMNPLAN
+inner join katmc on SPMNPLAN.CIZD = katmc.nrec
+left join ATTRNAM on 1411 = ATTRNAM.WTABLE and 'Ответственный исполнитель' = ATTRNAM.NAME
+left join AttrVal A1 on  ATTRNAM.WTABLE = A1.WTABLE and ATTRNAM.nRec = A1.CATTRNAM and KatMC.nRec = A1.CREC
+where
+    MNPLAN.cAnVal5 = #comp(3096224743817614) 
+and MnPlan.TypePlan = 29 
+and MnPlan.cWayAccou = #comp(4611946092306072754)
+and SPMNPLAN.WKODGR3 = 3
+// and SPMNPLAN.CMNPLAN = #comp(000B00000000616Dh)
+and (A1.VCOMP is null or A1.VCOMP <> SPSETAN.CKAU)
+and SPMNPLAN.CANVAL3 <> ( Case when A1.VCOMP is null then COMP(0) else SPSETAN.CKAU end)
+;
+
+sql
+Update SPMNPL
+set SPMNPL.CANVAL3 = SPMNPLAN.CANVAL3
+from SPMNPLAN
+inner join MNPLAN on SPMNPLAN.cMNPLAN = MNPLAN.nRec
+inner join SPMNPL on SPMNPLAN.nrec = SPMNPL.CSPMNPLAN
+where
+    MNPLAN.cAnVal5 = #comp(3096224743817614)
+and MnPlan.TypePlan = 29
+and MnPlan.cWayAccou = #comp(4611946092306072754)
+and SPMNPLAN.WKODGR3 = 3
+and SPMNPL.WKODGR3 = SPMNPLAN.WKODGR3
+// and SPMNPLAN.CMNPLAN = #comp(000B00000000616Dh)
+and ( SPMNPL.CANVAL3 <> SPMNPLAN.CANVAL3) ; // ИСПРАВЬ
+
+*/

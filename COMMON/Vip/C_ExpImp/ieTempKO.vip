@@ -1,0 +1,919 @@
+/*************************************************************************************************\
+* Наименование: Импорт Каталога организаций из Excel в Галактику                                  *
+* Контур/Модуль: Обмен бизнес-документами                                                         *
+* Примечание:                                                                                     *
+*          Запустить импорт можно из справочника организация последняя кнопка под заголовком окна *
+*          настройка для импорта GAL_import_Katorg_настройка4_new_C_ExpImp2.dot                   *      
+*                                                                                                 *
+* Вид работы  |Номер         |Дата      |Исполнитель              |Проект                         *
+* ---------------------------------------------------------------------------------------------   *
+* Разработка  |#2249         |12/04/2018|Шунин А.Г.               |НПО Энергомаш                  *
+\*************************************************************************************************/
+//
+// #2249 Импорт Каталога организаций из Excel в Галактику
+//
+// Добавлены новые поля из KATORG
+//
+// Добавлен импорт поля: "Применять налоги",
+//                        МАП для атрибута=число=1 при прочитанном "СМП" (Субъект малого и среднего бизнеса)
+
+// Добавлен импорт внешнего атрибута для KATORG: Число, Число=Номер записи источника, логический да/нет
+// Добавлен режим Лога (boLogOnly=true) Обработка с выводом лога в файл Excel без изменений в БД
+//
+// Изменён поиск существующей записи.
+//
+//
+#component "C_ExpImp"
+Alter InterFace ieTempKO;
+overload
+Function DefineField( sFieldValue : String; HeadOrSpec : Byte; sCode : String ) : Boolean;
+Procedure UpdateDocument( cTempDocument : Comp; cExistingDocument : Comp );  // штатная не копирует арибуты и новые поля
+Function ThisSignatureWasImported( Var cDocument : Comp ) : Boolean;
+Function ImportField( IsHeader : Boolean; wNumber : Word; Var sFieldValue : String ) : Boolean;
+Function ImportExcelField( sFieldName : string; iRow : longInt; Var sFieldValue : String ) : Boolean;
+function ImportDocument( cTempDoc : Comp ) : comp;
+Procedure AddDocument( IsHeader  : Boolean );
+function AddDocuments(bAll : boolean) : boolean;
+Procedure ShowErrorRecordInTmp;
+Function CreateKatOrgDescr (cSearch : comp;  bufKatOrg : type$p_tHeader) : boolean;
+
+end;
+#include exImConst.inc
+// include ieCommon.vpp
+const
+ieInfo = 10;
+end;
+var 
+  sLastFieldValue : string;
+  lCurColumn: longint;
+
+  boLogOnly : boolean; // true - режим, когда базу не меняем, только сообщаем в Excel о предстоящих изменениях;
+  iOutLogXL: integer = 0;
+  MaxLine,MaxCol: longint=0;
+
+  _cGROUP : comp;
+  mkValidIER : longint =0;
+
+Create View
+As Select
+KontrIer.nRec ,KontrIerX.nRec, KatOrgDescrUp.nRec
+From
+KatOrg KatOrgX
+,KontrIer, KontrIer KontrIerX
+//, KatOrgDescr KatOrgDescr0
+, KatOrgDescr KatOrgDescrUP
+Where
+((
+/*
+    KatOrgDescr.cGroup == KontrIer.cGroup
+and        KatOrg.NREC == KontrIer.cRecDs
+*/
+                _cGROUP == KontrIer.cGroup
+and    KatOrgDescr.nRec == KontrIer.cRecDs
+
+and _cGROUP == KatOrgDescrUP.nRec
+
+                 and 0 == KontrIerX.ISLEAF
+       and KatOrg.NAME == KontrIerX.NAME
+       and KatOrg.NAME == KatOrgX.NAME and ( KatOrg.NRec <> KatOrgX.NRec )
+     /*
+                                      and 1 == KatOrgDescr0.CODE
+                     and  KontrIer0.cGroup  == KatOrgDescr0.cGroup
+                            and KatOrg.NREC == KatOrgDescr0.CREC   */
+))
+;
+
+#Declare insert_KontrIer
+      if ( (insert KontrIer
+              set KontrIer.Name      := KatOrg.Name
+                , KontrIer.ShortName := KatOrg.ShortName
+                , KontrIer.cRecDs    := KatOrgDescr.nrec // KatOrg.nRec
+                , KontrIer.cGroup    := _cGROUP          // KatOrgDescr.cGroup
+           ) <> tsOk ) {}
+#END
+
+procedure CreateKatOrgIER; // Удаляет и создаёт заново KontrIer для текущего KatOrg
+{
+/*  // Что удалять из иерархии и как это найти не понятно. только по KatOrg.Name
+    _LOOP KontrIer0
+    if getfirst KatOrgDescr0 <> tsOK
+    delete current KontrIer0;
+*/
+
+var boUnic :boolean = (getfirst KatOrgX <> tsOK); // имя нашей организации Уникальное
+
+if boUnic ClearMarker(mkValidIER);
+
+
+  _LOOP KatOrgDescr where (( KatOrg.NREC == KatOrgDescr.CREC ))
+  {
+    _cGROUP := KatOrgDescr.nrec;
+
+    if getfirst KontrIer <> tsOK #insert_KontrIer
+
+    if boUnic InsertMarker(mkValidIER, KontrIer.nRec);
+
+    _cGROUP := KatOrgDescr.cGroup;
+    while _cGROUP <> comp(0) do
+    {
+       if getfirst KatOrgDescrUP = tsOK
+       {
+         if getfirst KontrIer <> tsOK #insert_KontrIer
+
+
+         if boUnic InsertMarker(mkValidIER, KontrIer.nRec);
+
+         if _cGROUP = KatOrgDescrUP.cGroup break; // защита от зацикливания
+         _cGROUP := KatOrgDescrUP.cGroup;
+
+       }else break;
+    } // while _cGROUP <> comp(0) do
+
+  } // _LOOP KatOrgDescr where (( KatOrg.NREC == KatOrgDescr.CREC ))
+
+  if boUnic
+  _Loop KontrIerX
+  if not FoundMarker(mkValidIER, KontrIerX.nRec) delete current KontrIerX; // удаляем иерархию, которой не должно быть
+
+} // procedure CreateKatOrgIER;
+
+// Код поля из текущей записи настройки импорта
+//
+Function GetIEHFldsCODE: word;
+{
+  var bPos: byte;
+  var sTemp: string = '';
+    sTemp := IEHFlds.Value;
+    bPos  := Pos('"', sTemp );
+    GetIEHFldsCODE := word( If ( bPos <> 0, SubStr( sTemp, 1, bPos - 1 ), sTemp ));
+} // Function GetIEHFldsCODE: word;
+
+Function CreateKatOrgDescr (cSearch : comp;  bufKatOrg : type$p_tHeader) : boolean;
+{
+  result := inherited::CreateKatOrgDescr (cSearch,  bufKatOrg);
+
+  if result
+  UpDate current tKatOrgDescr set tKatOrgDescr.SHORTNAME := bufKatOrg.SHORTNAME;
+}
+
+ExtendFormats scTmpPD;
+Screen scTmpPD;
+Fields
+  boLogOnly :NoProtect;
+<<
+
+
+
+  [.] Не делать изменений по кнопке ДОБАВИТЬ*, а показать ЛОГ того, что изменится`
+>>
+
+End;  //Screen
+
+Procedure ShowErrorRecordInTmp;
+{
+ if not boLogOnly  inherited::ShowErrorRecordInTmp
+ else  wMessageError := cmYes;
+}
+
+procedure MyLogErrorDetail(wStatus : word; pRec: comp; sR1C1, sValue, sDetailValue : string);
+{
+  ClearBuffer(#ExImLogE);
+  ExImLogE.CLOGR := ExImLogR.nRec;
+  if pRec > 0
+    ExImLogE.NOREFFLD := string(pRec,0,0) + ' ' + sR1C1; // суть ошибки
+  else
+    ExImLogE.NOREFFLD := ' ' + sR1C1; // суть ошибки
+
+  ExImLogE.VALUE  := sValue;// Значение источника
+  ExImLogE.STATUS := wStatus ;// 2-Warning
+  ExImLogE.RSTR   := sDetailValue; // описание ошибки
+  insert current ExImLogE;
+
+ if iOutLogXL > 0
+ if tHeader.REFS[20] > 0
+ {
+   var lRow1: longint = longint(tHeader.REFS[20]);
+
+   xlSetCellStringValue(string(pRec,0,0), lRow1, MaxCol+1, lRow1, MaxCol+1);
+   xlSetCellStringValue(sR1C1, lRow1, MaxCol+2, lRow1, MaxCol+2);
+   xlSetCellStringValue(sValue, lRow1, MaxCol+3, lRow1, MaxCol+3);
+   xlSetCellStringValue(sDetailValue, lRow1, MaxCol+4, lRow1, MaxCol+4);
+ }
+
+}
+
+function AddDocuments(bAll : boolean) : boolean;
+{
+  mkValidIER := InitMarker('',8,100,10,false);
+  iOutLogXL := 0;
+
+  if boLogOnly
+  if ExistFile(ExImLogT.FNAME)
+  { iOutLogXL++;
+    xlCreateExcelWithTemplate(ExImLogT.FNAME, True);
+    xlGetUsedRange(0,0,MaxLine,MaxCol);
+//    MaxCol++;
+
+    // заголовок
+    xlSetCellStringValue('Katorg.nRec',     1, MaxCol+1, 1, MaxCol+1);
+    xlSetCellStringValue('R1C1',            1, MaxCol+2, 1, MaxCol+2);
+    xlSetCellStringValue('Способ Поиска',   1, MaxCol+3, 1, MaxCol+3);
+    xlSetCellStringValue('Name для поиска', 1, MaxCol+4, 1, MaxCol+4);
+  }
+
+  result := inherited::AddDocuments(bAll);
+
+  if iOutLogXL > 0
+  xlkillExcel;
+
+  DoneMarker(mkValidIER,'');
+}
+
+
+/*
+  sSign1 := tHeader.Name;
+  sSign2 := tHeader.Unn;
+  sSign3 := tHeader.OKPO;
+  sSign4 := tHeader.Code;
+*/
+
+Function ThisSignatureWasImported( Var cDocument : Comp ) : Boolean;
+{
+  var boIS: boolean = false;
+  Var KOD1C, KOD1C2: string[20] ='';
+
+  KOD1C := tHeader.Code;
+
+  if length(KOD1C) < 9
+    KOD1C2 := LPadCh(String(LongInt(KOD1C)),'0',9)
+  else
+    KOD1C2 := String(LongInt(KOD1C));
+
+  ThisSignatureWasImported := false;
+
+// Убрал:  Всегда обновляем существующие записи
+//    Case ( fun.DuplicatesImportType ) Of // проверяем флаг из настройки
+//    ieFindDuplicatesInDB, ieUpdateDuplicates:
+
+  while true do
+  {
+#Define _LogMetod(_MtdName) if boIS {MyLogErrorDetail(ieInfo,katorg.nRec, tHeader.CODES[20] ,'Найдено по ' + #(_MtdName), tHeader.NAME); break;}
+
+    if tHeader.Unn <> '' and tHeader.KODPLATNDS <> '' and tHeader.CODE <> ''
+    boIS := (GetFirst KatOrg Where (( tHeader.Unn == KatOrg.UNN and tHeader.Name == katorg.name and tHeader.KODPLATNDS == katorg.KODPLATNDS(noindex) and KOD1C == katorg.code(noindex))) = tsOk );
+    #_LogMetod('1 Unn + KPP + CODE + Name=' + tHeader.Unn + ' ' + tHeader.KODPLATNDS + ' '+  KOD1C)
+
+    if tHeader.Unn <> '' and tHeader.KODPLATNDS <> '' and tHeader.CODE <> ''
+    boIS := (GetFirst KatOrg Where (( tHeader.Unn == KatOrg.UNN and tHeader.Name == katorg.name and tHeader.KODPLATNDS == katorg.KODPLATNDS(noindex) and KOD1C2 == katorg.code(noindex))) = tsOk );
+    #_LogMetod('2 Unn + KPP + CODE + Name=' + tHeader.Unn + ' ' + tHeader.KODPLATNDS + ' '+  KOD1C2)
+
+
+    if tHeader.Unn <> '' and tHeader.KODPLATNDS <> '' and tHeader.CODE <> ''
+    boIS := (GetFirst KatOrg Where (( tHeader.Unn == KatOrg.UNN and tHeader.KODPLATNDS == katorg.KODPLATNDS(noindex) and KOD1C == katorg.code(noindex))) = tsOk );
+    #_LogMetod('3 Unn + KPP + CODE=' + tHeader.Unn + ' ' + tHeader.KODPLATNDS + ' '+  KOD1C)
+
+    if tHeader.Unn <> '' and tHeader.KODPLATNDS <> '' and tHeader.CODE <> ''
+    boIS := (GetFirst KatOrg Where (( tHeader.Unn == KatOrg.UNN and tHeader.KODPLATNDS == katorg.KODPLATNDS(noindex) and KOD1C2 == katorg.code(noindex))) = tsOk );
+    #_LogMetod('4 Unn + KPP + CODE=' + tHeader.Unn + ' ' + tHeader.KODPLATNDS + ' '+  KOD1C2)
+
+
+    if tHeader.Unn <> '' // тут используется различие (Заполнен ИНН+КПП ) или ( есть ИНН + пустой КПП)
+    {
+      boIS := (GetFirst KatOrg Where (( tHeader.Unn == KatOrg.UNN and tHeader.Name == katorg.name and tHeader.KODPLATNDS == katorg.KODPLATNDS(noindex))) = tsOk );
+      #_LogMetod('5 Unn + KPP + Name=' + tHeader.Unn + ' ' + tHeader.KODPLATNDS)
+
+      boIS := (GetFirst KatOrg Where (( tHeader.Unn == KatOrg.UNN and tHeader.KODPLATNDS == katorg.KODPLATNDS(noindex))) = tsOk );
+      #_LogMetod('6 Unn + KPP=' + tHeader.Unn + ' ' + tHeader.KODPLATNDS)
+
+      boIS := (GetFirst KatOrg Where (( tHeader.Unn == KatOrg.UNN)) = tsOk );
+      #_LogMetod('7 Unn=' + tHeader.Unn)
+    }
+
+
+    if tHeader.CODE <> ''
+    boIS := (GetFirst KatOrg Where (( KOD1C == KatOrg.CODE)) = tsOk );
+    #_LogMetod('8 CODE=' + KOD1C)
+
+    if tHeader.CODE <> ''
+    boIS := (GetFirst KatOrg Where (( KOD1C2 == KatOrg.CODE)) = tsOk );
+    #_LogMetod('8 CODE=' + KOD1C2)
+
+/*
+    boIS := (GetFirst KatOrg Where (( tHeader.Name == katorg.name)) = tsOk );
+    #_LogMetod('9 NAME=' + tHeader.Name)
+*/
+    break; // обязательно!!
+  } // while true do
+
+  if boIS
+  {
+    ThisSignatureWasImported := true;
+    cDocument := KatOrg.nRec;
+  }
+
+} // Function ThisSignatureWasImported( Var cDocument : Comp ) : Boolean;
+
+/*******************************************************************************
+  AddDocument - добавить во временную таблицу импортированный документ
+********************************************************************************/
+Procedure AddDocument( IsHeader  : Boolean );
+{
+  If ( IsHeader )
+  {
+    //Обновляем все ссылки
+    UpdateHeaderLinks;  //  Перенесено перед LogDocument, чтоб номер документа lImportDocCounter в ieFun был единым.
+    fun.LogDocument(tHeader.NRec, ieImportedInTemp, tHeader.Name, IEHead.nRec);
+    if(fun.DuplicatesImportType <> ieUpdateDuplicates)
+      if GetFirst KatOrg where ((tHeader.NAME == KatOrg.NAME and tHeader.CSTATE == KatOrg.CSTATE and tHeader.UNN == KatOrg.UNN)) = tsOk
+      {
+        fun.Set_sCurFieldName( 'Наименование, Страна, УНП(ИНН)');
+        fun.LogError(0, ieErrorIndex, tHeader.NAME+', ' + sState+ ', ' +tHeader.UNN);
+      }
+
+    Update ExImLogE Where((0 == ExImLogE.cLogR)) Set ExImLogE.cLogR := ExImLogR.nRec, ExImLogE.rStr := string(lCurRow);
+    lDocumentsImported++;
+
+    if (tAdress.SADDRESS2 <> '')
+    {
+      insert current tAdress;
+      tHeader.cPostAddr := tAdress.nRec;
+    }
+
+    if (tAdressUr.SADDRESS2 <> '')
+    {
+      insert current tAdressUr;
+      tHeader.cJuridicalAddr := tAdressUr.nRec;
+    }
+
+    if (not iKatOrg.CheckUnique(type$KatOrg(tHeader.Buffer)))
+    {
+      fun.Set_sCurFieldName( 'Установлен контроль уникальности полей');
+      fun.LogError(0, constDocErrorCode, 'проверьте уникальность организации');
+    }
+
+    if( Insert Current tHeader = tsOk )
+    {
+      if (Predst <> '' or BigBoss <> '' or Buh <> '')
+      {
+        tPodrInfo.cPodr := tHeader.nRec;
+        if (Predst <> '')  SetPredst(Predst);
+        if (BigBoss <> '') SetBigBoss(BigBoss);
+        if (Buh <> '')     SetBuh(Buh);
+        if insert current tPodrInfo <> tsOk {};
+      }
+    }
+  }
+  Else
+  {
+    Update ExImLogE Where((0 == ExImLogE.cLogR)) Set ExImLogE.cLogR := ExImLogR.nRec;
+    tSpec.cOrg := cCurrentHeader;
+    if( Insert Current tSpec <> tsOk){}
+//    Update ExImLogE Where((0 == ExImLogE.cLogR)) Set ExImLogE.cLogR := ExImLogR.nRec;
+  }
+} // Procedure AddDocument
+
+Function DefineField( sFieldValue : String; HeadOrSpec : Byte; sCode : String ) : Boolean;
+{
+  DefineField := inherited::DefineField( sFieldValue, HeadOrSpec, sCode);
+
+  Case ( HeadOrSpec ) Of
+    ieHeader :
+    {
+
+       Case ( Word(sCode) ) Of
+         iehKO + 41 :{
+                       Var bPos : word;
+                       bPos := Pos('"', IEHFLDS.VALUE); // Есть формула, а в ней индекс массива
+                       if bPos > 0
+                       {
+                         var AttrValue: string;
+                         var iKey: word = word(SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1));
+
+                         if iKey > 0 and  iKey < 20
+                         tHeader.CODES[iKey]     := sLastFieldValue;
+
+                       }
+                       else
+                         tHeader.CODES[1]     := sFieldValue;
+
+
+           }
+         iehKO + 42 :tHeader.SPLATPRIORITY:= sFieldValue;
+         iehKO + 43 :tHeader.SJURIDICALID := sFieldValue;
+         iehKO + 44 :tHeader.NAMELATIN    := sFieldValue;
+         iehKO + 45 :tHeader.ADDRLATIN    := sFieldValue;
+         iehKO + 46 :tHeader.INSNAME      := sFieldValue;
+         iehKO + 47 :{
+                       Var bPos : word;
+                       bPos := Pos('"', IEHFLDS.VALUE); // Есть формула, а в ней индекс массива
+                       if bPos > 0
+                       {
+                         var AttrValue: string;
+                         var iKey: word = word(SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1));
+
+                         if iKey > 0 and  iKey < 20
+                         tHeader.REFS[iKey]     := COMP(sLastFieldValue);
+
+                       }
+                       else
+                         tHeader.REFS[1]     := COMP(sFieldValue);
+
+
+           }
+
+         iehKO + 49 : if (sFieldValue != '')
+                      {
+                        Var bPos : word;
+                        var AttrValue: string;
+                        bPos := Pos('"', SFieldValue);
+                        AttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+                        iexAttr.sSetAttr(coIEHFlds,tHeader.Nrec, SubStr(SFieldValue,1,bpos-1),AttrValue);
+                      }
+         iehKO + 50 : if (sFieldValue != '')
+                      if (sLastFieldValue != '')
+                      {
+                        Var bPos : word;
+                        var AttrNAME: string;
+                        bPos := Pos('"', IEHFlds.Value);
+                        if bPos > 0
+                        {
+                            AttrNAME := SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1);
+                            iexAttr.sSetAttr(coIEHFlds,tHeader.Nrec, AttrNAME, sLastFieldValue);
+                        }
+                      }
+         iehKO + 51 : tHeader.WTYPE := Longint(sFieldValue); // 1 - входит в корпорацию, 0 - нет
+
+         iehKO + 52 : {
+                        if sFieldValue = 'Только в продажах' sFieldValue := 2;
+
+                        tHeader.TIPKNT := (tHeader.TIPKNT and 255) or (word( sFieldValue ) shl 8); // 'Применять налоги: 0 -всегда, 1-только в закупках, 2-только в продажах, 3-никогда'
+
+                      }
+         iehKO + 53 : if (sFieldValue != '')  // 'Внешний атрибут число да/нет логический (boolean)
+                      {
+                        Var bPos : word;
+                        var AttrValue: string;
+                        var bVal: boolean = false;
+                        bPos := Pos('"', SFieldValue);
+                        if bPos = 0 exit;
+                        AttrValue := UpCase(SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos));
+
+                        if AttrValue <> ''
+                        {
+                          if AttrValue = 'НЕТ'  bVal := false   else
+                          if AttrValue = 'ЛОЖЬ' bVal := false   else
+                          {
+                             bVal := true; // есть какое-то значение
+                          }
+
+                          iexAttr.bSetAttr(coIEHFlds,tHeader.Nrec, SubStr(SFieldValue,1,bpos-1), bVal );
+                          DefineField := true;
+                        }
+                      }
+       iehKO + 54,
+       iehKO + 55 :  if (sFieldValue != '')  // Внешний атрибут число <- Номер записи источника' , 'N строки Excel
+                      {
+                        Var bPos : word;
+                        var AttrValue: string;
+                        bPos := Pos('"', SFieldValue);
+                        if bPos = 0 exit;
+                        AttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+                        AttrValue := Replace(AttrValue,',','.');
+
+                        if AttrValue <> ''
+                        {
+                          if AttrValue = 'СМП'   AttrValue := 1;
+                          iexAttr.doSetAttr(coIEHFlds,tHeader.Nrec, SubStr(SFieldValue,1,bpos-1), double(AttrValue));
+                        }
+                        DefineField := true;
+
+                        tHeader.REFS[20] := comp(AttrValue);
+                        tHeader.CODES[20] := 'R'+AttrValue+'C1'; // заплатка для ЛОГА - номер строки Excel
+                      }
+
+       End; // Case
+   }
+   End; // Case
+
+}
+
+Function ImportField( IsHeader : Boolean; wNumber : Word; Var sFieldValue : String ) : Boolean;
+{
+  if IsHeader
+  if IEHFlds.CODE = String(iehKO + 55)
+  {
+    result := true;
+    sFieldValue := string(lCurRow);
+    exit;
+  }
+
+  var sFieldName : string = if (IsHeader, IEHFlds.DbfName, IESFlds.DbfName);
+  if substr(sFieldName,1,1) = '=' // Значение указано в настройках импорта
+  {
+    sFieldValue := substr(sFieldName,2,255);
+    result := true;
+    exit;
+  }
+
+  result := inherited::ImportField(IsHeader, wNumber,sFieldValue);
+}
+
+
+Procedure UpdateDocument( cTempDocument : Comp; cExistingDocument : Comp );
+{
+  var isIns : boolean;
+
+  if(getfirst KatOrg where((cExistingDocument == KatOrg.nRec)) <> tsOk) exit;
+
+  var bPos, idx, UpKey, UpKeyAttr, wCODE: word = 0;
+  var sTemp: string = '';
+  var lRow1: longint = longint(tHeader.REFS[20]);
+
+  UpKey := 0; UpKeyAttr := 0;
+
+#Define _SetField(_FieldName) if KatOrg.#_FieldName <> tHeader.#_FieldName { if iOutLogXL > 0 xlAddCellStringValue('#_FieldName:=' + string(tHeader.#_FieldName)+ ''#10, lRow1, MaxCol+8); KatOrg.#_FieldName := tHeader.#_FieldName; UpKey++;}
+
+  _LOOP IEHFlds Where((IEHead.nRec == IEHFlds.cHead  And true == IEHFlds.isLeaf )) Ordered By Number
+  if iFileStruct.GetIndexFieldByName(IEHFlds.DbfName) > 0 // Это поле есть в файле импорта
+  {
+      wCODE := GetIEHFldsCODE;
+      case wCODE of
+
+         iehKO +  0: #_SetField(NAME) // KatOrg.Name       := tHeader.Name;
+         iehKO +  1: #_SetField(Code   ) // KatOrg.Code       := tHeader.Code;
+         iehKO +  2: #_SetField(TipOrg ) // KatOrg.TipOrg     := tHeader.TipOrg;
+         iehKO +  3: #_SetField(Addr   ) // KatOrg.Addr       := tHeader.Addr;
+         iehKO +  4: #_SetField(OKPO   ) // KatOrg.OKPO       := tHeader.OKPO;
+         iehKO +  5: #_SetField(OKDP   ) // KatOrg.OKDP       := tHeader.OKDP;
+         iehKO +  6: #_SetField(OKONH  ) // KatOrg.OKONH      := tHeader.OKONH;
+         iehKO +  7: #_SetField(Tel    ) // KatOrg.Tel        := tHeader.Tel;
+    //  KatOrg.cState     := tHeader.cState;
+    //  KatOrg.cCity      := tHeader.cCity;
+         iehKO +  10: #_SetField(CorpoIn    ) // KatOrg.CorpoIn    := tHeader.CorpoIn;
+         iehKO +  11: #_SetField(UNN        ) // KatOrg.UNN        := tHeader.UNN;
+         iehKO +  12: #_SetField(NeedCustom ) // KatOrg.NeedCustom := tHeader.NeedCustom;
+         iehKO +  13: #_SetField(MaxDolgRub ) // KatOrg.MaxDolgRub := tHeader.MaxDolgRub;
+         iehKO +  14: #_SetField(MaxDolgVal ) // KatOrg.MaxDolgVal := tHeader.MaxDolgVal;
+         iehKO +  15: #_SetField(Skid       ) // KatOrg.Skid       := tHeader.Skid;
+         iehKO +  16: #_SetField(IndexK     ) // KatOrg.IndexK     := tHeader.IndexK;
+         iehKO +  17: #_SetField(KodPlatNDS ) // KatOrg.KodPlatNDS := tHeader.KodPlatNDS;
+
+         iehKO + 21 : #_SetField(OGRN       ) // KatOrg.OGRN      := tHeader.OGRN ;
+         iehKO + 22 : #_SetField(ShortName  ) // KatOrg.ShortName := tHeader.ShortName ;
+         iehKO + 39 : #_SetField(OKATO      ) // KatOrg.OKATO     := tHeader.OKATO;
+
+         iehKO +  41: {   idx := 0;
+                          bPos := Pos('"', IEHFlds.Value);
+                          if bPos > 0
+                          {
+                            idx := byte(SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1));
+                          }
+                          if idx = 0 idx := 1;
+                          #_SetField(CODES[idx]) // KatOrg.CODES[idx] := tHeader.CODES[idx];
+                      }
+
+         iehKO +  42: #_SetField(SPLATPRIORITY ) // KatOrg.SPLATPRIORITY := tHeader.SPLATPRIORITY;
+         iehKO +  43: #_SetField(SJURIDICALID  ) // KatOrg.SJURIDICALID  := tHeader.SJURIDICALID ;
+         iehKO +  44: #_SetField(NAMELATIN     ) // KatOrg.NAMELATIN     := tHeader.NAMELATIN    ;
+         iehKO +  45: #_SetField(ADDRLATIN     ) // KatOrg.ADDRLATIN     := tHeader.ADDRLATIN    ;
+         iehKO +  46: #_SetField(INSNAME       ) // KatOrg.INSNAME       := tHeader.INSNAME      ;
+
+         iehKO +  47: {   idx := 0;
+                          bPos := Pos('"', IEHFlds.Value);
+                          if bPos > 0
+                          {
+                            idx := byte(SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1));
+                          }
+                          if idx = 0 idx := 1;
+                          #_SetField(REFS[idx]) // KatOrg.REFS[idx] := tHeader.REFS[idx];
+
+                          if idx = 3 // Сюда импортируется побитовые флаги вхождения в Группы Оргаинизаций
+                          {
+                            // Группы организаций для НПО Энергомаш
+                             if tHeader.RefS[3] > 0
+                             {
+                                var sGrList : string = '';
+                                  if (tHeader.RefS[3] and 8) > 0  sGrList := sGrList + '\Группа ОРКК';
+                                  if (tHeader.RefS[3] and 4) > 0  sGrList := sGrList + '\Покупатели';
+                                  if (tHeader.RefS[3] and 2) > 0  sGrList := sGrList + '\Поставщики';
+                                  if (tHeader.RefS[3] and 1) > 0  sGrList := sGrList + '\Компания группы "Роскосмос"';
+                                if sGrList <> ''
+                                {
+                                   sGrList := substr(sGrList,2,255); // убираем первый '\'
+                                   GetKatOrgDescr(sGrList);
+                                }
+                             }
+
+                                var bDesc : boolean = false;
+                                _loop tKatOrgDescr where ((tHeader.nRec == tKatOrgDescr.cRec))
+                                {
+                                    bDesc := true;
+                                    if (Getfirst KatOrgDescr where (( tKatOrgDescr.CODE == KatOrgDescr.CODE
+                                                                and tKatOrgDescr.cGroup == KatOrgDescr.cGroup
+                                                                        and KatOrg.nrec == KatOrgDescr.cRec )) ) <> tsOK
+                                    {
+                                      bDesc := true;
+                                      ClearBuffer(#KatOrgDescr);
+                                      KatOrgDescr.Buffer  := type$KatOrgDescr(tKatOrgDescr.Buffer);
+                                      KatOrgDescr.nRec    := comp(0);
+                                      KatOrgDescr.cRec := KatOrg.nrec;
+                                      KatOrgDescr.isLeaf := 1;
+                                      KatOrgDescr.Name := KatOrg.Name;
+                                      KatOrgDescr.SHORTNAME := KatOrg.SHORTNAME;
+                                      KatOrgDescr.isArch := 0;
+                                      insert current KatOrgDescr;
+                                    }
+                                }
+
+                                _loop KatOrgDescr where ((KatOrg.nRec == KatOrgDescr.cRec))
+                                if (Getfirst tKatOrgDescr where ((KatOrgDescr.CODE == tKatOrgDescr.CODE
+                                                            and KatOrgDescr.cGroup == tKatOrgDescr.cGroup
+                                                                  and tHeader.nRec == tKatOrgDescr.cRec )) ) <> tsOK
+                                {
+                                  if bDesc or (KatOrgDescr.cGroup <> comp(0))
+                                  Delete current KatOrgDescr;
+                                }
+
+                          }// if idx = 3
+                      } // iehKO +  47
+
+          iehKO +  51: #_SetField(WTYPE )  // KatOrg.WTYPE := tHeader.WTYPE;
+          iehKO +  52:
+          {
+            if (tHeader.TIPKNT or 255) <> (KatORG.TIPKNT or 255) // смотрим разницу в старшем байте
+            {
+               KatORG.TIPKNT := (KatORG.TIPKNT and 255) or (tHeader.TIPKNT);
+               UpKey++ ;
+
+               if iOutLogXL > 0 xlAddCellStringValue('KatORG.TIPKNT :=' + string(KatORG.TIPKNT)+ '('+string(KatORG.TIPKNT shr 8)+')'#10, lRow1, MaxCol+8);
+            }
+
+//            tHeader.TIPKNT := (KatOrg.TIPKNT and 255) or (word( sFieldValue ) shl 8); // 'Применять налоги: 0 -всегда, 1-только в закупках, 2-только в продажах, 3-никогда'
+            #_SetField(TIPKNT ) // KatOrg.TIPKNT := (KatOrg.TIPKNT and 255) or tHeader.TIPKNT ; // 'Применять налоги: 0 -всегда, 1-только в закупках, 2-только в продажах, 3-никогда'
+          }
+
+/* ------------- закомментировано ------------------------------------------------------------------
+     // Удаляем значения атрибутов, которые есть в настройке импорта
+
+     // тут ValueExists не работает. Потому, что атрибут в памяти, а не в базе.
+     // не хватает выхода на iexAttr.FindValue(false)
+     // без всего этого iExAttr.CopyAllAttrEx1 сама удалит и пересоздаст атрибуты
+
+
+           // В результате Удаляются все атрибуты без сравнения значений
+          iehKO +  49, // Внешний атрибут строка
+          iehKO +  50, // Внешний атрибут строка 255 символов
+          iehKO +  53, // Внешний атрибут число да/нет логический (boolean)
+          iehKO +  54, // Внешний атрибут число
+          iehKO +  55: // Внешний атрибут число <- Номер записи источника'
+          {
+              bPos := Pos('"', IEHFlds.Value);
+              if bPos > 0
+              {   var AttrNAME: string;
+                  AttrNAME := SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1);
+
+LogstrTofile('#attr.txt', AttrNAME);
+LogstrTofile('#attr.txt', 'coIEHFlds = ' + coIEHFlds +   '  tHeader.nRec =' + tHeader.nRec);
+
+                  if iexAttr.ValueExists(coIEHFlds, tHeader.nRec, AttrNAME) // Есть новое значение атрибута
+                  {
+LogstrTofile('#attr.txt', AttrNAME + ' Есть в tHeader ');
+                    if iexAttr.ValueExists(coKatOrg, KatOrg.nRec, AttrNAME) // Значение атрибута существует
+                    {
+LogstrTofile('#attr.txt', AttrNAME + ' Есть в  KatOrg ');
+                      Case wCODE of
+                       iehKO+49,
+                       iehKO+50:
+{
+LogstrTofile('#attr.txt', AttrNAME + ' в KatOrg  = ' + iexAttr.sGetAttr(coKatOrg, KatOrg.nRec, AttrNAME));
+LogstrTofile('#attr.txt', AttrNAME + ' в tHeader = ' + iexAttr.sGetAttr(coIEHFlds, tHeader.nRec, AttrNAME));
+}
+                       iehKO+53,
+                       iehKO+54,
+                       iehKO+55:
+{
+LogstrTofile('#attr.txt', AttrNAME + ' в KatOrg  = ' + string(iexAttr.doGetAttr(coKatOrg, KatOrg.nRec, AttrNAME)  ) );
+LogstrTofile('#attr.txt', AttrNAME + ' в tHeader = ' + string(iexAttr.sGetAttr(coIEHFlds, tHeader.nRec, AttrNAME) ) );
+}
+                      end;
+
+                      // Эти значения разные?
+                      if Case( wCODE;
+                       iehKO+49,
+                       iehKO+50: iexAttr.sGetAttr(coKatOrg, KatOrg.nRec, AttrNAME) <> iexAttr.sGetAttr(coIEHFlds, tHeader.nRec, AttrNAME),
+                       iehKO+53,
+                       iehKO+54,
+                       iehKO+55: iexAttr.doGetAttr(coKatOrg, KatOrg.nRec, AttrNAME) <> iexAttr.sGetAttr(coIEHFlds, tHeader.nRec, AttrNAME)
+                               ; false )
+                      {
+                        if boLogOnly
+                        if ((iehKO+55) <> wCODE)  // Не учитываем Номер записи источника
+                        {
+                          UpKeyAttr++; // Будут изменения атрибутов
+                          if iOutLogXL > 0
+                          if lRow1 > 0
+                          xlAddCellStringValue(AttrNAME + ''#10, lRow1, MaxCol+9);
+                        }
+
+                        if not boLogOnly
+                        {
+                           UpKeyAttr++; // Будут изменения атрибутов
+                           iexAttr.DeleteValue (coKatOrg, KatOrg.nRec, AttrNAME);
+                        }
+                      }
+                      else
+                      {
+                        // Значения одиннаковые - удаляем "новое" значение, чтоб не делать лишние изменения в базе
+                        iexAttr.DeleteValue (coIEHFlds, tHeader.nRec, AttrNAME);
+                      }
+                    }
+                  }
+                  else  // НЕТ значения атрибута
+                  if iexAttr.ValueExists(coKatOrg, KatOrg.nRec, AttrNAME) // А в Базе есть
+                  {
+                    if ((iehKO+55) <> wCODE) UpKeyAttr++; // Будут изменения
+
+                    // if not boLogOnly
+                    // if iexAttr.DeleteValue (coKatOrg, KatOrg.nRec, AttrNAME) > 0 {}
+                  }
+              }
+
+          }
+  ------------- закомментировано */
+      end; // Case
+  } // _LOOP IEHFlds Where((IEHead.nRec == IEHFlds.cHead  And true == IEHFlds.isLeaf )) Ordered By Number
+
+  if boLogOnly
+  {
+    // Тут выводим ЛОГ и выходим без изменений БД;
+      if lRow1 > 0
+      {
+          if UpKey > 0
+          { // Менялась
+            xlSetCellStringValue('Будет изменен Katorg. ' + UpKey + ' полей', lRow1, MaxCol+6, lRow1, MaxCol+6);
+          }
+          else
+          { // Запись без изменений
+            xlSetCellStringValue('Katorg без изменений', lRow1, MaxCol+6, lRow1, MaxCol+6);
+          }
+
+          if UpKeyAttr > 0
+          { // Менялась
+            xlSetCellStringValue('Будет изменены Атрибуты. ' + UpKeyAttr, lRow1, MaxCol+7, lRow1, MaxCol+7);
+          }
+          else
+          { // Запись без изменений
+            xlSetCellStringValue('Атрибуты без изменений', lRow1, MaxCol+7, lRow1, MaxCol+7);
+          }
+      }
+
+      fun.UpdateImportLog(cTempDocument, KatOrg.nRec, ieInfo, ExImLogT.nRec);
+      delete tSpec where (( tHeader.nRec == tSpec.cOrg));
+      delete tHeader where ((cTempDocument == tHeader.nRec));
+
+    exit;
+  }
+
+  if UpKey > 0
+  if(update current KatOrg = tsOk){
+
+  }
+
+  if UpKeyAttr > 0
+  iExAttr.CopyAllAttrEx1(coIEHFlds, tHeader.nRec, coKatOrg, KatOrg.nRec, false);
+
+  CreateKatOrgIER;
+
+  _loop tSpec
+  {
+    if GetFirst KatBank where (( tSpec.Name == katBank.name and KatOrg.nrec == KatBank.corg and tSpec.Schet1 == katBank.Schet1 and tSpec.MFO1 == KatBank.MFO1 ))=tsOk
+    {
+      if(fun.ThisCodePresentInTune(iesKO +  0)) KatBank.Name        := tSpec.Name;
+      if(fun.ThisCodePresentInTune(iesKO +  1)) KatBank.Remark      := tSpec.Remark;
+      if(fun.ThisCodePresentInTune(iesKO +  2)) KatBank.Addr        := tSpec.Addr;
+      if(fun.ThisCodePresentInTune(iesKO +  3)) KatBank.MFO1        := tSpec.MFO1;
+      if(fun.ThisCodePresentInTune(iesKO +  4)) KatBank.MFO2        := tSpec.MFO2;
+      if(fun.ThisCodePresentInTune(iesKO +  5)) KatBank.Schet1      := tSpec.Schet1;
+      if(fun.ThisCodePresentInTune(iesKO +  6)) KatBank.Schet2      := tSpec.Schet2;
+      if(fun.ThisCodePresentInTune(iesKO +  7)) KatBank.Schet3      := tSpec.Schet3;
+      if(fun.ThisCodePresentInTune(iesKO +  8)) KatBank.TipSchet    := tSpec.TipSchet;
+      if(fun.ThisCodePresentInTune(iesKO +  9)) KatBank.Aktiv       := tSpec.Aktiv;
+      if (Update current KatBank = tsok){}
+    }
+    else
+    {
+      isIns := false;
+      if GetFirst KatB where (( tSpec.Name == KatB.name(noindex) and tSpec.MFO1 == KatB.Mfo1(noindex) ))  <> tsOk
+        isIns := true
+      else
+        KatBank.cBank      := KatB.nRec;
+      if(fun.ThisCodePresentInTune(iesKO +  0)) KatBank.Name   :=KatB.Name       := tSpec.Name;
+      if(fun.ThisCodePresentInTune(iesKO +  1)) KatBank.Remark :=KatB.Remark     := tSpec.Remark;
+      if(fun.ThisCodePresentInTune(iesKO +  2)) KatBank.Addr   :=KatB.Addr       := tSpec.Addr;
+      if(fun.ThisCodePresentInTune(iesKO +  3)) KatBank.MFO1   :=KatB.MFO1       := tSpec.MFO1;
+      if(fun.ThisCodePresentInTune(iesKO +  4)) KatBank.MFO2   :=KatB.MFO2       := tSpec.MFO2;
+      if(fun.ThisCodePresentInTune(iesKO +  5)) KatBank.Schet1                   := tSpec.Schet1;
+      if(fun.ThisCodePresentInTune(iesKO +  6)) KatBank.Schet2 :=KatB.Korschet   := tSpec.Schet2;
+      if(fun.ThisCodePresentInTune(iesKO +  7)) KatBank.Schet3                   := tSpec.Schet3;
+      if(fun.ThisCodePresentInTune(iesKO +  8)) KatBank.TipSchet                 := tSpec.TipSchet;
+      if(fun.ThisCodePresentInTune(iesKO +  9)) KatBank.Aktiv                    := tSpec.Aktiv;
+                                                KatB.nRec := comp(0);
+                                                KatB.isLeaf :=1;
+      if isIns
+        if (Insert current KatB = tsok)
+          KatBank.cBank      := KatB.nRec;
+                                            KatBank.cOrg       := KatOrg.nRec;
+                                            KatBank.nRec       := comp(0);
+
+      if (Insert current KatBank = tsok)
+      {
+        // КОПИРОВАНИЕ ВНЕШНИХ АТРИБУТОВ ДЛЯ СПЕЦИФИКАЦИИ
+        iExAttr.CopyAllAttrEx(coIESFlds, tSpec.nRec, coKatBank, KatBank.nRec);
+        ////////////////////////////////
+      }
+    }
+  }
+
+  fun.UpdateImportLog(cTempDocument, KatOrg.nRec, ieImported, ExImLogT.nRec);
+  delete tSpec where (( tHeader.nRec == tSpec.cOrg));
+  delete tHeader where ((cTempDocument == tHeader.nRec));
+
+} // Procedure UpdateDocument( cTempDocument : Comp; cExistingDocument : Comp );
+
+/*******************************************************************************
+  ImportDocument - переносим запись из временной таблицы в постоянную
+********************************************************************************/
+function ImportDocument( cTempDoc : Comp ) : comp;
+{
+  result := 0;
+  If ( cTempDoc <> 0 )
+  {
+    If ( GetFirst tHeader Where (( cTempDoc == tHeader.nRec )) <> tsOk ) Exit;
+  }
+
+  if boLogOnly
+  {
+    MyLogErrorDetail(ieInfo,0,tHeader.CODES[20], 'Новая запись', tHeader.NAME);
+
+    fun.UpdateImportLog(cTempDoc, comp(0), ieInfo, ExImLogT.nRec);
+    Delete All NoVisual tSpec;
+    Delete Current tHeader;
+
+    exit;
+  }
+
+  // Очищаем адрес ячейки и номер строки Excel
+  tHeader.CODES[20] := '';
+  tHeader.RefS[20] := 0;
+  UpDate current tHeader;
+
+  // Группы организаций для НПО Энергомаш
+   if tHeader.RefS[3] > 0
+   {
+      var sGrList : string = '';
+        if (tHeader.RefS[3] and 8) > 0  sGrList := sGrList + '\Группа ОРКК';
+        if (tHeader.RefS[3] and 4) > 0  sGrList := sGrList + '\Покупатели';
+        if (tHeader.RefS[3] and 2) > 0  sGrList := sGrList + '\Поставщики';
+        if (tHeader.RefS[3] and 1) > 0  sGrList := sGrList + '\Компания группы "Роскосмос"';
+      if sGrList <> ''
+      {
+         sGrList := substr(sGrList,2,255); // убираем первый '\'
+         GetKatOrgDescr(sGrList);
+      }
+   }
+
+  result := inherited::ImportDocument( cTempDoc );
+
+  CreateKatOrgIER;
+} // function ImportDocument( cTempDoc : Comp ) : comp;
+
+
+Function ImportExcelField( sFieldName : string; iRow : longInt; Var sFieldValue : String ) : Boolean;
+{
+  lCurColumn := iFileStruct.GetIndexFieldByName(sFieldName);
+  result := xlGetCellValue(iRow, lCurColumn, sFieldValue);
+  sLastFieldValue := sFieldValue ;
+}
+
+HandleEvent
+cmInit:
+{
+  boLogOnly := FALSE;
+  inherited::HandleEvent(cmInit);
+}
+end;
+end.
+/*
+
+sql select KatOrgDescr.nRec, KatOrgDescr.cGroup, KontrIer.cRecDs KontrIer_cRecDs, KontrIer.cGroup Ier_cGroup, KontrIer.nRec, KatOrgDescr2.Name,KontrIer.name
+from KatOrgDescr
+left join KontrIer on KatOrgDescr.nRec = KontrIer.cRecDs
+left join KatOrgDescr KatOrgDescr2 on KontrIer.cGroup = KatOrgDescr2.nRec
+where KatOrgDescr.CREC = #comp(3096224743817771) ;
+
+
+sql select KatOrgDescr.nRec, KatOrgDescr.cGroup, KatOrgDescr.CREC, KatOrgDescr.NAME
+from KatOrgDescr where KatOrgDescr.CREC = #comp(3096224743817771) or KatOrgDescr.nRec = #comp(000A000000006BB1h ) or KatOrgDescr.nRec = #comp(000A000000000027h);
+
+LOGSTRTOFILE('IMPORT_XX.LOG','-------- 41  CODES CODES CODES CODES CODES CODES');
+*/

@@ -1,0 +1,980 @@
+/*************************************************************************************************\
+* Наименование:  Ведомость цехового учета затрат (осн. з\п + премии)                                                 *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:                                                                                     *
+* Вид работы  |Номер          |Дата    |Исполнитель              |Проект                          *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#822          |26/02/18 |Ермолов К.Р.             |НПО Энергомаш                   *
+\*************************************************************************************************/
+
+#include UserReport.vih
+#include marker.vih
+
+interface gp_vedcexuchzatr2 'Параметры отчета' gray
+Show at (,,50,11);
+
+table struct otchper // Текущий отчетный период
+(
+  data: date
+)
+;
+
+table struct zarprem // Счет, заказ, н\часы, зарплата (осн., доп.)
+(
+  sch: string,
+  zakaznmb: string,
+  nch: double,
+  ozp: decimal(31,15),
+  dzp: decimal(31,15)
+)
+with index
+(
+  i1 = sch + zakaznmb (unique)
+)
+;
+
+table struct strahrezerv // Счет, заказ, страховые, резерв на отпуска
+(
+  sch: string,
+  zakaznmb: string,
+  strah: decimal(31,15),
+  rezerv: decimal(31,15),
+  strahotpusk: decimal(31,15)
+)
+with index
+(
+  i1 = sch + zakaznmb (unique)
+)
+;
+
+table struct zarpremcex // Счет, заказ, н\часы, зарплата (осн., доп.)
+(
+  podr: string,
+  sch: string,
+  zakaznmb: string,
+  nch: double,
+  ozp: decimal(31,15),
+  dzp: decimal(31,15)
+)
+with index
+(
+  i1 = podr + sch + zakaznmb (unique)
+)
+;
+
+table struct strahrezervcex // Счет, заказ, страховые, резерв на отпуска
+(
+  podr: string,
+  sch: string,
+  zakaznmb: string,
+  strah: decimal(31,15),
+  rezerv: decimal(31,15),
+  strahotpusk: decimal(31,15)
+)
+with index
+(
+  i1 = podr + sch + zakaznmb (unique)
+)
+;
+
+table struct tSelPodr // Для маркера по подразделениям
+(
+nrec: comp,
+kod: string,
+name: string
+)
+with index
+(
+i1 = nrec (unique)
+)
+;
+
+table struct tselmnf //Виды производства
+(
+  nrec: comp,
+  name: string
+)
+with index
+(
+  i1 = nrec  (autoInc, unique)
+)
+;
+
+table struct zakazcex //Подразделения относящиеся к заказам
+(
+  zakaznmb: string,
+  podr: string
+)
+with index
+(
+  i1 = zakaznmb + podr (unique)
+)
+;
+
+create view gp_vedcexuchzatr2
+
+var
+podr, cpodr, pUserName, ExcelPath, sumzakazpodr, zakaznmb, schet, cexpodr, Filtr_mnf, Filtr_cmnf: string;
+counter, wErr: longint;
+god: integer;
+mes, forma: word;
+nch, ozp, dzp, strah, rezerv, vsegofot, vsegofotsum, strahotpusk, vsegostrah, vsegostrahsum,
+vsego, vsegosum, itognch, itogozp, itogdzp, itogstrah, itogrezerv, itogstrahotpusk, itogvsegofot,
+itogvsegostrah, itogvsego, proc1, proc2: double;
+pMarkerpodr, pMarkermnf: IMarker(marker) new;
+
+as select perech.procper
+from otchper, zarprem, zakazcex, strahrezerv, tSelPodr,strahrezervcex,zarpremcex, tselmnf, perech
+where ((13 == perech.vidper));
+
+#include Sql_Func.Vpp
+
+window wnSelMNF 'Вид производства' doAccept, EscClose;
+Show at (5,5,50,25);
+Browse brSelmnf '';
+Table tSelmnf;
+recMarker=pMarkermnf {tSelmnf.nrec};
+Fields
+tSelmnf.NAME 'Вид производства':[100],Protect,NoDel;
+end;
+end;
+
+window wnSelPodr 'Подразделения' doAccept, EscClose;
+Show at (5,5,100,25);
+Browse brtSelPodr '';
+Table tSelPodr;
+recMarker=pMarkerPodr {TselPodr.nrec};
+Fields
+tSelPodr.kod  'Код':[10],Protect,NoDel;
+tSelPodr.name 'Наименование подразделения':[100],Protect,NoDel;
+end;
+end;
+
+screen scr ('Параметры отчета',,sci1Esc);
+  fields
+  forma: [list
+         1 'Без разбивки на цеха',
+         2 'Цех'], protect;
+  Filtr_mnf: pickbutton, noprotect;
+  podr: pickbutton, noprotect;
+  mes : [list
+        1 '1',
+        2 '2',
+        3 '3',
+        4 '4',
+        5 '5',
+        6 '6',
+        7 '7',
+        8 '8',
+        9 '9',
+        10 '10',
+        11 '11',
+        12 '12'], protect;
+  god: noprotect, spinbutton [1, 1917, 2117];
+  proc1: [4.2], noprotect;
+  proc2: [4.2], noprotect;
+ buttons
+    cmGo, ,, 'Сформировать' ,,;
+    <<
+
+    Форма отчета:      .@@@@@@@@@@@@@@@@@@@@
+    Вид производства:  .@@@@@@@@@@@@@@@@@@@@
+    Подразделения:     .@@@@@@@@@@@@@@@@@@@@
+    Месяц:             .@@@@
+    Год:               .@@@@@
+    % отч. для ФОТ     .@@@@
+    % отч. для стр.взн..@@@@
+
+    <.Сформировать.>
+
+    >>
+end;
+
+handleevent
+
+cmInit:
+{
+  pUserName:= UserName();
+
+  sql
+  select dateval
+  from tuneval
+  where strempty = 'UP.DATOTCH' and obj = 10
+  into otchper
+  ;
+
+  sql
+  select #comp(0), attrval.vstring
+  from katpodr
+  inner join katpodr katpodr1 on (katpodr1.nrec = katpodr.cpodr and katpodr1.kod = substring(katpodr.kod,1,3)) or (katpodr1.nrec = katpodr.nrec and length(katpodr.kod) = 3)
+  inner join extcatlinks on extcatlinks.extcat = katpodr.nrec
+  inner join catalogs on catalogs.nrec = extcatlinks.staffcat
+  inner join attrval on attrval.crec = catalogs.nrec
+  inner join attrnam on attrnam.nrec = attrval.cattrnam
+  where attrnam.name = 'Вид производства'
+  group by attrval.vstring
+  into tselmnf
+  ;
+
+  mes:= month(otchper.data);
+  god:= year(otchper.data);
+  ClearFieldState(#podr, sfVisible);
+  ClearFieldState(#Filtr_mnf, sfVisible);
+  forma:= 1;
+  proc1:= perech.procper;
+  proc2:= 30.2;
+}
+
+cmPick:
+{
+  if curfield = #Filtr_mnf
+  {
+    runwindow(wnSelmnf);
+  }
+
+  if curfield = #podr
+  {
+    runwindow(wnSelPodr);
+  }
+}
+
+cmCheckField:
+{
+  if curField = #forma
+  {
+    if forma = 1
+    {
+      ClearFieldState(#podr, sfVisible);
+      ClearFieldState(#Filtr_mnf, sfVisible);
+    }
+
+    if forma = 2
+    {
+      SetFieldState(#podr, sfVisible);
+      SetFieldState(#Filtr_mnf, sfVisible);
+      filtr_mnf:='Не выбран';
+      podr:= 'Выберете вид производства';
+      pMarkermnf.UnselectAll;
+      pMarkerpodr.UnselectAll;
+    }
+  }
+}
+
+cmGo:
+{
+  counter:= 5;
+  nch:= 0;
+  ozp:= 0;
+  dzp:= 0;
+  strah:= 0;
+  rezerv:= 0;
+  vsegofot:= 0;
+  vsegofotsum:= 0;
+  strahotpusk:= 0;
+  vsegostrah:= 0;
+  vsegostrahsum:= 0;
+  vsego:= 0;
+  vsegosum:= 0;
+  itognch:= 0;
+  itogozp:= 0;
+  itogdzp:= 0;
+  itogvsegofot:= 0;
+  itogstrah:= 0;
+  itogrezerv:= 0;
+  itogstrahotpusk:= 0;
+  itogvsegostrah:= 0;
+  itogvsego:= 0;
+
+  if forma = 1
+  {
+    ExcelPath:= TranslatePath('%ClientStartPath%');
+    xlCreateExcelWithTemplate(ExcelPath+'XLS_ЭМ\ZP\gp_vedcexuchzatr2.xlsx',true);
+    if (xlIsExcelValid) xlSetActiveWorkBookByName('1');
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+
+    xlsetcellstringvalue('ВЕДОМОСТЬ ЦЕХОВОГО УЧЕТА ЗАТРАТ НА ПРОИЗВОДСТВО ПО ЗАКАЗАМ БЕЗ РАЗБИВКИ НА ЦЕХА ЗА ' + mes + ' МЕСЯЦ ' + god + ' ГОДА', 1, 1, 1, 1);
+
+    delete all from zarprem;
+
+    sql
+    select buhschet.code, mnplan.number, sum(case when nachisl1.vidopl in (1, 3, 5, 9, 10) then nachisl1.chasf else 0 end), sum(nachisl1.summa), sum(nachisl2.summa)
+    from mnplan
+    left join buhschet on buhschet.nrec = mnplan.canval2
+    left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7
+    left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+    inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3) and katpodr1.kod <> '446' and katpodr1.kod <> '999'
+    left join klvidopl on klvidopl.vidopl = nachislzakaz.vidopls
+    left join stzatr on stzatr.nrec = klvidopl.kauextr[1]
+    left join nachislzakaz nachisl1 on nachisl1.nrec = nachislzakaz.nrec and nachisl1.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec
+                                                                             and stzatr.name in ('01 Основная з/плата'
+                                                                                                ,'01.1 Основная  з/плата не уменьшающая налогообл.базу'
+                                                                                                ,'04 Премии'
+                                                                                                ,'04.1 Премия не уменьшающая налогообл.базу'
+                                                                                                ,'104 Проект "Управление качеством:автоматизированный учет отступлений от КД и ТД '
+                                                                                                ,'106 Проект "Управление качеством: разработка и внедрение системы учета затрат ка'
+                                                                                                ,'Основная з/плата, включая Премии'
+                                                                                                )
+    left join nachislzakaz nachisl2 on nachisl2.nrec = nachislzakaz.nrec and nachisl2.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec
+                                                                             and stzatr.name in ('02 Дополнительная з/плата'
+                                                                                                 ,'02.1 Дополнительная з/плата не уменьшающая налогообл.базу'
+                                                                                                 ,'Дополнительная з/плата'
+                                                                                                )
+    where nachislzakaz.mesn = :(mes) and nachislzakaz.yearn = :(god)
+    group by buhschet.code, mnplan.number
+    having sum(case when nachisl1.vidopl in (1, 3, 5, 9, 10) then nachisl1.chasf else 0 end) <> 0 or sum(nachisl1.summa) <> 0 or sum(nachisl2.summa) <> 0
+    into zarprem
+    ;
+
+    delete all from strahrezerv;
+
+    sql
+    select buhschet.code, mnplan.number, sum(nachislzakaz.summa)/100*:(proc2), sum(nachislzakaz.summa)/100*:(proc1),  (sum(nachislzakaz.summa)/100*:(proc1))/100*:(proc2)
+    from mnplan
+    left join buhschet on buhschet.nrec = mnplan.canval2
+    left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7
+    inner join klvidopl on klvidopl.vidopl = nachislzakaz.vidopls
+    inner join attrval on attrval.crec = klvidopl.nrec
+    inner join attrnam on attrnam.nrec = attrval.cattrnam and attrnam.name = '908 Фонд Резерв (ОВР)'
+    inner join katpodr on katpodr.nrec = nachislzakaz.cexoz
+    where nachislzakaz.mesn = :(mes) and nachislzakaz.yearn = :(god)
+    group by buhschet.code, mnplan.number
+    into strahrezerv
+    ;
+
+    if getfirst zarprem = tsok
+    {
+      schet:= zarprem.sch;
+    }
+
+    _loop zarprem
+    {
+      counter++;
+
+      if zarprem.sch = schet
+      {
+        nch:= nch + zarprem.nch;
+        ozp:= ozp + zarprem.ozp;
+        dzp:= dzp + zarprem.dzp;
+        vsegofot:= zarprem.ozp + zarprem.dzp;
+        vsegostrah:= 0;
+
+        xlsetcellnumbervalue(0, counter, 6, counter, 6);
+        xlsetcellnumbervalue(0, counter, 7, counter, 7);
+        xlsetcellnumbervalue(0, counter + 1, 7, counter + 1, 7);
+        xlsetcellnumbervalue(0, counter + 1, 8, counter + 1, 8);
+
+        _loop strahrezerv where ((zarprem.sch == strahrezerv.sch and zarprem.zakaznmb == strahrezerv.zakaznmb))
+        {
+            strah:= strah + strahrezerv.strah;
+            rezerv:= rezerv + strahrezerv.rezerv;
+            strahotpusk:= strahotpusk + strahrezerv.strahotpusk;
+            vsegostrah:= strahrezerv.strah + strahrezerv.strahotpusk;
+            vsegofot:= vsegofot + strahrezerv.rezerv;
+            xlsetcellnumbervalue(strahrezerv.strah, counter, 6, counter, 6);
+            xlsetcellnumbervalue(strahrezerv.rezerv, counter, 7, counter, 7);
+            if strahrezerv.rezerv = 0
+            {
+              xlsetcellnumbervalue(0, counter + 1, 7, counter + 1, 7);
+              strahotpusk:= strahotpusk - strahrezerv.strahotpusk;
+              vsegostrah:= vsegostrah - strahrezerv.strahotpusk;
+            }
+            else
+            {
+              xlsetcellnumbervalue(strahrezerv.strahotpusk, counter + 1, 7, counter + 1, 7);
+            }
+            xlsetcellnumbervalue(vsegostrah, counter + 1, 8, counter + 1, 8);
+        }
+
+        vsegofotsum:= vsegofotsum + vsegofot;
+        vsegostrahsum:= vsegostrahsum + vsegostrah;
+        vsego:= vsegofot + vsegostrah;
+        vsegosum:= vsegosum + vsego;
+        zakaznmb:= zarprem.zakaznmb;
+        xlframecells(1+2+4+8+32, 3, 1, 1, counter, 1, counter + 1, 9);
+        xlsetcellstringvalue(zarprem.sch, counter, 1, counter, 1);
+        xlsetcellstringvalue(zarprem.zakaznmb, counter, 2, counter ,2);
+        xlsetcellnumbervalue(zarprem.nch, counter, 3, counter, 3);
+        xlsetcellnumbervalue(zarprem.ozp, counter, 4, counter, 4);
+        xlsetcellnumbervalue(zarprem.dzp, counter, 5, counter, 5);
+        xlsetcellnumbervalue(vsegofot, counter, 8, counter, 8);
+        xlsetcellnumbervalue(vsego, counter, 9, counter, 9);
+
+        delete all from zakazcex;
+
+        sql
+        select mnplan.number, katpodr1.kod
+        from mnplan
+        left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7
+        left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+        inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3) and katpodr1.kod <> '446' and katpodr1.kod <> '999'
+        where mnplan.number = :(zakaznmb) and nachislzakaz.mesn = :(mes) and nachislzakaz.yearn = :(god)
+        group by mnplan.number, katpodr1.kod
+        into zakazcex
+        ;
+
+        sumzakazpodr:= '';
+
+        _loop zakazcex
+        {
+          sumzakazpodr:= sumzakazpodr + zakazcex.podr + ', ';
+        }
+
+        counter:= counter + 2;
+        xlmergecells(counter, 1, counter, 9);
+        xlframecells(1+2, 3, 1, 1, counter, 1, counter, 9);
+        xlsetcellstringvalue('Цеха: ' + substr(sumzakazpodr, 1, length(sumzakazpodr) - 2), counter, 1, counter ,1);
+      }
+      else
+      {
+        xlmergecells(counter, 1, counter, 2);
+        xlmergecells(counter + 1, 1, counter + 1, 2);
+        xlsetfontstyle(1, counter, 1, counter + 1, 9);
+        xlframecells(1+2+4+8+32, 3, 1, 1, counter, 1, counter + 1, 9);
+        xlsetcellstringvalue('Итого по группе', counter, 1, counter, 1);
+        xlsetcellnumbervalue(nch, counter, 3, counter, 3);
+        xlsetcellnumbervalue(ozp, counter, 4, counter, 4);
+        xlsetcellnumbervalue(dzp, counter, 5, counter, 5);
+        xlsetcellnumbervalue(strah, counter, 6, counter, 6);
+        xlsetcellnumbervalue(rezerv, counter, 7, counter, 7);
+        xlsetcellnumbervalue(vsegofotsum, counter, 8, counter, 8);
+        xlsetcellnumbervalue(strahotpusk, counter + 1, 7, counter + 1, 7);
+        xlsetcellnumbervalue(vsegostrahsum, counter + 1, 8, counter + 1, 8);
+        xlsetcellnumbervalue(vsegosum, counter, 9, counter, 9);
+
+        itognch:= itognch + nch;
+        itogozp:= itogozp + ozp;
+        itogdzp:= itogdzp + dzp;
+        itogvsegofot:= itogvsegofot + vsegofotsum;
+        itogstrah:= itogstrah + strah;
+        itogrezerv:= itogrezerv + rezerv;
+        itogstrahotpusk:= itogstrahotpusk + strahotpusk;
+        itogvsegostrah:= itogvsegostrah + vsegostrahsum;
+        itogvsego:= itogvsego + vsegosum;
+
+        counter:= counter + 2;
+
+        nch:= zarprem.nch;
+        ozp:= zarprem.ozp;
+        dzp:= zarprem.dzp;
+        vsegofot:= zarprem.ozp + zarprem.dzp;
+        strah:= 0;
+        rezerv:= 0;
+        strahotpusk:= 0;
+        vsegostrah:= 0;
+
+        xlsetcellnumbervalue(0, counter, 6, counter, 6);
+        xlsetcellnumbervalue(0, counter, 7, counter, 7);
+        xlsetcellnumbervalue(0, counter + 1, 7, counter + 1, 7);
+        xlsetcellnumbervalue(0, counter + 1, 8, counter + 1, 8);
+
+        _loop strahrezerv where ((zarprem.sch == strahrezerv.sch and zarprem.zakaznmb == strahrezerv.zakaznmb))
+        {
+            strah:= strahrezerv.strah;
+            rezerv:= strahrezerv.rezerv;
+            strahotpusk:= strahrezerv.strahotpusk;
+            vsegostrah:= strahrezerv.strah + strahrezerv.strahotpusk;
+            vsegofot:= vsegofot + strahrezerv.rezerv;
+            vsegostrahsum:= vsegostrah;
+            xlsetcellnumbervalue(strahrezerv.strah, counter, 6, counter, 6);
+            xlsetcellnumbervalue(strahrezerv.rezerv, counter, 7, counter, 7);
+            if strahrezerv.rezerv = 0
+            {
+              xlsetcellnumbervalue(0, counter + 1, 7, counter + 1, 7);
+              strahotpusk:= strahotpusk - strahrezerv.strahotpusk;
+              vsegostrah:= vsegostrah - strahrezerv.strahotpusk;
+            }
+            else
+            {
+              xlsetcellnumbervalue(strahrezerv.strahotpusk, counter + 1, 7, counter + 1, 7);
+            }
+            xlsetcellnumbervalue(vsegostrah, counter + 1, 8, counter + 1, 8);
+        }
+
+        vsegofotsum:= vsegofot;
+        vsego:= vsegofot + vsegostrah;
+        vsegosum:= vsego;
+
+        schet:= zarprem.sch;
+        zakaznmb:= zarprem.zakaznmb;
+        xlframecells(1+2+4+8+32, 3, 1, 1, counter, 1, counter + 1, 9);
+        xlsetcellstringvalue(zarprem.sch, counter, 1, counter, 1);
+        xlsetcellstringvalue(zarprem.zakaznmb, counter, 2, counter ,2);
+        xlsetcellnumbervalue(zarprem.nch, counter, 3, counter, 3);
+        xlsetcellnumbervalue(zarprem.ozp, counter, 4, counter, 4);
+        xlsetcellnumbervalue(zarprem.dzp, counter, 5, counter, 5);
+        xlsetcellnumbervalue(vsegofot, counter, 8, counter, 8);
+        xlsetcellnumbervalue(vsego, counter, 9, counter, 9);
+
+        delete all from zakazcex;
+
+        sql
+        select mnplan.number, katpodr1.kod
+        from mnplan
+        left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7
+        left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+        inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3) and katpodr1.kod <> '446' and katpodr1.kod <> '999'
+        where mnplan.number = :(zakaznmb) and nachislzakaz.mesn = :(mes) and nachislzakaz.yearn = :(god)
+        group by mnplan.number, katpodr1.kod
+        into zakazcex
+        ;
+
+        sumzakazpodr:= '';
+
+        _loop zakazcex
+        {
+          sumzakazpodr:= sumzakazpodr + zakazcex.podr + ', ';
+        }
+
+        counter:= counter + 2;
+        xlmergecells(counter, 1, counter, 9);
+        xlframecells(1+2, 3, 1, 1, counter, 1, counter, 9);
+        xlsetcellstringvalue('Цеха: ' + substr(sumzakazpodr, 1, length(sumzakazpodr) - 2), counter, 1, counter ,1);
+      }
+    }
+
+    if getlast zarprem = tsok
+    {
+      counter++;
+      xlsetfontstyle(1, counter, 1, counter + 1, 9);
+      xlmergecells(counter, 1, counter, 2);
+      xlmergecells(counter + 1, 1, counter + 1, 2);
+      xlframecells(1+2+4+8+32, 3, 1, 1, counter, 1, counter + 1, 9);
+      xlsetcellstringvalue('Итого по группе', counter, 1, counter, 1);
+      xlsetcellnumbervalue(nch, counter, 3, counter, 3);
+      xlsetcellnumbervalue(ozp, counter, 4, counter, 4);
+      xlsetcellnumbervalue(dzp, counter, 5, counter, 5);
+      xlsetcellnumbervalue(strah, counter, 6, counter, 6);
+      xlsetcellnumbervalue(rezerv, counter, 7, counter, 7);
+      xlsetcellnumbervalue(vsegofotsum, counter, 8, counter, 8);
+      xlsetcellnumbervalue(strahotpusk, counter + 1, 7, counter + 1, 7);
+      xlsetcellnumbervalue(vsegostrahsum, counter + 1, 8, counter + 1, 8);
+      xlsetcellnumbervalue(vsegosum, counter, 9, counter, 9);
+    }
+
+    itognch:= itognch + nch;
+    itogozp:= itogozp + ozp;
+    itogdzp:= itogdzp + dzp;
+    itogvsegofot:= itogvsegofot + vsegofotsum;
+    itogstrah:= itogstrah + strah;
+    itogrezerv:= itogrezerv + rezerv;
+    itogstrahotpusk:= itogstrahotpusk + strahotpusk;
+    itogvsegostrah:= itogvsegostrah + vsegostrahsum;
+    itogvsego:= itogvsego + vsegosum;
+
+    counter:= counter + 2;
+    xlsetfontstyle(1, counter, 1, counter + 1, 9);
+    xlmergecells(counter, 1, counter, 2);
+    xlmergecells(counter + 1, 1, counter + 1, 2);
+    xlframecells(1+2+4+8+32, 3, 1, 1, counter, 1, counter + 1, 9);
+    xlsetcellstringvalue('Итого по предприятию', counter, 1, counter, 1);
+    xlsetcellnumbervalue(itognch, counter, 3, counter, 3);
+    xlsetcellnumbervalue(itogozp, counter, 4, counter, 4);
+    xlsetcellnumbervalue(itogdzp, counter, 5, counter, 5);
+    xlsetcellnumbervalue(itogstrah, counter, 6, counter, 6);
+    xlsetcellnumbervalue(itogrezerv, counter, 7, counter, 7);
+    xlsetcellnumbervalue(itogvsegofot, counter, 8, counter, 8);
+    xlsetcellnumbervalue(itogstrahotpusk, counter + 1, 7, counter + 1, 7);
+    xlsetcellnumbervalue(itogvsegostrah, counter + 1, 8, counter + 1, 8);
+    xlsetcellnumbervalue(itogvsego, counter, 9, counter, 9);
+
+    StopVisual('',0);
+    xlkillExcel;
+  }
+
+  if forma = 2
+  {
+    ExcelPath:= TranslatePath('%ClientStartPath%');
+    xlCreateExcelWithTemplate(ExcelPath+'XLS_ЭМ\ZP\gp_vedcexuchzatr2.xlsx',true);
+    if (xlIsExcelValid) xlSetActiveWorkBookByName('1');
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+
+    xlsetcellstringvalue('ВЕДОМОСТЬ ЦЕХОВОГО УЧЕТА ЗАТРАТ НА ПРОИЗВОДСТВО ПО ЗАКАЗАМ ЗА ' + mes + ' МЕСЯЦ ' + god + ' ГОДА', 1, 1, 1, 1);
+
+    SubBounds(tbRmtSelPodr1);
+    AddBounds(tbRmtSelPodr2);
+
+    delete all from zarpremcex;
+
+    _loop pMarkerpodr
+    {
+      cpodr:= tSelPodr.kod;
+
+      sql
+      select katpodr1.kod, buhschet.code, mnplan.number,  sum(case when nachisl1.vidopl in (1, 3, 5, 9, 10) then nachisl1.chasf else 0 end), sum(nachisl1.summa), sum(nachisl2.summa)
+      from mnplan
+      left join buhschet on buhschet.nrec = mnplan.canval2
+      left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)
+      left join klvidopl on klvidopl.vidopl = nachislzakaz.vidopls
+      left join stzatr on stzatr.nrec = klvidopl.kauextr[1]
+      left join nachislzakaz nachisl1 on nachisl1.nrec = nachislzakaz.nrec and nachisl1.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec
+                                                                              and stzatr.name in ('01 Основная з/плата'
+                                                                                                 ,'01.1 Основная  з/плата не уменьшающая налогообл.базу'
+                                                                                                 ,'04 Премии'
+                                                                                                 ,'04.1 Премия не уменьшающая налогообл.базу'
+                                                                                                 ,'104 Проект "Управление качеством:автоматизированный учет отступлений от КД и ТД '
+                                                                                                 ,'106 Проект "Управление качеством: разработка и внедрение системы учета затрат ка'
+                                                                                                 ,'Основная з/плата, включая Премии'
+                                                                                                 )
+      left join nachislzakaz nachisl2 on nachisl2.nrec = nachislzakaz.nrec and nachisl2.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec
+                                                                              and stzatr.name in ('02 Дополнительная з/плата'
+                                                                                                 ,'02.1 Дополнительная з/плата не уменьшающая налогообл.базу'
+                                                                                                 ,'Дополнительная з/плата'
+                                                                                                 )
+      where nachislzakaz.mesn = :(mes) and nachislzakaz.yearn = :(god) and katpodr1.kod = :(cpodr)
+      group by katpodr1.kod, buhschet.code, mnplan.number
+      having sum(case when nachisl1.vidopl in (1, 3, 5, 9, 10) then nachisl1.chasf else 0 end) <> 0 or sum(nachisl1.summa) <> 0 or sum(nachisl2.summa) <> 0
+      into zarpremcex
+      ;
+    }
+
+    delete all from strahrezervcex;
+
+    _loop pMarkerpodr
+    {
+      cpodr:= tSelPodr.kod;
+
+      sql
+      select buhschet.code, mnplan.number, sum(nachislzakaz.summa)/100*:(proc2), sum(nachislzakaz.summa)/100*:(proc1),  (sum(nachislzakaz.summa)/100*:(proc1))/100*:(proc2)
+      from mnplan
+      left join buhschet on buhschet.nrec = mnplan.canval2
+      left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7
+      inner join klvidopl on klvidopl.vidopl = nachislzakaz.vidopls
+      inner join attrval on attrval.crec = klvidopl.nrec
+      inner join attrnam on attrnam.nrec = attrval.cattrnam and attrnam.name = '908 Фонд Резерв (ОВР)'
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)
+      where nachislzakaz.mesn = :(mes) and nachislzakaz.yearn = :(god) and katpodr1.kod = :(cpodr)
+      group by buhschet.code, mnplan.number
+      into strahrezervcex
+      ;
+    }
+
+    SubBounds(tbRmtSelPodr2);
+    AddBounds(tbRmtSelPodr1);
+
+    if getfirst zarpremcex = tsok
+    {
+      cexpodr:= zarpremcex.podr;
+    }
+
+    _loop zarpremcex
+    {
+      if counter = 5
+      {
+        counter++;
+        xlsetfontstyle(1, counter + 1, 1, counter + 1, 1);
+        xlframecells(1+2, 3, 1, 1, counter, 1, counter + 1, 9);
+        xlsetcellstringvalue('Цех ' + cexpodr, counter + 1, 1, counter + 1, 1);
+        counter:= counter + 2;
+      }
+      else
+      {
+        counter:= counter + 2;
+      }
+
+      if cexpodr = zarpremcex.podr
+      {
+        nch:= nch + zarpremcex.nch;
+        ozp:= ozp + zarpremcex.ozp;
+        dzp:= dzp + zarpremcex.dzp;
+        vsegofot:= zarpremcex.ozp + zarpremcex.dzp;
+        vsegostrah:= 0;
+
+        xlsetcellnumbervalue(0, counter, 6, counter, 6);
+        xlsetcellnumbervalue(0, counter, 7, counter, 7);
+        xlsetcellnumbervalue(0, counter + 1, 7, counter + 1, 7);
+        xlsetcellnumbervalue(0, counter + 1, 8, counter + 1, 8);
+
+        _loop strahrezervcex where ((zarpremcex.podr == strahrezervcex.podr and zarpremcex.sch == strahrezervcex.sch and zarpremcex.zakaznmb == strahrezervcex.zakaznmb))
+        {
+            strah:= strah + strahrezervcex.strah;
+            rezerv:= rezerv + strahrezervcex.rezerv;
+            strahotpusk:= strahotpusk + strahrezervcex.strahotpusk;
+            vsegostrah:= strahrezervcex.strah + strahrezervcex.strahotpusk;
+            vsegofot:= vsegofot + strahrezervcex.rezerv;
+            xlsetcellnumbervalue(strahrezervcex.strah, counter, 6, counter, 6);
+            xlsetcellnumbervalue(strahrezervcex.rezerv, counter, 7, counter, 7);
+            if strahrezervcex.rezerv = 0
+            {
+              xlsetcellnumbervalue(0, counter + 1, 7, counter + 1, 7);
+              strahotpusk:= strahotpusk - strahrezervcex.strahotpusk;
+              vsegostrah:= vsegostrah - strahrezervcex.strahotpusk;
+            }
+            else
+            {
+              xlsetcellnumbervalue(strahrezervcex.strahotpusk, counter + 1, 7, counter + 1, 7);
+            }
+            xlsetcellnumbervalue(vsegostrah, counter + 1, 8, counter + 1, 8);
+        }
+
+        vsegofotsum:= vsegofotsum + vsegofot;
+        vsegostrahsum:= vsegostrahsum + vsegostrah;
+        vsego:= vsegofot + vsegostrah;
+        vsegosum:= vsegosum + vsego;
+        xlframecells(1+2+4+8+32, 3, 1, 1, counter, 1, counter + 1, 9);
+        xlsetcellstringvalue(zarpremcex.sch, counter, 1, counter, 1);
+        xlsetcellstringvalue(zarpremcex.zakaznmb, counter, 2, counter ,2);
+        xlsetcellnumbervalue(zarpremcex.nch, counter, 3, counter, 3);
+        xlsetcellnumbervalue(zarpremcex.ozp, counter, 4, counter, 4);
+        xlsetcellnumbervalue(zarpremcex.dzp, counter, 5, counter, 5);
+        xlsetcellnumbervalue(vsegofot, counter, 8, counter, 8);
+        xlsetcellnumbervalue(vsego, counter, 9, counter, 9);
+      }
+      else
+      {
+        xlsetfontstyle(1, counter, 1, counter + 1, 9);
+        xlmergecells(counter, 1, counter, 2);
+        xlmergecells(counter + 1, 1, counter + 1, 2);
+        xlframecells(1+2+4+8+32, 3, 1, 1, counter, 1, counter + 1, 9);
+        xlsetcellstringvalue('Итого по цеху', counter, 1, counter, 1);
+        xlsetcellnumbervalue(nch, counter, 3, counter, 3);
+        xlsetcellnumbervalue(ozp, counter, 4, counter, 4);
+        xlsetcellnumbervalue(dzp, counter, 5, counter, 5);
+        xlsetcellnumbervalue(strah, counter, 6, counter, 6);
+        xlsetcellnumbervalue(rezerv, counter, 7, counter, 7);
+        xlsetcellnumbervalue(vsegofotsum, counter, 8, counter, 8);
+        xlsetcellnumbervalue(strahotpusk, counter + 1, 7, counter + 1, 7);
+        xlsetcellnumbervalue(vsegostrahsum, counter + 1, 8, counter + 1, 8);
+        xlsetcellnumbervalue(vsegosum, counter, 9, counter, 9);
+
+        cexpodr:= zarpremcex.podr;
+        counter:= counter + 2;
+        xlsetfontstyle(1, counter + 1, 1, counter + 1, 1);
+        xlframecells(1+2, 3, 1, 1, counter, 1, counter + 1, 9);
+        xlsetcellstringvalue('Цех ' + cexpodr, counter + 1, 1, counter + 1, 1);
+        counter:= counter + 2;
+
+        nch:= zarpremcex.nch;
+        ozp:= zarpremcex.ozp;
+        dzp:= zarpremcex.dzp;
+        vsegofot:= zarpremcex.ozp + zarpremcex.dzp;
+        strah:= 0;
+        rezerv:= 0;
+        strahotpusk:= 0;
+        vsegostrah:= 0;
+
+        xlsetcellnumbervalue(0, counter, 6, counter, 6);
+        xlsetcellnumbervalue(0, counter, 7, counter, 7);
+        xlsetcellnumbervalue(0, counter + 1, 7, counter + 1, 7);
+        xlsetcellnumbervalue(0, counter + 1, 8, counter + 1, 8);
+
+        _loop strahrezervcex where ((zarpremcex.podr == strahrezervcex.podr and zarpremcex.sch == strahrezervcex.sch and zarpremcex.zakaznmb == strahrezervcex.zakaznmb))
+        {
+            strah:= strahrezervcex.strah;
+            rezerv:= strahrezervcex.rezerv;
+            strahotpusk:= strahrezervcex.strahotpusk;
+            vsegostrah:= strahrezervcex.strah + strahrezervcex.strahotpusk;
+            vsegofot:= vsegofot + strahrezervcex.rezerv;
+            vsegostrahsum:= vsegostrah;
+            xlsetcellnumbervalue(strahrezervcex.strah, counter, 6, counter, 6);
+            xlsetcellnumbervalue(strahrezervcex.rezerv, counter, 7, counter, 7);
+            if strahrezervcex.rezerv = 0
+            {
+              xlsetcellnumbervalue(0, counter + 1, 7, counter + 1, 7);
+              strahotpusk:= strahotpusk - strahrezervcex.strahotpusk;
+              vsegostrah:= vsegostrah - strahrezervcex.strahotpusk;
+            }
+            else
+            {
+              xlsetcellnumbervalue(strahrezervcex.strahotpusk, counter + 1, 7, counter + 1, 7);
+            }
+            xlsetcellnumbervalue(vsegostrah, counter + 1, 8, counter + 1, 8);
+        }
+
+        vsegofotsum:= vsegofot;
+        vsego:= vsegofot + vsegostrah;
+        vsegosum:= vsego;
+
+        xlframecells(1+2+4+8+32, 3, 1, 1, counter, 1, counter + 1, 9);
+        xlsetcellstringvalue(zarpremcex.sch, counter, 1, counter, 1);
+        xlsetcellstringvalue(zarpremcex.zakaznmb, counter, 2, counter ,2);
+        xlsetcellnumbervalue(zarpremcex.nch, counter, 3, counter, 3);
+        xlsetcellnumbervalue(zarpremcex.ozp, counter, 4, counter, 4);
+        xlsetcellnumbervalue(zarpremcex.dzp, counter, 5, counter, 5);
+        xlsetcellnumbervalue(vsegofot, counter, 8, counter, 8);
+        xlsetcellnumbervalue(vsego, counter, 9, counter, 9);
+      }
+    }
+
+    if getlast zarpremcex = tsok
+    {
+      counter:= counter + 2;
+      xlsetfontstyle(1, counter, 1, counter + 1, 9);
+      xlmergecells(counter, 1, counter, 2);
+      xlmergecells(counter + 1, 1, counter + 1, 2);
+      xlframecells(1+2+4+8+32, 3, 1, 1, counter, 1, counter + 1, 9);
+      xlsetcellstringvalue('Итого по цеху', counter, 1, counter, 1);
+      xlsetcellnumbervalue(nch, counter, 3, counter, 3);
+      xlsetcellnumbervalue(ozp, counter, 4, counter, 4);
+      xlsetcellnumbervalue(dzp, counter, 5, counter, 5);
+      xlsetcellnumbervalue(strah, counter, 6, counter, 6);
+      xlsetcellnumbervalue(rezerv, counter, 7, counter, 7);
+      xlsetcellnumbervalue(vsegofotsum, counter, 8, counter, 8);
+      xlsetcellnumbervalue(strahotpusk, counter + 1, 7, counter + 1, 7);
+      xlsetcellnumbervalue(vsegostrahsum, counter + 1, 8, counter + 1, 8);
+      xlsetcellnumbervalue(vsegosum, counter, 9, counter, 9);
+    }
+
+    StopVisual('',0);
+    xlkillExcel;
+
+  }
+}
+
+end;
+
+windowevent wnSelmnf;
+
+cmdefault:
+{
+
+  sqlDropTmpTable ('tSelmnfUser');
+  sqlCreateTmpTable('table tSelmnfUser (name: string) with index (i1 = name);', ctmNormal);
+
+    SubBounds(tbRmtSelmnf1);
+    AddBounds(tbRmtSelmnf2);
+
+    if pMarkermnf.count = 0
+    {
+      pMarkermnf.mark;
+      Filtr_mnf:= tSelmnf.name;
+      podr:= 'Не выбрано';
+    }
+
+    _loop pMarkermnf
+    {
+      if pMarkermnf.count = 1
+      {
+        Filtr_mnf:= tSelmnf.name;
+        podr:= 'Не выбрано';
+      }
+    }
+
+    if pMarkermnf.count > 1
+    {
+      Filtr_mnf:= 'Выбрано ' + pMarkermnf.count;
+      podr:= 'Не выбрано';
+    }
+
+    pMarkermnf.storetodsk;
+
+    _loop pmarkermnf
+    {
+      Filtr_cmnf := tSelmnf.name;
+
+      stmt := sqlAllocStmt;
+      ClearQuery(vliSQLCommand);
+      PrepareSQLQuery('insert into tSelmnfUser (name) values ('''+Filtr_cmnf+''') ');
+      ExecDSQLex(0);
+    }
+
+    delete all from tSelPodr;
+
+    ClearQuery(vliSQLCommand);
+    PrepareSQLQuery('select katpodr1.nrec, katpodr1.kod, katpodr1.name');
+    PrepareSQLQuery('from katpodr');
+    PrepareSQLQuery('inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3) and katpodr1.kod <> ''446'' and katpodr1.kod <> ''999'' ');
+    PrepareSQLQuery('inner join extcatlinks on extcatlinks.extcat = katpodr.nrec');
+    PrepareSQLQuery('inner join catalogs on catalogs.nrec = extcatlinks.staffcat');
+    PrepareSQLQuery('inner join attrval on attrval.crec = catalogs.nrec');
+    PrepareSQLQuery('inner join attrnam on attrnam.nrec = attrval.cattrnam');
+    PrepareSQLQuery('inner join zar_user on (upper(zar_user.ownname) = upper('''+pUserName+'''))');
+    PrepareSQLQuery('where attrnam.name = ''Вид производства'' and (attrval.vstring in (select tSelmnfUser.name from tSelmnfUser)) and (zar_user.podrshare <> ''+'' or (katpodr.nrec in (select userrights.crecds from userrights where zar_user.ownname = userrights.ownname)))');
+    PrepareSQLQuery('group by katpodr1.nrec, katpodr1.kod, katpodr1.name');
+    PrepareSQLQuery('order by katpodr1.kod');
+    stmt:=0;
+    stmt := sqlAllocStmt;
+    wErr:=ExecDSQLex(tntSelPodr);
+
+    pMarkerpodr.UnselectAll;
+
+    SubBounds(tbRmtSelmnf2);
+    AddBounds(tbRmtSelmnf1);
+}
+
+cmClose:
+{
+  pMarkermnf.loadfromdsk;
+}
+
+end;
+
+windowevent wnSelPodr;
+
+cmDefault:
+{
+    SubBounds(tbRmtSelPodr1);
+    AddBounds(tbRmtSelPodr2);
+
+    if pMarkerpodr.count = 0
+    {
+      pMarkerpodr.mark;
+      podr:= tSelPodr.kod + ' ' + tSelpodr.name;
+    }
+
+    _loop pMarkerpodr
+    {
+      if pMarkerpodr.count = 1
+      {
+        podr:= tSelPodr.kod + ' ' + tSelpodr.name;
+      }
+    }
+
+    SubBounds(tbRmtSelPodr2);
+    AddBounds(tbRmtSelPodr1);
+
+    if pMarkerpodr.count > 1
+    {
+      podr:= 'Выбрано ' + pMarkerpodr.count;
+    }
+
+    pMarkerpodr.storetodsk;
+}
+
+cmClose:
+{
+  pMarkerpodr.loadfromdsk;
+}
+
+end;
+
+end.
+
+VipInterface UserReport_vedcexuchzatr2 Implements IUserReport;
+Interface UserReport_vedcexuchzatr2;
+
+Procedure Run;
+Begin
+  runinterface(gp_vedcexuchzatr2);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Ведомость цехового учета затрат на производство по заказам (осн. з\п + премии)';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Экономическая и статистическая отчетность';
+  End;
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'menuzarp';
+    2 : VisibleInModule := 'CONTROLLING';
+  end;
+end;
+
+End.

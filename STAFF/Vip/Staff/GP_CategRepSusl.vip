@@ -1,0 +1,1118 @@
+/**************************************************************************************************\
+* Наименование: Форма "Отчёт по категориям"                                                       *
+* Контур/Модуль: Управление персоналом                                                            *
+* Пункт меню: Отчеты / Отчеты пользователя / Ведение картотеки сотрудников / Отчёт по категориям  *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1161         |15/10/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include CatFunc.vih // Функции работы с каталогом
+
+interface GP_CategRepsUsl 'Отчёт о списочной численности' EscClose;
+
+  const
+    REP_NAME = 'GP_CategRepsusl'; // Название отчёта
+    REP_TITLE = 'Отчёт о списочной численности на'; // Заголовок отчёта
+    ST_SHOW_EXT_SOVM = 1; // доп.параметры - выводить внешних совместителей
+    TAB_CNT = 2; // Количество закладок в отчёте
+    TAB_TITLE_1 = 'Отчёт'; // Название закладки 1
+    TAB_TITLE_2 = 'Расшифровка'; // Название закладки 2
+    FT_ST_STR_ED = 1; // фильтр по подразделениям
+    CAT_DEP_ENTRY = -11; // Точка входа в каталог структурных единиц ШР
+    // Константы ошибок при работе с Excel
+    XE_BAD_OP           =  0; // не удалось выполнить операцию с Excel-файлом
+    XE_CREATE_FILE      =  1; // не удалось создать файл
+    XE_OPEN_FILE        =  2; // не удалось открыть файл
+    XE_INIT_FILE        =  3; // не удалось инициализировать Excel
+    XE_CREATE_MATRIX    =  4; // не удалось создать матрицу
+    XE_FREE_MATRIX      =  5; // не удалось освободить матрицу
+    XE_OUT_MATRIX       =  6; // не удалось вывести матрицу в отчёт
+    XE_WRITE_TO_MATRIX  =  7; // не удалось записать значение в матрицу
+    XE_FORMAT_CELL      =  8; // не удалось отформатировать ячейку
+    XE_SET_CELL_VALUE   =  9; // не удалось записать значение в ячейку
+    XE_SET_CELL_FORMULA = 10; // не удалось записать формулу
+    XE_RUN_MACRO        = 11; // не удалось запустить макрос
+    XE_ADD_SHEET        = 12; // не удалось добавить вкладку
+    XE_DEL_SHEET        = 13; // не удалось удалить вкладку
+    XE_RENAME_SHEET     = 14; // не удалось переименовать вкладку
+    XE_WRONG_TEMPLATE   = 15; // в xlt шаблоне не найден лист с именем
+    XE_SET_SHEET        = 16; // не удалось переключить вкладку
+  end;
+
+  table struct SData
+  (
+     TabNmb: tTabN         // Табельный номер
+   , StrTabn: TabNStr      // Строковое значение табельного номера
+   , cPerson: tNRec        // Ссылка на работника
+   , cDep: tNRec           // Ссылка на подразделение
+   , cPosition: tNRec      // Ссылка на должность
+   , cCateg: tNRec         // Ссылка на категорию
+   , DepCode: String[20]    // Код подразделения
+   , rate : double
+   , cAppoint : tNrec      // Ссылка на назначение
+   , otpNum  : word         //Номер отпуска
+   , cAppZGD : tNrec // Cсылка на ЗГД
+  )
+  With index
+  (
+    SData01 = cPerson,
+    SData02 = DepCode + TabNmb + StrTabn
+  );
+
+  table struct SCateg
+  (
+    cCateg: tNRec,         // Ссылка на категорию
+    Code: Word,            // Код категории
+    Name: String[80],      // Наименование категории
+    PersonNum: LongInt     // Итого по категории
+  )
+  With index
+  (
+    SCateg01 = cCateg,
+    SCateg02 = Code
+  );
+
+  table struct SDep
+  (
+    NRec: tNRec,           // Номер записи
+    cDep: tNRec,           // Ссылка на подразделение
+    Code: String[3],       // Код подразделения
+    PersonNum: LongInt,    // Итого по подразделению
+    WomenNum: LongInt      // Итого женщин по подразделению
+  )
+  With index
+  (
+    SDep01 = cDep,
+    SDep02 = Code
+  );
+
+  table struct SDepCateg
+  (
+    cSDep: tNRec,          // Ссылка на подразделение
+    cCateg: tNRec,         // Ссылка на категорию
+    PersonNum: LongInt     // Итого по категории
+  )
+  With index
+  (
+    SDepCateg01 = cSDep + cCateg
+  );
+
+  create view
+    var
+      pDate: Date; // Дата, на которую формируется отчёт
+      pFilters: Word; // Фильтры
+      pSettings: Word; // Дополнительные параметры
+    as select
+      ('(В отчет не попадут уволенные ' + DateToStr(pDate, 'DD.MM.YYYY') + ' и раньше)') (FieldName = UvInfoStr)
+
+    from
+      SData (SData02),
+      SCateg (SCateg02),
+      SDep (SDep02),
+      MoveLSc (MoveLSc02),
+      synonym Persons PersonsR,
+      synonym KlKatego KlKategoR,
+      synonym KlSovm KlSovmR,
+      synonym Catalogs CatDep,
+      synonym Catalogs CatDepR,
+      synonym Catalogs CatPosR
+   , otpusk
+      ,appointments app
+      ,catalogs wk
+      //для ЗГД
+//      ,appointments appZGD
+//      , staffstruct sf
+      /*
+     // ,appointments appZGD1
+      ,otpusk
+      ,attrnam
+      ,attrval
+      ,persons personsZGD
+      ,persons personsZGD1
+      ,catalogs CAT     */
+    where ((
+          pDate                   >>= Appointments.AppointDate
+      and Appointments.Person      == Persons.NRec
+      and Appointments.Department  == CatDep.NRec
+      and Appointments.EmpCategory == KlKatego.NRec
+      and word(Persons.cSovm)      == KlSovm.Sovm
+      and SData.cPerson            == PersonsR.NRec
+      and SData.cCateg             == KlKategoR.NRec
+      and SData.cDep               == CatDepR.NRec
+      and SData.cPosition          == CatPosR.NRec
+      and word(PersonsR.cSovm)     == KlSovmR.Sovm
+
+      and SCateg.cCateg            == SDepCateg.cCateg
+      and SDep.NRec                == SDepCateg.cSDep
+
+      and Sdata.cAppoint == app.nrec (noindex)
+      and app.workcond == wk.nrec  (noindex)
+      //ДЛЯ ЗГД
+      /*
+      and Sdata.cAppoint == appZGD.nrec (noindex)
+      and appZGD.STAFFSTR == sf.nrec
+      and word(25018) == attrnam.wtable
+      and 'Должность функционального руководителя' == attrnam.name
+      and attrnam.nrec == attrval.cattrnam     (noindex)
+      and word(25018) == attrval.wtable    (noindex)
+      and CAT.nrec == attrval.crec       (noindex)
+      and  appZGD.STAFFSTR == attrval.Vcomp   (noindex)
+      AND appZGD.NREC /== personsZGD.APPOINTCUR  (noindex)
+      and personsZGD.department == CAT.nrec     */
+
+      /*and app.STAFFSTR == staffstruct.nrec
+      and word(25018) == attrnam.wtable
+      and 'Должность функционального руководителя' == attrnam.name
+
+      and attrnam.nrec == attrval.cattrnam
+      and word(25018) == attrval.wtable
+
+      and CAT.nrec == attrval.crec
+
+      and attrval.Vcomp /== appZGD.STAFFSTR
+      AND appZGD.NREC /== personsZGD.APPOINTCUR  (noindex)
+      and personsZGD.department == CAT.nrec   */
+
+    ))
+    and Appointments.wAddWord1 < 2 // По ШР
+    and Appointments.Person != 0
+    and (Appointments.lPrizn = 0 or Appointments.lPrizn = 100)// Осн.место работы
+    and (pDate <= Appointments.DismissDate or Appointments.DismissDate = 0)
+
+    //and (pdate >= otp.datan and pdate <= otp.datok)
+    //and (pDate <= app.DismissDate or app.DismissDate = 0)
+
+     //Декрет
+   /// condition ByOtpDat = (pdate >= otp.datan) and (pdate <= otp.datok)
+
+  ;
+
+  var
+    IsAborted: Boolean;
+    IsPsnInfoLogged: Boolean;
+    ICatFunc: CatalogsFunctions;
+    TPersonNum: LongInt;
+    TWomenNum: LongInt;
+    // Фильтры
+    fsDept: String; // Подразделение - строка, описывающая выбор
+    fmDept: LongInt; // Подразделение - маркер для хранения выбранных подразделений
+    // Переменные для работы с Excel
+    RepRecCnt, DataRecCnt: LongInt; // Количество строк в отчёте
+    FirstCol: LongInt; // Номер первой колонки отчёта
+    LastCol: LongInt; // Номер последней колонки отчёта
+    FirstHeadRow: LongInt; // Номер первой строки отчёта
+    FirstBodyRow: LongInt; // Номер первой строки тела отчёта
+    LastBodyRow: LongInt; // Номер последней строки отчёта
+
+  #include GP_Log.var
+
+  window winParam 'Отчёт о списочной численности' DoAccept, EscClose, Gray;
+    show at (,, 68, 10);
+
+    screen scrParam ('',, sci1EnEsc);
+    fields
+      pDate ('Дата на которую формируется отчёт'): noProtect;
+      UvInfoStr: skip;
+      pFilters ('Выберите фильтр для расчета',, sci1Esc): NoProtect;
+      fsDept ('Заданный фильтр по структурным единицам штатного расписания',, sci13Esc): Protect, PickButton;
+      pSettings ('Дополнительные параметры'): noProtect;
+    buttons
+      cmOk,,, 'Ввод - принять выбор',,sci1Esc;
+      cmCancel,,, 'Отмена',,sci1Esc;
+    <<
+
+`Дата`.@@@@@@@@@@ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+`Фильтры`
+  [.] по подразделению `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Дополнительные параметры`
+  [.] выводить внешних совместителей`
+
+                     <.  ~O~K  .> <.О~т~мена.>
+    >>
+    end;
+
+    handleEvent
+      cmOk:
+        PutCommand(cmDefault);
+      cmDefault:
+        if (pFilters and FT_ST_STR_ED) != 0 and GetMarkerCount(fmDept) = 0 then
+        begin
+          Message('Выберите подразделение' );
+          abort;
+        end;
+    end;
+  end;
+
+  // Обновляет строку состояния фильтра
+  procedure UpdateFiltersState;
+  var
+    SelCnt: LongInt;
+    cTemp: Comp;
+{
+    fsDept := '';
+    SelCnt := GetMarkerCount(fmDept);
+    if SelCnt > 0 then
+      if (SelCnt = 1) and GetMarker(fmDept, 0, cTemp) then
+        fsDept := ICatFunc.GetCatalogsName(cTemp)
+      else
+        fsDept := 'Выбрано подразделений: ' + String(SelCnt);
+    RescanPanel(CurTable);
+}
+
+  // инициализация параметров отчета
+  function InitParam: Boolean;
+{
+    if not ReadMyDsk(pDate, REP_NAME + 'pDate', false) then
+      pDate := Cur_Date;
+    if not ReadMyDsk(pFilters, REP_NAME + 'pFilters', false) then
+      pFilters := 0;
+    if not ReadMyDsk(pSettings, REP_NAME + 'pSettings', false) then
+      pSettings := 0;
+    UpdateFiltersState;
+    result := true;
+}
+
+  // сохранение параметров отчета
+  procedure SaveParam;
+ {
+    SaveMyDsk(pDate, REP_NAME + 'pDate');
+    SaveMyDsk(pFilters, REP_NAME + 'pFilters');
+    SaveMyDsk(pSettings, REP_NAME + 'pSettings');
+}
+
+  // установка параметров отчета
+  function AskParam: Boolean;
+{
+    result := false;
+    if not InitParam then
+      Exit;
+    if RunWindowModal(winParam) = cmDefault then
+    begin
+      SaveParam;
+      result := true;
+    end;
+}
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  // Исключение для генерации ошибок, связанных с выводом в Excel файл
+  exception ExOnExecelError;
+
+  // Генерирует ошибку, связанную с выводом в Excel файл
+  procedure ExcelError(ErrCode: Word; AddInfo: String);
+  var
+    ErrText: String;
+{
+    case ErrCode of
+      XE_BAD_OP:
+        ErrText := 'не удалось выполнить операцию с Excel-файлом';
+      XE_CREATE_FILE:
+        ErrText := 'не удалось создать файл';
+      XE_OPEN_FILE:
+        ErrText := 'не удалось открыть файл';
+      XE_INIT_FILE:
+        ErrText := 'не удалось инициализировать Excel';
+      XE_CREATE_MATRIX:
+        ErrText := 'не удалось создать матрицу';
+      XE_OUT_MATRIX:
+        ErrText := 'не удалось вывести матрицу в отчёт';
+      XE_WRITE_TO_MATRIX:
+        ErrText := 'не удалось записать значение в матрицу';
+      XE_WRONG_TEMPLATE:
+        ErrText := 'в xlt шаблоне не найден лист с именем';
+      XE_FORMAT_CELL:
+        ErrText := 'не удалось отформатировать ячейку';
+      XE_SET_CELL_VALUE:
+        ErrText := 'не удалось записать значение в ячейку';
+      XE_RUN_MACRO:
+        ErrText := 'не удалось запустить макрос';
+      XE_ADD_SHEET:
+        ErrText := 'не удалось добавить вкладку';
+      XE_DEL_SHEET:
+        ErrText := 'не удалось удалить вкладку';
+      XE_RENAME_SHEET:
+        ErrText := 'не удалось переименовать вкладку';
+      XE_FREE_MATRIX:
+        ErrText := 'не удалось освободить матрицу';
+      XE_SET_CELL_FORMULA:
+        ErrText := 'не удалось записать формулу';
+      XE_SET_SHEET:
+        ErrText := 'не удалось переключиться на вкладку';
+    else
+      ErrText := '';
+    end;
+    oGP_Log.Error(ErrText + ' ' + AddInfo);
+    _raise ExOnExecelError;
+}
+
+  // Эта Функция делает более удобной проверку результата операции с Excel
+  // Первым параметром передаем функцию, которая работает с Excel, а вторым и третьим - информацию об ошибке,
+  // которая будет выведена, если эта функция вернёт false (т.е. выполнится с ошибкой)
+  procedure xlOp(IsCorrect: Boolean; ErrCode: Word; AddInfo: String);
+{
+    if not IsCorrect then
+      ExcelError(ErrCode, AddInfo);
+}
+
+  // Создаёт Excel файл и создаёт в нём вкладки для вывода отчёта
+  procedure PrepareExcelFile(OutFileName: String);
+  var
+    TabCnt: Word;
+{
+    if ExistFile(OutFileName) then
+      DeleteFile(OutFileName);
+    SetVisualHeader('Создание Excel-файла...');
+    // Создаем файл Excel
+    xlOp(xlCreateExcel(OutFileName, True), XE_CREATE_FILE, OutFileName);
+    xlOp(xlIsExcelValid, XE_INIT_FILE, '');
+    // Переименуем вкладки
+    // Если в отчете меньше вкладок, чем нам нужно добавим недостающие
+    TabCnt := 0;
+    xlOp(xlGetSheetsCount(TabCnt), XE_ADD_SHEET, '');
+    while TabCnt < TAB_CNT do
+    begin
+      xlOp(xlAddSheet, 11, '');
+      TabCnt++;
+    end;
+    // Если в больше вкладок, чем нам нужно, удалим лишние
+    while TabCnt > TAB_CNT do
+    begin
+      xlOp(xlDeleteSheet(1), XE_DEL_SHEET, '');
+      TabCnt--;
+    end;
+    // Переименуем вкладки
+    xlOp(xlSetSheetName(1, TAB_TITLE_1), XE_RENAME_SHEET, '');
+    xlOp(xlSetSheetName(2, TAB_TITLE_2), XE_RENAME_SHEET, '');
+    xlSetActiveSheet(1);
+}
+
+  // Вывод заголовка отчёта
+  procedure OutTitleRep(var R: longint);
+  {
+    // Выводим заголовок отчета
+    xlOp(xlSetCellStringValue(REP_TITLE + ' на ' + DateToStr(pDate, 'DD.MM.YYYY'), R, FirstCol, R, FirstCol), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    xlOp(xlSetFontSize(14, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    R++;
+  }
+
+  // Вывод шапки отчёта
+  procedure OutHeaderRep(var R: LongInt);
+  var
+    C: Word;
+    CS: Word;
+    CatCnt: Word;
+    S: String;
+{
+    SetVisualHeader('Форматирование Excel-файла...');
+    FirstCol := 1;
+
+    C := FirstCol - 1;
+
+    // № подразделения
+    xlOp(xlSetCellStringValue('№ подраз-деления', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(8, R, C, R, C), XE_FORMAT_CELL, '');
+    // Категории
+    CS := C + 1;
+    _loop SCateg
+    begin
+      S := SCateg.Name;
+      S := Replace(S, 'Вспомогательные', 'Вспом.');
+      S := Replace(S, 'вспомогательного', 'вспом.');
+      S := Replace(S, 'Основные', 'Осн.');
+      S := Replace(S, 'основного', 'осн.');
+      S := Replace(S, 'производства', 'пр-ва');
+      S := Replace(S, 'Руководители', 'Руково-дители');
+      S := Replace(S, 'Специалисты', 'Специа-листы');
+      S := Replace(S, 'Служащие', 'Служа-щие');
+      xlOp(xlSetCellStringValue(SCateg.Code, R + 1, ++C, R + 1, C), XE_SET_CELL_VALUE, '');
+      xlOp(xlSetCellStringValue(S, R + 2, C, R + 2, C), XE_SET_CELL_VALUE, '');
+      xlOp(xlSetColumnWidth(8, R, C, R, C), XE_FORMAT_CELL, '');
+    end;
+    // Если есть хоть одна категория
+    if C >= CS then
+      xlOp(xlSetCellStringValue('Категории', R, CS, R, CS), XE_SET_CELL_VALUE, '');
+    // Итого работников
+    xlOp(xlSetCellStringValue('Итого работ-ников', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(8, R, C, R, C), XE_FORMAT_CELL, '');
+    // В том числе женщин
+    xlOp(xlSetCellStringValue('В том числе женщин', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(8, R, C, R, C), XE_FORMAT_CELL, '');
+    LastCol := C;
+
+    // Выравниваем содержимое ячеек шапки по верхнему краю и по центру
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, R, FirstCol, R + 2, LastCol), XE_FORMAT_CELL, '');
+    // Устанавливаем текстовый формат для всех ячеек шапки
+    xlOp(xlSetNumberFormat('@', R, FirstCol, R + 2, LastCol), XE_FORMAT_CELL, '');
+    // Делаем шрифт шапки жирным
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R + 2, LastCol), XE_FORMAT_CELL, '');;
+
+    // Выравниваем текст в ячейках
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 1, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+    // Устанавливаем текстовый формат
+    xlOp(xlSetNumberFormat('@', FirstBodyRow, 1, LastBodyRow, 1), XE_FORMAT_CELL, ''); // Код подразделения
+
+    // Для всех ячеек в форме включаем перенос слов
+    xlOp(xlWrapText(R, FirstCol, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+    // Рисуем границы ячеек для всей формы
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0,
+     R, FirstCol, LastBodyRow + 1, LastCol), XE_FORMAT_CELL, '');
+
+    // Объединяем ячейки
+    CatCnt := RecordsInTable(#SCateg);
+    xlOp(xlMergeCells(R, 1, R + 2, 1), XE_FORMAT_CELL, '');
+    xlOp(xlMergeCells(R, CatCnt + 2, R + 2, CatCnt + 2), XE_FORMAT_CELL, '');
+    xlOp(xlMergeCells(R, CatCnt + 3, R + 2, CatCnt + 3), XE_FORMAT_CELL, '');
+    if CatCnt > 0 then
+      xlOp(xlMergeCells(R, 2, R, CatCnt + 1), XE_FORMAT_CELL, '');
+    // Корректируем высоту строк  шапки
+    xlOp(xlSetRowHeight(15, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    xlOp(xlSetRowHeight(15, R + 1, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    xlOp(xlSetRowHeight(60, R + 2, FirstCol, R + 2, LastCol), XE_FORMAT_CELL, '');
+
+    R += 3;
+}
+
+  // Вывод тела отчёта
+  procedure OutBodyRep(var R: LongInt);
+  var
+    C: Word;
+{
+    SetVisualHeader('Вывод данных в отчет...');
+    _loop SDep
+    begin
+      if IsAborted then
+        break;
+      NextVisual;
+      C := FirstCol - 1;
+      // № подразделения
+      xlOp(xlSetCellStringValue(SDep.Code, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Категории
+      _loop SCateg
+      begin
+        C++;
+        if IsValid(tnSDepCateg) then
+          xlOp(xlSetCellNumberValue(SDepCateg.PersonNum, R, C, R, C), XE_SET_CELL_VALUE, '');
+      end;
+      // Итого работников
+      xlOp(xlSetCellNumberValue(SDep.PersonNum, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // В том числе женщин
+      xlOp(xlSetCellNumberValue(SDep.WomenNum, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      R++;
+    end;
+}
+
+  // Вывод подвала отчёта
+  procedure OutFooterRep(var R: LongInt);
+  var
+    C: Word;
+{
+    C := FirstCol - 1;
+    // № подразделения
+    xlOp(xlSetCellStringValue('ИТОГО:', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    // Категории
+    _loop SCateg
+    begin
+      xlOp(xlSetCellNumberValue(SCateg.PersonNum, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    end;
+    // Итого работников
+    xlOp(xlSetCellNumberValue(TPersonNum, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    // В том числе женщин
+    xlOp(xlSetCellNumberValue(TWomenNum, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    // Выравниваем текст в ячейках подвала
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, R, 1, R, LastCol), XE_FORMAT_CELL, '');
+    // Делаем шрифт подвала жирным
+    xlOp(xlSetFontStyle(xlBold, R, 1, R, LastCol), XE_FORMAT_CELL, '');;
+    R++;
+}
+
+  // Вывод шапки расшифровки
+procedure OutHeaderData(var R: LongInt);
+  var
+    C: Word;
+{
+    SetVisualHeader('Форматирование Excel-файла...');
+    FirstCol := 1;
+
+    C := FirstCol - 1;
+    // Код ЗГД
+   /* xlOp(xlSetCellStringValue('Код ЗГД', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    // ЗГД 1 уровень
+    xlOp(xlSetCellStringValue('ЗГД 1 уровень', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(30, R, C, R, C), XE_FORMAT_CELL, '');
+      */
+    // Первые три символа кода подразделения
+    xlOp(xlSetCellStringValue('Код', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(5, R, C, R, C), XE_FORMAT_CELL, '');
+    // Код подразделения
+    xlOp(xlSetCellStringValue('Код подр.', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    // Наименование подразделения
+    xlOp(xlSetCellStringValue('Наименование подразделения', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(40, R, C, R, C), XE_FORMAT_CELL, '');
+    // Должность
+    xlOp(xlSetCellStringValue('Должность', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(40, R, C, R, C), XE_FORMAT_CELL, '');
+    // Код категории
+    xlOp(xlSetCellStringValue('Код кате-гории', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    // Наименование категории
+    xlOp(xlSetCellStringValue('Наименование категории', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(47, R, C, R, C), XE_FORMAT_CELL, '');
+    // Таб №
+    xlOp(xlSetCellStringValue('Таб №', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    // ФИО сотрудника
+    xlOp(xlSetCellStringValue('ФИО сотрудника', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(30, R, C, R, C), XE_FORMAT_CELL, '');
+    // Дата приема
+    xlOp(xlSetCellStringValue('Дата приема', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(11, R, C, R, C), XE_FORMAT_CELL, '');
+    // Дата увольнения
+    xlOp(xlSetCellStringValue('Дата увольнения', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(11, R, C, R, C), XE_FORMAT_CELL, '');
+    // История приемов и увольнений на предприятии
+    xlOp(xlSetCellStringValue('История приемов и увольнений на предприятии', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(22, R, C, R, C), XE_FORMAT_CELL, '');
+    // Код вида работы
+    xlOp(xlSetCellStringValue('Код вида работы', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    // Наименование вида работы
+    xlOp(xlSetCellStringValue('Наименование вида работы', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(30, R, C, R, C), XE_FORMAT_CELL, '');
+
+    xlOp(xlSetCellStringValue('Количество ставки занимаемое сотрудником', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(15, R, C, R, C), XE_FORMAT_CELL, '');
+    // условия труда
+    xlOp(xlSetCellStringValue('Класс условий труда', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    // Количество ставок
+    xlOp(xlSetCellStringValue('Количество ставок (декрет)', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(19, R, C, R, C), XE_FORMAT_CELL, '');
+
+
+    LastCol := C;
+
+    // Выравниваем содержимое ячеек шапки по верхнему краю и по центру
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Устанавливаем текстовый формат для всех ячеек шапки
+    xlOp(xlSetNumberFormat('@', R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Делаем шрифт шапки жирным
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');;
+    // Увеличиваем высоту шапки
+    xlOp(xlSetRowHeight(30, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+
+    // Выравниваем текст в ячейках
+    xlOp(xlAlignCellsEx(xlLeft, xlTop, FirstBodyRow, 1, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 1, LastBodyRow, 2), XE_FORMAT_CELL, ''); // Код подразделения
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 5, LastBodyRow, 5), XE_FORMAT_CELL, ''); // Код категории
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 7, LastBodyRow, 7), XE_FORMAT_CELL, ''); // Таб №
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 9, LastBodyRow, 10), XE_FORMAT_CELL, ''); // Дата приёма и увольнения
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 12, LastBodyRow, 12), XE_FORMAT_CELL, ''); // Код вида работы
+    // Устанавливаем текстовый формат
+    xlOp(xlSetNumberFormat('@', FirstBodyRow, 1, LastBodyRow, 2), XE_FORMAT_CELL, ''); // Код подразделения
+    xlOp(xlSetNumberFormat('@', FirstBodyRow, 7, LastBodyRow, 7), XE_FORMAT_CELL, ''); // Таб №
+
+    // Для всех ячеек в форме включаем перенос слов
+    xlOp(xlWrapText(R, FirstCol, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+    // Рисуем границы ячеек для всей формы
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0,
+     R, FirstCol, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+
+    R += 1;
+}
+
+  // Возращает список периодов их окна "История увольнений сотрудника" в 1-м разделе картотеки
+function GetPrevWorkPer(_cPersons: tNRec): String;
+{
+    result := '';
+    _loop MoveLSc where ((_cPersons == MoveLSc.tPerson))
+  {
+      result += if(result != '', '; ', '') +
+       DateToStr(MoveLSc.DatPos, 'DD.MM.YYYY') + ' - ' + 
+       DateToStr(MoveLSc.DatUv, 'DD.MM.YYYY');
+  }
+}
+
+//Функция декрета
+/*function GetKotpus (_cOtpusk: kotpus): Integer;
+{
+     _loop MoveLSc where ((_cPersons == MoveLSc.tPerson))
+     {
+       if(OtpuskR.kotups = '2'  or OtpuskR.kotups = '4' or OtpuskR.kotups = '2','asas','asasASADSD')
+        case OtpuskR.kotups of
+        '2','4','5' : {
+
+        }
+        end;
+
+     }
+}    */
+
+  // Вывод тела расшифровки
+procedure OutBodyData(var R: LongInt);
+  var
+    C: Word;
+{
+    SetVisualHeader('Вывод расшифровки в отчет...');
+    _loop SData
+    {
+      if IsAborted then
+        break;
+      NextVisual;
+      C := FirstCol - 1;
+      // Код ЗГД
+    //  xlOp(xlSetCellStringValue(String(CAT.Code, 1, 3), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // ЗГД 1 уровень
+     // xlOp(xlSetCellStringValue(string(personsZGD.FIO), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Первые три символа кода подразделения
+      xlOp(xlSetCellStringValue(SubStr(SData.DepCode, 1, 3), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Код подразделения
+      xlOp(xlSetCellStringValue(SData.DepCode, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Наименование подразделения
+      xlOp(xlSetCellStringValue(CatDepR.Name, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Должность
+      xlOp(xlSetCellStringValue(CatPosR.Name, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Код категории
+      xlOp(xlSetCellNumberValue(KlKategoR.Kod, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Наименование категории
+      xlOp(xlSetCellStringValue(KlKategoR.NaiKat, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Таб №
+      xlOp(xlSetCellStringValue(GetStrTabN(PersonsR.TabNmb, PersonsR.StrTabN), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // ФИО сотрудника
+      xlOp(xlSetCellStringValue(PersonsR.FIO, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Дата приема
+      xlOp(xlSetCellDateValue(PersonsR.AppDate, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Дата увольнения
+      xlOp(xlSetCellDateValue(PersonsR.DisDate, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // История приемов и увольнений на предприятии
+      xlOp(xlSetCellStringValue(GetPrevWorkPer(PersonsR.NRec), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Код вида работы
+      xlOp(xlSetCellNumberValue(Word(PersonsR.cSovm), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Наименование вида работы
+      xlOp(xlSetCellStringValue(KlSovmR.NSovm, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // количество занимаемых ставок
+      xlOp(xlSetCellStringValue(String(sData.rate), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Условия труда
+      xlOp(xlSetCellStringValue(String(wk.Code), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Количество ставок (декрет)
+      xlOp(xlSetCellStringValue(String(if(SData.otpNum = '2'  or SData.otpNum = '4' or SData.otpNum = '5'
+                                        or SData.otpNum = '6','1','0')), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+
+      R++;
+    }
+}
+
+  // Выводит информацию о текущем работнике в лог
+procedure OutPersonInfoToLog;
+ {
+    if not IsPsnInfoLogged then
+    {
+      IsPsnInfoLogged := true;
+      oGP_Log.Info('Таб.№ ' + GetStrTabN(Persons.TabNmb, Persons.StrTabN) + ' ' + Persons.FIO + ':' +
+       ' Вид работы: ' + To_Char(KlSovm.Sovm) + ' ' + KlSovm.NSovm);
+    }
+ }
+
+  // Подготовка данных для отчёта
+procedure PrepareData;
+  var
+    _DepCode: String[3];
+ {
+    if IsAborted then
+      exit;
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Анализ данных...', 1);
+    _try
+     {
+        /*if not (ConditionActive(tcByOtpDat)) {
+          PushCondition(tcByOtpDat);
+        }   */
+
+        TPersonNum := 0;
+        TWomenNum := 0;
+        _loop Appointments
+       {
+          if IsAborted then
+            break;
+          NextVisual;
+          IsPsnInfoLogged := false;
+          #ifdef __DEBUG__
+          oGP_Log.Info('');
+          OutPersonInfoToLog;
+          oGP_Log.Info(' Подразделение: ' + CatDep.Code + ' ' + CatDep.Name);
+          #end
+          // Если не влючен параметр "выводить внешних совместителей"
+          if (pSettings and ST_SHOW_EXT_SOVM) = 0 then
+            // В отчет не должны попадать внешние совместители, у которых вид работы с кодом = 1 "По совместительству (внешнее)"
+            if (Word(Persons.cSovm) = 1)
+            {
+              #ifdef __DEBUG__
+              oGP_Log.Info('  Код вида работы = ' + To_Char(Word(Persons.cSovm)) + '. В отчет не включен.');
+              #end
+              continue;
+            }
+          // Если работник уволен до или в дату, на которую формируется отчёт, не выводим его
+          if (Persons.DisDate != ZeroDate and Persons.DisDate <= pDate)
+          {
+            #ifdef __DEBUG__
+            oGP_Log.Info('  Дата увольнения в карточке = ' + DateToStr(Persons.DisDate, 'DD.MM.YYYY') + '. В отчет не включен.');
+            #end
+            continue;
+          }
+          if (pFilters and FT_ST_STR_ED) != 0 then
+            if not FoundMarker(fmDept, Appointments.Department) then
+            {
+              #ifdef __DEBUG__
+              oGP_Log.Info('  Не соответствует фильтру по подразделению. В отчет не включен.');
+              #end
+              continue;
+            }
+          if not IsValid(tnKlKatego) then
+          {
+            oGP_Log.Error('Не заполнена категория (Таб.№ ' + GetStrTabN(Persons.TabNmb, Persons.StrTabN) + ' ' + Persons.FIO + ')');
+            continue;
+          }
+          #ifdef __DEBUG__
+          oGP_Log.Info('  Включен в отчет');
+          #end
+          if not IsValid(tnCatDep) then
+          {
+            OutPersonInfoToLog;
+            oGP_Log.Info(' Ошибка: некорректная ссылка в Appointments.Department = ' + To_Char(Appointments.Department, 0, 0) +
+             ' (Appointments.NRec = ' + To_Char(Appointments.NRec, 0, 0) + ')');
+            continue;
+          }
+          // Добавляем запись в расшифровку
+          ClearBuffer(#SData);
+          SData.TabNmb := Persons.TabNmb;
+          SData.StrTabn := Persons.StrTabn;
+          SData.cPerson := Appointments.Person;
+          SData.cDep := Appointments.Department;
+          SData.cPosition := Appointments.Post;
+          SData.cCateg := Appointments.EmpCategory;
+          SData.DepCode := CatDep.Code;
+          SData.rate    := Appointments.rate;
+          SData.cAppoint    := Appointments.nrec;
+         // SData.cAppZGD := Appointments.STAFFSTR;
+
+
+
+          _loop otpusk where ((Appointments.Person == otpusk.TPERSON (noindex))) {
+             if (pdate >= otpusk.datan and pdate <= otpusk.datok) {
+                Sdata.otpNum := otpusk.KOTPUS;
+             }
+          }
+
+
+          if insert current SData != tsOk then
+         {
+            oGP_Log.Error('Не удалось добавить запись в таблицу SData (Appointments.NRec = ' + 
+             To_Char(Appointments.NRec, 0, 0) + ')');
+            continue;
+         }
+          // Обновляем список категорий
+          if getFirst SCateg where ((SData.cCateg == SCateg.cCateg)) != tsOk then
+          {
+            ClearBuffer(#SCateg);
+            SCateg.cCateg := SData.cCateg;
+            SCateg.Code := KlKatego.Kod;
+            SCateg.Name := KlKatego.NaiKat;
+            SCateg.PersonNum := 1;
+            if insert current SCateg != tsOk then
+           {
+              oGP_Log.Error('Не удалось добавить запись в таблицу SCateg (Appointments.NRec = ' + 
+               To_Char(Appointments.NRec, 0, 0) + ')');
+              continue;
+           }
+          } else
+          {
+            SCateg.PersonNum := SCateg.PersonNum + 1;
+            if update current SCateg != tsOk then
+            begin
+              oGP_Log.Error('Не удалось обновить запись в таблице SCateg (Appointments.NRec = ' + 
+               To_Char(Appointments.NRec, 0, 0) + ')');
+              continue;
+            end;
+          }
+          // Обновляем список подразделений
+          _DepCode := SubStr(CatDep.Code, 1, 3);
+          if getFirst SDep where ((_DepCode == SDep.Code)) != tsOk then
+          {
+            ClearBuffer(#SDep);
+            SDep.NRec := RecordsInTable(#SDep) + 1;
+            SDep.Code := _DepCode;
+            SDep.PersonNum := 1;
+            if Persons.Sex = 'Ж' then
+              SDep.WomenNum := 1;
+            if insert current SDep != tsOk then
+            {
+              oGP_Log.Error('Не удалось добавить запись в таблицу SDep (Appointments.NRec = ' + 
+               To_Char(Appointments.NRec, 0, 0) + ')');
+              continue;
+            };
+          } else
+          {
+            SDep.PersonNum := SDep.PersonNum + 1;
+            if Persons.Sex = 'Ж' then
+              SDep.WomenNum := SDep.WomenNum + 1;
+            if update current SDep != tsOk then
+            {
+              oGP_Log.Error('Не удалось обновить запись в таблице SDep (Appointments.NRec = ' + 
+               To_Char(Appointments.NRec, 0, 0) + ')');
+              continue;
+            }
+          }
+          // Увеличиваем общие итоги
+          TPersonNum++;
+          if Persons.Sex = 'Ж' then
+            TWomenNum++;
+          // Обновляем данные по кол-ву человек этой категории в этом подразделении
+          if getFirst SDepCateg where ((SDep.NRec == SDepCateg.cSDep and SCateg.cCateg == SDepCateg.cCateg)) != tsOk then
+          {
+            ClearBuffer(#SDepCateg);
+            SDepCateg.cSDep := SDep.NRec;
+            SDepCateg.cCateg := SCateg.cCateg;
+            SDepCateg.PersonNum := 1;
+            if insert current SDepCateg != tsOk then
+            {
+              oGP_Log.Error('Не удалось добавить запись в таблицу SDepCateg (Appointments.NRec = ' + 
+               To_Char(Appointments.NRec, 0, 0) + ')');
+              continue;
+            }
+          } else
+          {
+            SDepCateg.PersonNum := SDepCateg.PersonNum + 1;
+            if update current SDepCateg != tsOk then
+            {
+              oGP_Log.Error('Не удалось обновить запись в таблице SDepCateg (Appointments.NRec = ' + 
+               To_Char(Appointments.NRec, 0, 0) + ')');
+              continue;
+            }
+          }
+       }
+     }
+    _except
+      on ExUserBreak:
+        {
+          IsAborted := true;
+        }
+    StopVisual('', 0);
+ }
+
+  file MacroFile;
+
+  function CreateMacro(MacroFileName: string): Boolean;
+  {
+    result := false;
+    if MacroFile.OpenFile(MacroFileName, stCreate) then
+    {
+      MacroFile.Writeln('Sub FormatReport');
+      MacroFile.Writeln('  Sheets("' + Oem2Ansi(TAB_TITLE_2) + '").Select');
+      MacroFile.Writeln('  Selection.AutoFilter');
+      MacroFile.Writeln('  Sheets("' + Oem2Ansi(TAB_TITLE_1) + '").Select');
+      MacroFile.Writeln('  Application.PrintCommunication = False');
+      MacroFile.Writeln('  With ActiveSheet.PageSetup');
+      MacroFile.Writeln('    .Orientation = xlPortrait');
+      MacroFile.Writeln('    .LeftMargin = Application.InchesToPoints(0.7)');
+      MacroFile.Writeln('    .RightMargin = Application.InchesToPoints(0.4)');
+      MacroFile.Writeln('    .TopMargin = Application.InchesToPoints(0.75)');
+      MacroFile.Writeln('    .BottomMargin = Application.InchesToPoints(0.75)');
+      MacroFile.Writeln('    .HeaderMargin = Application.InchesToPoints(0.3)');
+      MacroFile.Writeln('    .FooterMargin = Application.InchesToPoints(0.3)');
+      MacroFile.Writeln('    .PaperSize = xlPaperA4');
+      MacroFile.Writeln('    .PrintTitleRows = "$2:$4"');
+      MacroFile.Writeln('    .PrintTitleColumns = ""');
+      MacroFile.Writeln('    .RightFooter = "&P"');
+//    MacroFile.Writeln('    .FitToPagesWide = 1');
+      MacroFile.Writeln('  End With');
+      MacroFile.Writeln('  Application.PrintCommunication = True');
+      MacroFile.Writeln('End Sub');
+      MacroFile.Close;
+      result := true;
+  } else
+      oGP_Log.Error('Не удалось создать файл "' + MacroFileName + '"');
+  }
+
+  procedure RunMacro;
+  var
+    MacroFileName: String;
+  {
+    if IsAborted then
+      exit;
+    MacroFileName := GetDefaultUserPath + REP_NAME + '.bas';
+    if not CreateMacro(MacroFileName) then
+      exit;
+    xlImportModule(MacroFileName);
+    xlRunMacro('FormatReport');
+    DeleteFile(MacroFileName);
+  }
+
+  // Формирует отчёт
+  procedure CreateReport;
+  var
+    OutFileName: String;
+    R: LongInt;
+  {
+    IsAborted := false;
+    PrepareData;
+    if IsAborted then
+      exit;
+
+    DataRecCnt := RecordsInTable(#SData);
+    if DataRecCnt = 0 then
+    {
+      Message('Нет данных для формирования отчёта');
+      exit;
+    }
+
+    RepRecCnt := RecordsInTable(#SDep);
+
+    OutFileName := GetDefaultUserPath + REP_TITLE + ' на ' + DatetoStr(pDate, 'DD.MM.YYYY') + '.xlsx';
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', RepRecCnt + DataRecCnt);
+    _try
+    {
+      PrepareExcelFile(OutFileName);
+
+      // Страница "Отчёт"
+      xlOp(xlSetActiveSheet(1), XE_SET_SHEET, TAB_TITLE_1);
+      FirstHeadRow := 2; // Одну строку оставляем для заголовка
+      FirstBodyRow := FirstHeadRow + 3; // Высота шапки - 3 строки
+      LastBodyRow := FirstBodyRow + RepRecCnt - 1;
+      R := 1;
+      // Выводим загловок отчёта
+      OutTitleRep(R);
+      // Выводим шапку отчёта
+      OutHeaderRep(R);
+      // Выводим тело отчёта
+      OutBodyRep(R);
+      // Выводим подвал отчёта
+      OutFooterRep(R);
+
+      // Страница "Расшифровка"
+      xlOp(xlSetActiveSheet(2), XE_SET_SHEET, TAB_TITLE_2);
+      R := 1;
+      // Выводим заголовок отчёта
+      FirstHeadRow := R;
+      FirstBodyRow := FirstHeadRow + 1; // Высота шапки - 1 строка
+      LastBodyRow := FirstBodyRow + DataRecCnt - 1;
+      // Выводим шапку отчёта
+      OutHeaderData(R);
+      // Выводим тело отчёта
+      OutBodyData(R);
+
+      // Запускаем макрос
+      xlOp(xlSetActiveSheet(1), XE_SET_SHEET, TAB_TITLE_1);
+      RunMacro;
+  }
+    _except on ExOnExecelError, ExUserBreak:
+    {
+      IsAborted := true;
+  }
+    StopVisual('',0);
+    xlKillExcel;
+  }
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  HandleEvent
+    cmInit:
+      {
+        fmDept := InitMarker(REP_NAME + 'fmDept', 8, 30, 10);
+        if AskParam then
+        begin
+          oGP_Log.Init(REP_NAME + '.log', true, true, true);
+          oGP_Log.SetVerboseMode(true);
+          CreateReport;
+          oGP_Log.Done(true);
+        end;
+        DoneMarker(fmDept, REP_NAME + 'fmDept');
+        abort;
+      }
+    cmCheckField:
+      case CurField of
+        #pFilters:
+          if pFilters > Word(OldFieldValue) then
+          {
+            case (pFilters - Word(OldFieldValue)) of
+              FT_ST_STR_ED:
+                {
+                  SelectField(#fsDept);
+                  PutCommand(cmPick);
+                }
+            end;
+          }
+
+      end;
+    cmPick:
+      case CurField of
+        #fsDept:
+          {
+            // Сохраняем в dsk текущий фильтр по структурным единицам
+            DoneMarker(fmDept, 'CatalogsMarker');
+            // Вызываем интерфейс выбора структурных единиц
+            RunInterface('Z_STAFFCAT::PickCatalog2', CAT_DEP_ENTRY, 0, 100, 0);
+            // Считываем из dsk список выбранных структурных единиц
+            fmDept := InitMarker('CatalogsMarker', 8, 30, 10);
+            pFilters := pFilters or FT_ST_STR_ED;
+            UpdateFiltersState;
+          }
+      end;
+    cmDelOnProtect:
+      case CurField of
+        #fsDept:
+          {
+            ClearMarker(fmDept);
+            pFilters := pFilters and (not FT_ST_STR_ED);
+            UpdateFiltersState;
+          }
+      end;
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_GP_CategRepsusl implements IUserReport;
+
+interface UserReport_GP_CategRepsusl;
+
+  procedure Run;
+  begin
+    RunInterface('GP_CategRepsusl');
+  end;
+
+  function GetReportName: String;
+  begin
+    result := 'Отчёт о списочной численности';
+  end;
+
+  function GetGroupName(Level: Word): String;
+  begin
+    result := '';
+    case Level of
+      1: result := 'Ведение картотеки сотрудников';
+    end;
+  end;
+
+  function GetPriority: Integer;
+  begin
+    result := 0;
+  end;
+
+  function VisibleInModule(Ind: Byte): String;
+  begin
+    result := '';
+    case Ind of
+      1: result := 'STAFFMAINMENU';
+    end;
+  end;
+
+end.

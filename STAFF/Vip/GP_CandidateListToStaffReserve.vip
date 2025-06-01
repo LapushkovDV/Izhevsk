@@ -1,0 +1,622 @@
+/*************************************************************************************************\
+* Наименование: Разработка отчетной формы "Список кандидатов в кадровый резерв на должность"      *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#188          |26/09/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include ComFiltr.vih
+#include RunStaj.vih         // Функции расчета стажей
+#include xlReport.Vih
+#include CatFunc.vih         // Функции работы с Catalogs
+#include StrFunc.vih         // Функции работы со строками
+
+#include Query.vih
+#include GP_QueryBuilder.vih
+#include GP_UserFilterStoreDSK.vih
+#include GP_UserFilterCatalogs.vih
+#include GP_UserFilterList.vih
+
+#include GP_CandidateListToStaffReserve.vih
+interface RunUsersRep_GP_CandidateListToStaffReserve;
+
+#include xlDlg.Inc                       // Константы Excel отчета
+
+var CF:CommonFiltr;
+    iRunStaj:RunStaj;
+    iCatFunc:CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+    iStrFunc:StringFunctions;     // Переменная типа интерфейс StringFunctions
+    pXL:XLSRepBuilder;  // объект формирования Excel-отчетов
+    pXLRepSetup:XLRepSetup;
+    sXLTFileName:string;
+    UserFilterList:GP_ObjUserFilterList;
+    FilterStore:GP_IUserFilterStore;
+    cPostFilter:comp;
+    iQBuilder:GP_QueryBuilder new;
+
+table struct SRep(
+  cPerson:comp,FIO:string,BornDate:date,AppointDate:date,
+  DepName:string,PostName:string,LevelName:string,Speciality:string,LevelOfReserve:string,
+  LastAttDat:date,LastAttRes:string
+)
+with index (i=FIO);
+
+table struct SRepCol(Name:string,Competence:comp)
+with index (i=Name,i2=Competence);
+
+table struct SRepCell(cPerson:comp,Competence:comp,cPost:comp,Rating:double)
+with index (i1=cPerson+Competence,i2=cPost+Competence);
+
+create view
+var RepDate1,RepDate2:date;
+    OnlyStaffReserve:word;
+from
+  SRep,SRepCol,SRepCell,
+  Catalogs;
+
+window WinRepParam 'Параметры отчета' Gray;
+show(20,10,100,24);
+
+screen scRepPeriod (,,sci13Esc);
+show(,,,2) Fixed_Y;
+fields
+  RepDate1:NoProtect,
+    {font={BackColor=if(OnlyStaffReserve>0 and RepDate1=ZeroDate,ColorNeed,0)}};
+  RepDate2:NoProtect,
+    {font={BackColor=if(OnlyStaffReserve>0 and RepDate2=ZeroDate,ColorNeed,0)}};
+<<
+   `Отчетный период с`.@@@@@@@@@@  `по`.@@@@@@@@@@
+>>
+end;
+embedded edCF interface CF;
+show(,3,,9) Fixed_Y;
+end;
+screen scRepParam (,,sci1Esc);
+show(,10,,);
+fields
+  [CompetenceFiltr] UserFilterList.FilterStr(1) (,,sci13Esc):Protect,PickButton;
+  OnlyStaffReserve:NoProtect;
+buttons
+  cmOK,,,'Запуск',,;
+  cmXLRepSetup,,,'Настройка Excel шаблона',,;
+  cmCancel,,,'Выход',,;
+<<
+   `Компетенция`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+     [.] Кадровый резерв`
+
+ <. ~С~формировать .>           <.Настройка шаблона.>            <. ~З~акрыть .>
+>>
+end;
+
+function CheckInPutVars:boolean;
+{
+  result:=false;
+
+  if (OnlyStaffReserve>0) {
+    if (RepDate1=ZeroDate) {
+      message('Пожалуйста, укажите дату начала отчетного периода.',error);
+      SelectFormat(scRepPeriod);
+      SelectField(fnRepDate1);
+      PutCommand(cmPick);
+      exit;
+    }
+    if (RepDate2=ZeroDate) {
+      message('Пожалуйста, укажите дату окончания отчетного периода.',error);
+      SelectFormat(scRepPeriod);
+      SelectField(fnRepDate2);
+      PutCommand(cmPick);
+      exit;
+    }
+  }
+
+  result:=true;
+}
+
+HandleEvent
+cmInit:{
+  ReadMyDsk(RepDate1,#__InterfaceName__+'RepDate1',false);
+  if (RepDate1=ZeroDate) {
+    RepDate1:=dGetTune('UP.DATOTCH');
+    RepDate1:=date(1,Month(RepDate1),Year(RepDate1));
+  }
+  ReadMyDsk(RepDate2,#__InterfaceName__+'RepDate2',false);
+  if (RepDate2=ZeroDate) {
+    RepDate2:=dGetTune('UP.DATOTCH');
+    RepDate2:=date(Last_Day(RepDate2),Month(RepDate2),Year(RepDate2));
+  }
+  ReadMyDsk(OnlyStaffReserve,#__InterfaceName__+'OnlyStaffReserve',false);
+
+  ReadMyDsk(sXLTFileName,#__InterfaceName__+'sXLTFileName',false);
+  if (sXLTFileName='')
+    sXLTFileName:=TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\GP_CandidateListToStaffReserve.xlt';
+
+  if (UserFilterList=NullRef) {
+    UserFilterList:=GP_ObjUserFilterList(new(GP_UserFilterList,UserFilterList(FilterStore)));
+
+    var cCompetence:comp=0;
+    if (getfirst fastfirstrow Catalogs
+        where((iCatFunc.GetCatalogsNRec(100)==Catalogs.cParent and 'Оценка персонала'==Catalogs.Name))=tsok)
+      cCompetence:=Catalogs.NRec
+    else
+      message('Не найдена папка "Оценка персонала" в каталоге "Компетенции".',error);
+    UserFilterList.Add(GP_IUserFilter(new(GP_UserFilterCatalogs,UserFilterCatalogs(fnCompetenceFiltr,'mCompetence',100,cCompetence))));
+  }
+
+  UserFilterList.Load;
+}
+cmDone:{
+  SaveMyDsk(RepDate1,#__InterfaceName__+'RepDate1');
+  SaveMyDsk(RepDate2,#__InterfaceName__+'RepDate2');
+  SaveMyDsk(OnlyStaffReserve,#__InterfaceName__+'OnlyStaffReserve');
+
+  SaveMyDsk(sXLTFileName,#__InterfaceName__+'sXLTFileName');
+
+  UserFilterList.Save;
+}
+cmOK:{
+  //Проверка параметров
+  if (not CheckInPutVars) exit;
+
+  CloseWindowEx(CurWindow,cmDefault);
+}
+cmXLRepSetup:{
+  var tmp:string=sXLTFileName;
+  if (pXLRepSetup.RunSetUpDialog(1, 'GP_CandidateListToStaffReserve', tmp))
+    sXLTFileName:=tmp;
+}
+end;
+end;//WinRepParam
+
+HandleEvent
+cmInit: abort;
+cmPick:{
+  if (UserFilterList.Pick(CurField))
+    RedrawPanel(CurTable);
+}
+cmDelOnProtect:{
+  if (UserFilterList.Del(CurField))
+    RedrawPanel(CurTable);
+}
+end;
+
+constructor Init;
+{
+  result:=true;
+
+  FilterStore:=GP_IUserFilterStore(new(GP_UserFilterStoreDSK,InitDSK(#__InterfaceName__)));
+  cPostFilter:=0;
+}
+
+procedure FindDescendant(cCat:comp;m:TPtr);
+{
+  if (cCat=0) exit;
+
+  _loop Catalogs where((cCat==Catalogs.cParent)) {
+    InsertMarker(m,Catalogs.NRec);
+    PushPos(tnCatalogs);
+    FindDescendant(Catalogs.NRec,m);
+    PopPos(tnCatalogs);
+  }
+}
+
+function LoadData:boolean;
+var hStrFilter:longint;
+    cLevelsOfReserve,cCompetence:comp;
+    Q:IQuery;
+    mAllCompetence,m:TPtr;
+{
+  result:=false;
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Отбор данных...', 0);
+
+  //Отбор сотрудников - строки отчета
+  cLevelsOfReserve:=0;
+  if (getfirst fastfirstrow Catalogs
+      where((iCatFunc.GetCatalogsNRec(100)==Catalogs.cParent and 'Уровни кадрового резерва'==Catalogs.Name))=tsok)
+    cLevelsOfReserve:=Catalogs.NRec
+  else
+    message('Не найден элемент "Уровни кадрового резерва" в каталоге "Компетенции".',error);
+
+  if (CF.GetPsnCount = 0)
+    CF.SelectAllPsn;
+
+  delete all SRep;
+  Q:=queryManager.createQuery(SQLQuery(
+    select distinct
+      Persons.NRec,
+      Persons.FIO,
+      Persons.BornDate,
+      COALESCE(Appointments.AppointDate,:(ZeroDate)),
+      COALESCE(CatDep.Name,''),
+      COALESCE(CatPost.Name,''),
+      COALESCE(CatLevel.Name,''),
+      COALESCE(CatSpeciality.Name,''),
+      COALESCE(CatCompetence.Name,''),
+      COALESCE(PlanAtt.dat1,:(ZeroDate)),
+      COALESCE(ResType.Name,'')
+    from
+      Persons
+      left join Appointments on (
+        case when Persons.AppointCur<>#comp(0) then Persons.AppointCur else Persons.AppointLast end = Appointments.NRec
+      )
+      left join Catalogs CatPost on (Appointments.Post = CatPost.NRec)
+      left join Catalogs CatDep on (Persons.Department = CatDep.NRec)
+      left join Catalogs CatLevel on (Persons.Education = CatLevel.NRec)
+      //Образование
+      left join (
+        select
+          Education.Person,Education.Level,Max(Education.ToDate) as ToDate
+        from
+          Education
+        group by
+          Education.Person,Education.Level
+      ) LastEduc on (Persons.NRec = LastEduc.Person and Persons.Education = LastEduc.Level)
+      left join Education on (Persons.NRec = Education.Person and Persons.Education = Education.Level and LastEduc.ToDate = Education.ToDate)
+      left join Catalogs CatSpeciality on (Education.Speciality = CatSpeciality.NRec)
+      //Уровни кадрового резерва
+      left join (
+        select
+          CompetencePost.cPost,Max(CompetencePost.cName) as cName
+        from
+          CompetencePost
+          inner join CompetencePost Par on (CompetencePost.cParent = Par.NRec and :(cLevelsOfReserve) = Par.cName)
+        group by
+          CompetencePost.cPost
+      ) CompetPost on (Appointments.Post = CompetPost.cPost)
+      left join Catalogs CatCompetence on (CompetPost.cName = CatCompetence.NRec)
+      //аттестация
+      left join (
+        select
+          PlanAtt.cPers,Max(PlanAtt.dat1) as dat1
+        from
+          PlanAtt
+        group by
+          PlanAtt.cPers
+      ) LastPlanAtt on (Persons.NRec = LastPlanAtt.cPers)
+      left join PlanAtt on (Persons.NRec = PlanAtt.cPers and LastPlanAtt.dat1 = PlanAtt.dat1)
+      left join Catalogs ResType on (PlanAtt.cType = ResType.NRec)
+    where
+      %Filter
+  ));
+
+  hStrFilter:=0;
+  if (CF.GetPsnCount > 0)
+    hStrFilter:=iQBuilder.MakeCriteriaFromMarker('Persons.NRec',CF.GetPersonsMarker);
+
+  m:=FilterStore.LoadMarker('mCompetence');
+  if (GetMarkerCount(m)>0) {
+    sqlAddStr(hStrFilter,'and exists(select CompetencePers.NRec');
+    sqlAddStr(hStrFilter,'           from CompetencePers');
+    sqlAddStr(hStrFilter,'           where CompetencePers.cPers = Persons.NRec');
+    iQBuilder.AddCriteriaFromMarker(hStrFilter,'and CompetencePers.cName',m);
+    sqlAddStr(hStrFilter,')');
+  }
+  DoneMarker(m,'');
+
+  if (OnlyStaffReserve>0) {
+    sqlAddStr(hStrFilter,'and exists(select FuturePost.NRec');
+    sqlAddStr(hStrFilter,'           from FuturePost');
+    sqlAddStr(hStrFilter,'           where FuturePost.cPers = Persons.NRec');
+    sqlAddStr(hStrFilter,'                 and FuturePost.Dat1<=:RepDate2');
+    sqlAddStr(hStrFilter,'                 and (FuturePost.Dat2>=:RepDate1 or FuturePost.Dat2=#date(0,0,0))');
+    sqlAddStr(hStrFilter,')');
+  }
+
+  if (cPostFilter<>0)
+    sqlAddStr(hStrFilter,'and Appointments.Post = :cPostFilter and Appointments.NRec is not null');
+
+  if (hStrFilter<>0) {
+    Q.setMacro('Filter',hStrFilter);
+    sqlFreeStr(hStrFilter);
+    if (OnlyStaffReserve>0) {
+      Q.setParam('RepDate1',RepDate1);
+      Q.setParam('RepDate2',RepDate2);
+    }
+    if (cPostFilter<>0)
+      Q.setParam('cPostFilter',cPostFilter);
+  }
+
+
+  result:=Q.Execute.ErrorCode=0;
+  if (result)
+    sqlCopyInto(Q.getResultSet,tnSRep,false)
+  else {
+    message('Ошибка выполнения DSQL запроса при отборе данных ('+string(Q.ErrorCode)+').',error);
+    StopVisual;
+    exit;
+  }
+
+  result:=RecordsInTable(tnSRep)>0;
+  if (not result) {
+    message('Нет данных для формирования отчета.');
+    StopVisual;
+    exit;
+  }
+
+  //Отбор оценок компетенцией - ячейки динамической части отчета
+  cCompetence:=0;
+  if (getfirst fastfirstrow Catalogs
+      where((iCatFunc.GetCatalogsNRec(100)==Catalogs.cParent and 'Оценка персонала'==Catalogs.Name))=tsok)
+    cCompetence:=Catalogs.NRec
+  else
+    message('Не найдена папка "Оценка персонала" в каталоге "Компетенции".',error);
+
+  mAllCompetence:=InitMarker('',8,0,1);
+  FindDescendant(cCompetence,mAllCompetence);
+
+  delete all SRepCell;
+  Q:=queryManager.createQuery(SQLQuery(
+    select distinct
+      CompetencePers.cPers,
+      CompetencePers.cName,
+      0,
+      CompetencePers.doRating
+    from
+      CompetencePers
+    where
+      %Filter
+  ));
+
+  hStrFilter:=0;
+  if (CF.GetPsnCount > 0)
+    hStrFilter:=iQBuilder.MakeCriteriaFromMarker('CompetencePers.cPers',CF.GetPersonsMarker);
+
+  m:=FilterStore.LoadMarker('mCompetence');
+  if (GetMarkerCount(m)>0)
+    iQBuilder.AddCriteriaFromMarker(hStrFilter,'and CompetencePers.cName',m)
+  else if (GetMarkerCount(mAllCompetence)>0)
+    iQBuilder.AddCriteriaFromMarker(hStrFilter,'and CompetencePers.cName',mAllCompetence);
+  DoneMarker(m,'');
+
+  if (OnlyStaffReserve>0) {
+    sqlAddStr(hStrFilter,'and exists(select FuturePost.NRec');
+    sqlAddStr(hStrFilter,'           from FuturePost');
+    sqlAddStr(hStrFilter,'           where FuturePost.cPers = CompetencePers.cPers');
+    sqlAddStr(hStrFilter,'                 and FuturePost.Dat1<=:RepDate2');
+    sqlAddStr(hStrFilter,'                 and (FuturePost.Dat2>=:RepDate1 or FuturePost.Dat2=#date(0,0,0))');
+    sqlAddStr(hStrFilter,')');
+  }
+
+  if (cPostFilter<>0) {
+    sqlAddStr(hStrFilter,'and exists(');
+    sqlAddStr(hStrFilter,'  select Persons.NRec');
+    sqlAddStr(hStrFilter,'  from Persons');
+    sqlAddStr(hStrFilter,'       inner join Appointments on (');
+    sqlAddStr(hStrFilter,'         case when Persons.AppointCur<>#comp(0)');
+    sqlAddStr(hStrFilter,'              then Persons.AppointCur');
+    sqlAddStr(hStrFilter,'              else Persons.AppointLast');
+    sqlAddStr(hStrFilter,'         end = Appointments.NRec');
+    sqlAddStr(hStrFilter,'         and Appointments.Post = :cPostFilter');
+    sqlAddStr(hStrFilter,'       )');
+    sqlAddStr(hStrFilter,'  where Persons.NRec = CompetencePers.cPers');
+    sqlAddStr(hStrFilter,')');
+  }
+
+  if (hStrFilter<>0) {
+    Q.setMacro('Filter',hStrFilter);
+    sqlFreeStr(hStrFilter);
+    if (OnlyStaffReserve>0) {
+      Q.setParam('RepDate1',RepDate1);
+      Q.setParam('RepDate2',RepDate2);
+    }
+    if (cPostFilter<>0)
+      Q.setParam('cPostFilter',cPostFilter);
+  }
+
+  result:=Q.Execute.ErrorCode=0;
+  if (result)
+    sqlCopyInto(Q.getResultSet,tnSRepCell,false)
+  else
+    message('Ошибка выполнения DSQL запроса при отборе данных ('+string(Q.ErrorCode)+').',error);
+
+  if (cPostFilter<>0) {
+    Q:=queryManager.createQuery(SQLQuery(
+      select distinct
+        0,
+        CompetencePost.cName,
+        CompetencePost.cPost,
+        CompetencePost.doRating
+      from
+        CompetencePost
+      where
+        CompetencePost.cPost = :(cPostFilter)
+        %Filter
+    ));
+
+    hStrFilter:=0;
+    m:=FilterStore.LoadMarker('mCompetence');
+    if (GetMarkerCount(m)>0)
+      iQBuilder.AddCriteriaFromMarker(hStrFilter,'and CompetencePost.cName',m)
+    else if (GetMarkerCount(mAllCompetence)>0)
+      iQBuilder.AddCriteriaFromMarker(hStrFilter,'and CompetencePost.cName',mAllCompetence);
+    DoneMarker(m,'');
+
+    if (hStrFilter<>0) {
+      Q.setMacro('Filter',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+
+    result:=Q.Execute.ErrorCode=0;
+    if (result)
+      sqlCopyInto(Q.getResultSet,tnSRepCell,false)
+    else
+      message('Ошибка выполнения DSQL запроса при отборе данных ('+string(Q.ErrorCode)+').',error);
+  }
+
+  DoneMarker(mAllCompetence,'');
+  StopVisual;
+}
+
+procedure AddFilterRow(val:string);
+{
+  pXL.ClearTblBuffer;
+  pXL.SetTblStringFldValue('Имя_Значение',val);
+  pXL.InsTblRow;
+}
+
+procedure PrintFilters;
+var m:TPtr;
+{
+  pXL.CreateTbl('Фильтры');
+  pXL.CreateTblFld('Имя_Значение');
+
+  if (OnlyStaffReserve>0)
+    AddFilterRow('Отчетный период с '+DateToStr(RepDate1,'DD.MM.YYYY')+' по '+DateToStr(RepDate2,'DD.MM.YYYY'));
+
+  AddFilterRow('Подразделения: '+CF.GetDepartmentsFilterStr);
+  AddFilterRow('Сотрудники: '+CF.GetPersonsFilterStr);
+
+  m:=FilterStore.LoadMarker('mCompetence');
+  if (GetMarkerCount(m)>0)
+    AddFilterRow('Компетенция: '+CompetenceFiltr);
+  DoneMarker(m,'');
+
+  if (OnlyStaffReserve>0)
+    AddFilterRow('Только кадровый резерв');
+
+  if (cPostFilter<>0)
+    AddFilterRow('Должность: '+iCatFunc.GetCatalogsName(cPostFilter));
+
+  pXL.PublishTbl('Фильтры');
+}
+
+procedure PrintToExcel;
+var sXLSFileName:string;
+    RatingSum:double;
+    i,RatingCount:longint;
+{
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Вывод в Excel...', RecordsInTable(tnSRep));
+
+  sXLSFileName := pXL.CreateReport(sXLTFileName, True);
+
+  delete all SRepCol;
+  _loop SRepCell
+   _Loop SRepCol  where((SRepCell.Competence==SRepCol.Competence ))
+    _Loop Catalogs where((  SRepCell.Competence==Catalogs.NRec))
+     if (not IsValidAll(tnSRepCol))
+      insert SRepCol set
+        SRepCol.Competence:=SRepCell.Competence,
+        SRepCol.Name:=Catalogs.Name;
+
+  pXL.CreateVar(sXLSFileName);
+  i:=0;
+  _loop SRepCol
+    pXL.SetStringVar('Имя_оценки_'+string(++i),SRepCol.Name);
+  pXL.PublishVar;
+
+  pXL.CreateTbls(sXLSFileName);
+
+  PrintFilters;
+
+  pXL.CreateTbl('Список_кандидатов');
+  pXL.CreateTblFld('Уровни_кадрового_резерва');
+  pXL.CreateTblFld('Сотрудник');
+  pXL.CreateTblFld('Подразделение');
+  pXL.CreateTblFld('Должность');
+  pXL.CreateTblFld('Стаж_в_должности');
+  pXL.CreateTblFld('Стаж_на_предприятии');
+  pXL.CreateTblFld('Дата_рождения');
+  pXL.CreateTblFld('Возраст');
+  pXL.CreateTblFld('Вид_образования');
+  pXL.CreateTblFld('Специальность');
+  pXL.CreateTblFld('Атетстация_дата');
+  pXL.CreateTblFld('Атетстация_результат');
+  pXL.CreateTblFld('КПЭ');
+
+  i:=0;
+  _loop SRepCol
+    pXL.CreateTblFld('Оценка_'+string(++i));
+
+  if (cPostFilter<>0) {
+    pXL.ClearTblBuffer;
+    pXL.SetTblStringFldValue('Должность',iCatFunc.GetCatalogsName(cPostFilter));
+    i:=0;
+    RatingCount:=0;
+    RatingSum:=0;
+    _loop SRepCol
+     _Loop SRepCell
+     where((SRepCol.Competence==SRepCell.Competence and cPostFilter==SRepCell.cPost)) {
+      i++;
+      if (IsValidAll(tnSRepCell)) {
+        RatingCount++;
+        RatingSum+=SRepCell.Rating;
+        pXL.SetTblNumberFldValue('Оценка_'+string(i),SRepCell.Rating);
+      }
+    }
+    pXL.SetTblNumberFldValue('КПЭ',RatingSum/RatingCount);
+    pXL.InsTblRow;
+  }
+
+  _loop SRep {
+    if (not NextVisual) break;
+
+    pXL.ClearTblBuffer;
+    pXL.SetTblStringFldValue('Уровни_кадрового_резерва',SRep.LevelOfReserve);
+    iStrFunc.GetFioIn(SRep.FIO);
+    pXL.SetTblStringFldValue('Сотрудник',SRep.FIO);
+    pXL.SetTblStringFldValue('Подразделение',SRep.DepName);
+    pXL.SetTblStringFldValue('Должность',SRep.PostName);
+    pXL.SetTblDateFldValue('Стаж_в_должности',SRep.AppointDate);
+    pXL.SetTblStringFldValue('Стаж_на_предприятии',iRunStaj.RunStrStaj(SRep.cPerson,89,Cur_Date));//Стаж работы на предприятии
+    pXL.SetTblDateFldValue('Дата_рождения',SRep.BornDate);
+    pXL.SetTblNumberFldValue('Возраст',Year(Sub_Date(Cur_Date,SRep.BornDate)));
+    pXL.SetTblStringFldValue('Вид_образования',SRep.LevelName);
+    pXL.SetTblStringFldValue('Специальность',SRep.Speciality);
+    pXL.SetTblDateFldValue('Атетстация_дата',SRep.LastAttDat);
+    pXL.SetTblStringFldValue('Атетстация_результат',SRep.LastAttRes);
+
+    i:=0;
+    RatingCount:=0;
+    RatingSum:=0;
+    _loop SRepCol
+     _Loop SRepCell  where((SRepCol.Competence==SRepCell.Competence and SRep.cPerson==SRepCell.cPerson))
+     { i++;
+       if (IsValidAll(tnSRepCell)) {
+        RatingCount++;
+        RatingSum+=SRepCell.Rating;
+        pXL.SetTblNumberFldValue('Оценка_'+string(i),SRepCell.Rating);
+      }
+     }
+    pXL.SetTblNumberFldValue('КПЭ',RatingSum/RatingCount);
+    pXL.InsTblRow;
+  }//_loop SRep
+  pXL.PublishTbl('Список_кандидатов');
+
+  pXL.LoadReport(oem2ansi(sXLSFileName));
+  pXL.DisConnectExcel;
+
+  StopVisual;
+}
+
+procedure RunRep;
+{
+  if (RunWindowModal(WinRepParam)<>cmDefault) exit;
+
+  if (LoadData)
+    PrintToExcel;
+}
+
+procedure RunReportByPost(cPost:comp);
+{
+  cPostFilter:=cPost;
+
+  RunRep;
+}
+
+// Запустить пользовательский интерфейс
+procedure RunUserReport(IntNrec : comp);
+{
+  #__Unused__(IntNrec)
+  RunRep;
+}
+
+// Наименование интерфейса
+function GetDescription: string;
+{
+  result:='Список кандидатов в кадровый резерв на должность';
+}
+
+end.

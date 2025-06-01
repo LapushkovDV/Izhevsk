@@ -1,0 +1,782 @@
+/*************************************************************************************************\
+* Наименование: Журнал учета сотрудников, прошедших аттестацию                                    *
+* Контур/Модуль: Управление персоналом                                                            *
+* Пункт меню: Отчеты / Отчеты пользователя / Аттестации / Журнал учета сотрудников, прошедших     *
+*             аттестацию                                                                          *
+* Примечание:                                                                                     *
+* Форма реализована на основании исходных текстов стандартного интерфейса AttJorn.                *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#163          |28/07/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#define GPInt GP_AttJorn // #(GPInt)
+#define GPNam Журнал учета сотрудников, прошедших аттестацию // #(GPNam)
+
+#include PickCat.vih  // Для работы с подразделениями
+#include CatFunc.vih  // Функции работы с каталогами
+#include ComDeptF.vih // Фильтр по подразделениям и должностям
+#include AppFuncs.vih // Функции работы с назначениями
+#include GP_Log.vih
+#include GP_DepFunc.vih
+
+interface GP_AttJorn '#(GPNam)' (, hcStaff_JRegistrAttestacSotr) escClose, gray;
+  show at (,, 76, 16);
+
+  Var
+    IsAborted: Boolean;
+    VInter: CommonFiltrDept;
+    iCatFunc: CatalogsFunctions;
+    VAppFuncs: AppointmentsFunctions;
+
+  #include GP_Log.var
+  #include GP_DepFunc.var
+
+  create view
+    Var
+      DateN: Date;
+      DateOk: Date;
+      cAttType: tNRec; // Тип аттестации
+      Status: Word;
+      Report: byte;
+      IndexNoOt: LongInt;
+      JobMarker: TPtr;
+      JobCount: LongInt;
+      JobPsn: tNRec;
+    as select
+      if(JobCount = 1, CatJobNature.Name, 
+       if(JobCount > 1, 'множественный выбор: ' + String(JobCount), 'не установлен')) (FieldName = JobFilter)
+    from
+      Appointments (ApntByDate),
+      Education (EducByDate),
+      synonym Catalogs CatJobNature,
+      synonym Catalogs CatAttType,
+      synonym Catalogs CatEduLvl,
+      synonym Catalogs CatEduLvlP,
+      synonym Catalogs CatEduTopic
+    Where ((
+          JobPsn              == CatJobNature.NRec
+      and cAttType            == CatAttType.NRec
+
+      and DateN              <<= PlanAtt.Dat1
+      and DateOk             >>= PlanAtt.Dat1
+      and PlanAtt.cPers       == Persons.NREC
+      and PlanAtt.cRecommend  == RegimeChanges.NRec 
+      and PlanAtt.cRef3       == Attestation.NRec
+      // Сведения об образовании
+      and Persons.NRec        == Education.Person
+      and Education.Level     == CatEduLvl.NRec
+      and CatEduLvl.cParent   == CatEduLvlP.NRec
+      and Education.cAddInf1  == CatEduTopic.NRec
+      // Утвержденные приказы по РПД 50
+      and Persons.NRec        == ContDoc.Person
+      and 50                  == ContDoc.TypeOper
+      and ContDoc.NRec        == AppHist.cContDoc
+    ));
+
+  procedure CopyMarkers(fromMarker: TPtr; toMarker: TPtr);
+  var
+    i: LongInt;
+    Item: Comp;
+    MrkCount: LongInt;
+  begin
+    ClearMarker(toMarker);
+    MrkCount := GetMarkerCount(fromMarker) - 1;
+    for (i := 0; i <= MrkCount; i := i + 1)
+      if GetMarker(fromMarker, i, Item) then
+        InsertMarker(toMarker, Item);
+  end;
+
+  procedure CopyPostToCat_andSoOn(Marker: TPtr; MarkInCat: Boolean);
+  var
+    CatalogsMarker: TPtr;
+  begin
+    CatalogsMarker := InitMarker('CatalogsMarker', 8, 200, 10);
+    if MarkInCat then
+      CopyMarkers(Marker, CatalogsMarker)
+    else
+      CopyMarkers(CatalogsMarker, Marker);
+    DoneMarker(CatalogsMarker, 'CatalogsMarker');
+  end;
+
+  procedure SelectJob;
+  begin
+    CopyPostToCat_andSoOn(JobMarker, true);
+    if RunInterface('PickCatalog2', -12, JobPsn, 100) = cmDefault then
+    begin
+      CopyPostToCat_andSoOn(JobMarker, false);
+      JobCount := GetMarkerCount(JobMarker);
+      GetMarker(JobMarker, 0, JobPsn);
+    end;
+  end;
+
+  procedure ClearJobFilter;
+  begin
+    ClearMarker(JobMarker);
+    set JobCount:= 0;
+  end;
+
+  screen scrParams;
+    show at (,,, 6);
+  fields
+    DateN ('дата начала отчетного периода',, sci13Esc): noProtect;
+    DateOk ('дата окончания отчетного периода',, sci13Esc): noProtect;
+    Status ('База для просмотра: работающие, текущие, архив'):
+     [list 0 'работающие', 1 'текущие', 2 'архив', 3 'вся картотека'], protect;
+    JobFilter ('Характер работы',, sci13Esc): protect;
+    CatAttType.Name ('Тип аттестации',, sci13Esc): protect;
+  <<
+
+ `Период формирования: с`  .@@@@@@@@@@`по`.@@@@@@@@@@
+
+ `База для просмотра:`     .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Характер работы:`        .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Тип аттестации`          .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  >>
+  end;
+
+  embedded ComFiltrEmbedded interface VInter;
+    Show at (, 7,, 12);
+  end;
+
+  screen scrButtons;
+    show at (, 13,,);
+  buttons
+    cmStaffAllDep,,, 'Печать отчета', , scStaffForButton;
+    cmCancel,,, 'Отмена', , scStaffForButton;
+  <<
+
+    <. Сформировать .>                                <.    Отмена    .>
+
+  >>
+  End;
+
+  // Проверяет соответствие установленному фильтру по типу аттестации
+  function CheckAttType: Boolean;
+  begin
+    result := true;
+    if cAttType = 0 then
+      exit;
+    if not IsValid(tnAttestation) then
+      result := false
+    else
+      if cAttType != Attestation.cType then
+        result := false;
+  end;
+
+  // Проверяет соответствие значению поля "База для просмотра"
+  function CheckStatus: Boolean;
+  begin
+    case Status of
+      0: result := Persons.IsEmployee = 'С' and ZeroDate = Persons.DisDate; // работающие
+      1: result := Persons.IsEmployee = 'С'; // текущие
+      2: result := Persons.IsEmployee = 'У'; // архив
+      else
+        result := true;
+    end;
+  end;
+
+  // Обучение
+  // выводим данные из 2 раздела картотеки . из вкладок "Повышение квалификации" и "Профессиональная переподготовка":
+  // Берем данные за запрашиваемый период по отчету:
+  // из строк "вид образования" и "тема обучения", наименования через пробел.
+  function GetEducation: String;
+  var
+    S: String;
+    NeedInclude: Boolean;
+  begin
+    result := '';
+    // Анализируем все записи в разделе картотеки "Сведения об образовании", у которых заполнено поле "Дата поступления"
+    _loop Education where (Education.FromDate != ZeroDate)
+    begin
+      NextVisual;
+      NeedInclude := false;
+      if not IsValidAll(tnCatEduLvl) then
+        continue;
+      // Если обучение началось после окончания периода отчёта
+      if Education.FromDate > DateOk then
+        continue;
+      // Если заполнено поле "Дата окончания"
+      if Education.ToDate != ZeroDate then
+        // Если обучение закончилось до начала периода отчёта
+        if Education.ToDate < DateN then
+          continue;
+      // Если это Повышение квалификации или Профессиональная переподготовка
+      if CatEduLvl.SysCode = -101 or CatEduLvl.SysCode = -102 or CatEduLvl.SysCode = -103 or
+       CatEduLvl.SysCode = 702 or CatEduLvl.SysCode = 703 then
+        NeedInclude := true;
+      if not NeedInclude then
+        if IsValidAll(tnCatEduLvlP) then
+          if CatEduLvlP.SysCode = 702 or CatEduLvlP.SysCode = 703 then
+            NeedInclude := true;
+      if not NeedInclude then
+        continue;
+      // Выводим Вид образования
+      S := CatEduLvl.Name;
+      // и тему обучения
+      if IsValidAll(tnCatEduTopic) then
+        S := S + ' ' + CatEduTopic.Name;
+      if S != '' then
+        result += if(result != '', ''#13#10, '') + S;
+    end;
+  end;
+
+  // Перевод/перемещение
+  // берем данные из 6 раздела картотеки за запрашиваемый период, при условии изменения должности
+  // - наименование новой должности
+  function GetTransfer: String;
+  var
+    _cApp: tNRec;
+    _cPost: tNRec;
+    S: String;
+  begin
+    result := '';
+    // Получаем должность на начало отчётного периода
+    _cPost := 0;
+    _cApp := VAppFuncs.GetAppNrec_OnDate(Persons.NRec, DateN);
+    if getFirst Appointments where ((_cApp == Appointments.NRec)) = tsOK then
+      _cPost := Appointments.Post;
+    // Проходим по всем назначениям с типом "основное назначение" за отчётный период 
+    _loop Appointments where ((
+          Persons.NRec  == Appointments.Person
+      and 0             == Appointments.lPrizn
+      and DateN        <<= Appointments.AppointDate
+      and DateOk       >>= Appointments.AppointDate
+    )) and (Appointments.Post != 0)
+    begin
+      NextVisual;
+      // Если в назначении изменилась должность
+      if Appointments.Post != _cPost then
+      begin
+        S := ICatFunc.GetCatalogsName(Appointments.Post);
+        if S != '' then
+          result += if(result != '', ''#13#10, '') + S;
+        _cPost := Appointments.Post;
+      end;
+    end;
+  end;
+
+  // Оклад
+  // берем данные по сотруднику на основании РПД № 50 "Изменение оклада" с обязательным заполненным
+  // полем "Основание" - любые слова с содержанием "аттестац".
+  // Условие - если есть такие приказы в этот период - выводим слово "да", если нет таких приказов
+  // по сотруднику - выводим слово "нет"
+  function GetOklad: String;
+  begin
+    result := 'нет';
+    _loop ContDoc
+    begin
+      NextVisual;
+      if IsValidAll(tnAppHist) then
+        if DateN <= AppHist.dRec and AppHist.dRec <= DateOk then
+          if InStr('аттестац', LoCase(ContDoc.sBottom)) > 0 then
+          begin
+            result := 'да';
+            break;
+          end;
+    end;
+  end;
+
+  //------------------------------------------------------------------------------------------------
+  // Вывод отчёта в Excel
+  //------------------------------------------------------------------------------------------------
+
+  const
+    TAB_CNT = 1; // Количество закладок в отчёте
+    TAB_TITLE_1 = 'Отчёт'; // Название закладки 2
+    // Константы ошибок при работе с Excel
+    XE_BAD_OP           =  0; // не удалось выполнить операцию с Excel-файлом
+    XE_CREATE_FILE      =  1; // не удалось создать файл
+    XE_OPEN_FILE        =  2; // не удалось открыть файл
+    XE_INIT_FILE        =  3; // не удалось инициализировать Excel
+    XE_CREATE_MATRIX    =  4; // не удалось создать матрицу
+    XE_FREE_MATRIX      =  5; // не удалось освободить матрицу
+    XE_OUT_MATRIX       =  6; // не удалось вывести матрицу в отчёт
+    XE_WRITE_TO_MATRIX  =  7; // не удалось записать значение в матрицу
+    XE_FORMAT_CELL      =  8; // не удалось отформатировать ячейку
+    XE_SET_CELL_VALUE   =  9; // не удалось записать значение в ячейку
+    XE_SET_CELL_FORMULA = 10; // не удалось записать формулу
+    XE_RUN_MACRO        = 11; // не удалось запустить макрос
+    XE_ADD_SHEET        = 12; // не удалось добавить вкладку
+    XE_DEL_SHEET        = 13; // не удалось удалить вкладку
+    XE_RENAME_SHEET     = 14; // не удалось переименовать вкладку
+    XE_WRONG_TEMPLATE   = 15; // в xlt шаблоне не найден лист с именем
+  end;
+
+  var
+    FirstCol: LongInt; // Номер первой колонки отчёта
+    LastCol: LongInt; // Номер последней колонки отчёта
+    FirstHeadRow: LongInt; // Номер первой строки отчёта
+    FirstBodyRow: LongInt; // Номер первой строки тела отчёта
+    LastBodyRow: LongInt; // Номер последней строки отчёта
+
+  // Исключение для генерации ошибок, связанных с выводом в Excel файл
+  exception ExOnExecelError;
+
+  // Генерирует ошибку, связанную с выводом в Excel файл
+  procedure ExcelError(ErrCode: Word; AddInfo: String);
+  var
+    ErrText: String;
+  begin
+    case ErrCode of
+      XE_BAD_OP:
+        ErrText := 'не удалось выполнить операцию с Excel-файлом';
+      XE_CREATE_FILE:
+        ErrText := 'не удалось создать файл';
+      XE_OPEN_FILE:
+        ErrText := 'не удалось открыть файл';
+      XE_INIT_FILE:
+        ErrText := 'не удалось инициализировать Excel';
+      XE_CREATE_MATRIX:
+        ErrText := 'не удалось создать матрицу';
+      XE_OUT_MATRIX:
+        ErrText := 'не удалось вывести матрицу в отчёт';
+      XE_WRITE_TO_MATRIX:
+        ErrText := 'не удалось записать значение в матрицу';
+      XE_WRONG_TEMPLATE:
+        ErrText := 'в xlt шаблоне не найден лист с именем';
+      XE_FORMAT_CELL:
+        ErrText := 'не удалось отформатировать ячейку';
+      XE_SET_CELL_VALUE:
+        ErrText := 'не удалось записать значение в ячейку';
+      XE_RUN_MACRO:
+        ErrText := 'не удалось запустить макрос';
+      XE_ADD_SHEET:
+        ErrText := 'не удалось добавить вкладку';
+      XE_DEL_SHEET:
+        ErrText := 'не удалось удалить вкладку';
+      XE_RENAME_SHEET:
+        ErrText := 'не удалось переименовать вкладку';
+      XE_FREE_MATRIX:
+        ErrText := 'не удалось освободить матрицу';
+      XE_SET_CELL_FORMULA:
+        ErrText := 'не удалось записать формулу';
+    else
+      ErrText := '';
+    end;
+    Message('Ошибка: ' + ErrText + ' ' + AddInfo);
+    _raise ExOnExecelError;
+  end;
+
+  // Эта Функция делает более удобной проверку результата операции с Excel
+  // Первым параметром передаем функцию, которая работает с Excel, а вторым и третьим - информацию об ошибке,
+  // которая будет выведена, если эта функция вернёт false (т.е. выполнится с ошибкой)
+  procedure xlOp(IsCorrect: Boolean; ErrCode: Word; AddInfo: String);
+  begin
+    if not IsCorrect then
+      ExcelError(ErrCode, AddInfo);
+  end;
+
+  // Создаёт Excel файл и создаёт в нём вкладки для вывода отчёта
+  procedure PrepareExcelFile(OutFileName: String);
+  var
+    TabCnt: Word;
+  begin
+    if ExistFile(OutFileName) then
+      DeleteFile(OutFileName);
+    SetVisualHeader('Создание Excel-файла...');
+    // Создаем файл Excel
+    xlOp(xlCreateExcel(OutFileName, True), XE_CREATE_FILE, OutFileName);
+    xlOp(xlIsExcelValid, XE_INIT_FILE, '');
+    // Переименуем вкладки
+    // Если в отчете меньше вкладок, чем нам нужно добавим недостающие
+    TabCnt := 0;
+    xlOp(xlGetSheetsCount(TabCnt), XE_BAD_OP, '');
+    while TabCnt < TAB_CNT do
+    begin
+      xlOp(xlAddSheet, XE_ADD_SHEET, '');
+      TabCnt++;
+    end;
+    // Если в больше вкладок, чем нам нужно, удалим лишние
+    while TabCnt > TAB_CNT do
+    begin
+      xlOp(xlDeleteSheet(1), XE_DEL_SHEET, '');
+      TabCnt--;
+    end;
+    // Переименуем вкладки
+    xlOp(xlSetSheetName(1, TAB_TITLE_1), XE_RENAME_SHEET, '');
+  end;
+
+  procedure OutTitle(var R: LongInt);
+  begin
+    // Выводим заголовок
+    xlOp(xlSetCellStringValue('#(GPNam) за период с ' + DateToStr(DateN, 'DD.MM.YYYY') + ' по ' + DatetoStr(DateOk, 'DD.MM.YYYY'), R, 1, R, 1), XE_SET_CELL_VALUE, '');
+    // сделаем его жирным
+    xlOp(xlSetFontStyle(xlBold, R, 1, R, 1), XE_FORMAT_CELL, '');
+    // и крупным
+    xlOp(xlSetFontSize(14, R, 1, R, 1), XE_FORMAT_CELL, '');
+    R++;
+  end;
+
+  // Вывод шапки отчёта
+  procedure OutHeader(var R: LongInt);
+  var
+    C: Word;
+  begin
+    SetVisualHeader('Форматирование Excel-файла...');
+    FirstCol := 1;
+
+    C := FirstCol - 1;
+    // № п/п
+    xlOp(xlSetCellStringValue('№ п/п', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(6, R, C, R, C), XE_FORMAT_CELL, '');
+    // Ф.И.О.
+    xlOp(xlSetCellStringValue('Ф.И.О.', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(25, R, C, R, C), XE_FORMAT_CELL, '');
+    // Табельный номер
+    xlOp(xlSetCellStringValue('Табельный номер', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    // Структурное подразделение
+    xlOp(xlSetCellStringValue('Структурное подразделение', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(7, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(30, R, C + 1, R, C + 1), XE_FORMAT_CELL, '');
+    xlOp(xlMergeCells(R, C, R, ++C), XE_FORMAT_CELL, '');
+    // Должность
+    xlOp(xlSetCellStringValue('Должность', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(40, R, C, R, C), XE_FORMAT_CELL, '');
+    // Дата аттестации
+    xlOp(xlSetCellStringValue('Дата аттестации', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(14, R, C, R, C), XE_FORMAT_CELL, '');
+    // Номер приказа
+    xlOp(xlSetCellStringValue('Номер приказа', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // Тип аттестации
+    xlOp(xlSetCellStringValue('Тип аттестации', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(40, R, C, R, C), XE_FORMAT_CELL, '');
+    // Результат аттестации
+    xlOp(xlSetCellStringValue('Результат аттестации', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(40, R, C, R, C), XE_FORMAT_CELL, '');
+    // Рекомендация
+    xlOp(xlSetCellStringValue('Рекомендация', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(30, R, C, R, C), XE_FORMAT_CELL, '');
+    // Планируемое подразделение
+    xlOp(xlSetCellStringValue('Планируемое подразделение', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(30, R, C, R, C), XE_FORMAT_CELL, '');
+    // Планируемая должность
+    xlOp(xlSetCellStringValue('Планируемая должность', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(25, R, C, R, C), XE_FORMAT_CELL, '');
+    // Обучение
+    xlOp(xlSetCellStringValue('Обучение', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(40, R, C, R, C), XE_FORMAT_CELL, '');
+    // Перевод/перемещение
+    xlOp(xlSetCellStringValue('Перевод/перемещение', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(25, R, C, R, C), XE_FORMAT_CELL, '');
+    // Оклад
+    xlOp(xlSetCellStringValue('Оклад', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+
+    LastCol := C;
+
+    // Выравниваем содержимое ячеек шапки по верхнему краю и по центру
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Устанавливаем текстовый формат для всех ячеек шапки
+    xlOp(xlSetNumberFormat('@', R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Увеличиваем высоту шапки
+    xlOp(xlSetRowHeight(30, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Делаем текст шапки жирным
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Рисуем границы ячеек для шапки
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+
+    R += 1;
+  end;
+
+  // Вывод тела отчёта
+  procedure OutBody(var R: LongInt);
+  var
+    C: Word;
+    N: LongInt;
+    dCheckDate: Date;
+    IndexNoOt: LongInt;
+    DepName, DepCode, Position: String;
+    _cApp: tNRec; //ссылка на назначение
+  begin
+    oGP_Log.Init('GP_AttJorn.log', true, true, true);
+    oGP_Log.SetVerboseMode(false);
+    oGP_Log.Info('Журнал учета сотрудников, прошедших аттестацию:');
+    N := 0;
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak, 'Обработка информации', 1);
+    _try
+    begin
+      _loop PlanAtt
+      begin
+        NextVisual;
+        // Получить дату для определения назначения
+        // GetDateForCheckAppoint(DocDate, PeriodEndDate : date ): date;
+        dCheckDate := VInter.GetDateForCheckAppoint(PlanAtt.Dat1, DateOk);
+        // Найти назначение на дату и проверить по правам доступа и фильтрам
+        // function FindAndCheckAppoint(cPerson: comp; dCheckDate: date; cPersDep: comp; wFlag: word; var cResApp: comp): boolean;
+        if not VInter.FindAndCheckAppoint(Persons.NRec, dCheckDate, Persons.Department, 0, _cApp) then
+          continue;
+        // Проверяем соответствие значению поля "База для просмотра"
+        if not CheckStatus then
+          continue;
+        // Проверяем на характер работы
+        if JobCount > 0 then
+          if not SearchMarker(JobMarker, Persons.JobNature, IndexNoOt) then
+            continue;
+        // Проверяем соответствие установленному фильтру по типу аттестации
+        if not CheckAttType then
+          continue;
+
+        C := FirstCol - 1;
+        // № п/п
+        xlOp(xlSetCellNumberValue(++N, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Ф.И.О.
+        xlOp(xlSetCellStringValue(Persons.FIO, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Табельный номер
+        xlOp(xlSetCellStringValue(GetStrTabN(Persons.TabNmb, Persons.StrTabN), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Структурное подразделение
+        if getFirst Appointments where ((_cApp == Appointments.NRec)) = tsOk then
+        begin
+          DepName := oGP_DepFunc.GetFullDepName(Appointments.Department);
+          DepCode := oGP_DepFunc.GetDepCode(Appointments.Department, true);
+          Position := iCatFunc.GetCatalogsName(Appointments.Post);
+        end else
+        begin
+          DepName := oGP_DepFunc.GetFullDepName(Persons.Department);
+          DepCode := oGP_DepFunc.GetDepCode(Persons.Department, true);
+          Position := '';
+        end;
+        xlOp(xlSetCellStringValue(DepCode, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        xlOp(xlSetCellStringValue(DepName, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Должность
+        xlOp(xlSetCellStringValue(Position, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Дата аттестации
+        xlOp(xlSetCellDateValue(PlanAtt.Dat1, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Номер приказа
+        xlOp(xlSetNumberFormat('@', R, ++C, R, C), XE_FORMAT_CELL, '');
+        xlOp(xlSetCellStringValue(RegimeChanges.OrderNmb, R, C, R, C), XE_SET_CELL_VALUE, '');
+        // Тип аттестации
+        xlOp(xlSetCellStringValue(iCatFunc.GetCatalogsName(Attestation.cType), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Результат аттестации
+        xlOp(xlSetCellStringValue(iCatFunc.GetCatalogsName(PlanAtt.cType), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Рекомендация
+        xlOp(xlSetCellStringValue(iCatFunc.GetCatalogsName(PlanAtt.cKateg), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Планируемое подразделение
+        xlOp(xlSetCellStringValue(iCatFunc.GetCatalogsName(PlanAtt.cDepart), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Планируемая должность
+        xlOp(xlSetCellStringValue(iCatFunc.GetCatalogsName(PlanAtt.cRef2), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Обучение
+        xlOp(xlSetCellStringValue(GetEducation, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Перевод/перемещение
+        xlOp(xlSetCellStringValue(GetTransfer, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        // Оклад
+        xlOp(xlSetCellStringValue(GetOklad, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        R++;
+      end;
+    end
+    _except on ExUserBreak:
+    begin
+      IsAborted := true;
+      _reRaise;
+    end
+    _finally
+    begin
+      StopVisual('', 0);
+      oGP_Log.Done(true);
+    end;
+
+    LastBodyRow := FirstBodyRow + N - 1;
+
+    // Выравниваем текст по верхнему краю в теле отчёта
+    xlOp(xlAlignCellsEx(xlLeft, xlTop, FirstBodyRow, FirstCol, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+    // Центрируем текст в теле отчёта
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 1, LastBodyRow, 1), XE_FORMAT_CELL, ''); // № п/п
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 3, LastBodyRow, 4), XE_FORMAT_CELL, ''); // Табельный номер, Код подразделения
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 7, LastBodyRow, 8), XE_FORMAT_CELL, ''); // Дата аттестации, Номер приказа
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, 16, LastBodyRow, 16), XE_FORMAT_CELL, ''); // Оклад
+
+    // Для всех ячеек в форме включаем перенос слов
+    xlOp(xlWrapText(FirstHeadRow, FirstCol, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+    // Рисуем границы ячеек для всей формы
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0, FirstHeadRow, FirstCol, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+  end;
+
+  file MacroFile;
+
+  function CreateMacro(MacroFileName: string): Boolean;
+  begin
+    result := false;
+    if MacroFile.OpenFile(MacroFileName, stCreate) then
+    begin
+      MacroFile.Writeln('Sub FormatReport');
+      MacroFile.Writeln('  Range("A2").Select');
+      MacroFile.Writeln('  Range(Selection, ActiveCell.SpecialCells(xlLastCell)).Select');
+      MacroFile.Writeln('  Selection.AutoFilter');
+      MacroFile.Writeln('  Range("A3").Select');
+      MacroFile.Writeln('  Application.PrintCommunication = False');
+      MacroFile.Writeln('  With ActiveSheet.PageSetup');
+      MacroFile.Writeln('      .LeftMargin = Application.InchesToPoints(0.7)');
+      MacroFile.Writeln('      .RightMargin = Application.InchesToPoints(0.7)');
+      MacroFile.Writeln('      .TopMargin = Application.InchesToPoints(0.75)');
+      MacroFile.Writeln('      .BottomMargin = Application.InchesToPoints(0.75)');
+      MacroFile.Writeln('      .Orientation = xlLandscape');
+      MacroFile.Writeln('      .PaperSize = xlPaperA4');
+      MacroFile.Writeln('      .FitToPagesWide = 1');
+      MacroFile.Writeln('  End With');
+      MacroFile.Writeln('  Application.PrintCommunication = True');
+      MacroFile.Writeln('End Sub');
+      MacroFile.Close;
+      result := true;
+    end else
+      Message('Ошибка: Не удалось создать файл "' + MacroFileName + '"');
+  end;
+
+  procedure RunMacro;
+  var
+    MacroFileName: String;
+  begin
+    if IsAborted then
+      exit;
+    MacroFileName := GetDefaultUserPath + '#(GPInt).bas';
+    if not CreateMacro(MacroFileName) then
+      exit;
+    xlImportModule(MacroFileName);
+    xlRunMacro('FormatReport');
+    DeleteFile(MacroFileName);
+  end;
+
+  // Формирует отчёт
+  procedure CreateReport;
+  var
+    OutFileName: String;
+    R: LongInt;
+  begin
+    OutFileName := GetDefaultUserPath + '#(GPNam) с ' + DatetoStr(DateN, 'DD.MM.YYYY') + ' по ' + DatetoStr(DateOk, 'DD.MM.YYYY') + '.xlsx';
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+    _try
+    begin
+      PrepareExcelFile(OutFileName);
+      R := 1;
+      // Выводим заголовок отчёта
+      OutTitle(R);
+      FirstHeadRow := R;
+      FirstBodyRow := FirstHeadRow + 1; // Высота шапки - 1 строка
+      // Выводим шапку отчёта
+      OutHeader(R);
+      // Выводим тело отчёта
+      OutBody(R);
+      // Запускаем макрос
+      RunMacro;
+    end
+    _except on ExOnExecelError, ExUserBreak:
+    begin
+      IsAborted := true;
+    end
+    _finally
+    begin
+      StopVisual('',0);
+      xlKillExcel;
+    end;
+  end;
+
+  //------------------------------------------------------------------------------------------------
+
+  handleEvent
+    cmInit:
+      begin
+        LoadVipInterface(VInter);
+        VInter.ObjInit(Cur_Date, false, false);
+        VInter.AddValArrayAppoint(0, 'основное на дату аттестации');
+        VInter.SetFormatWithAppoint;
+        if not ReadMyDsk(DateN, '#(GPInt)_DateN', false) then
+          set DateN := Cur_Date;
+        if not ReadMyDsk(DateOk, '#(GPInt)_DateOk', false) then
+          set DateOk := Cur_Date;
+        if not ReadMyDsk(Status, '#(GPInt)_Status', false) then
+          set Status := 0;
+        if not ReadMyDSK(cAttType, '#(GPInt)_cAttType', false) then
+          cAttType := 0;
+        JobMarker := InitMarker('#(GPInt)_JobMarker', 8, 200, 10);
+        JobCount := GetMarkerCount(JobMarker);
+        if JobCount = 1 then
+          GetMarker(JobMarker, 0, JobPsn);
+        IsAborted := false;
+      end;
+    cmPick:
+      case CurField of
+        #JobFilter:
+          SelectJob;
+        #CatAttType.Name:
+          begin
+            var _cAttType: tNRec;
+            if RunInterface(PickCatalog2, -126, _cAttType, 0) = cmDefault then
+              set cAttType := _cAttType;
+          end;
+      end;
+    cmDelOnprotect:
+      case curfield of
+        #JobFilter:
+          ClearJobFilter;
+        #CatAttType.Name:
+          set cAttType := 0;
+      end;
+    cmDone:
+      begin
+        SaveMyDsk(DateN, '#(GPInt)_DateN');
+        SaveMyDsk(DateOk, '#(GPInt)_DateOk');
+        SaveMyDsk(Status, '#(GPInt)_Status');
+        SaveMyDSK(cAttType, '#(GPInt)_cAttType');
+        DoneMarker(JobMarker, '#(GPInt)_JobMarker');
+      end;
+    cmCancel:
+      begin
+        VInter.IntClose(not IsAborted);
+        PutCommand(cmDone);
+      end;
+    cmClose:
+      begin
+        VInter.IntClose(not IsAborted);
+        PutCommand(cmDone);
+      end;
+    cmStaffAllDep:
+      begin
+        CreateReport;
+        CloseInterface(cmCancel);
+      end;
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_#(GPInt) implements IUserReport;
+
+interface UserReport_#(GPInt);
+
+  procedure Run;
+  begin
+    RunInterface('#(GPInt)');
+  end;
+
+  function GetReportName: String;
+  begin
+    result:= '#(GPNam)';
+  end;
+
+  function GetGroupName(Level: Word): String;
+  begin
+    result:= '';
+    case Level of
+      1: result:= 'Аттестации';
+    end;
+  end;
+
+  function GetPriority: Integer;
+  begin
+    result:= 0;
+  end;
+
+  function VisibleInModule(Ind: Byte): String;
+  begin
+    result:= '';
+    case Ind of
+      1: result:= 'STAFFMAINMENU';
+    end;
+  end;
+
+end.

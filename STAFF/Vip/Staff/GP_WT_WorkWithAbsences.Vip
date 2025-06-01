@@ -1,0 +1,1155 @@
+/*************************************************************************************************\
+* Наименование: Скуд - Справка о затратах на С, РВ и В(из таб.учета)                              *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: На базе #1860                                                                       *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2517         |16/02/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+//GP_WT_WorkWithA_PER_BY_MES ввод периода как месяц/год, иначе - даты
+#DEFINE NO_GP_WT_WorkWithA_PER_BY_MES
+//---------------------------------
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+#include CLSFUNCS.VIH // ф-ии пересканирования текущих л/с
+#include PAFILTER.VIH // функц-л работы с подразделениями и тек. лицевыми счетами
+#include ChoiseYourPersons.vih
+#include Query.vih
+#include CatFunc.Vih
+#include GetKau.Vih
+//-------------------------
+#include GP_QueryBuilder.vih
+#include GP_SCUD_StateMentOnAbsent.Vih
+#include GP_SCUD_Function.Vih
+#doc
+АНАЛИТИЧЕСКИЙ ОТЧЕТ ПО ФАКТИЧЕСКИ ОТРАБОТАННОМУ  ВРЕМЕНИ С УЧЕТОМ НЕЯВОК
+#end
+
+Interface GP_WT_WorkWithAbsences 'Факт отработанного времени + Неявки';
+#IFDEF GP_WT_WorkWithA_PER_BY_MES
+Show at (,,50,19);
+#ELSE
+Show at (,,50,18);
+#ENDIF
+
+//====================
+  procedure SelectMarKat;forward;
+  Procedure SetFilterNM(_Field:longint=0);forward;
+//====================
+
+table struct local tmp_report_sp
+(  nrec     :comp
+ , pr       :Integer
+ , sortname :string // для сортировки
+ , cRec     :comp   // ссылка на заголовок
+ , FIo      :string
+ , cPers    :comp
+ , cPost    :comp
+ , cPodr    :comp
+ , Kateg    :word
+ , MesN     :word
+ , YearN    :word
+ , dmd : array[1..38] of double
+ , dms : array[1..38] of string
+)
+with index
+( tmp_report_sp01  = nrec (AutoInc, Unique),
+  tmp_report_sp03  = cRec+sortname+YearN+MesN,
+  tmp_report_sp04  = cRec+cPers+cPodr+cPost+YearN+MesN+Kateg
+);
+//------------------
+// Для предвыборки табеля
+Table Struct local tmp_LsTab
+( cLstab  :comp
+ ,cPerexod:comp
+ ,cKatPodr:comp
+ ,cAppoint:comp
+ ,Kateg   :word
+ ,Fio     :string[100]
+ ,cPersons:comp
+ ,cLschet :comp
+ ,Podr_Kod:string[10]
+ ,STRTABN:string[10]
+ ,Podr_KodAll:string[10]
+ ,Podr_Name:string
+ ,Podr_Nrec:comp
+ ,sPost   :string
+ ,MesN    :word
+ ,YearN   :word
+)
+with index
+( tmp_LsTab01 = cLsTab + cPerexod
+);
+
+//------------------
+// Для предвыборки заявлений
+Table Struct local tmp_Zauv
+(   EventDate:date //   : date "Дата события"
+  , EventTmB :time //  : time "Время события с"
+  , EventTmE :time //  : time "Время события по"
+  , wType    :word //  0 - личные невыходы,1 - служебные
+  , cPersons :comp
+  , cGP_SCUD_PERS :comp
+  //, DocNumber:string[30]
+  //, DocDate:date
+  , cGp_SCUD_DOC_SP :comp
+  , cGp_SCUD_DOC    :comp
+
+)
+with index
+( tmp_Zauv01 = cPersons + EventDate
+);
+//============================================
+#include GP_SCUD_StateMentOnAbsent.Var
+#include GP_SCUD_Function.Var
+#include GetKau.Var
+//============================================
+var
+  CS: IContextSession; // для захвата прикладного контекста табеля
+  //---------------
+  iCatFunc            : CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+  iQBuilder:GP_QueryBuilder new;
+  //для стандартного фильтра по подразделению
+  PAF:  TraditionalPersonalAccountFilter;
+  CLSF:      CurLSFunctions;
+  //-----------------------
+  viCYPersons         : ChoiseYourPersons;
+  //-----------------------
+  pStatus_GetDefault :comp; // статус по умолчанию
+
+  wMesB,wMesE, wMes:word;
+  DTB,DTE,DTB_Period,DTE_Period,DT_Calc:date;
+  DayB,DayE:word;
+  wYear:word;
+  wYearB:word;
+  wYearE:word;
+  sPopdis  :string;// подпись отчета
+  sDolg    :string;// подпись отчета
+  maxColCount:Longint;
+  pNotationRV1,pNotationRV2:comp;
+
+#include Excel_Var.vpp
+//-----------------------------------------
+   wOption:word;
+   wVivod :word;
+//-----------------------------------------
+// Фильтры
+//-----------------------------------------
+   wFilter:word;
+   Marker_Count :longint;
+    wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   KauMarkerName:string;
+   Marker_Tmp :longint;
+   #mrkfld_(Persons)
+   //---------------
+   DepList :longint;
+   //------------------------
+   VidKat      : string[100];
+   MarkKat:longint;
+   //------------------------
+
+Create view
+var
+  pRep       :comp;
+  pRep_Main  :comp;
+  pPost      :comp;
+  pDepartMent:comp;
+  pLschet    :comp;
+  sUserName:string;
+as select KlKatego.Nrec
+, (PAF.GetDepartmentFilterStr)  (fieldname = FiltrPodr)
+, tmp_LsTab.*
+, tmp_Zauv.*
+From KlKatego,  tmp_report_sp(tmp_report_sp03)
+, ZAR_USER
+, StaffStruct
+, tmp_LsTab(tmp_LsTab01)
+// подхватим переработку
+, GP_Scud_Saldo
+//------- фильтры
+ , Persons    Persons_Flt
+where
+((
+   sUserName == Zar_User.OwnName
+//---------------
+and pDepartment == StaffStruct.Department
+and pPost       == StaffStruct.POST
+and DTE_Period >>= StaffStruct.DInPut
+and ( StaffStruct.DClose=ZeroDate
+     or StaffStruct.DClose>=DTB
+  )
+ and  0 == tmp_report_sp.cRec
+// подхватим переработку
+and tmp_LsTab.cPersons == GP_SCUD_PERS.cPersons
+//and GP_SCUD_PERS.Nrec  == GP_Scud_Saldo.cGP_SCUD_PERS
+and tmp_LsTab.cPersons  == GP_Scud_Saldo.cPersons
+and wYear               == GP_Scud_Saldo.Yearn
+and tmp_LsTab.MesN      == GP_Scud_Saldo.MESN
+and tmp_LsTab.cPersons  == tmp_Zauv.cPersons
+and DTB        <<= tmp_Zauv.EventDate
+and DTE        >>= tmp_Zauv.EventDate
+//------- фильтры
+and wc_nrec == Persons_Flt.Nrec
+
+))
+;
+
+//------------------------------------
+Create view vSpr
+var
+  pPerson :comp;
+From Persons, Appointments
+where
+((  pPerson == Persons.Nrec
+and Persons.Appointcur == Appointments.Nrec
+));
+
+//------------------------------------
+create view vPodr
+var
+ sPodr_kod:string;
+From KatPodr
+where (( sPodr_kod == KatPodr.kod));
+
+
+
+
+//------------------------------------
+#include Excel_Fun.vpp
+//------------------------------------
+
+
+//------------------------------------
+//
+//------------------------------------
+Procedure SaveParam;
+{ SaveMyDsk(wMesB    ,'GP_WT_OverWorkRep_wMesB'    );
+  SaveMyDsk(wMesE    ,'GP_WT_OverWorkRep_wMesE'    );
+  SaveMyDsk(DTB_Period ,'GP_WT_OverWorkRep_DTB_Period' );
+  SaveMyDsk(DTE_Period ,'GP_WT_OverWorkRep_DTE_Period' );
+  SaveMyDsk(wYearB    ,'GP_WT_OverWorkRep_wYearB'    );
+  SaveMyDsk(wYearE    ,'GP_WT_OverWorkRep_wYearE'    );
+  SaveMyDsk(wFilter  ,'GP_WT_OverWorkRep_wFilter'  );
+  SaveMyDsk(wOption  ,'GP_WT_OverWorkRep_wOption'  );
+  SaveMyDsk(wVivod   ,'GP_WT_OverWorkRep_wVivod'   );
+  SaveMyDsk(sPopdis  ,'GP_WT_OverWorkRep_sPopdis'  );//
+  SaveMyDsk(sDolg    ,'GP_WT_OverWorkRep_sDolg'    );
+  SaveMyDsk(logfilekl,'GP_WT_OverWorkRep_logfilekl');
+  DoneMarker(MarkKat ,'VIDNej_MarkKat');
+  DoneMarker(Marker_Persons, 'GP_WT_OverWorkRep_Persons');
+
+} //Procedure SaveParam;
+
+//------------------------------------
+//
+//------------------------------------
+Procedure ReadParam;
+{ if not ReadMyDsk(wMesB    ,'GP_WT_OverWorkRep_wMesB'    ,False) wMesB  :=MonthRas;
+  if not ReadMyDsk(wMesE    ,'GP_WT_OverWorkRep_wMesE'    ,False) wMesE  :=MonthRas;
+  if not ReadMyDsk(wYearB   ,'GP_WT_OverWorkRep_wYearB'   ,False) wYearB  :=YearRas;
+  if not ReadMyDsk(wYearE   ,'GP_WT_OverWorkRep_wYearE'   ,False) wYearE  :=YearRas;
+  if not ReadMyDsk(DTB_Period ,'GP_WT_OverWorkRep_DTB_Period',False ) DTB_Period:=date(1,wMesB,wYearB);
+  if not ReadMyDsk(DTE_Period ,'GP_WT_OverWorkRep_DTE_Period',False ) DTE_Period:=date(Last_Day(date(1,wMesE,wYearE) ),wMesE,wYearE);
+
+  if not ReadMyDsk(wFilter  ,'GP_WT_OverWorkRep_wFilter'  ,False) wFilter:=0;
+  if not ReadMyDsk(wOption  ,'GP_WT_OverWorkRep_wOption'  ,False) wOption:=0;
+  if not ReadMyDsk(wVivod   ,'GP_WT_OverWorkRep_wVivod'   ,False) wVivod :=127;
+  if not ReadMyDsk(sPopdis  ,'GP_WT_OverWorkRep_sPopdis'  ,False) sPopdis:=sGetTune('USER.FIO');//
+  if not ReadMyDsk(sDolg    ,'GP_WT_OverWorkRep_sDolg'    ,False) sDolg  :='';
+  if not ReadMyDsk(logfilekl,'GP_WT_OverWorkRep_logfilekl',False) LogFileKl  :=false;
+  MarkKat := InitMarker('VIDNej_MarkKat', 8, 10, 10);
+  Marker_Persons  :=InitMarker('GP_WT_OverWorkRep_Persons' , 8, 50, 10, True);
+  SelectMarKat;
+  SetFilterNM(0);
+} //Procedure ReadParam;
+
+//------------------------------------------------------------------------------
+// Пометка категорий
+//------------------------------------------------------------------------------
+  procedure SelectMarKat;
+  var i1:longint;
+      _pNrec:comp;
+  {
+      VidKat := '';
+      if GetMarkerCount(MarkKat)>1
+      { set VidKat:='множественный выбор ('+string(GetMarkerCount(MarkKat))+')';
+      }
+      else
+      for (I1 := 0; I1 < GetMarkerCount(MarkKat); I1 := I1 + 1)
+      { if (GetMarker(MarkKat, I1, _pNrec))
+        if (GetFirst Klkatego where ((_pNrec == Klkatego.NREC)) = tsOk)
+        { set VidKat:=Klkatego.naikat;
+          break;
+        }
+      }
+
+    if (VidKat= '')
+      set VidKat:='не установлен';
+    redrawpanel(#Zar_User);
+  } // procedure SelectMarKat
+
+//------------------------------------------------------------------------------
+// обработка изменения фильтра по подразделениям  - см CompSrc\Z\Z_PayRep\vip\VIEWREES.VIP
+//------------------------------------------------------------------------------
+  procedure SetupDepartments(Change: comp);
+  {
+    var p2: double;    // для компиляции
+    var PrCex: comp;
+    PrCex := ZAR_USER.CURCEX;
+    RunInterface('GetPodaln', Change, prCex, p2);
+  }
+
+  //---------------------------------------
+  // Установка наименований фильтров
+  //---------------------------------------
+  Procedure SetFilterNM(_Field:longint=0);
+  { if _Field=0 or _Field=#Filtr_Persons
+    { #mrkfiltr_(Persons_Flt,Persons,Nrec,wc_nrec,Persons_Flt.Fio)
+    }
+    ReScanPanel(#Zar_User);
+  } //Procedure SetFilterNM(_Field:longint)
+
+
+
+Function Chk_Filter(_pCex:comp) :boolean; Cacheable;
+{ Result:=True;
+  if IsBitCtW(wFilter,1)
+  { if not FoundMarker(DepList,_pCex)
+    { Result:=False;
+    }
+  }
+} //Function Chk_Filter(_pCex:comp) :boolean; Cacheable;
+
+Function MyGet_Func_Boss(_pPodr:comp;_pPost:comp):string; cacheable;
+var _pPost_FB:comp;
+    _pPersons_FB:comp;
+{ Result:='-';
+  //if (wOption and 1)>0 then Exit;
+  pDepartMent:=GetCatalogsByKatPodr(_pPodr);
+  pPost:=_pPost;
+  if getfirst StaffStruct=tsok
+  { _pPost_FB   :=0;
+    _pPersons_FB:=0;
+    Result:=MyGetInitial(Get_Func_Boss(StaffStruct.Nrec,_pPost_FB,_pPersons_FB,DTE),True);
+    if Result=''
+    { Result:='-'
+    }
+    else
+    { Result:=Result+chr(10)+iCatFunc.GetCatalogsName(_pPost_FB);
+    }
+  }
+  //
+
+} //Function MyGet_Func_Boss(_pPodr:comp;_pPost:comp):string; cacheable;
+
+
+Procedure InsTabel(_Change:comp);
+var ii,jj:word;
+    _ChafF:double;
+    _Mes,_Year:word;
+{ WT_ResetFilter;
+  // если включено раздельное ведение табелей
+  //    if (SeparateTableKeeping)
+  // установим фильтр по данному переходу в межпериод
+  WT_SetAttributeFilter(wtaChange, _Change);
+  WT_AddDayRangeFilter(DayB,DayE);
+  _Mes:=0;_Year:=0;
+  if IsBitCTW(wOption,2)
+  { _Mes :=wMes;
+    _Year:=wYear;
+  }
+  var _boIns:boolean=false;
+  if getfirst tmp_report_sp where (( 0 == tmp_report_sp.cRec
+     and tmp_LsTab.cPersons == tmp_report_sp.cPers
+     and tmp_LsTab.Podr_nrec== tmp_report_sp.cPodr
+     and tmp_LsTab.cAppoint == tmp_report_sp.cPost
+     and _Year             == tmp_report_sp.YearN
+     and _Mes              == tmp_report_sp.MesN
+     //and tmp_LsTab.Kateg    == tmp_report_sp.Kateg
+     ))<>tsok
+  { ClearBuffer(#tmp_report_sp);
+    tmp_report_sp.cRec:=0;
+    tmp_report_sp.SortName:=tmp_LsTab.Fio;
+    tmp_report_sp.Kateg   :=tmp_LsTab.Kateg;
+    tmp_report_sp.cPers   :=tmp_LsTab.cPersons;
+    tmp_report_sp.cPodr   :=tmp_LsTab.Podr_Nrec;
+    tmp_report_sp.cPost   :=tmp_LsTab.cAppoint;
+    tmp_report_sp.dms[1]  :=tmp_LsTab.Podr_kod;
+    tmp_report_sp.dms[36]  :=tmp_LsTab.Podr_kodAll;
+    tmp_report_sp.dms[37]  :=tmp_LsTab.STRTABN;
+    tmp_report_sp.dms[2]  :=tmp_LsTab.Podr_name;
+    tmp_report_sp.dms[3]  :=tmp_LsTab.FIO;
+    tmp_report_sp.dms[4]  :=tmp_LsTab.sPost;
+    tmp_report_sp.dms[5]  :=string(tmp_LsTab.Kateg);
+    tmp_report_sp.YearN   :=_Year;
+    tmp_report_sp.MesN    :=_Mes ;
+    insert current tmp_report_sp;
+
+  }
+
+  //------------------
+  // Здесь вычислим часы
+  //------------------
+  //плановые часы по графику
+  //tmp_report_sp.dmd[5]:=tmp_report_sp.dmd[5]+WT_GetHoursEx(hkworking,stPlanned,0);
+  tmp_report_sp.dmd[5]:=tmp_report_sp.dmd[5]+WT_GetHoursBwDaysEx(hkworking,0,0,stPlanned,1,31,0) ;
+  //фактически отработанное время, час.
+  tmp_report_sp.dmd[6]:=tmp_report_sp.dmd[6]+WT_GetHoursEx(hkworking,stActual,0);
+  if WT_LoadMonthlyAbsences = 0
+  { var _AbsenceCount:longint=WT_GetAbsenceCount(atMonthly);
+    for(jj := 0; jj < _AbsenceCount; Inc(jj))
+    { var pNotation: comp=0;
+      var _aaMark:string;
+      _aaMark:='';
+      // if not WT_GetAbsenceAttribute(atMonthly, jj, aaNotation, pNotation)
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaMark, _aaMark) then continue;
+      var _aaBeginning , _aaEnding :date=ZeroDate;
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaBeginning, _aaBeginning) then continue;
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaEnding   , _aaEnding   ) then continue;
+
+      ii:=0;
+      case _aaMark of
+      'ОТ' : ii:=07;
+      'ОД' : ii:=08;
+      'У'  : ii:=09;
+      'УД' : ii:=10;
+      'ДО' : ii:=11;
+      'Д'  : ii:=12;
+      'Г'  : ii:=13;
+      'ПР' : ii:=14;
+      'Б'  : ii:=15;
+      'К'  : ii:=16;
+      'ПК' : ii:=17;
+      'ПМ' : ii:=18;
+      'Т'  : ii:=19;
+      'ОТГ': ii:=20;
+      'РВ' : ii:=21; //РВ
+      'РО' : ii:=22;
+      'ОВК' : ii:=27;
+      'НД'  : ii:= 28;
+      'РП'  : ii:= 29;
+      // 30 должно быть  НБ вроде как
+      'НН'  : ii:= 31; // впереди оставлена дырка под НБ
+      else continue;
+      end;
+      _ChafF:=0;
+      WT_GetAbsenceAttribute(atMonthly, jj, aaHours,_ChafF);
+      if _ChafF=0
+        _ChafF:=WT_GHBDEx(1,0,0,-1,_aaBeginning , _aaEnding,0);
+
+      tmp_report_sp.dmd[ii]+=_ChafF;
+    } //for(jj := 0; jj < WT_GetAbsenceCount(atMonthly); Inc(jj))
+  } //if WT_LoadMonthlyAbsences = 0
+
+  //сверхурочка
+  tmp_report_sp.dmd[23]+=WT_GetHours(hkOverwork,stActual)+WT_GetHours(hkOverworkRest,stActual);
+  //------------------------
+  // подхватим переработку
+  if true //_boIns //только первый раз
+  { if getfirst GP_Scud_Saldo =tsok
+    { for(jj := 1; jj <=31 ; jj++)
+      { if WT_TestDayEx(jj
+         ,dkWorking //2
+         ,stPlanned //0
+         ,0
+         )
+       {  tmp_report_sp.dmd[26]+=GP_Scud_Saldo.CH_OVERWORK2[jj];
+       }
+     } //for(jj := 1; jj <=31 ; jj++)
+    } //if getfirst GP_Scud_Saldo
+    //---------------- Заявления
+    _Loop  tmp_Zauv
+    { jj:=Day(tmp_Zauv.EventDate);
+      if not WT_TestDayEx(jj
+        ,dkWorking //2
+        ,stPlanned //0
+        ,0
+         ) then continue;
+      if not pGP_SCUD_A.SetDocPosition(0,tmp_Zauv.cGP_SCUD_DOC,tmp_Zauv.cGP_SCUD_DOC_SP) then continue;
+     _ChafF:=iGP_SCUD_Function.GetDoubleFromTime(
+               pGP_SCUD_A.GetPlanTime(tmp_Zauv.cGp_SCUD_PERS
+                  ,tmp_Zauv.EventDate //_DT:date;
+                  ,tmp_Zauv.EventTMB , tmp_Zauv.EventTME)
+                   );
+     case tmp_Zauv.wType of
+     2: tmp_report_sp.dmd[24]+=_ChafF;
+     1: tmp_report_sp.dmd[25]+=_ChafF;
+     end;
+
+    } //_Loop  tmp_Zauv
+  }
+
+  update current tmp_report_sp;
+} //Function InsTabel(_Change:comp);
+
+//==========================
+Procedure Tabel_Init;
+{ Loadworkingtable(tmp_lstab.clschet,wMes,wYear);
+  WT_ResetFilter;
+  //kol_vixod:=WT_GetDaysBwDates(dkWeeKend,1, dtb,dte);
+  //mylogwrite(false,'Табель '+string(lstab.tabn)+', выходных='+string(kol_vixod));
+}
+
+//==============================
+// сбор данных
+//==============================
+Function SborData : boolean;
+var _pLsTab:comp;
+    wErr:longint;
+{ SborData:=False;
+  timelog('GP_WT_WorkWithAbsences->SborData:Start');
+
+  DTB:=date(1,wMes,wYear);
+  DTE:=date(Last_Day(DTB),wMes,wYear);
+  if DTB<DTB_Period DTB:=DTB_Period;
+  if DTE>DTE_Period DTE:=DTE_Period;
+  DayB:=Day(DTB);
+  DayE:=Day(DTE);
+  MyLogWrite(false,' Сбор '+DateToStr(DTB,'DD/MM/YYYY')+' - '+DateToStr(DTE,'DD/MM/YYYY') );
+  if not iNextVisual('Сбор данных за '+string(wMes)+' мес. '+string(wYear)+' год' ) exit;
+  delete all tmp_LsTab;
+  _Try
+  { var hStrFilter,hStrFilter1:longint=0;
+    var hStrFilter_kat :longint=0;
+    var hStrFilter_Pers:longint=0;
+    var Q: IQuery;
+    //-------------------
+    Q:=queryManager.createQuery(SQLQuery(
+      select  Distinct
+       Lstab.Nrec as cLstab // :comp
+      ,#Comp(0) as cPerexod//:comp
+      ,CASE WHEN LsTab.Cexoz=#Comp(0) then LsTab.cex else LsTab.Cexoz End as cKatPodr//:comp
+      ,CASE WHEN LsTab.cAppoint=#COMP(0) THEN Lschet.cAppoint ELSE LsTab.cAppoint END as cAppoint//:comp
+      ,LsTab.Kateg as Kateg //  :word
+      ,Persons.Fio as Fio   ///  :string[100]
+      ,LsTab.tPerson as cPersons//:comp
+      ,LsTab.cLschet as cLschet // :comp
+      ,COALESCE(SubString(KatPodr.Kod,1,3),'-') as Podr_kod
+      ,KatPodr.Kod as Podr_kodAll
+      ,Persons.STRTABN as STRTABN
+      ,COALESCE(KatPodr.Name,'-') as Podr_name
+      ,COALESCE(KatPodr.Nrec,#Comp(0)) as Podr_nrec
+
+      ,COALESCE(Catalogs.Name,'') as sPost
+      ,LsTab.MesN //   :word
+      ,LsTab.YearN //
+      From LsTab
+      Inner join Persons on Persons.Nrec = LsTab.tPerson
+      Inner join Lschet  on Lschet.Nrec = LsTab.cLschet
+        and (Lschet.DatUv=#Date(0,0,0)  or Lschet.DatUv>=:(DTB) )
+        and Lschet.Sovm<>3
+      //Left outer join KatPodr on KatPodr.Nrec =CASE WHEN LsTab.Cexoz=#Comp(0) Then LsTab.cex Else LsTab.Cexoz End
+      Left outer join KatPodr on KatPodr.Nrec = LsTab.cex
+      left outer join Catalogs on Catalogs.Nrec = CASE WHEN LsTab.cAppoint=#COMP(0) THEN Lschet.cAppoint ELSE LsTab.cAppoint END
+      left outer join KlKatego on KlKatego.Kod = LsTab.Kateg
+      left outer join MOVELSC on MOVELSC.CLSCHET =Lschet.nrec
+          and MOVELSC.DATPOS<=:(DTE)
+          and MOVELSC.DATUV >=:(DTB)
+      where lstab.yearn =:(wYear)
+         and LsTab.mesn =:(wMes)
+         and (Lschet.DAtPos<=:(DTE) or COALESCE(MOVELSC.Nrec,#comp(0))<>#comp(0) )
+         %Filter_LsTab
+         %Filter_Kat
+         %Filter_Pers
+      Union
+      SELECT   Distinct
+       Lstab.Nrec as  cLstab // :comp
+      ,Perexod.Nrec as cPerexod//:comp
+      ,Perexod.Cexp as cKatPodr//:comp
+      ,Perexod.cAppoint as cAppoint//:comp
+      ,Perexod.Kateg as Kateg //  :word
+      ,Persons.Fio as Fio   ///  :string[100]
+      ,LsTab.tPerson as cPersons//:comp
+      ,LsTab.cLschet   as cLschet // :comp
+      ,COALESCE(SubString(KatPodr.Kod,1,3),'-') as Podr_kod
+      ,KatPodr.Kod as Podr_kodAll
+      ,Persons.STRTABN as STRTABN
+      ,COALESCE(KatPodr.Name,'-') as Podr_name
+      ,COALESCE(KatPodr.Nrec,#Comp(0)) as Podr_nrec
+      ,COALESCE(Catalogs.Name,'') as sPost
+      ,LsTab.MesN //   :word
+      ,LsTab.YearN //
+      From LsTab
+      inner join Perexod on PEREXOD.CLSCH = lstab.cLSchet
+          and PEREXOD.DATIZM>=:(DTB) and PEREXOD.DATIZM<=:(DTE)
+      Inner join Persons on Persons.Nrec = LsTab.tPerson
+      Inner join Lschet  on Lschet.Nrec = LsTab.cLschet
+        and (Lschet.DatUv=#Date(0,0,0)  or Lschet.DatUv>=:(DTB) )
+      Left outer join KatPodr on KatPodr.Nrec = Case
+             when Perexod.Cexp = #Comp(0) then LsTab.cex else Perexod.Cexp end
+      left outer join Catalogs on Catalogs.Nrec = Case
+             when Perexod.cAppoint = #Comp(0) then LsTab.cAppoint else Perexod.cAppoint end
+      left outer join KlKatego on KlKatego.Kod = Perexod.Kateg
+      where lstab.yearn =:(wYear)
+         and LsTab.mesn =:(wMes)
+         %Filter_Perexod
+         %Filter_Kat
+         %Filter_Pers
+    )); //queryManager.createQuery(SQLQuery(
+    if IsBitCTW(wFilter,1)
+    { //sqlAddStr(hStrFilter ,iQBuilder.MakeCriteriaFromMarker(' and CASE WHEN LsTab.Cexoz=#Comp(0) Then LsTab.cex Else LsTab.Cexoz End ',DepList));
+      sqlAddStr(hStrFilter ,iQBuilder.MakeCriteriaFromMarker(' and LsTab.cex  ',DepList));
+      sqlAddStr(hStrFilter1,iQBuilder.MakeCriteriaFromMarker(' and Perexod.cexp ',DepList));
+      timelog('SborData:фильтр по подразделениям hStrFilter='+string(hStrFilter));
+    }
+    //---------------------
+    if (hStrFilter<>0)
+    { Q.setMacro('Filter_LsTab',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { Q.setMacro('Filter_LsTab','');
+    }
+    //---------------------
+    if (hStrFilter1<>0)
+    { Q.setMacro('Filter_Perexod',hStrFilter1);
+      sqlFreeStr(hStrFilter1);
+    }
+    else
+    { Q.setMacro('Filter_Perexod','');
+    }
+    //---------------------
+    if IsBitCTW(wFilter,2)
+    { sqlAddStr(hStrFilter_kat ,iQBuilder.MakeCriteriaFromMarker(' and KlKatego.Nrec ',MarkKat));
+      timelog('SborData:фильтр по категориям hStrFilter='+string(hStrFilter_Kat));
+    }
+    if (hStrFilter_Kat<>0)
+    { Q.setMacro('Filter_Kat',hStrFilter_Kat);
+      sqlFreeStr(hStrFilter_Kat);
+    }
+    else
+    { Q.setMacro('Filter_Kat','');
+    }
+    //---------------------
+    if IsBitCTW(wFilter,3)
+    { sqlAddStr(hStrFilter_Pers ,iQBuilder.MakeCriteriaFromMarker(' and Lstab.tPerson ',Marker_Persons));
+      timelog('SborData:фильтр по сотрудникам hStrFilter='+string(hStrFilter_Pers));
+    }
+    if (hStrFilter_Pers<>0)
+    { Q.setMacro('Filter_Pers',hStrFilter_Pers);
+      sqlFreeStr(hStrFilter_Pers);
+    }
+    else
+    { Q.setMacro('Filter_Pers','');
+    }
+
+    //---------------------
+
+    if (Q.Execute.ErrorCode<>0)
+    { message('Ошибка выполнения DSQL запроса 1 при отборе значений ('+string(Q.ErrorCode)+').',error);
+      Exit;
+    }
+    else
+    { wErr:=sqlCopyInto(Q.getResultSet,TNtmp_LsTab,true);
+      timelog('SborData этап 1 '+String(wErr)+', выбрали '+RecordsInTable(TNtmp_LsTab));
+    }
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса 001 '+ExploreException);
+  }
+  _finally
+  {
+  }
+  StopVisual('',0);
+  StartNewVisual(vtIndicatorVisual,vfTimer + vfBreak + vfConfirm
+        ,'Сбор данных за '+string(wMes)+' мес. '+string(wYear)+' год'
+        ,RecordsInTable(#tmp_Lstab));
+  _pLsTab:=0;
+  _loop fullcache tmp_lstab
+  { if not nextvisual then exit;
+    if _pLsTab<>tmp_lsTab.cLstab
+    { _pLsTab:=tmp_lsTab.cLstab;
+      Tabel_Init;
+    }
+    InsTabel(tmp_lsTab.cPerexod);
+  } // _loop lstab
+  SborData:=true;
+  timelog('GP_WT_WorkWithAbsences->SborData:FINISH '+RecordsInTable(#tmp_report_sp));
+
+} //Function SborData : boolean;
+
+//=======================================
+Function HideShowColumnXLS(hideColumn:longint; _width:word=0):boolean;
+{ Result:=xlSetColumnWidth(_width, 1,hideColumn, 1,hideColumn);
+}
+
+//=======================================
+// Печать данных
+//---------------------------------------
+Function PrintDoc(_wTP:word; _wLev:word; _Prec:comp):longint;
+var
+    ii:word;
+    ww_str:string;
+{ #__UNUSED__(_wTP,_wLev,_Prec)
+  Result:=0;
+
+  set PRep:=_Prec;
+  maxColCount:=37;//29 + 2 на месяц/год
+  if not iNextVisual('Вывод данных ')
+  { Result:=-1;
+     exit;
+  }
+  ww_str:='Отчетный период: '+DateToStr(DTB_Period,'DD month YYYY г.')
+      +' -' +DateToStr(DTE_Period,'DD month YYYY г.')
+    ;
+  wexrow:=2; wexcol:=1;
+  MyPutExcel(ww_Str,10,0,-1,-1);
+  //-----------------
+
+  HeaderStrCount:=4;
+  wexrow:=HeaderStrCount+1;
+  MyXlCreaMatrix(1000,maxColCount);
+  wexrow:=wexrow-1;
+  _Loop tmp_report_sp
+  { wexrow++;wexcol:=1;
+    if not NextVisual then break;
+
+    MyPutExcel(chr(13)+tmp_report_sp.dms[1],10,0,-1,-1);//№ подразделение
+    MyPutExcel(chr(13)+tmp_report_sp.dms[36],10,0,-1,-1);//полное подразделение
+    MyPutExcel(tmp_report_sp.dms[2],10,0,-1,-1);//наименование подразделения
+    MyPutExcel(tmp_report_sp.dms[3],10,0,-1,-1);//Фамилия
+    MyPutExcel(chr(13)+tmp_report_sp.dms[37],10,0,-1,-1);//табельный номер
+    MyPutExcel(tmp_report_sp.dms[4],10,0,-1,-1);//Должность
+    MyPutExcelNumber(tmp_report_sp.Kateg ,0,10,0,-1,-1);//Категория
+    MyPutExcelNumber(tmp_report_sp.Yearn ,0,10,0,-1,-1);//Год
+    MyPutExcelNumber(tmp_report_sp.MesN ,0,10,0,-1,-1);//Месяц
+
+    for(ii:=5;ii<=maxColCount;ii++)
+    {
+      if isBitCTW(wOption,1)
+      {
+        MyPutExcelNumber(tmp_report_sp.dmd[ii]/24,5,10,0,-1,-1);//Фамилия
+      }
+      else
+      {
+        MyPutExcelNumber(Round(tmp_report_sp.dmd[ii]/8,2),if(ii>=5,2,0),10,0,-1,-1);//Кадры сказали считать в днях,а именно делить на 8...
+      }
+    }
+
+  } //_Loop tmp_report_SP
+  //нужно установить формат
+  if isBitCTW(wOption,1)
+  { //сделал в шаблоне xlSetNumberFormat('[h]:mm:ss;@',HeaderStrCount+1,7,wexrow,maxColCount);
+  }
+  MyxlWriteMatrix(wexrow);
+  xlFreeMatrix;
+  matrixkl:=False;
+  MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount+1 ,1,wexrow,maxColCount); //Обрамление
+  xlWrapText(HeaderStrCount, 1, wexrow, maxColCount);
+  //-------- спрячем колонки с месяцем и годом
+
+  if not isBitCTW(wOption,2)
+  { HideShowColumnXLS(8);
+    HideShowColumnXLS(9);
+  }
+
+
+  //******************************************
+  // Подписи
+  //******************************************
+  wexrow:=wexrow+3;  wexcol:=1;
+  xlMergeCells(wexrow,1,wexrow,3);
+  MyPutExcel(sDolg,10,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=1;
+  xlMergeCells(wexrow,1,wexrow,3);
+  MyPutExcel(MyGetInitial(sPopdis,true),10,0,-1,-1); //
+  wexcol:=8;//6
+  MyPutExcel('подпись',8,0,-1,-1); //
+  MyxlFrameCells( xlBorderT  , xlThin, 0, 0, wexrow ,5,wexrow,6); //Обрамление
+
+} //Function PrintDoc(_wTP:word; _wLev:word; _Prec:comp):longint;
+
+
+//------------------------------------
+// Установить период в датах
+//------------------------------------
+Procedure SetPeriodDT;
+{ DTB_Period:=date(1,wMesB,wYearE);
+  DTE_Period:=date(Last_Day(Date(1,wMesE,wYearE)),wMesE,wYearE);
+}
+//------------------------------------
+//
+//------------------------------------
+Function FormDoc:boolean;
+var
+   werr:word;
+{ timelog('FormDoc:Start');
+  if IsBitCTW(wFilter,1)
+  { if DepList <> 0
+      DoneMarker(DepList, '');
+    DepList := CLSF.LoadCurrentDepartmentList;
+  }
+  ClearFuncCache;
+  pStatus_GetDefault:=pGP_SCUD_A.GetStatus_Default();
+#IFDEF GP_WT_WorkWithA_PER_BY_MES
+  SetPeriodDT;
+
+  if DTB_Period>DTE_Period
+  { Message('Начало периода не может быть больше окончания');
+    Exit;
+  }
+#ELSE
+  wMesB :=Month(DTB_Period);
+  wYearB:=Year (DTB_Period);
+  wMesE :=Month(DTE_Period);
+  wYearE:=Year (DTE_Period);
+#ENDIF
+  DT_Calc:=DTB_Period;
+  LogFileNm:=GetStringParameter('Files','OutputFilesDirectory',0)
+                               +'!GP_WT_OVER.log';
+  nmtemplate:='GP_WT_WorkWithAbsences.xlsm';
+  if isBitCTW(wOption,1)
+  { nmtemplate:='GP_WT_WorkWithAbsences_H_MM.xlsm';
+  }
+  werr:=ExcelInit(nmtemplate,true);
+
+  if FileExist(LogFileNm) DeleteFile(LogFileNm);
+  MyLogWrite(true,'START');
+  MyLogWrite(false,' pN otationRV1='+string(pNotationRV1,0,0)+', pNotationRV2='+string(pNotationRV2,0,0));
+  matrixkl:=false;
+  //----------------------------
+  ResetBounds(#tmp_Report_sp);
+  Delete all tmp_Report_sp;
+  Delete all tmp_Report_sp;
+  SetBounds(#tmp_Report_sp);
+
+  ResetBounds(#tmp_Zauv);
+  Delete all tmp_Zauv;
+  Delete all tmp_Zauv;
+  SetBounds(#tmp_Zauv);
+
+  //----------------------------
+  // Инициализация
+  //----------------------------
+  MyLogWrite(false,' Вершина дерева '+string(pRep_Main));
+
+  //----------------------------
+  // Сбор данных
+  //----------------------------
+  //--- соберем заявления
+  _TRY
+  { SQL Select
+       GP_SCUD_Doc.DocDate                as EventDate // : date "Дата события"
+     , GP_SCUD_Doc_SP.EventTmB            as EventTmB  // : time "Время события с"
+     , GP_SCUD_Doc_SP.EventTmE            as EventTmE  //  : time "Время события по"
+     , COALESCE(GP_SCUD_Reason.wType,0)   as wType
+     , GP_SCUD_PERS.cPersons              as cPersons
+     , GP_SCUD_Doc_SP.cGP_Scud_Pers       as cGP_Scud_Pers
+     , Gp_SCUD_DOC_SP.Nrec as cGp_SCUD_DOC_SP// :comp
+     , Gp_SCUD_DOC.Nrec as cGp_SCUD_DOC //    :comp
+    FROM
+      Gp_SCUD_DOC
+    Inner join GP_SCUD_Doc_SP on GP_SCUD_Doc_SP.cGP_SCUD_Doc = GP_SCUD_Doc.Nrec
+    inner join GP_SCUD_PERS   on GP_SCUD_PERS.Nrec = GP_SCUD_Doc_SP.cGP_SCUD_PERS
+    inner join GP_SCUD_Reason on GP_SCUD_Reason.Nrec = GP_SCUD_Doc.cReason
+    WHERE  GP_SCUD_Doc.wType=1010 //GP_iSC_statement_on_absence;//1010
+      and (GP_SCUD_Doc.cStatus<>:(pStatus_GetDefault) )
+      and :(DTB_Period)<=GP_SCUD_Doc.DocDate
+      and :(DTE_Period)>=GP_SCUD_Doc.DocDate
+    into Tmp_ZAUV ;
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса 001 '+ExploreException);
+  }
+  _finally
+  { timelog('отобрали заявлений '+String(RecordsInTable(#Tmp_ZAUV)));
+  }
+  //------------------------------
+
+
+  //for(wMes:=wMesB;wMes<=wMesE;wMes++)
+  DT_Calc:=DTB_Period;
+  do
+  { wMes :=month(DT_CALC);
+    wYear:=year(DT_CALC);
+
+    Result:=SborData;
+    if not Result exit;
+    DT_CALC:=Add_months(DT_CALC,1);
+  } //for(wMes:=wMesB;wMes<=wMesE;wMes++)
+  while DT_Calc<DTE_Period
+  //---------------------------------
+  delete tmp_report_sp where
+      tmp_report_sp.dmd[06]=0 and tmp_report_sp.dmd[07]=0 and tmp_report_sp.dmd[08]=0 and tmp_report_sp.dmd[09]=0 and tmp_report_sp.dmd[10]=0
+  and tmp_report_sp.dmd[11]=0 and tmp_report_sp.dmd[12]=0 and tmp_report_sp.dmd[13]=0 and tmp_report_sp.dmd[14]=0 and tmp_report_sp.dmd[15]=0
+  and tmp_report_sp.dmd[16]=0 and tmp_report_sp.dmd[17]=0 and tmp_report_sp.dmd[18]=0 and tmp_report_sp.dmd[19]=0 and tmp_report_sp.dmd[20]=0
+  and tmp_report_sp.dmd[21]=0 and tmp_report_sp.dmd[22]=0 and tmp_report_sp.dmd[23]=0 and tmp_report_sp.dmd[24]=0 and tmp_report_sp.dmd[25]=0
+  ;
+  //---------------------------------
+
+  StopVisual('',0);
+  //----------------------------
+  // Печать
+  //----------------------------
+  StartNewVisual(vtIndicatorVisual,vfTimer + vfBreak + vfConfirm,'Вывод данных'
+        ,RecordsInTable(#tmp_report_sp));
+  PrintDoc(0,0,0);
+  MyXlEnd;
+  Timelog('FomDoc : Finish  ');
+} //Function FormDoc:boolean;
+
+//-------------------------------------
+Screen scrParam 'Параметры формирования' (,,sci1Esc);
+Table Zar_User;
+Fields
+#IFDEF GP_WT_WorkWithA_PER_BY_MES
+  wMesB :#Month_List
+  wYearB:noProtect;
+  wMese :#Month_List
+  wYearE:noProtect;
+#ELSE
+  DTB_Period : noprotect;
+  DTE_Period : noprotect;
+#ENDIF
+  sPopdis  :NoProtect,PickButton;// подпись отчета
+  sDolg    :NoProtect,PickButton;// подпись отчета
+  logfilekl:NoProtect;
+  wFilter:NoProtect;
+  //FILTR_KatPodr : Protect,PickButton;
+  FiltrPodr: Protect,PickButton;
+  VidKat   : Protect,PickButton;
+  Filtr_Persons: Protect,PickButton;
+  wOption:NoProtect;
+Buttons
+#IFDEF GP_WT_WorkWithA_PER_BY_MES
+  cmValue1, [singleline],,, 'назад' , hcAllBOk, scGalDial;
+  cmValue2, [singleline],,, 'вперед', hcAllBOk, scGalDial;
+  cmValue3, [singleline],,, 'назад' , hcAllBOk, scGalDial;
+  cmValue4, [singleline],,, 'вперед', hcAllBOk, scGalDial;
+#ENDIF
+  cmOk,default,,'Сформировать отчет', hcOplTrudhlp, sci1Esc;
+  cmCancel,,,'Выход', hcOplTrudhlp, sci1Esc;
+<<
+#IFDEF GP_WT_WorkWithA_PER_BY_MES
+  `Период`
+  `c` .@@@@@@@@@@ мес. .@@@@@@ год <.<<.> <.>>.>
+  `по`.@@@@@@@@@@ мес. .@@@@@@ год <.<<.> <.>>.>
+#ELSE
+  `Период`
+  `c` .@@@@@@@@@@@@@@  `по`.@@@@@@@@@@@@@
+#ENDIF
+  `Фио подписанта`
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Должность подписанта`
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  `Фильтры`                  [.] Отладка`
+  [.] По подразделению`.@@@@@@@@@@@@@@@@@@@@@
+  [.] По категории`    .@@@@@@@@@@@@@@@@@@@@@
+  [.] По сотруднику`   .@@@@@@@@@@@@@@@@@@@@@
+
+  `Опции`
+  [.] Выводить время в часах-минуты`
+  [.] Выводить раздельно по месяцам`
+
+  <.~С~формировать.>   <.  ~О~тмена  .>
+>>
+end; //scrParam 'Параметры формирования' (,,sci1Esc), Cyan;
+
+
+//--------------------------------------------
+// Обработчик событий интерфейса
+//--------------------------------------------
+HandleEvent
+//------------------------------
+cmInit:
+{ TimeLog_Init;
+  ReadParam;
+  var CL: ContextList;
+  if (not CL.Add(CS, 'WorkingTable'))
+  { abort;
+    exit;
+  }
+  sUserName:=UserName();
+}
+//------------------------------
+cmDone:
+{ SaveParam;
+}
+//------------------------------
+cmPick:
+{  case CurField of
+   //----------------------------
+   #sPopdis,#sDolg :
+   {
+      var wK:word;
+      var DummyMarker1, DummyMarker2: TPtr;
+      var _pTmp:comp=0;
+      var _cRec:comp;
+      DummyMarker1 := InitMarker('', 8, 10, 10);
+      DummyMarker2 := InitMarker('', 8, 1, 1);
+      wK:=0;
+      _pTmp:=0;
+
+      if (viCYPersons.Choice(DummyMarker1, 3, vfCanSelect, wK, _cRec, DummyMarker2))
+      {
+        set _pTmp:=viCYPersons.GetPsnByKindChoice(wK, _cRec);
+        vSpr.pPerson :=_pTmp;
+        if vSpr.Getfirst Persons=tsok
+        { sPopdis:=vSpr.Persons.Fio;
+          if vSpr.Getfirst Appointments=tsok
+           sDolg:=iCatFunc.GetCatalogsName(vSpr.Appointments.Post);
+        }
+      }
+      DoneMarker(DummyMarker1, '');
+      DoneMarker(DummyMarker2, '');
+   }
+
+   //------------
+   #FiltrPodr:
+   {
+     SetupDepartments(comp(11));
+     //UpdateFilter;
+     if PAF.IsDepartmentFilterSet <> IsBitCtW(wFilter,1)
+       BitOnW(wFilter,1);
+   }
+   //------------------------------
+   #VidKat:
+   {
+      RunInterface(pickkat1,word(0), MarkKat, vfMultipleSelection);
+      SelectMarKat;
+      BitOnW(wFilter,2);
+   }
+   //------------------------------
+   #Filtr_Persons:
+   { KauMarkerName := iGetKau.GetMarkerName(cgKau_Persons);
+     StoreMarker(Marker_Persons,KauMarkerName);
+     If (iGetKau.GetCodeKau(cgiPickMult+cgiNotClear,cgKau_Persons,Comp(0)) <> 0)
+     { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+       CopyMarker(Marker_Persons,Marker_Tmp);
+       DoneMarker(Marker_Tmp,'');
+       SetFilterNm(#Filtr_Persons);
+       BitOnW(wFilter,3);
+     }
+   }
+   end;
+} //cmPick:
+cmDelOnProtect:
+{
+   case CurField of
+   //--------------
+   #FiltrPodr:
+   {
+     PAF.ClearDepartmentFilter;
+     ReReadRecord(#ZAR_USER);
+     BitOffW(wFilter,1);
+     //   UpdateFilter;
+   }
+   //------------------------------
+   #VidKat:
+   { ClearMarker(MarkKat);
+      SelectMarKat;
+      BitOffW(wFilter,2);
+   }
+   //------------------------------
+   #Filtr_Persons:
+   { ClearMarker(Marker_Persons);
+     BitOffW(wFilter,3);
+     SetFilterNm(#Filtr_Persons);
+   }
+   end;
+} //cmDelOnProtect:
+#IFDEF GP_WT_WorkWithA_PER_BY_MES
+//------------------------------
+cmValue1:
+{ set wMesB:=wMesB-1;
+  if wMesB=0
+  { wMesB:=12; wYearB:=wYearB-1;
+  }
+  SetPeriodDT;
+  if DTE_Period<DTB_Period
+  { set wmesE :=wMesB;
+    set wYearE:=wYearB;
+  }
+}
+//------------------------------
+cmValue2:
+{ set wMesB:=wMesB+1;
+  if wMesB>12
+  { wMesB:=1; wYearB:=wYearB+1;
+  }
+  SetPeriodDT;
+  if DTE_Period<DTB_Period
+  { set wmesE :=wMesB;
+    set wYearE:=wYearB;
+  }
+}
+//------------------------------
+cmValue3:
+{ set wMesE:=wMesE-1;
+  if wMesE=0
+  { wMesE:=12; wYearE:=wYearE-1;
+  }
+  SetPeriodDT;
+  if DTE_Period<DTB_Period
+  { set wmesB :=wMesE;
+    set wYearB:=wYearE;
+  }
+}
+//------------------------------
+cmValue4:
+{ set wMesE:=wMesE+1;
+  if wMesE>12
+  { wMesE:=1; wYearE:=wYearE+1;
+  }
+  SetPeriodDT;
+  if DTE_Period<DTB_Period
+  { set wmesB :=wMesE;
+    set wYearB:=wYearE;
+  }
+}
+#ENDIF
+//------------------------------
+cmCheckField:
+{ case CurField of
+#IFDEF GP_WT_WorkWithA_PER_BY_MES
+  #wmesB,#wYearB:
+  { SetPeriodDT;
+    if DTE_Period<DTB_Period
+    { message('Дата окончания периода не может быть меньше даты начала');
+      set DTE_Period:=DTB_Period;
+      set wmesE :=wMesB;
+      set wYearE:=wYearB;
+    }
+  }
+  //------------------------------
+  #wmesE,#wYearE:
+  { SetPeriodDT;
+    if DTE_Period<DTB_Period
+    { message('Дата окончания периода не может быть меньше даты начала');
+      set DTB_Period:=DTE_Period;
+      set wmesB :=wMesE ;
+      set wYearB:=wYearE;
+    }
+  }
+#ELSE
+  //------------------------------
+  #DTB_Period:
+  { if DTE_Period<DTB_Period
+    { message('Дата окончания периода не может быть меньше даты начала');
+      set DTE_Period:=DTB_Period;
+    }
+  }
+  //------------------------------
+  #DTE_Period:
+  { if DTE_Period<DTB_Period
+    { message('Дата окончания периода не может быть меньше даты начала');
+      set DTB_Period:=DTE_Period;
+    }
+  }
+#ENDIF
+  end;
+}
+//------------------------------
+cmOk:
+{  xlKillExcel;
+   StartNewVisual(vtNumericVisual,vfTimer + vfBreak + vfConfirm,'Подготовка данных для отчета',0);
+   if not FormDoc then message('Ошибки при формировании');
+   StopVisual('',0);
+   xlKillExcel;
+   //CloseInterFace(cmDone);
+}
+end;
+
+end.

@@ -1,0 +1,500 @@
+/*************************************************************************************************\
+* Наименование:  Доработка ведения заказов/проектов                                               *
+*                РПД № 01 Интерфейс приказа "Прием"                                               *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:    Доработки для учета в СКУД                                                       *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#175          |18/10/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Доработка   |#1358         |04/12/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Доработка   |#1931         |22/02/18|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Доработка   |#2356         |08/05/18|Тищенко Р.Н.             |НПО Энергомаш                    *
+* Разработка  |#52868(пер.)  |22/06/23|kurennykh                |НПО Энергомаш                    *
+\*************************************************************************************************/
+// отключаем extendFormats
+#include GetKau.vih
+#include RPD.Vih
+#include Marker.Vih
+#include GP_SCUD_PersEdit.Vih
+#include GP_LSBankReq.vih
+
+#component "Z_STAFFORDERS"
+
+#doc
+  Интерфейс приказа "Прием на работу"
+  Доработки системы для учета в СКУД
+#end
+
+//******************************************************************************
+Alter Interface RPD_1 ;
+//******************************************************************************
+
+OverLoad
+  Procedure DeleteNewDataUnderButtons(cComp: comp);
+  function IRPD_Base.ChildCheckOneOrder(cNrec : comp = 0): boolean;
+  function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+  //Procedure IRPD_Base.EnableDisable;
+  procedure IRPD_Base.MyDel;
+  Procedure FillFirstPersons(bCheckNeedTabn: boolean);
+end;
+
+var
+  iGP_SCUD_PersEdit:GP_SCUD_PersEdit;//для работы с картотекой в СКУД
+  IsShiftAllObj: boolean;
+
+#include GP_LSBankReq.var
+
+Create View
+var
+  wFakel      : word;
+  cTrDogType  : comp;
+  cJobNature  : comp;
+  cKindApp    : comp;
+  cTrDog      : comp;
+as
+select
+  1
+from
+  SpAllStaff LastSpAllStaff
+;
+
+// Сдвигает в анкетном редакторе scr вниз на DeltaCount строк все поля начиная с поля ObjFrom
+function ShiftAllObj(scr, ObjFrom: string; DeltaCount: word = 1): boolean;
+{
+  result := false;
+
+  var yFrom: integer = 0;
+  var rc: longint = cfsGetProp(ObjFrom, cfpOrigin_Y, yFrom);
+  if (rc <> cfOK or yFrom = 0)
+    exit;
+  var Delta: integer = 0;
+  rc := cfsGetProp(ObjFrom, cfpSize_Y, Delta);
+  if (rc <> cfOK or Delta = 0)
+    exit;
+  Delta += 6;
+  Delta *= DeltaCount;
+
+  var aList: array [1..1] of string;
+  SetLimit(aList, 0);
+  rc := cfsEnumObjects(scr, aList, false);
+  if (rc <> cfOK)
+    exit;
+
+  var i, n: longint;
+  n := Count(aList);
+  for (i := 1; i <= n; i++) {
+    if (UpCase(aList[i]) = 'L_FIRSTSCR_БАНКОВСКИЕ_РЕКВИЗИТЫ_И_ПЕРЕЧИСЛЕНИЯ' or
+        UpCase(aList[i]) = 'I_FIRSTSCR_CONTDOC.WATTRDOC4')
+      continue;
+    var y: integer = 0;
+    rc := cfsGetProp(aList[i], cfpOrigin_Y, y);
+    if (rc = cfOK) {
+      if (y = 0) { // Может быть элемент скрыт
+        var IsVisible: boolean = false;
+        rc := cfsGetProp(aList[i], cfpVisible, IsVisible);
+        if (not IsVisible and rc = cfOK) {
+          cfsSetProp(aList[i], cfpVisible, true);
+          cfsGetProp(aList[i], cfpOrigin_Y, y);
+          cfsSetProp(aList[i], cfpVisible, false);
+        }
+      }
+
+      if (y > yFrom)
+        rc := cfsSetProp(aList[i], cfpOrigin_Y, y + Delta);
+    }
+  }
+  result := true;
+}
+extendFormats FirstScr;
+
+screen FirstScr;
+  Show  at (, 5,, 12.2) fixed_y;
+  Table ContDoc;// Без этого не работаю стандартные обработчики по событиям таблицы ContDoc
+  fields
+    ContDoc.wAttrDoc4 ('Копировать, или нет в открываемый лицевой счёт банковские реквизиты и перечисления из постоянных удержаний старого лицевого счёта',, sci13EnEsc):
+     [LIST 0 'копировать из старого ЛС',
+           1 'не заполнять'
+     ], protect;
+<<
+
+
+
+
+
+
+
+
+
+
+`Банковские реквизиты и перечисления`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+
+end;
+
+procedure EnableDisableBankReq;
+{
+  // Поле "Банковские реквизиты и перечисления" доступно только если в поле "Вариант оформ-я" значение "Повторное трудоустройство"
+  // и в поле "Вариант ЛС и карточки" значение "Новые ЛС и карточка" или "Новый ЛС, старая карточка"
+  // RepeatEmpl - константа из стандартного интерфейса RPD_1
+  //SetFieldAndLabelVisible(#ContDoc.wAttrDoc4, fnFieldsOpen and ContDoc.wDopAttr = RepeatEmpl
+  // and (ContDoc.wOrder = 0 or ContDoc.wOrder = 2));
+  SetFieldAndLabelVisible(#ContDoc.wAttrDoc4,ContDoc.wDopAttr = RepeatEmpl);
+  ToggleFieldSelectable(#ContDoc.wAttrDoc4,TitleDoc.wStatus=0);
+}
+
+//******************************************************************************
+// Процедура очистки введенных данных, привязанных к карточке
+//******************************************************************************
+Procedure DeleteNewDataUnderButtons(cComp: comp);
+{ //на вход идет ContDoc.Person - если там 0, то будет удалено много информации по не утвержденным приказам
+  if cComp=0 then Exit;
+  Inherited::DeleteNewDataUnderButtons(cComp);
+}
+
+//******************************************************************************
+//  Процедура удаления
+//******************************************************************************
+procedure IRPD_Base.MyDel;
+{ if TitleDoc.wStatus=1
+    iGP_SCUD_PersEdit.DeleteBufferPers(Persons.Nrec,ContDoc.ObjNrec,TitleDoc.Nrec,Contdoc.Nrec,PartDoc.TypeOper);
+  inherited::MyDel;
+} //procedure IRPD_Base.MyDel;
+//******************************************************************************
+//  Процедура утверждения индивидуального приказа по текущему работнику (по таблице ContDoc)
+//******************************************************************************
+function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+{ 
+  // Ищем предыдущий лицевой счёт
+  var _cLSchetSrc: tNRec = 0;
+  if cNrec <> 0
+    GetFirst ContDoc where ((cNrec == ContDoc.NRec));
+  if (GetFirstLschet(ContDoc.cNew1))
+    _cLSchetSrc := LSchet.NRec;
+  Result:=Inherited::ChildConfirmOneOrder(cNrec);
+  if Result
+  { iGP_SCUD_PersEdit.MakeBufferPers(Persons.Nrec,ContDoc.ObjNrec,TitleDoc.Nrec,Contdoc.Nrec,PartDoc.TypeOper);
+    // Если в поле "Вариант оформ-я" выбрано значение "Повторное трудоустройство"
+    if (ContDoc.wDopAttr = RepeatEmpl)
+      // и в поле "Вариант ЛС и карточки" значение "Новые ЛС и карточка" или "Новый ЛС, старая карточка"
+      if (ContDoc.wOrder = 0 or ContDoc.wOrder = 2)
+        // и в поле "Банковские реквизиты и перечисления" выбрано "копировать из старого ЛС"
+        if (ContDoc.wAttrDoc4 = 0)
+        {
+          // Копируем в открываемый лицевой счёт банковские реквизиты и перечисления из постоянных удержаний
+          // старого лицевого счета
+          // Ищем новый лицевой счёт
+          //var _cLSchetDst: tNRec = oGP_LSBankReq.FindLSchet(ContDoc.LiTabN, ContDoc.StTabN);
+          var _cLSchetDst: tNRec=0;
+          if ( GetFirstLschet(Persons.nRec) )
+            _cLSchetDst:=Lschet.nrec;
+
+          timelog('RPD1->ChildConfirmOneOrder:Банк '+string(_cLSchetSrc,0,0)+', '+string(_cLSchetDst,0,0));
+          if (_cLSchetSrc <> 0 and _cLSchetDst <> 0)
+          and (_cLSchetSrc <>  _cLSchetDst)
+          {
+            // в поле "Начало пересчёта" проставляем наибольшую дату из двух: либо дату повторного приема на работу из приказа,
+            // либо дату начала отчётного периода модуля Зарплата
+            var _StartPerDt: Date = dGetTune('UP.DATOTCH');
+            if (ContDoc.dPrik > _StartPerDt)
+              _StartPerDt := ContDoc.dPrik;
+            // Копируем банковские реквизиты
+            oGP_LSBankReq.CopyBankReq(_cLSchetSrc, _cLSchetDst, true, _StartPerDt);
+            displ('Скопированы банковские реквизиты');
+            //Проведена привязка старого и нового лицевых счетов сотрудника: Абратанов Николай
+          }
+          else
+          { displ(Persons.fio+': Не скопированы банковские реквизиты');
+          }
+        }
+  }
+} //function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+
+//******************************************************************************
+// можно вынести в RPD_BASE, но тогда начинают идти 6 предупреждений на base_Payment
+// да и EnableDisable в 8 перехвачена
+//******************************************************************************
+Create view vNotes
+var
+  nRecTable:comp;
+  wChoice  :word;
+From Notes
+where ((
+      wChoice     == Notes.choice
+  and nRecTable   == Notes.Owner
+));
+
+File FMemo;
+
+Function MyCheckNotes(_wChoice:word):boolean;
+{ Result:=false;
+  vNotes.nRecTable:=ContDoc.Nrec;
+  vNotes.wChoice  :=_wChoice;
+  Result:=vNotes.Getfirst Notes=tsok;
+  if not Result exit;
+  if FMemo.OpenMemo(vNotes.Notes.NOTE)
+  { Result:=FMemo.GetSize()<>0;
+    FMemo.Close;
+  }
+} //Function MyCheckNotes(_wChoice:word):boolean;
+//******************************************************************************
+// Установить надписи на кнопках
+//******************************************************************************
+Procedure MySetButtonTitle(_nm_screen:string='');
+{ //'Z_STAFFORDERS::NOTESFORCONTDOC.Memo_NOTES.NOTE'
+  var ww_str:string;
+  if _nm_screen='' _nm_screen:='b_SCRDOC';
+  //cmViewAdvance1
+  ww_str:=if(MyCheckNotes(3002),'Примечан.+','Примечание');
+  cfsSetProp(_nm_screen+'_Примечание',cfpTitle,ww_str);
+  //--
+  ww_str:=if(MyCheckNotes(3005),'Доп.условия+','Доп. условия');
+  cfsSetProp(_nm_screen+'_Доп._условия',cfpTitle,ww_str);
+  ReScanPanel(#PERSONS);
+} //Procedure MySetButtonTitle;
+
+//******************************************************************************
+// Процедура открытия\закрытия полей для редактирования
+//******************************************************************************
+/*Procedure IRPD_Base.EnableDisable;
+{
+  timelog('RPD_1->EnableDisable:Start:fnFieldsOpen='+string(fnFieldsOpen)+',wModeView='+string(wModeView));
+  timelog('RPD_1->EnableDisable:ContDoc.wDopAttr = UsualReception='+string(ContDoc.wDopAttr = UsualReception));
+  timelog('RPD_1->EnableDisable:ContDoc.wDopAttr = UsualReception='+string(ContDoc.wDopAttr = UsualReception));
+
+  //-------------------------
+  MySetButtonTitle('b_SCRDOC');
+  //-------------------------
+  Inherited::EnableDisable;
+  //-------------------------
+
+  if (boGetTune('UP.STAFF.COMMONRULES.GP_DisableTaxRate')) //Запретить редактирование поля "Тар.стаф. Оклад"
+    ToggleFieldSelectable(#AppHist.TaxRate,false);
+  EnableDisableBankReq;
+
+  //Характер работы
+  cfsSetExtProp('i_FIRSTSCR_JOBNATURECAT.NAME',cfpFontBackColor,if(IsValidAll(tnJobNatureCat),0,ColorNeed));
+  timelog('RPD_1->EnableDisable:Finish');
+
+}//Procedure EnableDisable;  */
+
+function IRPD_Base.ChildCheckOneOrder(cNrec : comp = 0): boolean;
+{
+  result:=inherited::ChildCheckOneOrder(cNrec);
+
+  if (not IsValidAll(tnJobNatureCat)) {
+    SetErrorOrder('Приказ утвердить нельзя: не указан характер работы.');
+    result := false;
+  }
+
+  if (ContDoc.dat1<>ZeroDate) {
+    if (ContDoc.dat1 <> Add_Day(ContDoc.dPrik,13) and
+        ContDoc.dat1 <> Sub_Day(Add_Months(ContDoc.dPrik,2),1) and
+        ContDoc.dat1 <> Sub_Day(Add_Months(ContDoc.dPrik,3),1) and
+        ContDoc.dat1 <> Sub_Day(Add_Months(ContDoc.dPrik,6),1)) {
+      SetErrorOrder('Приказ утвердить нельзя: поле "Испыт.срок по." должно содержать значения: 2 недели, 2 месяца, 3 месяца, 6 месяцев.');
+      result := false;
+    }
+  }
+
+  if (ContDoc.wDopAttr=UsualReception) //Прием/Обычное оформление приказа
+  { if (getfirst fastfirstrow Passports where((Persons.NRec==Passports.Person and 501==Passports.SysCode))=tsok)
+    { //СНИЛС
+      var RecCount:longint=0;
+      var _sFio    :string='';
+      var _StrTabn :string='';
+      //var d1:date=date(1,1,Year(ContDoc.dPrik));
+      sql
+        select Count(Passports.NRec),Max(Persons.Fio),Max(Persons.StrTabn)
+        from        Passports
+        inner join Persons on Persons.Nrec = Passports.Person
+      where   Passports.Nmb = :(Passports.Nmb) and  Passports.SysCode = 501
+          and Passports.Person <>:(Persons.Nrec)
+      into (RecCount, _sFio, _StrTabn);
+      if (RecCount>0)
+      {
+        result := false;
+        SetErrorOrder('Приказ утвердить нельзя: необходимо выбрать вариант оформления приказа "Повторное трудоустройство".');
+        SetErrorOrder('СНИЛС повторяется например у '+_StrTabn+','+_sFio+', всего '+string(RecCount)+' повторений' );
+      }
+      else
+      if (bCheckBeforePrint)
+      { SetErrorOrder('Предыдущее трудоустройство проверено.',Information);
+      }
+    } //if (getfirst fastfirstrow Passports where((Persons.NRec==Passports.Person and 501==Passports.SysCode))=tsok)
+  }//if (ContDoc.wDopAttr=UsualReception) //Прием/Обычное оформление приказа
+  // что то я не понял - скобок не хватает?
+  if (not result and boUsePartOrders and ContDoc.wYearPr = 3)
+    update current ContDoc set ContDoc.wYearPr := 0;
+} //function ChildCheckOneOrder(cNrec : comp = 0): boolean;
+
+Procedure CreateTrDog(_c : comp);
+{
+  if (_c <> 0h) then
+  {
+    Exit;
+  }
+
+  /*var newNum : string = '';
+
+  if (getLast LastSpAllStaff where ((     5 == LastSpAllStaff.wNoCon (noIndex)
+                                      and 0 << LastSpAllStaff.nRec              )) = tsOk) then
+  {
+    newNum := string(if(LongInt(LastSpAllStaff.ResString[1]) > 0, LongInt(LastSpAllStaff.ResString[1]) + 1, 1));
+  }*/
+
+  ClearBuffer(#SpAllStaff);
+    SpAllStaff.nRec         := 0h;
+    SpAllStaff.wNoCon       := 5;
+    SpAllStaff.ResComp[1]   := cTrDogType;
+    SpAllStaff.ResDate[1]   := TitleDoc.DocDate; //ContDoc.dPrik;
+    SpAllStaff.ResDate[2]   := TitleDoc.DocDate; //ContDoc.dPrik;
+    SpAllStaff.ResString[1] := TitleDoc.DocNmb; //newNum;
+  Insert Current SpAllStaff;
+
+  cTrDog := SpAllStaff.nRec;
+}
+
+Procedure FillFirstPersons(bCheckNeedTabn: boolean);
+{
+  inherited::FillFirstPersons(bCheckNeedTabn);
+
+  if (wFakel = 1) then
+  {
+    Set Persons.JobNature := cJobNature;
+    Update Current Persons;
+  }
+}
+
+
+//******************************************************************************
+// События таблицы ContDoc
+//******************************************************************************
+TableEvent table ContDoc;
+cmCheckField:
+{ timelog('RPD_1->ContDoc->cmCheckField:start');
+  case inherited::handleEvent(cmCheckField) of
+    heAbort: { abort; exit; }
+    heStop: { stop; exit; }
+  end;
+  timelog('RPD_1->ContDoc->cmCheckField:finish');
+
+}
+end;//TableEvent table ContDoc
+
+TableEvent Table Appointments;
+  cmCheckField :
+  {
+    if (inherited::HandleEvent(cmCheckField) = heAbort) then
+    {
+      Abort;
+    }
+    if (wFakel = 1) then
+    {
+      Case CurField Of
+        #ContDoc.dPrik:
+        {
+          ContDoc.Dat1 := Sub_Day(Add_Months(ContDoc.dPrik, 3), 1);
+          SetModified(true);
+          if (getFirst FastFirstRow LastSpAllStaff where ((cTrDog == LastSpAllStaff.nRec)) = tsOk) then
+          {
+            set LastSpAllStaff.ResDate[1] := ContDoc.dPrik;
+            Update Current LastSpAllStaff;
+          }
+        }
+      End;
+    }
+  }
+  cmSetDefault:
+  {
+    if (inherited::HandleEvent(cmSetDefault) = heAbort) then
+    {
+      Abort;
+    }
+    if (wFakel = 1) then
+    {
+      if (ContDoc.dPrik <> Date(0, 0, 0)) then
+      {
+        ContDoc.Dat1 := Sub_Day(Add_Months(ContDoc.dPrik, 3), 1);
+        CreateTrDog(cTrDog);
+        Appointments.KindApp := cKindApp;
+        Appointments.ResComp[1] := SpAllStaff.nRec;
+      }
+    }
+  }
+End;
+
+//------------------------
+// События интерфейса
+//------------------------
+HandleEvent
+  cmIdle: // бывают ведь и различные виды приема, когда надо дизеблить
+  {
+    case inherited::handleEvent(cmIdle) of
+    heAbort: { abort; exit; }
+    heStop: { stop; exit; }
+    end;
+    // Если сдвиг еще не произведен
+    if (not IsShiftAllObj)
+    { //'Z_STAFFORDERS::ORDERSLIST.WHATISINORDER.MDF.Z_STAFFORDERS::CONTAINEROFORDERS.MDF.
+      //Z_STAFFORDERS::RPD_1.FIRSTSCR.STRAHCAT.CATDATA'
+      // Сдвигаем в анкетном редакторе FirstScr поля чтобы освободить место для новых полей
+      IsShiftAllObj := ShiftAllObj('FIRSTSCR', 'i_FIRSTSCR_CONTDOC.WORDER');
+    }
+  }
+cmViewAdvance1: //просмотр примечания к приказу
+{ if  inherited :: handleEvent (cmViewAdvance1)=heAbort then Abort;
+  MySetButtonTitle;
+}
+
+cmValue21: //доп. условия
+{ if  inherited :: handleEvent (cmValue21)=heAbort then Abort;
+  MySetButtonTitle;
+  // почему то сразу не обновляется
+  EnableDisable;
+}
+cmOnVipLoad:
+{
+  timelog_init;
+  timelog('RPD_1->cmOnVipLoad');
+
+  case inherited::handleEvent(cmOnVipLoad) of
+    heAbort: { abort; exit; }
+    heStop:  { stop; exit; }
+  end;
+
+  wFakel := wGetTune('UP.FakelGAL.Fakel');
+  if (wFakel = 1) then
+  {
+    cTrDog := 0h;
+    cTrDogType := coGetTune('FAKEL.UP.RPD1.TRDOGTYPE');
+    cJobNature := coGetTune('FAKEL.UP.RPD1.JOBNATURE');
+    cKindApp   := coGetTune('FAKEL.UP.RPD1.KINDAPP');
+  }
+}
+cmCheckField:
+{ timelog('RPD_1->cmCheckField:start');
+  case inherited::handleEvent(cmCheckField) of
+    heAbort: { abort; exit; }
+    heStop: { stop; exit; }
+  end;
+  case CurField of
+  #ContDoc.wDopAttr, #ContDoc.wOrder:
+  {  EnableDisableBankReq;
+    //EnableDisable;
+  }
+  end;
+  timelog('RPD_1->cmCheckField:Finish');
+}
+cmPick:
+{ timelog('RPD_1->cmPick:Start');
+  case inherited::handleEvent(cmPick) of
+  heAbort: { abort; exit; }
+  heStop: { stop; exit; }
+  end;
+  timelog('RPD_1->cmPick:Finish');
+}
+
+end;
+
+END.

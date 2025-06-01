@@ -1,0 +1,1275 @@
+/*************************************************************************************************\
+* Наименование: Импорт Остатков ТМЦ\ Анализ и Установка КодА Партии Перед импортом партий         *
+* Контур/Модуль:                                                                                  *
+* Примечание:  запуск:  \Сервис \Утилиты \Запуск внешнего интерфейса                              *
+*  Привязка к партиям, которые создали пользователи из приходных документов                       *
+*  отличия таких партий: Atl_Owner, из 111 Katsopr. Установка им Кода из Источника                *
+*  и пометка Кода у партий из старого импорта без такой привязки                                  *
+* Вид работы  |Номер         |Дата      |Исполнитель              |Проект                         *
+* ---------------------------------------------------------------------------------------------   *
+* Разработка  |#3105         |20/11/2018|Шунин А.Г.               |НПО Энергомаш                  *
+\*************************************************************************************************/
+// component "C_EXPIMP"
+#include ImpDefine.vih
+#component "GP_Common"
+Interface GP_PartyImp 'Анализ и Установка КодА Партии Перед импортом партий из Excel' gray dialog;
+
+Const
+xlBCYellow =   65535; // Желтый
+xlBCBrown  =   49407; // Рыжий
+xlBCGreen  = 5296274; // Зелёный
+xlBCRed             =255; // Красный
+xlBCDarkRed         =192; // ТемноКрасный
+xlBC           =15773696; // Синий
+xlBCDark       =12611584; // ТемноСиния
+xlBCBlakBlue   = 6299648; // ЧёрноСиний
+xlBCDarkPurple =10498160; // ТёмноФиолетовый
+xlBCLiteGal    =15652797; // СветлоГалактический
+xlBCGal        =15123099; // Галактический
+
+xlBCError=xlBCBrown;
+xlBCFindOK=xlBCLiteGal;
+xlBCErrUpDate=xlBCYellow;
+
+end;
+;
+
+table struct mXLParty
+(
+// sPKOD, sPKOD0, sPNAME, sMCKOD : string;
+  Line: longint,
+  pKOD: string[20],
+  pNAME: string,
+  MCKOD: string[20],
+  sOrg: string[20],
+  cOrg: comp,
+  cmc: comp,
+  cParty: comp,
+  pp: word // номер прохода
+)
+with index (
+ i0 = Line, i1 = cParty + pp , i3 = pKOD + MCKOD
+)
+;
+
+Table struct mtAList
+(
+wTable:word, // код таблицы для атрибута, если < 100, то код поля для импорта, например wZak
+bob: word, // 0 - не обязательное, 1- обязательное порядок чтения
+Name: string[80], // Наименование атрибута
+Col: longInt, // колонка
+COut: longInt, // колонка куда выдавать старое значение
+cAttrnam:comp, // ссылка на Атрибут
+ATTRTYPE: word,
+rObject : word,
+// M: boolean,
+NameList: string// варианты наименований в Excel
+)
+with index (
+ i0 = Col , idx2 = bOb (Desc)
+)
+;
+
+
+// table struct tmPartyOUT (Line: longint, NN: Word, cParty: comp) with index (i1=Line+ NN);
+
+const
+ ImportOwner = Comp(000A000000000072h); // UserID = Alt_Owner
+ minNRec1 :comp = 100000000h;        // условно, Максимальный код из 1С
+end;
+table struct mtPartyFind
+(
+   cRec: comp, // KatParty.nRec
+   KOD: string[20],
+   NN : word  // приоритет по совпадению
+) with index (i1=NN + cREC);
+
+var
+ refImpDef : C_EXPIMP::ImpDefine;
+cCurrent_User: comp; // = UserId;
+lCapLine, // строка заголовка,
+Counter, MaxLine, MaxCol, npp : longint;
+sFileName, nm_file: string;
+
+lPKOD,lPNAME, lBarkod, lNumIN, lDIN , lNumINSF, lDINSF, lOrg  : longint;
+// НомерВходящегоДокумента	ДатаВходящегоДокумента	НомерВходящегоДокументаСФ	ДатаВходящегоДокументаСФ
+
+
+
+sPKODx, sPKOD, sPKOD0, sPNAME, sMCKOD: string; // , sOrg  : string;
+
+gError: word;
+sTune, sTuneOK,sError: String;
+
+sValue : string;
+Str, StrKod, StrName: string;
+// dd, dValue: double;
+// cc, cValue: comp;
+wFlagDop: word;
+NeedUpDateAtr, UpDateCnt: word;
+
+DCol: longint; // смещение для вывода старых значений
+
+pDsopr: Date;
+cPartyFind: comp;
+
+create view jView
+as select KatMC.nRec
+from
+ mXLParty
+ , mXLParty mXLPartyDB // Дубли
+ , KatMC, mtAList, AttrNam, mtPartyFind, KatParty, KatParty KatPartyMy // , KatParty KatPartyFree
+ , KatORG
+where
+((
+   sMCKOD == KatMC.BARKOD
+and mXLParty.cmc== KatPartyMy.CMC and sPKODx == KatPartyMy.KOD (noindex)
+
+and cPartyFind == KatParty.nRec
+
+and mXLParty.sOrg == KATORG.CODE
+
+and mXLParty.pKOD  == mXLPartyDB.pKOD
+and mXLParty.MCKOD == mXLPartyDB.MCKOD
+))
+;
+
+
+var
+ cPartyOK: comp;
+ sPkodOK: string;
+
+create view vUpParty
+as select KatPartyOther.KOD
+from
+  KatParty KatPartyOther
+where
+((
+  jView.mXLParty.cmc == KatPartyOther.CMC and sPkodOK == KatPartyOther.KOD (noindex) and (cPartyOK <> KatPartyOther.nRec)
+))
+;
+
+Create view vFindParty
+as
+select mtPartyFind.cRec, KatParty.KOD, KatParty.NAME, KATMC.nRec, KATMC.BARKOD
+from
+KatParty, mtPartyFind, KATMC, mXLParty
+where
+((
+mtPartyFind.cRec == KatParty.nRec
+and KatParty.CMC == KATMC.nRec
+
+and mtPartyFind.cRec == mXLParty.cParty
+))
+;
+
+function GetCount(_pKOD: string): longint;
+{
+  var ll:longint;
+  _pKOD := _pKOD+'%';
+  sql select count(*) from katparty where katparty.kod like :(_pKOD) into (ll);
+  GetCount := ll;
+}
+function GetParty1(_pKOD: string): comp;
+{
+  var cc:Comp = 0;
+  _pKOD := _pKOD+'%';
+ _Try
+ {  sql select top 1 katparty.nRec from katparty where katparty.kod like :(_pKOD) into (cc);
+ }
+ _Except
+ else
+ {
+     cc:= comp(0);
+ }
+
+  GetParty1 := cc;
+}
+
+procedure xlOut1(pCol:longint;pStr: string);
+{
+  xlSetCellStringValue(pStr,Counter,MaxCol+pCol,Counter,MaxCol+pCol);
+}//  procedure xlOut1
+
+var LineError: word;
+procedure xlOutE(pCol:longint;pStr: string);
+{
+  LineError++;
+  xlSetCellStringValue(pStr,Counter,MaxCol+pCol,Counter,MaxCol+pCol);
+  xlSetBackColor( xlBCError , Counter, MaxCol+1, Counter, MaxCol+1);
+}//  procedure xlOutE
+
+Function FindPartyByDateInName(pCmc: comp; pName: string): comp;
+var // DIn:Date;
+sDIn, sPrice, sPriceX, sPrice00,sNUM, sNUMSF: string[20];
+i: byte;
+Name2, sLike: string;
+{
+ result := comp(0);
+// LogStrToFile('#Counter.log',  Counter + ' in' + pCmc);
+
+
+  sDIn := sNUM := sNUMSF := sPrice := '';
+ i := InStr('руб', pName);
+ if i > 0 sPrice := trim(SubStr(pName, 1, i-1))
+ else
+ {
+
+   i := InStr('(НДС ', pName);
+   if i > 0 sPrice := trim(SubStr(pName, 1, i-1))
+ }
+
+ sPrice := Replace(sPrice,' ','');
+ sPrice := Replace(sPrice,',','.');
+
+ if Abs(Double(sPrice)) < 0.00001
+ { xlOut1(3,'Нет цены = ' + sPrice);
+   exit;
+ }
+
+
+ Name2 := SubStr(pName, i+1,255);
+
+ i := InStr('от', Name2);
+ if i > 2 // день 2 знака
+ {
+   sDIn := SubStr(Name2, i+3,10);
+ }
+
+ i := InStr('№', pName);
+ if i > 0
+ {
+   Name2 := Trim(SubStr(pName, i+1,255));
+   i := InStr(' ', Name2);
+   if i > 0
+   sNUM := trim(SubStr(Name2, 1, i));
+ }
+
+ if lNumIN   > 0
+ {
+    xlgetcellvalue(Counter, lNumIN,Str);
+    Str := Trim(Str);
+    if Str <> ''
+    {
+
+// if sNUM <> Str
+// LogStrToFile('#Counter.log',  Counter + ' sNUM было = ' + sNUM + ' стало=' + Str);
+       sNUM := Str;
+    }
+
+ }
+
+ if lDIN     > 0
+ {
+    xlgetcellvalue(Counter, lDIN,Str);
+    Str := Trim(Str);
+    Str := SubStr(Str,1,10);
+    if Str <> ''
+    {
+// if sDin <> Str
+// LogStrToFile('#Counter.log',  Counter + ' sDin было = ' + sDin + ' стало=' + Str);
+      sDin := Str;
+    }
+
+ }
+
+// LogStrToFile('#Counter.log',  Counter + ' x2');
+// sDIn=27_06_2018, sPrice=1406.76,sNUM=201,sNUMSF=201
+
+sPriceX := SubStr(sPrice,1, Length(sPrice)-1); // Цена без копейки
+ sDIn := Replace(sDIn,'.','_');
+
+//  LogStrToFile('#FindParty.log','sDIn='+sDIn+', sPrice='+sPrice+',sNUM='+sNUM+',sNUMSF='+sNUMSF + ' sPriceX=' + sPriceX );
+ LogStrToFile('#FindParty.log','sDIn='+sDIn+', sPrice='+sPrice+',sNUM='+sNUM+' , sPriceX=' + sPriceX );
+ sLike := sPrice+'%'+ sDIn + '%' +sNUM+ '%';
+ LogStrToFile('#FindParty.log',      sLike);
+ vFindParty.Delete all mtPartyFind;
+
+ _Try // С привязкой к МЦ
+ {
+   SQL
+     Select Katparty.nrec as cRec, Katparty.kod as KOD,
+     Case
+       when Katparty.Name like :( sPrice +'%'+ sDIn + '%' +sNUM + '%') then 0
+       when Katparty.Name like :( sPrice +'%'+ sNUM + '%' +sDIn + '%') then 1
+       when Katparty.Name like :( sPrice +'%'+ sDIn + '%' )            then 2
+       when Katparty.Name like :( sPriceX+'%'+ sDIn + '%' +sNUM + '%') then 10
+       when Katparty.Name like :( sPriceX+'%'+ sNUM + '%' +sDIn + '%') then 11
+       when Katparty.Name like :( sPriceX+'%'+ sDIn + '%' )            then 12
+       else 99
+     end as NN
+     from KATSOPR
+      inner join Spsopr on KATSOPR.nrec = Spsopr.cSopr and Spsopr.CmcUsl = :(pCmc)
+      inner join KatParty on Spsopr.cParty = KatParty.nRec
+     where
+       101 = KATSOPR.Vidsopr
+       and KATSOPR.DSOPR < :(pDsopr)
+       and Katparty.cmc = :(pCmc)
+       and Katparty.Atl_Owner <> :(ImportOwner)
+       and
+       (
+           Katparty.Name like :( sPrice+'%'+ sDIn + '%' +sNUM+ '%' )
+        or Katparty.Name like :( sPrice+'%'+ sNUM + '%' +sDIn + '%' )
+        or Katparty.Name like :( sPrice+'%'+ sDIn + '%' )
+        or // Цена без копейки
+           Katparty.Name like :( sPriceX+'%'+ sDIn + '%' +sNUM+ '%' )
+        or Katparty.Name like :( sPriceX+'%'+ sNUM + '%' +sDIn + '%' )
+        or Katparty.Name like :( sPriceX+'%'+ sDIn + '%' )
+
+       )
+     into mtPartyFind
+     ;
+ }
+ _Except
+ else
+ {  LogStrToFile('#FindParty.log','Возникло исключение при запуске запроса '#13'('+sLike+ ')'#13+ExploreException);
+ }
+ LogStrToFile('#Counter.log',  Counter + ' x3');
+
+ // С привязкой к МЦ
+ Var wKey: word = 0;
+ vFindParty._Loop mtPartyFind
+ if vFindParty.Getfirst mXLParty <> tsOK // партия ещё не используется в Импорте
+ {
+   if wKey = 0 or ( sPKOD0 = vFindParty.mtPartyFind.kod or sPKOD = vFindParty.mtPartyFind.kod )
+   {
+
+     xlOut1( 4, vFindParty.mtPartyFind.NN);
+     xlOut1( 5, vFindParty.mtPartyFind.kod);
+
+     vFindParty._Loop KatParty
+     xlOut1( 6, vFindParty.KatParty.NAME);
+     wKey++;
+     result := vFindParty.mtPartyFind.cREC ;
+     if ( sPKOD0 = vFindParty.mtPartyFind.kod or sPKOD = vFindParty.mtPartyFind.kod ) break;
+   }
+
+ }
+  /*
+   vFindParty._Loop mtPartyFind
+   vFindParty._Loop KatParty
+   {
+      if sPKOD0 = vFindParty.mtPartyFind.kod or sPKOD = vFindParty.mtPartyFind.kod
+      {
+        result := vFindParty.mtPartyFind.cREC ;
+        xlOut1( 4, vFindParty.mtPartyFind.NN);
+        xlOut1( 5, vFindParty.mtPartyFind.kod);
+        xlOut1( 6, vFindParty.KatParty.NAME);
+      }
+      LogStrToFile('#FindParty.log',vFindParty.mtPartyFind.NN+ ' ' + vFindParty.mtPartyFind.cREC + '  kod='+vFindParty.mtPartyFind.kod + ' Name='+ vFindParty.KatParty.NAME);
+   } */
+ // С привязкой к МЦ
+
+LogStrToFile('#Counter.log',  Counter + ' xOut-');
+
+} // Function FindPartyByDateInName(pCmc: comp, pName: string): comp;
+
+
+var wDataCount: word = 0;
+function ReadColNumByNamesOK: boolean;
+Var
+   lCol:longint;
+   wOK: word = 0;
+{
+  Update all mtAList set mtAList.Col := 0;
+
+  lPNAME := lBarkod := 0;
+  lNumIN := lDIN := lNumINSF := lDINSF := lOrg := 0;
+
+  lCapLine := 1; lCol:=0; str := '';
+    while (lCol <= MaxCol) and (lCapLine < 50)// по Колонкам lCapLine строки ищем заголовок
+    do
+    {
+      lCol++;
+      xlgetcellvalue(lCapLine, lCol, str);
+      str := trim( str );
+      str := Replace(str,''#13,' ');
+      str := Replace(str,''#10,' ');
+      str := Replace(str,'  ',' ');      str := Replace(str,'  ',' ');      str := Replace(str,'  ',' ');
+            Case str of
+'ТМЦ / Услуга':{
+                  // Наименование МЦ
+                }
+'"Номенклатурный номер"','Номенклатурный номер',
+             'КодМЦ': lBarkod :=lCol;
+
+         'КодПартии':   lPKOD := lCol;
+
+'НаименованиеПартии',
+         'ИмяПартии':  lPNAME := lCol;
+//
+  'НомерВходящегоДокумента': lNumIN   := lCol;
+   'ДатаВходящегоДокумента': lDIN     := lCol;
+//'НомерВходящегоДокументаСФ': lNumINSF := lCol;
+// 'ДатаВходящегоДокументаСФ': lDINSF   := lCol;
+            'КонтрагентКод': lOrg := lCol;
+                else
+                {
+                  _LOOP mtAList
+                    if mtAList.NAME = str {wOK++;mtAList.Col := lCol; Update current mtAList}
+                    else
+                    if Instr(';'+UpCase(str)+';',mtAList.NAMEList)>0 {wOK++;mtAList.Col := lCol; Update current mtAList}
+                }
+            end; // Case
+
+      if false
+      if lCol = MaxCol
+      if lBarkod = 0 or lPNAME=0
+      {
+        lPNAME := lBarkod := 0;
+        lCapLine++; wOK := 0; lCol:=0;
+        Update all mtAList set mtAList.Col := 0;
+      }
+
+    }// while lCol <= MaxCol // по Колонкам lCapLine строки
+
+
+    gError :=0;  wDataCount := 0;
+    sTuneOK := sTune := sError := '';
+    _LOOP mtAList
+    {
+      sTune := sTune + ''#13+ mtAList.NAME + '= ' + mtAList.Col;
+      if mtAList.Col = 0
+      {
+        sError := sError + ''#13+ mtAList.NAME;
+        gError++;
+      }
+      else
+      {
+        sTuneOK := sTuneOK + ''#13+ mtAList.NAME + '= ' + mtAList.Col;
+        wDataCount++;
+      }
+
+    }
+
+//    if lBarkod = 0 or lPNAME=0 gError++;
+
+//    if lBarkod = 0 or lPNAME=0 or gError > 0
+    if not ( lBarkod > 0 and lPKOD>0 and lPNAME > 0)  //
+    {
+        message ( 'Ошибка формата файла. Не найдена колонка'
+                        +''#13'КодПартии='+ lPKOD
+                        +''#13'ИмяПартии='+ lPNAME
+                    +''#13'НомерВходящего='+ lNumIN
+                     +''#13'ДатаВходящего='+ lDIN
+//                  +''#13'НомерВходящегоСФ='+ lNumINSF
+  //                 +''#13'ДатаВходящегоСФ='+ lDINSF
+                    +''#13'КонтрагентКод=' + lOrg
+                        +''#13'Ном.№=' + lBarkod + sError );
+
+       ReadColNumByNamesOK := False;
+    }
+    else
+    ReadColNumByNamesOK := true;
+
+    DCol := 9; // тут 3 - первая свободная ячейка лога справа от таблицы. см.
+    _LOOP mtAList
+    if mtAList.Col > 0
+    {  mtAList.cOut := DCol++;
+       UpDate current mtAList;
+    }
+}// function ReadColNumByNamesOK: boolean;
+
+Create View vAttr
+var
+  cAttr, cpPlan: comp;
+as
+select
+attrNam.nRec
+from
+attrNam, ExImLogE , BuhSchet, EXCLASSSEG, SPSETAN, CalPlan
+where
+((
+  cAttr == attrNam.nRec
+
+  and      0 == ExImLogE.cLogR
+  and UserId == ExImLogE.ATL_OWNER (noindex)
+
+  and cpPlan == CalPlan.nRec
+))
+;
+function LinkAttrID(pWTable: word; pCATTRNAM, pcRec: comp; sValue: string): boolean;
+{
+  Var sOldValue: string = '';
+
+  result := False;
+
+  vAttr.cAttr := pCATTRNAM;
+  if vAttr.getfirst ATTRNAM <> tsOK exit;
+
+      Case vAttr.AttrNam.ATTRTYPE of
+      0:// строка
+       {
+         sOldValue := sGetAttrID(pWTable, pcRec,pCATTRNAM);
+         if sOldValue <> Str
+         {
+           if (wFlagDop and 1b) > 0
+             result := sSetAttrID(pWTable, pcRec, vAttr.cAttr, Str)
+           else
+             result := true;
+
+           exit;
+         }
+       }
+      1: // число
+       {
+         var dValue : double = double(Replace(sValue, ',','.'));
+         var dOldValue : double = doGetAttrID(pWTable, pcRec,vAttr.cAttr);
+         if dOldValue <> dValue
+         {
+           if (wFlagDop and 1b) > 0
+             result := doSetAttrID(pWTable, pcRec, vAttr.cAttr, dValue)
+           else
+             result := true;
+
+           exit;
+         }
+       }
+      2: // Дата
+       {}
+      3: // Время
+       {}
+      4: // мемо-поле
+       {}
+      5: // ссылка
+       {
+
+         Var StrKod, StrName: String = '';
+         var cValue : comp = comp(0);
+         var cOldValue : comp = comp(0);
+         StrKod := ExtractDelimitedWord(sValue, 1, ' ');
+
+// Нет обработки КАУ с кодом 1502 ссылка->Счета бухгалтерского учета
+// Нет обработки КАУ с кодом 5073 ссылка->Государственный контракт
+
+         Case vAttr.AttrNam.ROBJECT of
+
+              5022: // Пункты календарных планов
+                   {
+
+                      vAttr.cpPlan := comp(sValue); // У нижестоящего
+//                      message('vAttr.cpPlan  = ' + vAttr.cpPlan );
+                      if vAttr.Getfirst CalPlan <> tsOK
+                      {
+                        vAttr.cpPlan := vAttr.cpPlan + comp(minNRec1); // У одиночного
+
+//                        message('vAttr.cpPlan  = ' + vAttr.cpPlan );
+
+                        if vAttr.Getfirst CalPlan <> tsOK exit;
+
+                      }
+
+                      cValue := vAttr.CalPlan.nRec;
+                      sValue := 'ПКП №'+vAttr.CalPlan.NoDOC; // + ' от ' + CALPLAN.DINPUT;
+                      if (Instr(DateToStr(vAttr.CALPLAN.DINPUT,'DD/MM/YYYY'), sValue) = 0 ) and
+                        (Instr(DateToStr(vAttr.CALPLAN.DINPUT,'DD.MM.YYYY'), sValue) = 0 )
+                      sValue := sValue + ' от ' + DateToStr(vAttr.CALPLAN.DINPUT,' от DD/MM/YYYY г.');
+
+                   } //  5022: // Пункты календарных планов
+//          if vAttr.AttrNam.ROBJECT = 1502 //  ссылка->Счета бухгалтерского учета
+              5073: // Идентификатор государственного контракта
+                if vAttr.Getfirst EXCLASSSEG where (( 24 ==EXCLASSSEG.CLASSCODE and UpCase(sValue)==EXCLASSSEG.NAME (length = 40) )) = tsOK
+                  cValue := vAttr.EXCLASSSEG.Nrec;
+         1502,5063:{  // ссылка->Счета бухгалтерского учета
+                      var Str6: string;
+                      Str6 := substr(sValue, 1, 6);
+                      Str6 := RePlace(Str6, '/', '.');
+
+                      if Str6 = '10.151' sValue := '10.01' else
+                      if Str6 = '10.200' sValue := '10.02' else
+                      if Str6 = '10.156' sValue := '10.13' else
+                      if Str6 = '10.450' sValue := '10.04' else
+                      if Str6 = '10.956' sValue := '10.09' else
+                      if Str6 = '08.451' sValue := '10.12' else
+                      if Str6 = '10.300' sValue := '10.03' else
+                      if Str6 = '10.900' sValue := '10.09' else
+                      if Str6 = '10.952' sValue := '10.10' else
+                      if Str6 = '10.152' sValue := '10.13' else
+                      if Str6 = '10.965' sValue := '10.13' else
+                      if Str6 = '10.902' sValue := '10.13' else
+                      if Str6 = '10.101' sValue := '10.06' else
+                      if Str6 = '10.900' sValue := '10.09' else
+                      if Str6 = '10.652' sValue := '10.13' else
+                      if Str6 = '10.550' sValue := '10.05' else
+                      if Str6 = 'Готовая продукция' sValue := '43' ;
+
+                   if (vAttr.getfirst SPSETAN where (( 10142 == SPSETAN.KODGRKAU  and  (InStr(sValue,trim(SPSETAN.Name) ) =1 ) )) = tsOk)
+                   {
+                     sValue := vAttr.SPSETAN.Name;
+                     cValue := vAttr.SPSETAN.cKAU;
+                   }
+                   else
+                   if (vAttr.getfirst BuhSchet where ((coGetTune('FIN.USER.CPLANSSCH') == Buhschet.CPLANSSCH and sValue == Buhschet.CODE)) = tsOk)
+                   {
+                     sValue := vAttr.BuhSchet.Name;
+                     cValue := vAttr.Buhschet.Nrec;
+                   }
+                   else
+                   if (vAttr.getfirst BuhSchet where ((cValue == Buhschet.Nrec)) = tsOk)
+                     sValue := vAttr.BuhSchet.Name;
+              }
+              else // Case
+              {
+                  if StrKod <> ''
+                  {
+                    StrName := Trim(SubStr( sValue, Length(StrKod)+1, 255));
+                    cValue := refImpDef.GetKauID(vAttr.AttrNam.ROBJECT,StrName, StrKod);
+
+                    if cValue = comp(0) vAttr.Delete ExImLogE; // побочный продукт refImpDef
+                  }
+
+                  if cValue = comp(0) cValue := refImpDef.GetKauID(vAttr.AttrNam.ROBJECT, sValue, '');
+
+                  if cValue = comp(0)
+                  {
+                     vAttr.Delete ExImLogE; // побочный продукт refImpDef
+                     exit; // Не найдено в справочнике значение=' + sValue);
+                  }
+                  else
+                  {
+                    cOldValue := coGetAttrID(pWTable, pcRec,vAttr.cAttr);
+                    if cValue <> cOldValue
+                    {
+                       if (wFlagDop and 1b) > 0
+                         result := coSetAttrID(pWTable, pcRec, vAttr.cAttr, cValue, sValue)
+                       else
+                         result := true;
+
+                       exit;
+                    }
+                    else
+                      result := true;
+
+                  }
+                exit;
+              } // else Case
+         end;
+
+         if cValue <> comp(0)
+         {
+           coSetAttrID(pWTable,pcRec, vAttr.cAttr ,cValue,sValue);
+           result := true;
+         }
+
+       } // 5: // ссылка
+      end; // Case
+
+  result := true;
+} // function LinkAttrID
+
+screen scrWImp;
+Show at (,,,11);
+fields
+nm_file:NoProtect, PickButton;
+wFlagDop:NoProtect;
+pDsopr :NoProtect;
+buttons
+      cmColTune; cmImport;
+<<
+  Импорт Атрибутов МЦ
+  Файл Excel
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Обработка:`
+ [.] Делать изменения в Базе`
+ [.] Искать сначала партию, созданную пользователем см ниже!`
+ [.] Изменять КОД Партий на KOD из Файла`
+ [.] Создавать новые партии для не найденных`
+ [.] Пропускать пустые ячейки. "Пусто = не определено"`
+ [.] Импортировать атрибуты !!долго!!`
+ [.] Искать партию по началу кода из Excel`
+ [.] Искать партию по началу кода из Excel без привязки к МЦ из Excel`
+
+ Партию, созданную пользователем искать по приходным накладным с датой до.@@@@@@@@@@
+
+    <. Проверить соответствие полей .>        <. Запустить Анализ Партий .>
+>>
+end;
+Browse brAttr;
+Show at (,12,,);
+table mtAList;
+fields
+  mtAList.Col  '№ Колонки в Excel':[3], Protect;
+  mtAList.Name 'Наименование атрибута':[30], Protect;
+  mtAList.NameList 'Имена колонок':[30], Protect;
+  mtAList.cAttrnam 'cAttrnam ' :[30], Protect;
+end;
+
+
+Procedure AddAttr(pS,pS2: string);
+{
+  if getfirst Attrnam where (( coKatParty == Attrnam.WTABLE and pS==Attrnam.NAME)) = tsOK
+  {
+    insert into mtAList set mtAList.Name := pS, mtAList.NameList := ';'+ UpCase(if(pS2='',pS,pS2) )+';' , mtAList.cAttrnam := Attrnam.nRec,
+    mtAList.ATTRTYPE := Attrnam.ATTRTYPE, mtAList.rObject := AttrNam.rObject;
+  }
+  else
+  {
+    insert into mtAList set mtAList.Name := pS, mtAList.NameList := ';'+ pS+';'+ UpCase(pS)+';';
+    sError := sError + ''#13+ pS;
+    gError++;
+  }
+}
+
+
+HandleEvent // интерфейс
+
+cmINIT:
+{
+  pDsopr := date(01,01,2019);
+  cCurrent_User:= UserId;
+  lCapLine := 1; // строка заголовка, будет уточнена
+  if not ReadMyDsk(nm_file  , 'GP_PartyImp_nm_file', false) nm_file := '';
+  if not ReadMyDsk(wFlagDop , 'GP_PartyImp_Flags'  , false) wFlagDop:= 11111b;
+  gError:= 0; sError := '';
+
+//  AddAttr('МОЛ');
+/* AddAttr('Нормативный срок закупки','');
+ AddAttr('Нормативный срок на входной контроль','');
+ AddAttr('Нормативный срок поставки','');
+ AddAttr('Ответственный исполнитель','ОТВ. ИСПОЛНИТЕЛЬ;"Отв.исполнитель";Отв.исполнитель');
+  */
+
+//  'КонтрагентКод');
+
+! AddAttr('Заказ','ШифрЗаказа');
+! AddAttr('Идентификатор государственного контракта','ИГК');
+! AddAttr('.Аналитика БухСчета','СчетУчетаБУ');
+! AddAttr('.Счет НУ','СчетУчетаНУ');
+! AddAttr('.Договор_ПКП','КодДоговора');
+
+ AddAttr('Документ создания','Документ создания');
+ AddAttr('Партия-источник','Партия-источник');
+
+
+  if sError <> ''
+  {
+    if gError = 1 if Yes<>Message('Продолжить??'#13'Не найден атрибут к Партии:'#13 + sError) CloseInterface(cmCancel);
+    if gError > 1 if Yes<>Message('Продолжить??'#13'Не найдены атрибуты к Партии:'#13 + sError) CloseInterface(cmCancel);
+  }
+}
+cmColTune:
+{
+  if nm_file = ''
+  {
+    Message('Укажите файл для импорта');
+    SelectField(#nm_file);
+    exit;
+  }
+  sFileName := nm_file ;
+
+  if (not ExistFile(sFileName))
+  { message('Не файла "'+sFileName+'"',error);
+    exit;
+  }
+
+
+    if (not xlOpenNewExcel(false))
+    {
+      message('Ошибка запуска Excel', Error);
+      if not xlKillExcel
+        message('Ошибка закрытия Excel', Error);
+      exit;
+    }
+
+    if (not xlOpenWorkBook(sFileName))
+    {
+      Message('Ошибка открытия книги: "' + sFileName + '"');
+      xlKillExcel;
+      Exit;
+    }
+
+  if (xlIsExcelValid) xlSetActiveSheetByName('1');
+
+  xlGetUsedRange(0,0,MaxLine,MaxCol);
+  Counter:=lCapLine;
+  if ReadColNumByNamesOK
+  {
+    xlkillExcel;
+    ReScanPanel(tnmtAList);
+        message ( 'Найдены колонки:'
+                        +''#13'КодПартии=' + lPKOD
+                        +''#13'ИмяПартии=' + lPNAME
+                    +''#13'НомерВходящего=' + lNumIN
+                     +''#13'ДатаВходящего=' + lDIN
+//                  +''#13'НомерВходящегоСФ=' + lNumINSF
+  //                 +''#13'ДатаВходящегоСФ=' + lDINSF
+                     +''#13'КонтрагентКод=' + lOrg
+                        +''#13'Ном.№='     + lBarkod + sTune );
+  }
+  else
+  {
+    xlkillExcel;
+    ReScanPanel(tnmtAList);
+  }
+} // cmColTune
+
+cmImport:
+{
+  Delete all mXLParty;
+  SaveMyDsk(nm_file    , 'GP_PartyImp_nm_file');
+  SaveMyDsk(wFlagDop   , 'GP_PartyImp_Flags'  );
+
+  if nm_file = ''
+  {
+    Message('Укажите файл для импорта');
+    SelectField(#nm_file);
+    exit;
+  }
+  sFileName := nm_file ;
+
+  if (not ExistFile(sFileName))
+  { message('Не найден шаблон файла "'+sFileName+'"',error);
+    exit;
+  }
+
+  if (not xlCreateExcelWithTemplate(sFileName,true))
+  { message('Ошибка создания нового файла в Excel"'+sFileName+'".',error);
+    exit;
+  }
+
+  if (xlIsExcelValid) xlSetActiveSheetByName('1');
+
+  xlGetUsedRange(0,0,MaxLine,MaxCol);
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Импорт из Excel ...', MaxLine div 7);
+
+// Читаем заголовок и находим номера колонок по названию полей
+
+Var boOk: boolean = ReadColNumByNamesOK;
+
+if boOk
+{
+
+  Counter:=lCapLine;
+
+// Заголовки для протокола
+  xlOut1( 1, 'Статус');
+  xlOut1( 2, 'Katmc.Nrec');
+  xlOut1( 3, 'KatParty.Nrec');
+  xlOut1( 4, 'FindPartyMetod');
+  xlOut1( 5, 'KatParty.KOD');
+  xlOut1( 6, 'KatParty.NAME');
+  xlOut1( 7, 'Katmc.NAME');
+  xlOut1( 8, 'Количество');
+  _Loop mtAList
+     if mtAList.Col > 0
+        xlOut1( mtAList.cOut, 'Атрибут ' +mtAList.Name);
+
+xlSetBackColor( xlBCGal , Counter, MaxCol+1, Counter, MaxCol+wDataCount+2);
+
+while counter < MaxLine
+do
+{
+  Counter++;
+
+  if Counter mod 3 = 0
+    if not nextvisual { boOk := False ; break; }
+
+    xlgetcellvalue(Counter, lBarkod,Str);
+    Str := Trim(Str);
+
+    if Str = ''
+    {  xlOutE(1 , 'Нет Баркода') ;
+       continue;
+    }
+
+  ClearBuffer(#mXLParty);
+  mXLParty.Line := Counter;
+  mXLParty.MCKOD :=Str;
+
+    xlgetcellvalue(Counter, lPKOD,Str);
+    Str := Trim(Str);
+    if Str = ''
+    {  xlOutE(1 , 'Нет Кода Партии') ;
+       continue;
+    }
+  mXLParty.pKOD := Str;
+
+
+  if getfirst mXLPartyDB = tsOK
+  {  xlOutE(1 , 'Пропускаю. Уже есть') ;
+     xlOutE(2 , 'В строке =' ) ;
+     xlOutE(3 , String(mXLPartyDB.Line)) ;
+     continue;
+  }
+
+    xlgetcellvalue(Counter, lPNAME,Str);
+    Str := Trim(Str);
+    if Str = ''
+    {  xlOutE(1 , 'Нет Партии') ;
+       continue;
+    }
+  mXLParty.pNAME := Str;
+
+  if lOrg > 0
+  {
+    xlgetcellvalue(Counter, lOrg,Str);
+    Str := Trim(Str);
+    if Str <> ''
+    {
+      Str := LPADCH(Str,'0',9);
+      mXLParty.sOrg:= Str;
+    }
+  }
+
+  insert current mXLParty;
+} // while counter < MaxLine do
+}// if ReadColNumByNamesOK
+
+
+RestartVisual('Привязка справочников', RecordsInTable(#mXLParty));
+
+if boOk // Цикл не прерывался, дальше
+_Loop mXLParty// Привязка к МЦ и ORG
+{
+  if not nextvisual { boOk := False ; break; }
+  Counter := mXLParty.Line;
+  sMCKOD := mXLParty.MCKOD;
+    if getfirst KATMC <> tsOK
+    {
+      sMCKOD := LPADCH(sMCKOD,'0',10);
+      if getfirst KATMC <> tsOK
+      {
+        xlOutE(1 , 'Не найдена МЦ ' + sMCKOD);
+        continue;
+      }
+    }
+   mXLParty.MCKOD := sMCKOD;
+   mXLParty.cmc := Katmc.nRec;
+
+   xlOut1(2, string(Katmc.nRec,0,0) );
+   xlOut1(7, Katmc.Name );
+
+  if lOrg > 0
+  if mXLParty.sORG <> ''
+  {
+    if Getfirst KATORG = tsOK
+    {
+      mXLParty.cOrg := KATORG.nRec;
+    }
+    else
+    {
+      xlSetBackColor( xlBCError , Counter, lOrg, Counter, lOrg);
+    }
+  }
+
+  UpDate Current mXLParty;
+} // _Loop mXLParty// Привязка к МЦ и ORG
+
+if boOk
+delete mXLParty where mXLParty.cmc = comp(0);
+// .. проход 1.  По коду партии
+if boOk RestartVisual('Поиск Партий по КОДу', RecordsInTable(#mXLParty));
+if boOk ShowVisualNoDelay;
+if boOk
+_Loop mXLParty
+{
+  if not nextvisual { boOk := False; break;}
+  Counter := mXLParty.Line;
+
+  sPKOD := mXLParty.pKOD;
+  sPKOD0 := LPADCH(sPKOD,'0',9);
+
+  cPartyFind := 0;
+
+    sPKODx := sPKOD0;
+    if GetFirst KatPartyMy = tsOK
+    {
+      cPartyFind := KatPartyMy.nRec;
+    }
+    else
+    {
+      sPKODx := sPKOD;
+      if GetFirst KatPartyMy = tsOK
+      {
+        cPartyFind := KatPartyMy.nRec;
+      }
+    }
+
+    if cPartyFind <> 0
+    if getfirst KatParty = tsOK
+    {
+      xlOut1( 1,'OK');
+      xlOut1( 3,String(cPartyFind,0,0));
+      xlOut1( 4, 'kod');
+      xlOut1( 5, KatParty.kod);
+      xlOut1( 6, KatParty.NAME);
+      xlOut1( 8, GetCount(mXLParty.pKOD));
+
+      mXLParty.cParty := KatParty.nRec;
+      Update current mXLParty;
+    }
+
+}   // Поиск по коду
+
+RestartVisual('Поиск партий по наименованию', RecordsInTable(#mXLParty));
+if nextvisual {};
+
+if boOk
+if (wFlagDop and 10b) > 0 // Ищем партии, которые создал пользователь
+_Loop mXLParty
+if mXLParty.cParty = comp(0)
+{
+  if not nextvisual { boOk := false; break;}
+  Counter := mXLParty.Line;
+
+  sPKOD := mXLParty.pKOD;
+  sPKOD0 := LPADCH(sPKOD,'0',9);
+
+  cPartyFind := FindPartyByDateInName(mXLParty.cmc, mXLParty.pNAME);
+
+    if cPartyFind=0
+    {
+      xlOut1(1,'Партия не найдена');
+      continue;
+    }
+    else
+    {
+      xlOut1( 1,'OK');
+      xlOut1( 3,String(cPartyFind,0,0));
+      xlOut1( 4, 'Name');
+      xlOut1( 5, KatParty.kod);
+      xlOut1( 6, KatParty.NAME);
+      xlOut1( 8, GetCount(mXLParty.pKOD));
+
+      mXLParty.cParty := cPartyFind;
+      Update current mXLParty;
+    }
+} // Ищем партии, которые создал пользователь
+
+
+if (wFlagDop and 1000000b) > 0 // Поиск Партий по началу КОДа
+if boOk RestartVisual('Поиск Партий по началу КОДа', RecordsInTable(#mXLParty));
+if boOk ShowVisualNoDelay;
+if boOk
+_Loop mXLParty
+if mXLParty.cParty = comp(0)
+{
+  if not nextvisual { boOk := False; break;}
+  Counter := mXLParty.Line;
+
+  sPKOD := mXLParty.pKOD + '%';
+  cPartyFind := 0;
+
+    if (GetFirst KatPartyMy where(( mXLParty.cmc == KatPartyMy.CMC )) and  KatPartyMy.KOD like sPKOD  )= tsOK
+    {
+      cPartyFind := KatPartyMy.nRec;
+    }
+
+    if cPartyFind <> 0
+    if getfirst KatParty = tsOK
+    {
+      xlOut1( 1,'OK');
+      xlOut1( 3,String(cPartyFind,0,0));
+      xlOut1( 4, 'kod ext');
+      xlOut1( 5, KatParty.kod);
+      xlOut1( 6, KatParty.NAME);
+      xlOut1( 8, GetCount(mXLParty.pKOD));
+
+      mXLParty.cParty := KatParty.nRec;
+      Update current mXLParty;
+    }
+}   // Поиск по Началу кода
+
+if (wFlagDop and 10000000b) > 0 // Поиск Партий по началу КОДа без МЦ
+if boOk RestartVisual('Поиск Партий по началу КОДа без МЦ', RecordsInTable(#mXLParty));
+if boOk ShowVisualNoDelay;
+if boOk
+_Loop mXLParty
+if mXLParty.cParty = comp(0)
+{
+  if not nextvisual { boOk := False; break;}
+  Counter := mXLParty.Line;
+
+  sPKOD := mXLParty.pKOD + '%';
+
+  cPartyFind := GetParty1(mXLParty.pKOD);
+
+    if cPartyFind <> 0
+    if getfirst KatParty = tsOK
+    {
+      xlOut1( 1,'OK');
+      xlOut1( 3,String(cPartyFind,0,0));
+      xlOut1( 4, 'kod extNoMC');
+      xlOut1( 5, KatParty.kod);
+      xlOut1( 6, KatParty.NAME);
+      xlOut1( 8, GetCount(mXLParty.pKOD));
+
+      mXLParty.cParty := KatParty.nRec;
+      Update current mXLParty;
+    }
+}   // Поиск по Началу кода
+
+RestartVisual('Изменение кода Партии', RecordsInTable(#mXLParty));
+if nextvisual {};
+
+if boOk
+if (wFlagDop and 1b) > 0
+_Loop mXLParty
+if mXLParty.cParty <> Comp(0) // партию нашли или создали
+{
+  if not nextvisual { boOk := False ; break; }
+
+  cPartyFind := mXLParty.cParty;
+  Counter := mXLParty.Line;
+
+  sPKOD := mXLParty.pKOD;
+  sPKOD0 := LPADCH(sPKOD,'0',9);
+
+  UpDateCnt := 0;
+
+        cPartyOK:= cPartyFind;
+        sPkodOK := sPKOD;
+  if GetFirst KatParty = tsOK
+  {
+    if (wFlagDop and 100b) > 0 // Изменение кода Партии
+    {
+          While vUpParty.getfirst KatPartyOther = tsOK
+          do
+          {
+            vUpParty.Update KatPartyOther
+                     set
+                     KatPartyOther.kod := 'z_' + sPkodOK,
+                     KatPartyOther.Name := if(Length(KatPartyOther.Name)>253, SubStr(KatPartyOther.Name,1,253), KatPartyOther.Name) + 'z_';
+          }
+
+          sPkodOK := sPKOD0;
+          While vUpParty.getfirst KatPartyOther = tsOK
+          do
+          {
+            vUpParty.Update KatPartyOther
+                     set
+                     KatPartyOther.kod := 'x_' + sPkodOK,
+                     KatPartyOther.Name := if(Length(KatPartyOther.Name)>253, SubStr(KatPartyOther.Name,1,253), KatPartyOther.Name) + 'z_';
+          }
+
+         // Правильный код в нашу партию
+          if (KatParty.kod <> sPKOD0)
+          {
+            KatParty.kod := sPKOD0;
+            UpDateCnt++;
+          }
+    } // Изменение кода Партии
+
+
+    if lORG > 0
+    if mXLParty.cOrg <> comp(0)
+    if KatParty.CORGPAR <> mXLParty.cOrg
+    {
+      UpDateCnt++;
+      KatParty.CORGPAR :=  mXLParty.cOrg;
+      xlSetBackColor( xlBCGal , Counter, lORG, Counter, lORG);
+    }
+    else
+      xlSetBackColor( xlBCGreen , Counter, lORG, Counter, lORG);
+
+    if UpDateCnt >0
+    if UpDate current KatParty <> tsOK
+      xlSetBackColor( xlBCErrUpDate , Counter, 1, Counter, maxCol+10);
+  }// if GetFirst KatParty = tsOK
+
+}// Loop
+
+if boOk RestartVisual('Создание новых партий', RecordsInTable(#mXLParty));
+if boOk ShowVisualNoDelay;
+
+if boOk
+if    (wFlagDop and 0001b) = 0 //  установлено [v] делать изменения
+  or (wFlagDop and 1000b) = 0 //  установлено [v] Создавать новые Партии
+{
+ // НИЧЕГО
+}
+else
+if boOk
+_Loop mXLParty
+if mXLParty.cParty = comp(0)
+if mXLParty.cmc <>  comp(0)
+{
+  if not nextvisual { boOk := False ; break; }
+  cPartyFind := comp(0);
+  Counter := mXLParty.Line;
+
+  sPKOD := mXLParty.pKOD;
+  sPKOD0 := LPADCH(sPKOD,'0',9);
+      ClearBuffer(tnKatParty);
+      KatParty.CMC  := mXLParty.cmc; // Katmc.nRec;
+      KatParty.Name := mXLParty.pNAME;
+      KatParty.KOD  := sPKOD0;
+      KatParty.CORGPAR := mXLParty.cOrg;
+      KatParty.CNOTE:= Comp(3096224743817373); // оформляемый
+      if Insert current KatParty = tsOK
+      {
+        cPartyFind := KatParty.nRec;
+        xlOut1(1,'Партия добавлена');
+        xlOut1(3,String(cPartyFind,0,0));
+
+        xlOut1( 4, 'Inserted');
+        xlOut1( 5, KatParty.kod);
+        xlOut1( 6, KatParty.NAME);
+      }
+      else
+      {
+        xlOut1(1,'Ошибка при создании Партии');
+        continue;
+      }
+   mXLParty.cParty := cPartyFind;
+   UpDate current mXLParty;
+
+} // _Loop  Создание новых партий
+
+
+  // Атрибуты к партии
+if boOk
+if (wFlagDop and 100000b) > 0 // Импортировать атрибуты
+{
+  RestartVisual('Импорт атрибутов из Excel', RecordsInTable(#mXLParty));
+  ShowVisualNoDelay;
+}
+
+if boOk
+if (wFlagDop and 100000b) > 0 // Импортировать атрибуты
+_Loop mXLParty
+if mXLParty.cParty <> comp(0)
+{
+  if not nextvisual { boOk := False ; break; }
+  Counter := mXLParty.LINE;
+
+  cPartyFind := mXLParty.cParty;
+
+  _Loop mtAList ordered by index idx2
+  if mtAList.Col > 0
+  {
+    xlgetcellvalue(Counter, mtAList.Col, Str);
+    Str := Trim(Str);
+    if Str <> ''
+    if LinkAttrID(coKatParty, mtAList.cAttrnam, cPartyFind, Str)
+     xlSetBackColor( xlBCGal , Counter, mtAList.Col , Counter, mtAList.Col)
+    else
+     xlSetBackColor( xlBCError , Counter, mtAList.Col , Counter, mtAList.Col);
+
+  }
+} // _LOOP Импорт атрибутов из Excel
+
+xlkillExcel;
+StopVisual('',0);
+
+jView.PutTableToDBF (#mXLParty,'mXLParty.xls',0);
+
+
+if not boOk Message('Прервано пользователем');
+
+} // cmImport:
+
+cmPick:
+{ case CurField of
+  #nm_file:
+  { var ww_str:string=GetFileName('*.xls;*.xlsx','Выберите файл c данными по Задолженности');
+    if ww_str<>''
+    {
+       set nm_file:=ww_str;
+    }
+  }
+  end;
+} // cmPick:
+end; // HandleEvent
+End. // interface

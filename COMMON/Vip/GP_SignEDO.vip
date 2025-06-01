@@ -1,0 +1,461 @@
+/*************************************************************************************************\
+  Наименование: Работа с ЭЦП в документах
+  Контур/Модуль: БУ
+  Примечание: #3628 ЭЦП
+  Вид работы  |Номер           |Дата    |Исполнитель              |Проект
+  -----------------------------------------------------------------------------------------------
+  Разработка  |#3628           |03/08/18|Кириллов Э.П.            |НПО Энергомаш
+\*************************************************************************************************/
+#include ExportDoc.vih
+#include TuneEDO.vih
+#include GP_SignEDO.vih
+#include GP_Log.vih
+#include StatLog.vih
+#include Notes.vih
+#include ControlSign.vih
+#ifdef ComponentVersion
+//#component "L_Common" - перебросим в другое место!
+#component "GP_Common"
+#end
+
+#doc
+Работа с ЭЦП в документах
+#end
+//------------------------------------------------------------------------------
+Interface GP_SignEDO;
+//------------------------------------------------------------------------------
+var 
+  oGP_Log:GP_Log;
+#if(#__TOOLVERSION__ >= 5005.035)
+#else
+  boCertificate:boolean=false;
+  LastError:string='';
+
+//==============================================
+
+  create view
+  var
+    pPlPor:comp;
+  as select
+     PlPor.Nrec
+  From
+    PlPor
+  where ((
+    pPlPor == PlPor.Nrec
+  ));
+//==============================================
+
+
+//------------------------------------------------------------------------------
+//  Сбросим признаки инициализации
+//------------------------------------------------------------------------------
+Procedure oSignEDO01.ResetInit;
+{ boCertificate:=false;
+  LastError:='';
+  bInit:=false
+}
+#endif
+
+//------------------------------------------------------------------------------
+//  Выбор сертификата
+//------------------------------------------------------------------------------
+Function oSignEDO.SetCertificate: boolean;
+{ boCertificate:=false;
+  LastError:='';
+  result:=Inherited::SetCertificate;
+  boCertificate:=result;
+}
+
+//------------------------------------------------------------------------------
+// Подпись ЭЦП xml-файла
+//------------------------------------------------------------------------------
+  Function oSignEDO.SignXMLCreate(fileName: string; isVerify: boolean = false): boolean;
+  var
+    sRes: string;
+  {
+    result := false;
+
+    if not bInit   exit;
+
+    _try
+    {
+      OleCall3(oleGalSignEDO, ocFunc, 'SignXMLCreate', fileName, CADESCOM_XML_SIGNATURE_TYPE_ENVELOPED, sRes);
+
+      if (sRes != '')
+      { // message(sRes, mfError);
+        LastError:='Ошибка подписи:'+sRes;
+      }
+      else
+      {
+        if isVerify
+          VerifyXML(fileName, isVerify);
+
+        result := true;
+      }
+    }
+    _except
+       else
+       { // message(ExploreException, mfError);
+         LastError:=ExploreException;
+       }
+  } //Function oSignEDO.SignXMLCreate(fileName: string; isVerify: boolean = false): boolean;
+
+
+//------------------------------------------------------------------------------
+//  Проверим был ли установлен сертификат
+//------------------------------------------------------------------------------
+Function IsSetCertificate: boolean;
+{ Result:=boCertificate;
+}
+
+//------------------------------------------------------------------------------
+//
+//------------------------------------------------------------------------------
+Function GetDoc(pDoc: comp): boolean;
+{
+  result := false;
+
+  case wTable of
+
+    coSchFact:
+    {
+      if (Is_CorrV_SF(SchFact.TipUser))
+        result := GetVipRef(oDoc, 'L_Common::ExportCorrSF');
+      else
+        result := GetVipRef(oDoc, 'L_Common::ExportSF');
+    }
+
+    coKatSopr:
+      result := GetVipRef(oDoc, 'L_Common::ExportKS');
+#IFDEF _GP_
+    coPlPor:
+      result := GetVipRef(oDoc, 'L_Common::ExportPlPor');
+#ENDIF
+  end;
+
+  if (result)
+    result := oDoc.GotoDoc(pDoc);
+} //Function GetDoc(pDoc: comp): boolean;
+
+//------------------------------------------------------------------------------
+//
+//------------------------------------------------------------------------------
+Function isCanSignDoc(_CoSing: boolean): boolean;
+{ //Result:=Inherited::isCanSignDoc(_CoSing);
+    result := true;
+    if wTable<>coKatSopr then Exit;
+    case KatSopr.VidSopr of
+
+      cgDoc_0204, // Акт на списание МЦ
+      cgDoc_0504, // Акт на списание сырья в производстве
+      cgDoc_0508, // Акт на оказание услуг в производстве
+      cgDoc_0611, // Акт об излишках
+      cgDoc_0612, // Акт об излишках
+      cgDoc_0621, // Акт на комплектование, Акт на пакетирование
+      cgDoc_0622: // Акт на разукомплектование, Акт на распакетирование
+        result := oControl.CanSignDoc(KatSopr.cPodrFrom);
+
+      cgDoc_0501, // накладной на отпуск сырья в производство
+      cgDoc_0502, // накладной на приход готовой продукции
+      cgDoc_0503, // накладной на возврат сырья из производства
+      cgDoc_0505, // межцеховая накладной
+      cgDoc_0506, // накладной на внутреннее перемещение в производстве
+      cgDoc_0600, // накладной на внутреннее перемещение
+      cgDoc_0601, // накладной на передачу МЦ в ОС
+      cgDoc_0602, // накладной на передачу МЦ в спецоснастку
+      cgDoc_0603, // накладной на передачу МЦ в розничную торговлю
+      cgDoc_0605, // накладной на передачу МЦ в НМА
+      cgDoc_0606: // транзитной накладной
+        result := oControl.CanSignDoc(if(_CoSing, KatSopr.cPodrTo, KatSopr.cPodrFrom));
+
+      cgDoc_0607: // накладной на внутреннее перемещение
+      {}
+
+    end;
+#IFDEF _SPB_
+  case KatSopr.VidSopr of
+  cgDoc_0201,
+  cgDoc_0101,
+  cgDoc_0106, // накладной на возврат по рекламации
+  cgDoc_0600, // накладной на внутреннее перемещение
+  cgDoc_0601, // накладной на передачу МЦ в ОС
+  cgDoc_0602, // накладной на передачу МЦ в спецоснастку
+  cgDoc_0603, // накладной на передачу МЦ в розничную торговлю
+  cgDoc_0605, // накладной на передачу МЦ в НМА
+  cgDoc_0606: // транзитной накладной
+  { if KatSopr.DOPR=0 // нет ордеров - не формируем
+    { Exit;
+    }
+  }
+#ENDIF  
+} //Function isCanSignDoc(_CoSing: boolean): boolean;
+
+
+
+//------------------------------------------------------------------------------
+// Проверим - был ли инифиализирован объект
+//------------------------------------------------------------------------------
+Function Init_Chk: boolean;
+{ Result:=bInit;//
+}
+
+
+//------------------------------------------------------------------------------
+// Подпись ЭЦП сообщение без лога
+//------------------------------------------------------------------------------
+Function SignCreate2TmpFile(var fileName: string; isCoSign: boolean = false; isVerify: boolean = false; _wTable:word=0; _Nrec:comp=0): boolean;
+var
+  sRes: string='';
+  isCoSing:boolean=false;
+{
+    sFileName := GetPathParameter('Files', 'TmpFilesDirectory', ifFirstParameter) + 'tmp001.sig';
+    if FileExist(sFileName) deletefile(sFileName);
+    LogStrToFile(sFileName,'Test подписи');
+    case _wTable of
+    coKatSopr:
+    { if _Nrec<>0
+      { wTable:=_wTable;
+        wTable := coKatSopr;
+        sAttr := csAttrSignKatSopr;
+        cRec  := _Nrec;
+        isCoSing := IsExistsSign(false); // IsExistsSignKS(cRec);
+
+
+        if isCoSing
+          result := SaveToFile(FileName);
+        else
+          if GetDoc(cRec)
+            result := MakeFile;
+             
+      }
+    }
+    end;
+    timelog('SignCreate2TmpFile->sFileName='+sFileName);
+    result := false;
+    if not bInit
+      exit;
+    _try
+    {
+      OleCall4( oleGalSignEDO, ocFunc, 'SignCreate', sfileName, CADESCOM_CADES_BES, isCoSign, sRes);
+      if (sRes != '')
+      { sFileName:='';
+        timelog('SignCreateNoSave ERR='+sRes);
+        LastError:='Ошибка подписи:'+sRes;
+
+      }
+      else
+      {
+        result := true;
+      }
+    }
+    _except
+       else
+       {  sRes:=ExploreException;
+          timelog('SignCreateNoSave ERR2='+sRes);
+          LastError:=sRes;
+          message(sRes, mfError);
+       }
+    set FileName:=sFileName;   
+    timelog('SignCreateNoSave '+sFileName)
+}//Function SignCreateNoSave(var fileName: string; isCoSign: boolean = false; isVerify: boolean = false): boolean;
+
+
+//------------------------------------------------------------------------------
+// Заодно пробуем подписать и документ
+//------------------------------------------------------------------------------
+Function SignXMLCreateTable(fileName: string; isVerify: boolean = false; _wTable:word=0; _cRec:comp=0): boolean;
+var isCoSing:boolean=false;
+{ //if _wTable=0 or _cRec=0
+  LastError:='';
+  timelog('GP_SignEDO->SignXMLCreateTable:fileName='+fileName);
+  timelog('GP_SignEDO->SignXMLCreateTable:isVerify='+string(isVerify)+', _wTable='+string(_wTable)+', _cRec='+string(_cRec,0,0));
+  Result:=True;
+  if fileName<>''
+  { Result:=SignXMLCreate(fileName, isVerify);
+    timelog('GP_SignEDO->SignXMLCreateTable: Подписали файл '+string(Result) );
+  }
+  if Not Result Exit;
+  if _wTable=0 or _crec=0 Exit;
+  cRec:=_crec;
+  wTable:=_wTable;
+  case wTable of
+  coKatSopr:
+  { sAttr := csAttrSignKatSopr;
+    if getfirst KatSopr where ((cRec == KatSopr.Nrec))<>tsok then Exit
+  }
+  coSchFact: 
+  { sAttr := csAttrSignEDO;
+    if getfirst SchFact where ((cRec == SchFact.Nrec))<>tsok then Exit
+  }
+  coPlpor:
+  { sAttr := csAttrSignEDO; //'ЭЦП счета-фактуры';
+    pPlPor:=cRec;
+    if getfirst PlPor <>tsok then Exit
+  }
+  else Exit;
+  end;
+  timelog('GP_SignEDO->SignXMLCreateTable: sAttr='+sAttr);
+
+  wTable := _wTable;
+  isCoSing := IsExistsSign(false);
+  timelog('GP_SignEDO->SignXMLCreateTable: IsCoSing='+string(IsCoSing));
+  //---------------------
+  if isCoSing Exit; // Уже подписан не будем переподписывать
+  //---------------------
+  case _wTable of
+  coKatSopr:if not isCanSignDoc(isCoSing) Exit;
+  end;
+  timelog('GP_SignEDO->SignXMLCreateTable: isCanSignDoc=true');
+  // сохраняем ЭЦП
+  if isCoSing // Повторно уже не формируем
+  { sFileName := GetPathParameter('Files', 'TmpFilesDirectory', ifFirstParameter) + 'tmp001.sig';
+    result := SaveToFile(sFileName);
+    if not Result
+    { LastError:='Ошибка сохранения файла';
+    }
+  }
+  else
+  { 
+    if GetDoc(cRec)
+    { timelog('GP_SignEDO->SignXMLCreateTable: GetDoc=true');
+      result := MakeFile;
+      if not Result
+      { LastError:='Ошибка создания слепка документа';
+      }
+
+    }
+    else
+    { LastError:='Ошибка поиска шаблона выгрузки документа';
+    }
+  }
+  if result
+  { timelog('GP_SignEDO->SignXMLCreateTable:подписываем документ');
+    result := SignCreate(sFileName, isCoSing, false);
+    timelog('GP_SignEDO->SignXMLCreateTable:result='+string(result));
+    if not Result
+    { LastError:='Ошибка подписи документа';
+    }
+  }
+  DeleteFile(sFileName);
+  if not Result {}
+  // Здесь еще можно добавить статусы     
+  //Result:=true; // ВСЕГДА!
+  
+}
+
+//==============================
+// Показать отчет о подписывании
+//------------------------------
+Function InitRepError:boolean;
+{ frmSign.abortform;
+  Result:=not frmSign.Error;
+}
+
+//==============================
+// Записать строку в отчет
+//------------------------------
+Procedure WriteRepError(_s:string);
+{ frmSign.Write(_s);
+}
+
+//==============================
+// Показать отчет о подписывании
+//------------------------------
+Procedure ShowRepError(_boShow:boolean=true);
+{ frmSign.PutEvent(feBreak);
+  if _boShow
+   frmSign.ShowFile('')
+  else
+    frmSign.AbortForm;
+}
+
+//==============================
+// инициализировать лог
+//------------------------------
+Procedure Init_Log;
+{ oGP_Log.Init('GP_SignEDO.Log', true, true, true);
+}
+
+//==============================
+// Записать в лог
+//------------------------------
+Procedure Write_Log(_s:string);
+{ oGP_Log.Write(_s);
+
+}
+//==============================
+// Показать лог
+//------------------------------
+Procedure Show_Log(_boShow:boolean=true);
+{ oGP_Log.Done(_boShow);
+}
+
+//==============================
+// Проверка ЭЦП
+Function VerifyDoc_GP: boolean;
+{
+  result := false;
+
+  if not IsExistsSign(false)
+  { message('У документа нет ЭЦП!');
+  }
+  else
+  {
+    sFileName := GetPathParameter('Files', 'TmpFilesDirectory', ifFirstParameter) + 'tmp001.sig';
+
+    SaveToFile(sFileName);
+    result := VerifySign(sFileName);
+    DeleteFile(sFileName);
+
+    if not result
+    {
+      var res: string = '';
+#IFDEF _GP_
+      Init_Log;
+      case wTable of
+      coSchFact: oGP_Log.write('Счет-фактура № ' + SchFact.Num + ' от ' + DatetoStr(SchFact.dFact, 'DD.MM.YYYY'));
+      coPlPor:
+      { var _DocName:string='Платежный документ';
+        if getfirst KatDoc where (( PlPor.tidkgal == KatDoc.TiDkUsers))=tsok
+        { _DocName:=KatDoc.Name;
+        }
+        oGP_Log.write(_DocName + ' № ' + PlPor.NoDok + ' от ' + DatetoStr(PlPor.DatVip, 'DD.MM.YYYY'));
+      }
+      else
+        oGP_Log.write(KatDoc.Name + ' № ' + KatSopr.nSopr + ' от ' + DatetoStr(KatSopr.dSopr, 'DD.MM.YYYY'));
+      end;//case wTable of
+      OleCall1(oleGalSignEDO, ocFunc, 'GetlastError', res);
+      oGP_Log.Write(res);
+      Show_Log;
+#ELSE
+      if (wTable = coSchFact)
+        frmSign.write('Счет-фактура № ' + SchFact.Num + ' от ' + DatetoStr(SchFact.dFact, 'DD.MM.YYYY'));
+      else
+        frmSign.write(KatDoc.Name + ' № ' + KatSopr.nSopr + ' от ' + DatetoStr(KatSopr.dSopr, 'DD.MM.YYYY'));
+      frmSign.write(res);
+      frmSign.PutEvent(feBreak);
+      frmSign.ShowFile('');
+#ENDIF
+    }
+  }
+}
+
+// Проверка ЭЦП платежного документа
+Function VerifyPlPor(_pPlPor:comp):boolean;
+{ result := false;
+
+  if (GetFirst PlPor where (( _pPlPor == PlPor.NRec )) <> tsOk)
+    exit;
+
+  wTable := coPlPor;
+  cRec   := PlPor.NRec;
+  sAttr  := csAttrSignEDO;
+  result := VerifyDoc_GP;
+
+} //Function VerifyPlPor(_pPlPor:comp):boolean;
+
+Function GetLastError:string;
+{ Result:=LastError;
+}
+
+end.

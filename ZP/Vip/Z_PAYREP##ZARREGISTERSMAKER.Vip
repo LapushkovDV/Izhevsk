@@ -1,0 +1,301 @@
+/*************************************************************************************************\
+* Наименование:  Ведение заказов/проектов - Распределение ФОТ работников по заказам               *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Запуск - Настройка - Распределение ФОТ работников по заказам                     *
+*                также встроен в тпбель учета рабочего времени                                    *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#795          |07/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#DEFINE _ZARREGISTERSMAKER_TEST_
+#include GP_GRVPLAN.Vih
+#include CompoundHierarchy.vih // набивка и обход составной иерархии
+#include ZarRegister.vih
+#component "Z_PAYREP"
+#doc
+<b>Формирование реестров</b>
+<p>Деление реестров на перечисление.
+<p>объединение реестров по налогам
+#end
+Alter Interface ZARREGISTERSMAKER;
+OverLoad
+  procedure InsertDocument;
+/*
+  function LaunchProcess: integer;
+  function GetNamePayee(Tbl: word; ARec: comp): string;
+  procedure SetNameSbban(Entity: comp; Code: word);
+*/
+  procedure LoadOptions;
+  procedure PostProcess;
+
+end;
+
+//Управление персоналом \ Общие настройки \ Больничные, отпуска, расчеты по среднему \ Печать дополнительного протокола отладки"
+//включить в любое значение при проблемах
+//также переключить следует сделать настройку  UP.CACHELOGGING (Управление персоналом \ Кэшировать запись сообщений в протокол)
+//пользовательской и включить в "Нет". Смотреть лог в ZARERROR.OUT
+var UP_ZAR_ZU_DFLAG7 : word;
+// Маркер для сбора информации
+var MarkerSB:Longint;
+var ATTR_SB_VPLAN:comp;//ВА Группа заказов к SBBAB
+ __myloglog : string = '';
+//------------------------
+// фильтры
+//------------------------
+   wFilter:word;
+   Marker_Count :longint;
+   wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   Marker_Tmp :longint;
+   #mrkfld_(vPlan)
+
+//'Z_PAYREP::ZARREGISTERSMAKER.SCRHEADING.DOCNAME'
+
+create view X
+as select
+  vPlan_Flt.Name
+From
+  vPlan vPlan_Flt
+where ((
+  wc_nrec == vPlan_Flt.Nrec
+))  ;
+
+
+procedure MyLog(_str: string);
+{
+  exit;
+  if __myloglog = '' then
+   __myloglog := GetStringParameter('Files','OutputFilesDirectory',0)+ '\ZARREGISTERSMAKER_'+DateToStr(Cur_Date,'YYYY_MM_DD')+TimeToStr(Cur_Time,'HHMM')+'.log';
+  logstrtofile(__myloglog, _str);
+}
+  //---------------------------------------
+  // Установка наименований фильтров
+  //---------------------------------------
+  Procedure SetFilterNM(_Field:longint=0);
+  { if _Field=0 or _Field=#Filtr_vPlan
+    { #mrkfiltr_(vPlan_Flt,vPlan,Nrec,wc_nrec,vPlan_Flt.Name)
+    }
+    ReScanPanel(#Zar_User);
+  } //Procedure SetFilterNM(_Field:longint)
+
+
+//------------------------------------------------------------------------------
+// вставить заполненный документ в БД
+//------------------------------------------------------------------------------
+
+  procedure InsertDocument;
+  { if UP_ZAR_ZU_DFLAG7>0  displ('InsertDocument Start');
+    Inherited::InsertDocument;
+    if UP_ZAR_ZU_DFLAG7>0  displ('InsertDocument пишем в маркер');
+    InsertMarker(MarkerSB,SbBan.Nrec);
+    if UP_ZAR_ZU_DFLAG7>0  displ('InsertDocument Finish');
+}
+
+//------------------------------------------------------------------------------
+// завершающая обработка записей
+//------------------------------------------------------------------------------
+  procedure PostProcess;
+  var
+     CurDeduction_Save:longint;
+  {
+//       Inherited::PostProcess;
+
+    //if DA.IsIncomeTax(B.VIDUD)
+/*
+Что хотели сделать: в НДФЛ обычный объединить и НДФЛ с мат выгоды
+
+Варинат1.
+ на самом деле тут надо смотреть на таблицу podnal1  и если там есть podnal1.VIDPER = P.VIDOPERS, то не обрабатывать запись
+
+вариант2 . бюолее предпочтительный
+ сделать настройку с выбором множественным удержаний с типом НДФЛ, которые надро объединять с НДФЛ13% и только их и обрабатывать
+
+*/
+
+    CurDeduction_Save:=CurDeduction;
+    MyLog('CurDeduction = ' + CurDeduction);
+    if SDOCS.CODE=rgIncomeTax
+    { if   CurDeduction <> 182  // ндфл 13%
+       and CurDeduction <> 17 // ндфл 15%
+       and CurDeduction <> 55 // ндфл 18%
+       and CurDeduction <> 56 // ндфл 20%
+       and CurDeduction <> 57 // ндфл 22%
+      { _loop fullcache P where ((CurPersAccount == P.CLSCHET and AD_Year(AccountMonth) == P.YEARN and AD_Month(AccountMonth) == P.MESN))
+                             and P.VIDOPERS <> 17
+                             and P.VIDOPERS <> 55 // ндфл 18%
+                             and P.VIDOPERS <> 56 // ндфл 20%
+                             and P.VIDOPERS <> 57 // ндфл 22%
+        {
+          MyLog('P.VIDOPERS = ' + P.VIDOPERS + ' P.SUMMA=' + P.SUMMA);
+
+          if P.VIDOPERS=182
+          { update current P set P.VIDOPERS:=10000;
+            {
+             MyLog('   update current P set P.VIDOPERS:=10000;  continue');
+             continue;
+            }
+          }
+          if (P.VIDOPERS <> CurDeduction)
+           {
+            MyLog('   if (P.VIDOPERS <> CurDeduction)  continue');
+            continue;
+           }
+
+          update current P set P.VIDOPERS:=182;
+          MyLog('   update current P set P.VIDOPERS:=182;');
+        } //_loop fullcache P where ((CurPersAccount
+        CurDeduction:=182;
+      } //if CurDeduction<>182
+    } //if SDOCS.CODE=rgIncomeTax
+
+    //------------------------
+    Inherited::PostProcess;
+    //------------------------
+
+    if SDOCS.CODE=rgIncomeTax
+    { if  CurDeduction_Save <> 182
+      and CurDeduction_Save <> 17 // ндфл 15%
+      and CurDeduction_Save <> 55 // ндфл 18%
+      and CurDeduction_Save <> 56 // ндфл 20%
+      and CurDeduction_Save <> 57 // ндфл 22%
+      { _loop fullcache P where ((CurPersAccount == P.CLSCHET and AD_Year(AccountMonth) == P.YEARN and AD_Month(AccountMonth) == P.MESN))
+                              and P.VIDOPERS <> 17
+                              and P.VIDOPERS <> 55 // ндфл 18%
+                              and P.VIDOPERS <> 56 // ндфл 20%
+                              and P.VIDOPERS <> 57 // ндфл 22%
+        { if P.VIDOPERS=10000
+             update current P set P.VIDOPERS:=182
+          else
+          if P.VIDOPERS=182
+             update current P set P.VIDOPERS:=CurDeduction_Save;
+        }
+        CurDeduction:=CurDeduction_Save;
+      } //if CurDeduction<>182
+    } //if SDOCS.CODE=rgIncomeTax
+
+  } //procedure PostProcess;
+//------------------------------------------------------------------------------
+// подгружаем опции из деска
+//------------------------------------------------------------------------------
+  procedure LoadOptions;
+  { Inherited::LoadOptions;
+    //Переопределим значения для поля DocName
+    var ArName: array[1..1] of string;
+    var ArCode: array[1..1] of longint;
+
+    SetLimit(ArName, 0);
+    SetLimit(ArCode, 0);
+    ArCode[Count(ArCode)+1] := 0;
+    ArCode[Count(ArCode)+1] := 1;
+    ArCode[Count(ArCode)+1] := 2;
+    ArCode[Count(ArCode)+1] := 3;//<<<< новое значение!
+    ArCode[Count(ArCode)+1] := 4;//<<<< новое значение!
+    ArName[Count(ArName)+1] := 'по получателю';
+    ArName[Count(ArName)+1] := 'по банку';
+    ArName[Count(ArName)+1] := 'по назн. платежа';
+      ArName[Count(ArName)+1] := 'по банку и гос.заказу';//<<<< новое значение!
+      ArName[Count(ArName)+1] := 'по банку, гос.заказу и субсидии';//<<<< новое значение!
+    SetEnumList(ScrHeading, #DocName, ArName, ArCode);
+    MarkerSB     :=InitMarker(''                         , 8,500,100);
+    Marker_Tmp   :=InitMarker(''                         , 8, 50, 10, True);
+    Marker_vPlan :=InitMarker('ZARREGISTERSMAKER_vPlan'  , 8, 50, 10, True);
+    ClearMarker(MarkerSB  );
+    ClearMarker(Marker_Tmp);
+    SetFilterNM(0);
+    if not ReadMyDsk(wFilter,'ZARREGISTERSMAKER_wFilter',False) wFilter:=0;
+    //Управление персоналом \ Общие настройки \ Больничные, отпуска, расчеты по среднему \ Печать дополнительного протокола отладки"
+    //включить в любое значение при проблемах
+    UP_ZAR_ZU_DFLAG7 :=wGetTune('UP.ZAR.ZU.DFLAG7');
+    ATTR_SB_VPLAN:=ExtAttr_CreateComp(coSBBAN,'Группа заказов', cgAttrType_Comp, word(100), coVPlan );
+  } //procedure LoadSetting;
+//******************************************************************************
+// Форматы
+//******************************************************************************
+ExtendFormats ScrHeading;
+
+screen ScrHeading '' ('', hcrpud, sci13Esc);
+show at (,,,6) fixed_Y;
+table Zar_User;
+//bevel b1 {0, 0, 80, 6, bsLowered, bsFrame};
+fields
+ wFilter     :NoProtect;
+ Filtr_vPlan ('Выделять реестра по следующим госзаказам',,sci13Esc): PickButton,Protect;
+<<
+
+
+
+                                  [.] Выделять только след.заказы` .@@@@@@@@@@
+
+
+>>
+end; // screen
+
+
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+  HandleEvent
+  cmOk:
+  { var DocName_Save:word;
+    DocName_Save:=DocName;
+    if DocName=3 or DocName=4 
+      DocName:=1;
+    ClearMarker(MarkerSB);
+    if  Inherited::HandleEvent(cmOk)=heAbort Abort;
+    DocName:=DocName_Save;
+    UnLoadOptions;
+
+    if (DocName=3 or DocName=4) and GetMarkerCount(MarkerSB)>0// по банку и заказу
+    { ClearMarker(Marker_Tmp);
+      if (wFilter and 1)>0
+      { CopyMarker(Marker_Tmp,Marker_vPlan);
+        StoreMarker(Marker_Tmp,'GP_ZP_ReestrDiv_vPlan');
+      }
+      else
+      { StoreMarker(Marker_Tmp,'GP_ZP_ReestrDiv_vPlan');
+      }
+      SaveMyDsk(DocName, 'GP_ZP_ReestrDiv_WorkType');
+      RunInterFace(GP_ZP::GP_ZP_ReestrDiv,MarkerSB, BO.PRIZDEL = 1);
+      ClearMyDsk('GP_ZP_ReestrDiv_WorkType');
+      ClearMarker(Marker_Tmp);
+      StoreMarker(Marker_Tmp,'GP_ZP_ReestrDiv_vPlan');
+    }
+  }
+  cmPick:
+  { if  Inherited::HandleEvent(cmPick)=heAbort Abort;
+    case CurField of
+    #Filtr_vPlan:
+    { var pVPlan:comp;
+      GetMarker(Marker_vPlan,0,pVPlan);
+      if (RunInterface(GP_GRVPLAN,pVPlan,0
+        ,17//pWorkType
+        ,Marker_vPlan
+         ) <> cmCancel)
+      {
+        //ClearMarker(Marker_vPlan);
+        //InsertMarker(Marker_vPlan,pVPlan);
+        SetFilterNM(0);
+      } //if (RunInterface(GRVPLAN,pVPlan,0
+    } //Filtr_vPlan:
+    end;
+  }
+  cmDelOnProtect:
+  { if  Inherited::HandleEvent(cmDelOnProtect)=heAbort Abort;
+    case CurField of
+    #Filtr_vPlan:
+    { ClearMarker(Marker_vPlan);
+      SetFilterNM(0);
+    }
+    end;
+  }
+  cmDone:
+  { DoneMarker(MarkerSB    ,'');
+    DoneMarker(Marker_vPlan,'ZARREGISTERSMAKER_vPlan');
+    DoneMarker(Marker_tmp  ,'');
+    SaveMyDsk(wFilter,'ZARREGISTERSMAKER_wFilter');
+    if  Inherited::HandleEvent(cmDone)=heAbort Abort;
+
+
+  }
+  end;
+end.

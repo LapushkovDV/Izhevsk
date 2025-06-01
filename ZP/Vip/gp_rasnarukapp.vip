@@ -1,0 +1,1502 @@
+/*************************************************************************************************\
+* Наименование:  Расходы на руководящий аппарат за период                                         *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:                                                                                     *
+* Вид работы  |Номер          |Дата    |Исполнитель              |Проект                          *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#816          |03/04/18 |Ермолов К.Р.             |НПО Энергомаш                   *
+* Разработка  |#60339        |16/10/23 |kurennykh                |НПО Энергомаш                   *
+\*************************************************************************************************/
+
+#doc
+      #60339    Костыль по Азовцеву
+#end
+
+#include userreport.vih
+#include marker.vih
+#include GP_GetFIOPostByPeriod.Vih
+
+interface gp_rasnarukapp 'Параметры отчета' gray
+Show at (,,40,7);
+
+table struct tSelPers // Для фильтра по сотрудникам
+(
+nrec: comp,
+kod: string,
+post: string,
+appdate: date,
+disdate: date,
+fio: string
+)
+with index
+(
+i1 = fio + appdate
+)
+;
+
+table struct tNachisl // З/П
+(
+persnrec: comp,
+fio: string,
+tabnum: string,
+podr: string,
+post: string,
+mes: word,
+year: integer,
+summa: decimal(31,15)
+)
+with index
+(
+i1 = fio + tabnum + mes,
+i2 = tabnum + mes + podr (unique)
+)
+;
+
+table struct tNachislVodSecr // З/П водителя и секретаря
+(
+zgdnrec: comp,
+fio: string,
+tabnum: string,
+podr: string,
+post: string,
+mes: word,
+year: integer,
+tip: word,
+fromdate: date,
+todate: date,
+PersDisDate: date,
+summa: decimal(31,15)
+)
+with index
+(
+i1 = tip + mes,
+i2 = zgdnrec + tip + mes
+)
+;
+
+table struct tPerevodtek // Налоги на ФОТ
+(
+fio: string,
+tabnum: string,
+podr: string,
+mes: word,
+year: integer,
+s1: decimal(31,15),
+s2: decimal(31,15),
+s3: decimal(31,15)
+)
+with index
+(
+i1 = fio + tabnum + mes,
+i2 = tabnum + mes + podr (unique)
+)
+;
+
+table struct tPerevodtekVodSecr // Налоги водителя и секретаря
+(
+zgdnrec: comp,
+fio: string,
+tabnum: string,
+podr: string,
+post: string,
+mes: word,
+year: integer,
+tip: word,
+fromdate: date,
+todate: date,
+PersDisDate: date,
+s1: decimal(31,15),
+s2: decimal(31,15)
+)
+with index
+(
+i1 = tip + mes,
+i2 = zgdnrec + tip + mes + tabnum
+)
+;
+
+table struct tOborot // Проводки
+(
+persnrec  : comp,
+fio       : string,
+analitika : string,
+summa     : decimal(31,15)
+)
+with index
+(
+i1 = persnrec
+)
+;
+
+create view gp_rasnarukapp
+
+var
+kvartal, mes: word;
+counter, countSheets: longint;
+god: integer;
+excelpath, Filtr_Persons, pUserName, ptabnum, sFIO, sPost, VodSecTabnum: string;
+pMarkerPers: IMarker(marker) new;
+cpers, cPersNrec: comp;
+itogzp, itogs1, itogs2, itogs3, itognalog,
+ZpSecr, NalogSecr, ZpVod, NalogVod,
+s1Secr, s2Secr, s1Vod, s2Vod: double;
+
+select tSelPers.nrec from tSelPers, tNachisl, tPerevodtek, tOborot, tPerevodtekVodSecr, tNachislVodSecr;
+
+Procedure GetOborot(_d, _m1, _m2, _y : word);
+{
+  var qStr : longint = 0;
+
+  sqlFreeStr(qStr);
+
+  sqlAddStr(qStr, '    select                                                                                                           ');
+  sqlAddStr(qStr, '      persons.nrec                                              as  persnrec                                         ');
+  sqlAddStr(qStr, '    , persons.fio                                               as  fio                                              ');
+  sqlAddStr(qStr, '    , substring(attrval.vstring, 5, length(attrval.vstring))    as  analitika                                        ');
+  sqlAddStr(qStr, '    , sum(oborot.sumob)                                         as  summa                                            ');
+  sqlAddStr(qStr, '    from oborot                                                                                                      ');
+  sqlAddStr(qStr, '    left join spkau on spkau.nrec = oborot.kauks[2]                                                                  ');
+  sqlAddStr(qStr, '    inner join attrnam on attrnam.wtable = 8512 and attrnam.name = ''.Входит в отчет по руководителям''              ');
+  sqlAddStr(qStr, '    inner join attrval on attrval.wtable = 8512 and attrval.cattrnam = attrnam.nrec and spkau.nrec = attrval.crec    ');
+  sqlAddStr(qStr, '    left join persons on persons.nrec = oborot.kauks[1]                                                              ');
+  sqlAddStr(qStr, '    where oborot.datob between #date(01                , ' + string(_m1) + ', ' + string(_y) + ')                    ');
+  sqlAddStr(qStr, '                           and #date(' + string(_d) + ', ' + string(_m2) + ', ' + string(_y) + ')                    ');
+  sqlAddStr(qStr, '          and spkau.name <> ''240 Закупка услуг сотовой связи''                                                      ');
+  sqlAddStr(qStr, '    group by persons.nrec, persons.fio, substring(attrval.vstring, 5, length(attrval.vstring))                       ');
+  sqlAddStr(qStr, '                                                                                                                     ');
+  sqlAddStr(qStr, '    union all                                                                                                        ');
+  sqlAddStr(qStr, '                                                                                                                     ');
+  sqlAddStr(qStr, '    select                                                                                                           ');
+  sqlAddStr(qStr, '      persons.nrec                                              as  persnrec                                         ');
+  sqlAddStr(qStr, '    , persons.fio                                               as  fio                                              ');
+  sqlAddStr(qStr, '    , ''Мобильная связь''                                       as  analitika                                        ');
+  sqlAddStr(qStr, '    , sum(oborot.sumob)                                         as  summa                                            ');
+  sqlAddStr(qStr, '    from oborot                                                                                                      ');
+  sqlAddStr(qStr, '    left join spkau on spkau.nrec = oborot.kauks[6]                                                                  ');
+  sqlAddStr(qStr, '    left join persons on persons.nrec = oborot.kauks[4]                                                              ');
+  sqlAddStr(qStr, '    where oborot.datob between #date(01                , ' + string(_m1) + ', ' + string(_y) + ')                    ');
+  sqlAddStr(qStr, '                           and #date(' + string(_d) + ', ' + string(_m2) + ', ' + string(_y) + ')                    ');
+  sqlAddStr(qStr, '          and oborot.dbscheto <> ''19''                                                                              ');
+  sqlAddStr(qStr, '          and oborot.krschetk = ''60''                                                                               ');
+  sqlAddStr(qStr, '          and oborot.subschk = ''11''                                                                                ');
+  sqlAddStr(qStr, '    group by persons.nrec, persons.fio                                                                               ');
+
+  var objQuery : iQuery;
+      objQuery := queryManager.createQuery(qStr);
+
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка обработки записей (GetOborot) ' + objQuery.errorCode, Error);
+  }
+  else
+  {
+    sqlCopyInto(objQuery, tntOborot, true);
+  }
+  sqlFreeStr(qStr);
+}
+
+window wnSelPers 'Сотрудники' doAccept, EscClose;
+Show at (5,5,170,25);
+Browse brSelPers '' ;
+Table tSelPers;
+recMarker=pMarkerPers {tSelPers.nrec};
+Fields
+tSelPers.fio 'ФИО':[40],Protect,NoDel;
+tSelPers.kod  'Код подр.':[10],Protect,NoDel;
+tSelPers.post  'Должность':[100],Protect,NoDel;
+tSelPers.appdate 'Дата начала':[10],Protect,NoDel;
+tSelPers.disdate 'Дата окончания':[10],Protect,NoDel;
+end;
+end;
+
+screen scr ('Параметры отчета',,sci13Esc);
+  fields
+  kvartal : [list
+            1 '1',
+            2 '2',
+            3 '3',
+            4 '4'], protect;
+  god: noprotect, spinbutton [1, 1917, 2117];
+  Filtr_Persons: pickbutton, noprotect;
+ buttons
+    cmGo, ,, 'Сформировать' ,,;
+    <<
+
+    Квартал:      .@@@
+    Год:          .@@@@@
+    Лицевые счета:.@@@@@@@@@@@@@@@@@@
+
+    <.Сформировать.>
+
+    >>
+end;
+
+handleevent
+
+cmInit:
+{
+  pUserName:= UserName();
+  kvartal:= 1;
+  god:= year(dgettune('UP.DATOTCH'));
+  Filtr_Persons:= 'Не выбраны';
+
+  SQL
+  select Distinct lschet.nrec, CatDept.Code, CatPost.Name, Appointments.AppointDate, Appointments.DisMissDate, Persons.Fio
+  From Catalogs CatPostMain
+  inner join Catalogs CatPost on CatPost.cParent = CatPostMain.Nrec
+  inner join Appointments on Appointments.Post = CatPost.Nrec and ((Appointments.LPrizn >= 0 and Appointments.LPrizn <= 3) or Appointments.LPrizn = 100)
+  Inner join Persons on Persons.Nrec = Appointments.Person
+  Inner join Catalogs CatDept on CatDept.Nrec = Appointments.Department
+  inner join lschet on lschet.nrec = appointments.caddnrec2
+  where CatPostMain.Name = '_Первые руководители и их заместители'
+
+  union all
+
+  select
+    lschet.nrec, '511', 'Заместитель генерального директора по закупкам', #date(17, 07, 2023), #date(31, 12, 2023), 'Азовцев Константин Алексеевич'
+  from lschet
+  where lschet.nrec = #comp(0000000010050061h)
+
+  into tSelPers
+  ;
+}
+
+cmPick:
+{
+  if curfield = #Filtr_persons
+  {
+    runwindow(wnSelPers);
+  }
+}
+
+cmGo:
+{
+  StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+
+  delete all from tNachisl;
+  delete all from tPerevodtek;
+  delete all from tOborot;
+  delete all from tNachislVodSecr;
+  delete all from tPerevodtekVodSecr;
+
+  SubBounds(tbRmtSelPers1);
+  AddBounds(tbRmtSelPers2);
+
+  if kvartal = 1
+  {
+    _loop pMarkerPers
+    {
+      cpers:= tSelPers.nrec;
+
+      sql
+      select persons.nrec, persons.fio, lschet.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, round(sum(nachislzakaz.summa), 2)
+      from nachislzakaz
+      left join lschet on lschet.nrec = nachislzakaz.clsch
+      left join persons on lschet.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      left join catalogs on catalogs.nrec = lschet.cappoint
+      where (nachislzakaz.mesn = 1 or nachislzakaz.mesn = 2 or nachislzakaz.mesn = 3) and nachislzakaz.yearn = :(god)
+      and (nachislzakaz.vidopl <> 079 and nachislzakaz.vidopl <> 178 and nachislzakaz.vidopl <> 179
+      and nachislzakaz.vidopl <> 180 and nachislzakaz.vidopl <> 181 and nachislzakaz.vidopl <> 182
+      and nachislzakaz.vidopl <> 189) and nachislzakaz.clsch = :(cpers)
+      group by persons.nrec, persons.fio, lschet.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn
+      into tNachisl
+      ;
+
+      sql
+      select persons.fio, lschet.strtabn, katpodr.kod, perevodtekzakaz.mesn, perevodtekzakaz.yearn,
+      round(sum(coalesce(perevodtekzakaz2.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz3.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz5.sumper,0)), 2) +
+      round(sum(coalesce(perevodtekzakaz11.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz12.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz14.sumper,0)), 2),
+      round(sum(perevodtekzakaz8.sumper), 2), round(sum(perevodtekzakaz3.sumper), 2)
+      from perevodtekzakaz
+      left join lschet on lschet.nrec = perevodtekzakaz.clsch
+      left join persons on lschet.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+      left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.nrec = perevodtekzakaz.nrec and perevodtekzakaz2.vidper = 2
+      left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.nrec = perevodtekzakaz.nrec and perevodtekzakaz3.vidper = 3
+      left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.nrec = perevodtekzakaz.nrec and perevodtekzakaz5.vidper = 5
+      left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.nrec = perevodtekzakaz.nrec and perevodtekzakaz8.vidper = 8
+      left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.nrec = perevodtekzakaz.nrec and perevodtekzakaz11.vidper = 11
+      left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.nrec = perevodtekzakaz.nrec and perevodtekzakaz12.vidper = 12
+      left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.nrec = perevodtekzakaz.nrec and perevodtekzakaz14.vidper = 14
+      where (perevodtekzakaz.mesn = 1 or perevodtekzakaz.mesn = 2 or perevodtekzakaz.mesn = 3)
+      and perevodtekzakaz.yearn = :(god) and perevodtekzakaz.clsch = :(cpers)
+      group by persons.fio, lschet.strtabn, katpodr.kod, perevodtekzakaz.mesn, perevodtekzakaz.yearn
+      into tPerevodtek
+      ;
+
+      sql
+      select appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate, round(sum(nachislzakaz.summa), 2)
+      from lschet
+      left join appointments on appointments.caddnrec2 = lschet.nrec
+      left join gp_kpi_pers_class on gp_kpi_pers_class.clink_app = appointments.nrec
+      left join appointments a1 on a1.nrec = gp_kpi_pers_class.cappoint
+      left join lschet l1 on l1.nrec = a1.caddnrec2
+      left join nachislzakaz on nachislzakaz.clsch = l1.nrec
+      and (nachislzakaz.mesn = 1 or nachislzakaz.mesn = 2 or nachislzakaz.mesn = 3) and nachislzakaz.yearn = :(god)
+      and (nachislzakaz.vidopl <> 079 and nachislzakaz.vidopl <> 178 and nachislzakaz.vidopl <> 179
+      and nachislzakaz.vidopl <> 180 and nachislzakaz.vidopl <> 181 and nachislzakaz.vidopl <> 182
+      and nachislzakaz.vidopl <> 189)
+      left join persons on l1.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      left join catalogs on catalogs.nrec = l1.cappoint
+      where lschet.nrec = :(cpers)
+      and (cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = nachislzakaz.yearn or cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = 0)
+      and ((cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) between 1 and 3) or (cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) = 0))
+      and ((cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) = nachislzakaz.yearn and cast(substring(date2str('%MM', gp_kpi_pers_class.fromdate),1,2) as word) <= 3)
+      or cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) < nachislzakaz.yearn)
+      group by appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate
+      into tNachislVodSecr
+      ;
+
+      sql
+      select appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, perevodtekzakaz.mesn, perevodtekzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate,
+      round(sum(coalesce(perevodtekzakaz2.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz3.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz5.sumper,0)), 2) +
+      round(sum(coalesce(perevodtekzakaz11.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz12.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz14.sumper,0)), 2),
+      round(sum(perevodtekzakaz8.sumper), 2), round(sum(perevodtekzakaz3.sumper), 2)
+      from lschet
+      left join appointments on appointments.caddnrec2 = lschet.nrec
+      left join gp_kpi_pers_class on gp_kpi_pers_class.clink_app = appointments.nrec
+      left join appointments a1 on a1.nrec = gp_kpi_pers_class.cappoint
+      left join lschet l1 on l1.nrec = a1.caddnrec2
+      left join perevodtekzakaz on perevodtekzakaz.clsch = l1.nrec and perevodtekzakaz.yearn = :(god) and (perevodtekzakaz.mesn = 1 or perevodtekzakaz.mesn = 2 or perevodtekzakaz.mesn = 3)
+      left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.nrec = perevodtekzakaz.nrec and perevodtekzakaz2.vidper = 2
+      left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.nrec = perevodtekzakaz.nrec and perevodtekzakaz3.vidper = 3
+      left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.nrec = perevodtekzakaz.nrec and perevodtekzakaz5.vidper = 5
+      left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.nrec = perevodtekzakaz.nrec and perevodtekzakaz8.vidper = 8
+      left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.nrec = perevodtekzakaz.nrec and perevodtekzakaz11.vidper = 11
+      left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.nrec = perevodtekzakaz.nrec and perevodtekzakaz12.vidper = 12
+      left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.nrec = perevodtekzakaz.nrec and perevodtekzakaz14.vidper = 14
+      left join persons on l1.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+      left join catalogs on catalogs.nrec = l1.cappoint
+      where lschet.nrec = :(cpers)
+      and (cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = perevodtekzakaz.yearn or cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = 0)
+      and ((cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) between 1 and 3) or (cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) = 0))
+      and ((cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) = perevodtekzakaz.yearn and cast(substring(date2str('%MM', gp_kpi_pers_class.fromdate),1,2) as word) <= 3)
+      or cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) < perevodtekzakaz.yearn)
+      group by appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, perevodtekzakaz.mesn, perevodtekzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate
+      into tPerevodtekVodSecr
+      ;
+    }
+
+    GetOborot(31, 1, 3, god);
+  }
+
+  if kvartal = 2
+  {
+    _loop pMarkerPers
+    {
+      cpers:= tSelPers.nrec;
+
+      sql
+      select persons.nrec, persons.fio, lschet.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, round(sum(nachislzakaz.summa), 2)
+      from nachislzakaz
+      left join lschet on lschet.nrec = nachislzakaz.clsch
+      left join persons on lschet.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      left join catalogs on catalogs.nrec = lschet.cappoint
+      where (nachislzakaz.mesn = 4 or nachislzakaz.mesn = 5 or nachislzakaz.mesn = 6) and nachislzakaz.yearn = :(god)
+      and (nachislzakaz.vidopl <> 079 and nachislzakaz.vidopl <> 178 and nachislzakaz.vidopl <> 179
+      and nachislzakaz.vidopl <> 180 and nachislzakaz.vidopl <> 181 and nachislzakaz.vidopl <> 182
+      and nachislzakaz.vidopl <> 189) and nachislzakaz.clsch = :(cpers)
+      group by persons.nrec, persons.fio, lschet.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn
+      into tNachisl
+      ;
+
+      sql
+      select persons.fio, lschet.strtabn, katpodr.kod, perevodtekzakaz.mesn, perevodtekzakaz.yearn,
+      round(sum(coalesce(perevodtekzakaz2.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz3.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz5.sumper,0)), 2) +
+      round(sum(coalesce(perevodtekzakaz11.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz12.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz14.sumper,0)), 2),
+      round(sum(perevodtekzakaz8.sumper), 2), round(sum(perevodtekzakaz3.sumper), 2)
+      from perevodtekzakaz
+      left join lschet on lschet.nrec = perevodtekzakaz.clsch
+      left join persons on lschet.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+      left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.nrec = perevodtekzakaz.nrec and perevodtekzakaz2.vidper = 2
+      left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.nrec = perevodtekzakaz.nrec and perevodtekzakaz3.vidper = 3
+      left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.nrec = perevodtekzakaz.nrec and perevodtekzakaz5.vidper = 5
+      left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.nrec = perevodtekzakaz.nrec and perevodtekzakaz8.vidper = 8
+      left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.nrec = perevodtekzakaz.nrec and perevodtekzakaz11.vidper = 11
+      left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.nrec = perevodtekzakaz.nrec and perevodtekzakaz12.vidper = 12
+      left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.nrec = perevodtekzakaz.nrec and perevodtekzakaz14.vidper = 14
+      where (perevodtekzakaz.mesn = 4 or perevodtekzakaz.mesn = 5 or perevodtekzakaz.mesn = 6)
+      and perevodtekzakaz.yearn = :(god) and perevodtekzakaz.clsch = :(cpers)
+      group by persons.fio, lschet.strtabn, katpodr.kod, perevodtekzakaz.mesn, perevodtekzakaz.yearn
+      into tPerevodtek
+      ;
+
+      sql
+      select appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate, round(sum(nachislzakaz.summa), 2)
+      from lschet
+      left join appointments on appointments.caddnrec2 = lschet.nrec
+      left join gp_kpi_pers_class on gp_kpi_pers_class.clink_app = appointments.nrec
+      left join appointments a1 on a1.nrec = gp_kpi_pers_class.cappoint
+      left join lschet l1 on l1.nrec = a1.caddnrec2
+      left join nachislzakaz on nachislzakaz.clsch = l1.nrec
+      and (nachislzakaz.mesn = 4 or nachislzakaz.mesn = 5 or nachislzakaz.mesn = 6) and nachislzakaz.yearn = :(god)
+      and (nachislzakaz.vidopl <> 079 and nachislzakaz.vidopl <> 178 and nachislzakaz.vidopl <> 179
+      and nachislzakaz.vidopl <> 180 and nachislzakaz.vidopl <> 181 and nachislzakaz.vidopl <> 182
+      and nachislzakaz.vidopl <> 189)
+      left join persons on l1.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      left join catalogs on catalogs.nrec = l1.cappoint
+      where lschet.nrec = :(cpers)
+      and (cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = nachislzakaz.yearn or cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = 0)
+      and ((cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) between 4 and 6) or (cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) = 0))
+      and ((cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) = nachislzakaz.yearn and cast(substring(date2str('%MM', gp_kpi_pers_class.fromdate),1,2) as word) <= 6)
+      or cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) < nachislzakaz.yearn)
+      group by appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate
+      into tNachislVodSecr
+      ;
+
+      sql
+      select appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, perevodtekzakaz.mesn, perevodtekzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate,
+      round(sum(coalesce(perevodtekzakaz2.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz3.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz5.sumper,0)), 2) +
+      round(sum(coalesce(perevodtekzakaz11.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz12.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz14.sumper,0)), 2),
+      round(sum(perevodtekzakaz8.sumper), 2), round(sum(perevodtekzakaz3.sumper), 2)
+      from lschet
+      left join appointments on appointments.caddnrec2 = lschet.nrec
+      left join gp_kpi_pers_class on gp_kpi_pers_class.clink_app = appointments.nrec
+      left join appointments a1 on a1.nrec = gp_kpi_pers_class.cappoint
+      left join lschet l1 on l1.nrec = a1.caddnrec2
+      left join perevodtekzakaz on perevodtekzakaz.clsch = l1.nrec and perevodtekzakaz.yearn = :(god) and (perevodtekzakaz.mesn = 4 or perevodtekzakaz.mesn = 5 or perevodtekzakaz.mesn = 6)
+      left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.nrec = perevodtekzakaz.nrec and perevodtekzakaz2.vidper = 2
+      left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.nrec = perevodtekzakaz.nrec and perevodtekzakaz3.vidper = 3
+      left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.nrec = perevodtekzakaz.nrec and perevodtekzakaz5.vidper = 5
+      left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.nrec = perevodtekzakaz.nrec and perevodtekzakaz8.vidper = 8
+      left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.nrec = perevodtekzakaz.nrec and perevodtekzakaz11.vidper = 11
+      left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.nrec = perevodtekzakaz.nrec and perevodtekzakaz12.vidper = 12
+      left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.nrec = perevodtekzakaz.nrec and perevodtekzakaz14.vidper = 14
+      left join persons on l1.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+      left join catalogs on catalogs.nrec = l1.cappoint
+      where lschet.nrec = :(cpers)
+      and (cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = perevodtekzakaz.yearn or cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = 0)
+      and ((cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) between 4 and 6) or (cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) = 0))
+      and ((cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) = perevodtekzakaz.yearn and cast(substring(date2str('%MM', gp_kpi_pers_class.fromdate),1,2) as word) <= 6)
+      or cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) < perevodtekzakaz.yearn)
+      group by appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, perevodtekzakaz.mesn, perevodtekzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate
+      into tPerevodtekVodSecr
+      ;
+    }
+
+    GetOborot(30, 4, 6, god);
+  }
+
+  if kvartal = 3
+  {
+    _loop pMarkerPers
+    {
+      cpers:= tSelPers.nrec;
+
+      sql
+      select persons.nrec, persons.fio, lschet.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, round(sum(nachislzakaz.summa), 2)
+      from nachislzakaz
+      left join lschet on lschet.nrec = nachislzakaz.clsch
+      left join persons on lschet.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      left join catalogs on catalogs.nrec = lschet.cappoint
+      where (nachislzakaz.mesn = 7 or nachislzakaz.mesn = 8 or nachislzakaz.mesn = 9) and nachislzakaz.yearn = :(god)
+      and (nachislzakaz.vidopl <> 079 and nachislzakaz.vidopl <> 178 and nachislzakaz.vidopl <> 179
+      and nachislzakaz.vidopl <> 180 and nachislzakaz.vidopl <> 181 and nachislzakaz.vidopl <> 182
+      and nachislzakaz.vidopl <> 189) and nachislzakaz.clsch = :(cpers)
+      group by persons.nrec, persons.fio, lschet.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn
+      into tNachisl
+      ;
+
+      sql
+      select persons.fio, lschet.strtabn, katpodr.kod, perevodtekzakaz.mesn, perevodtekzakaz.yearn,
+      round(sum(coalesce(perevodtekzakaz2.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz3.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz5.sumper,0)), 2) +
+      round(sum(coalesce(perevodtekzakaz11.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz12.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz14.sumper,0)), 2),
+      round(sum(perevodtekzakaz8.sumper), 2), round(sum(perevodtekzakaz3.sumper), 2)
+      from perevodtekzakaz
+      left join lschet on lschet.nrec = perevodtekzakaz.clsch
+      left join persons on lschet.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+      left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.nrec = perevodtekzakaz.nrec and perevodtekzakaz2.vidper = 2
+      left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.nrec = perevodtekzakaz.nrec and perevodtekzakaz3.vidper = 3
+      left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.nrec = perevodtekzakaz.nrec and perevodtekzakaz5.vidper = 5
+      left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.nrec = perevodtekzakaz.nrec and perevodtekzakaz8.vidper = 8
+      left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.nrec = perevodtekzakaz.nrec and perevodtekzakaz11.vidper = 11
+      left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.nrec = perevodtekzakaz.nrec and perevodtekzakaz12.vidper = 12
+      left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.nrec = perevodtekzakaz.nrec and perevodtekzakaz14.vidper = 14
+      where (perevodtekzakaz.mesn = 7 or perevodtekzakaz.mesn = 8 or perevodtekzakaz.mesn = 9)
+      and perevodtekzakaz.yearn = :(god) and perevodtekzakaz.clsch = :(cpers)
+      group by persons.fio, lschet.strtabn, katpodr.kod, perevodtekzakaz.mesn, perevodtekzakaz.yearn
+      into tPerevodtek
+      ;
+
+      sql
+      select appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate, round(sum(nachislzakaz.summa), 2)
+      from lschet
+      left join appointments on appointments.caddnrec2 = lschet.nrec
+      left join gp_kpi_pers_class on gp_kpi_pers_class.clink_app = appointments.nrec
+      left join appointments a1 on a1.nrec = gp_kpi_pers_class.cappoint
+      left join lschet l1 on l1.nrec = a1.caddnrec2
+      left join nachislzakaz on nachislzakaz.clsch = l1.nrec
+      and (nachislzakaz.mesn = 7 or nachislzakaz.mesn = 8 or nachislzakaz.mesn = 9) and nachislzakaz.yearn = :(god)
+      and (nachislzakaz.vidopl <> 079 and nachislzakaz.vidopl <> 178 and nachislzakaz.vidopl <> 179
+      and nachislzakaz.vidopl <> 180 and nachislzakaz.vidopl <> 181 and nachislzakaz.vidopl <> 182
+      and nachislzakaz.vidopl <> 189)
+      left join persons on l1.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      left join catalogs on catalogs.nrec = l1.cappoint
+      where lschet.nrec = :(cpers)
+      and (cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = nachislzakaz.yearn or cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = 0)
+      and ((cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) between 7 and 9) or (cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) = 0))
+      and ((cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) = nachislzakaz.yearn and cast(substring(date2str('%MM', gp_kpi_pers_class.fromdate),1,2) as word) <= 9)
+      or cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) < nachislzakaz.yearn)
+      group by appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate
+      into tNachislVodSecr
+      ;
+
+      sql
+      select appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, perevodtekzakaz.mesn, perevodtekzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate,
+      round(sum(coalesce(perevodtekzakaz2.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz3.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz5.sumper,0)), 2) +
+      round(sum(coalesce(perevodtekzakaz11.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz12.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz14.sumper,0)), 2),
+      round(sum(perevodtekzakaz8.sumper), 2), round(sum(perevodtekzakaz3.sumper), 2)
+      from lschet
+      left join appointments on appointments.caddnrec2 = lschet.nrec
+      left join gp_kpi_pers_class on gp_kpi_pers_class.clink_app = appointments.nrec
+      left join appointments a1 on a1.nrec = gp_kpi_pers_class.cappoint
+      left join lschet l1 on l1.nrec = a1.caddnrec2
+      left join perevodtekzakaz on perevodtekzakaz.clsch = l1.nrec and perevodtekzakaz.yearn = :(god) and (perevodtekzakaz.mesn = 7 or perevodtekzakaz.mesn = 8 or perevodtekzakaz.mesn = 9)
+      left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.nrec = perevodtekzakaz.nrec and perevodtekzakaz2.vidper = 2
+      left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.nrec = perevodtekzakaz.nrec and perevodtekzakaz3.vidper = 3
+      left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.nrec = perevodtekzakaz.nrec and perevodtekzakaz5.vidper = 5
+      left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.nrec = perevodtekzakaz.nrec and perevodtekzakaz8.vidper = 8
+      left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.nrec = perevodtekzakaz.nrec and perevodtekzakaz11.vidper = 11
+      left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.nrec = perevodtekzakaz.nrec and perevodtekzakaz12.vidper = 12
+      left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.nrec = perevodtekzakaz.nrec and perevodtekzakaz14.vidper = 14
+      left join persons on l1.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+      left join catalogs on catalogs.nrec = l1.cappoint
+      where lschet.nrec = :(cpers)
+      and (cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = perevodtekzakaz.yearn or cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = 0)
+      and ((cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) between 7 and 9) or (cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) = 0))
+      and ((cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) = perevodtekzakaz.yearn and cast(substring(date2str('%MM', gp_kpi_pers_class.fromdate),1,2) as word) <= 9)
+      or cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) < perevodtekzakaz.yearn)
+      group by appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, perevodtekzakaz.mesn, perevodtekzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate
+      into tPerevodtekVodSecr
+      ;
+    }
+    GetOborot(30, 7, 9, god);
+  }
+
+  if kvartal = 4
+  {
+    _loop pMarkerPers
+    {
+      cpers:= tSelPers.nrec;
+
+      sql
+      select persons.nrec, persons.fio, lschet.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, round(sum(nachislzakaz.summa), 2)
+      from nachislzakaz
+      left join lschet on lschet.nrec = nachislzakaz.clsch
+      left join persons on lschet.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      left join catalogs on catalogs.nrec = lschet.cappoint
+      where (nachislzakaz.mesn = 10 or nachislzakaz.mesn = 11 or nachislzakaz.mesn = 12) and nachislzakaz.yearn = :(god)
+      and (nachislzakaz.vidopl <> 079 and nachislzakaz.vidopl <> 178 and nachislzakaz.vidopl <> 179
+      and nachislzakaz.vidopl <> 180 and nachislzakaz.vidopl <> 181 and nachislzakaz.vidopl <> 182
+      and nachislzakaz.vidopl <> 189) and nachislzakaz.clsch = :(cpers)
+      group by persons.nrec, persons.fio, lschet.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn
+      into tNachisl
+      ;
+
+      sql
+      select persons.fio, lschet.strtabn, katpodr.kod, perevodtekzakaz.mesn, perevodtekzakaz.yearn,
+      round(sum(coalesce(perevodtekzakaz2.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz3.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz5.sumper,0)), 2) +
+      round(sum(coalesce(perevodtekzakaz11.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz12.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz14.sumper,0)), 2),
+      round(sum(perevodtekzakaz8.sumper), 2), round(sum(perevodtekzakaz3.sumper), 2)
+      from perevodtekzakaz
+      left join lschet on lschet.nrec = perevodtekzakaz.clsch
+      left join persons on lschet.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+      left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.nrec = perevodtekzakaz.nrec and perevodtekzakaz2.vidper = 2
+      left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.nrec = perevodtekzakaz.nrec and perevodtekzakaz3.vidper = 3
+      left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.nrec = perevodtekzakaz.nrec and perevodtekzakaz5.vidper = 5
+      left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.nrec = perevodtekzakaz.nrec and perevodtekzakaz8.vidper = 8
+      left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.nrec = perevodtekzakaz.nrec and perevodtekzakaz11.vidper = 11
+      left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.nrec = perevodtekzakaz.nrec and perevodtekzakaz12.vidper = 12
+      left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.nrec = perevodtekzakaz.nrec and perevodtekzakaz14.vidper = 14
+      where (perevodtekzakaz.mesn = 10 or perevodtekzakaz.mesn = 11 or perevodtekzakaz.mesn = 12)
+      and perevodtekzakaz.yearn = :(god) and perevodtekzakaz.clsch = :(cpers)
+      group by persons.fio, lschet.strtabn, katpodr.kod, perevodtekzakaz.mesn, perevodtekzakaz.yearn
+      into tPerevodtek
+      ;
+
+      sql
+      select appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate, round(sum(nachislzakaz.summa), 2)
+      from lschet
+      left join appointments on appointments.caddnrec2 = lschet.nrec
+      left join gp_kpi_pers_class on gp_kpi_pers_class.clink_app = appointments.nrec
+      left join appointments a1 on a1.nrec = gp_kpi_pers_class.cappoint
+      left join lschet l1 on l1.nrec = a1.caddnrec2
+      left join nachislzakaz on nachislzakaz.clsch = l1.nrec
+      and (nachislzakaz.mesn = 10 or nachislzakaz.mesn = 11 or nachislzakaz.mesn = 12) and nachislzakaz.yearn = :(god)
+      and (nachislzakaz.vidopl <> 079 and nachislzakaz.vidopl <> 178 and nachislzakaz.vidopl <> 179
+      and nachislzakaz.vidopl <> 180 and nachislzakaz.vidopl <> 181 and nachislzakaz.vidopl <> 182
+      and nachislzakaz.vidopl <> 189)
+      left join persons on l1.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      left join catalogs on catalogs.nrec = l1.cappoint
+      where lschet.nrec = :(cpers)
+      and (cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = nachislzakaz.yearn or cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = 0)
+      and ((cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) between 10 and 12) or (cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) = 0))
+      and ((cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) = nachislzakaz.yearn and cast(substring(date2str('%MM', gp_kpi_pers_class.fromdate),1,2) as word) <= 12)
+      or cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) < nachislzakaz.yearn)
+      group by appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, nachislzakaz.mesn, nachislzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate
+      into tNachislVodSecr
+      ;
+
+      sql
+      select appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, perevodtekzakaz.mesn, perevodtekzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate,
+      round(sum(coalesce(perevodtekzakaz2.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz3.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz5.sumper,0)), 2) +
+      round(sum(coalesce(perevodtekzakaz11.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz12.sumper,0)), 2) + round(sum(coalesce(perevodtekzakaz14.sumper,0)), 2),
+      round(sum(perevodtekzakaz8.sumper), 2), round(sum(perevodtekzakaz3.sumper), 2)
+      from lschet
+      left join appointments on appointments.caddnrec2 = lschet.nrec
+      left join gp_kpi_pers_class on gp_kpi_pers_class.clink_app = appointments.nrec
+      left join appointments a1 on a1.nrec = gp_kpi_pers_class.cappoint
+      left join lschet l1 on l1.nrec = a1.caddnrec2
+      left join perevodtekzakaz on perevodtekzakaz.clsch = l1.nrec and perevodtekzakaz.yearn = :(god) and (perevodtekzakaz.mesn = 10 or perevodtekzakaz.mesn = 11 or perevodtekzakaz.mesn = 12)
+      left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.nrec = perevodtekzakaz.nrec and perevodtekzakaz2.vidper = 2
+      left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.nrec = perevodtekzakaz.nrec and perevodtekzakaz3.vidper = 3
+      left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.nrec = perevodtekzakaz.nrec and perevodtekzakaz5.vidper = 5
+      left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.nrec = perevodtekzakaz.nrec and perevodtekzakaz8.vidper = 8
+      left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.nrec = perevodtekzakaz.nrec and perevodtekzakaz11.vidper = 11
+      left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.nrec = perevodtekzakaz.nrec and perevodtekzakaz12.vidper = 12
+      left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.nrec = perevodtekzakaz.nrec and perevodtekzakaz14.vidper = 14
+      left join persons on l1.tperson = persons.nrec
+      left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+      left join catalogs on catalogs.nrec = l1.cappoint
+      where lschet.nrec = :(cpers)
+      and (cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = perevodtekzakaz.yearn or cast(substring(date2str('%yyyy', gp_kpi_pers_class.todate),1,4) as integer) = 0)
+      and ((cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) between 10 and 12) or (cast(substring(date2str('%MM', gp_kpi_pers_class.todate),1,2) as word) = 0))
+      and ((cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) = perevodtekzakaz.yearn and cast(substring(date2str('%MM', gp_kpi_pers_class.fromdate),1,2) as word) <= 12)
+      or cast(substring(date2str('%yyyy', gp_kpi_pers_class.fromdate),1,4) as integer) < perevodtekzakaz.yearn)
+      group by appointments.person, persons.fio, l1.strtabn, katpodr.kod, catalogs.name, perevodtekzakaz.mesn, perevodtekzakaz.yearn, gp_kpi_pers_class.vidopl, gp_kpi_pers_class.fromdate, gp_kpi_pers_class.todate, persons.disdate
+      into tPerevodtekVodSecr
+      ;
+    }
+    GetOborot(31, 10, 12, god);
+  }
+
+  SubBounds(tbRmtSelPers2);
+  AddBounds(tbRmtSelPers1);
+
+  ExcelPath:= TranslatePath('%ClientStartPath%');
+  xlCreateExcelWithTemplate(ExcelPath+'XLS_ЭМ\ZP\gp_rasnarukapp.xlsm',true);
+  if (xlIsExcelValid) xlSetActiveWorkBookByName('1');
+
+  itogzp:= 0;
+  itogs1:= 0;
+  itogs2:= 0;
+  itogs3:= 0;
+  itognalog:= 0;
+  ptabnum:= '';
+  counter:= 2;
+  countSheets:= 1;
+
+  xlsetcellstringvalue('Расходы на руководящий аппарат за ' + kvartal + ' квартал ' + god + ' года', 1, 1, 1, 1);
+
+  if getfirst tNachisl = tsok
+  {
+    ptabnum:= tNachisl.tabnum;
+    sFIO:= tNachisl.fio;
+    sPost:= tNachisl.post;
+    cPersNrec:= tNachisl.persnrec;
+    xlsetcellstringvalue(tNachisl.podr, 3, 3, 3, 3);
+    xlsetcellstringvalue(tNachisl.tabnum, 3, 1, 3, 1);
+    xlsetcellstringvalue(tNachisl.fio, 3, 2, 3, 2);
+  }
+
+  _loop tNachisl
+  {
+    counter++;
+
+    if ptabnum = tNachisl.tabnum
+    {
+      itogzp:= itogzp + tNachisl.summa;
+
+      if counter <> 3
+      {
+        xlmergecells(counter, 1, counter, 2);
+      }
+
+      xlsetcellstringvalue(tNachisl.podr, counter, 3, counter, 3);
+      xlsetcellstringvalue(tNachisl.mes, counter, 4, counter, 4);
+      xlsetcellNumberValue(round(tNachisl.summa/1000, 2), counter, 5, counter, 5);
+      xlsetcellnumbervalue(0, counter, 6, counter, 6);
+      xlsetcellnumbervalue(0, counter, 7, counter, 7);
+      xlsetcellnumbervalue(0, counter, 8, counter, 8);
+
+      _loop tPerevodtek where ((tNachisl.tabnum == tPerevodtek.tabnum and tNachisl.mes == tPerevodtek.mes and tNachisl.podr == tPerevodtek.podr))
+      {
+        itogs1:= itogs1 + tPerevodtek.s1;
+        itogs2:= itogs2 + tPerevodtek.s2;
+        itogs3:= itogs3 + tPerevodtek.s3;
+        itognalog:= itogs1 + itogs2;
+
+        xlsetcellNumberValue(round(tPerevodtek.s1/1000, 2), counter, 6, counter, 6);
+        xlsetcellNumberValue(round(tPerevodtek.s2/1000, 2), counter, 7, counter, 7);
+        xlsetcellNumberValue(round((tPerevodtek.s1 + tPerevodtek.s2)/1000, 2), counter, 8, counter, 8);
+      }
+
+      ZpSecr:= 0; ZpVod:= 0; NalogSecr:= 0; NalogVod:= 0; s1Secr:= 0; s2Secr:= 0; s1Vod:= 0; s2Vod:= 0;
+
+      _loop tNachislVodSecr where ((tNachisl.persnrec == tNachislVodSecr.zgdnrec and 10002 == tNachislVodSecr.tip))
+      {
+        if (month(tNachislVodSecr.fromdate) > tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) >= tNachislVodSecr.year) delete current tNachislVodSecr
+
+        else if (month(tNachislVodSecr.todate) < tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) <= tNachislVodSecr.year and tNachislVodSecr.todate <> 0) delete current tNachislVodSecr
+
+        else if (month(tNachislVodSecr.todate) = tNachislVodSecr.mes and year(tNachislVodSecr.todate) = tNachislVodSecr.year and tNachislVodSecr.todate <> tNachislVodSecr.PersDisDate)
+        ZpSecr:= ZpSecr + (tNachislVodSecr.summa/Last_day(tNachislVodSecr.todate)*Day(tNachislVodSecr.todate))
+
+        else if (month(tNachislVodSecr.fromdate) = tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) = tNachislVodSecr.year and tNachislVodSecr.todate = tNachislVodSecr.PersDisDate)
+        ZpSecr:= ZpSecr + (tNachislVodSecr.summa/Last_day(tNachislVodSecr.fromdate)*(Last_day(tNachislVodSecr.fromdate)-Day(tNachislVodSecr.fromdate)+1))
+
+        else ZpSecr:= ZpSecr + tNachislVodSecr.summa;
+      }
+
+      _loop tPerevodtekVodSecr where ((tNachisl.persnrec == tPerevodtekVodSecr.zgdnrec and 10002 == tPerevodtekVodSecr.tip))
+      {
+        if (month(tPerevodtekVodSecr.fromdate) > tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) >= tPerevodtekVodSecr.year) delete current tPerevodtekVodSecr
+
+        else if (month(tPerevodtekVodSecr.todate) < tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) <= tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate <> 0) delete current tPerevodtekVodSecr
+
+        else if (month(tPerevodtekVodSecr.todate) = tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.todate) = tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate <> tPerevodtekVodSecr.PersDisDate)
+        {
+          NalogSecr:= NalogSecr + ((tPerevodtekVodSecr.s1+tPerevodtekVodSecr.s2)/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+          s1Secr:= s1Secr + (tPerevodtekVodSecr.s1/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+          s2Secr:= s2Secr + (tPerevodtekVodSecr.s2/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+        }
+
+        else if (month(tPerevodtekVodSecr.fromdate) = tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) = tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate = tPerevodtekVodSecr.PersDisDate)
+        {
+          NalogSecr:= NalogSecr + ((tPerevodtekVodSecr.s1+tPerevodtekVodSecr.s2)/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+          s1Secr:= s1Secr + (tPerevodtekVodSecr.s1/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+          s2Secr:= s2Secr + (tPerevodtekVodSecr.s2/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+        }
+
+        else
+        {
+          NalogSecr:= NalogSecr + tPerevodtekVodSecr.s1 + tPerevodtekVodSecr.s2;
+          s1Secr:= s1Secr + tPerevodtekVodSecr.s1;
+          s2Secr:= s2Secr + tPerevodtekVodSecr.s2;
+        }
+      }
+
+      _loop tNachislVodSecr where ((tNachisl.persnrec == tNachislVodSecr.zgdnrec and 10001 == tNachislVodSecr.tip))
+      {
+        if (month(tNachislVodSecr.fromdate) > tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) >= tNachislVodSecr.year) delete current tNachislVodSecr
+
+        else if (month(tNachislVodSecr.todate) < tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) <= tNachislVodSecr.year and tNachislVodSecr.todate <> 0) delete current tNachislVodSecr
+
+        else if (month(tNachislVodSecr.todate) = tNachislVodSecr.mes and year(tNachislVodSecr.todate) = tNachislVodSecr.year and tNachislVodSecr.todate <> tNachislVodSecr.PersDisDate)
+        ZpVod:= ZpVod + (tNachislVodSecr.summa/Last_day(tNachislVodSecr.todate)*Day(tNachislVodSecr.todate))
+
+        else if (month(tNachislVodSecr.fromdate) = tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) = tNachislVodSecr.year and tNachislVodSecr.todate = tNachislVodSecr.PersDisDate)
+        ZpVod:= ZpVod + (tNachislVodSecr.summa/Last_day(tNachislVodSecr.fromdate)*(Last_day(tNachislVodSecr.fromdate)-Day(tNachislVodSecr.fromdate)+1))
+
+        else ZpVod:= ZpVod + tNachislVodSecr.summa;
+      }
+
+      _loop tPerevodtekVodSecr where ((tNachisl.persnrec == tPerevodtekVodSecr.zgdnrec and 10001 == tPerevodtekVodSecr.tip))
+      {
+        if (month(tPerevodtekVodSecr.fromdate) > tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) >= tPerevodtekVodSecr.year) delete current tPerevodtekVodSecr
+
+        else if (month(tPerevodtekVodSecr.todate) < tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) <= tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate <> 0) delete current tPerevodtekVodSecr
+
+        else if (month(tPerevodtekVodSecr.todate) = tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.todate) = tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate <> tPerevodtekVodSecr.PersDisDate)
+        {
+          NalogVod:= NalogVod + ((tPerevodtekVodSecr.s1+tPerevodtekVodSecr.s2)/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+          s1Vod:= s1Vod + (tPerevodtekVodSecr.s1/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+          s2Vod:= s2Vod + (tPerevodtekVodSecr.s2/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+        }
+
+        else if (month(tPerevodtekVodSecr.fromdate) = tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) = tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate = tPerevodtekVodSecr.PersDisDate)
+        {
+          NalogVod:= NalogVod + ((tPerevodtekVodSecr.s1+tPerevodtekVodSecr.s2)/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+          s1Vod:= s1Vod + (tPerevodtekVodSecr.s1/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+          s2Vod:= s2Vod + (tPerevodtekVodSecr.s2/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+        }
+
+        else
+        {
+          NalogVod:= NalogVod + tPerevodtekVodSecr.s1 + tPerevodtekVodSecr.s2;
+          s1Vod:= s1Vod + tPerevodtekVodSecr.s1;
+          s2Vod:= s2Vod + tPerevodtekVodSecr.s2;
+        }
+      }
+    }
+    else
+    {
+      xlsetfontstyle(1, counter, 1, counter, 8);
+      xlmergecells(counter, 1, counter, 4);
+      xlAlignCells(-4152, counter, 1, counter, 1);
+      xlsetcellstringvalue('Итого руководитель: ', counter, 1, counter, 1);
+      xlsetcellNumberValue(round(itogzp/1000, 2), counter, 5, counter, 5);
+      xlsetcellNumberValue(round(itogs1/1000, 2), counter, 6, counter, 6);
+      xlsetcellNumberValue(round(itogs2/1000, 2), counter, 7, counter, 7);
+      xlsetcellNumberValue(round(itognalog/1000, 2), counter, 8, counter, 8);
+
+      mes:= 0; VodSecTabnum:= '';
+
+      _loop tNachislVodSecr where ((cPersNrec == tNachislVodSecr.zgdnrec and 10002 == tNachislVodSecr.tip))
+      {
+        if mes <> tNachislVodSecr.mes or VodSecTabnum <> tNachislVodSecr.tabnum
+        {
+          counter++;
+          xlsetcellstringvalue(tNachislVodSecr.tabnum, counter, 1, counter, 1);
+          xlsetcellstringvalue(tNachislVodSecr.fio, counter, 2, counter, 2);
+          xlsetcellstringvalue(tNachislVodSecr.podr, counter, 3, counter, 3);
+          xlsetcellstringvalue(tNachislVodSecr.mes, counter, 4, counter, 4);
+          xlsetcellNumberValue(round(tNachislVodSecr.summa/1000, 2), counter, 5, counter, 5);
+          xlsetcellnumbervalue(0, counter, 6, counter, 6);
+          xlsetcellnumbervalue(0, counter, 7, counter, 7);
+          xlsetcellnumbervalue(0, counter, 8, counter, 8);
+
+          _loop tPerevodtekVodSecr where ((tNachislVodSecr.zgdnrec == tPerevodtekVodSecr.zgdnrec and 10002 == tPerevodtekVodSecr.tip
+          and tNachislVodSecr.mes == tPerevodtekVodSecr.mes and tNachislVodSecr.tabnum == tPerevodtekVodSecr.tabnum))
+          {
+            xlsetcellNumberValue(round(tPerevodtekVodSecr.s1/1000, 2), counter, 6, counter, 6);
+            xlsetcellNumberValue(round(tPerevodtekVodSecr.s2/1000, 2), counter, 7, counter, 7);
+            xlsetcellNumberValue(round((tPerevodtekVodSecr.s1 + tPerevodtekVodSecr.s2)/1000, 2), counter, 8, counter, 8);
+          }
+        }
+
+        mes:= tNachislVodSecr.mes;
+        VodSecTabnum:= tNachislVodSecr.tabnum;
+      }
+
+      counter++;
+      xlsetfontstyle(1, counter, 1, counter, 8);
+      xlmergecells(counter, 1, counter, 4);
+      xlAlignCells(-4152, counter, 1, counter, 1);
+      xlsetcellstringvalue('Итого секретари: ', counter, 1, counter, 1);
+      xlsetcellNumberValue(round(ZpSecr/1000, 2), counter, 5, counter, 5);
+      xlsetcellNumberValue(round(s1Secr/1000, 2), counter, 6, counter, 6);
+      xlsetcellNumberValue(round(s2Secr/1000, 2), counter, 7, counter, 7);
+      xlsetcellNumberValue(round(NalogSecr/1000, 2), counter, 8, counter, 8);
+
+      mes:= 0; VodSecTabnum:= '';
+
+      _loop tNachislVodSecr where ((cPersNrec == tNachislVodSecr.zgdnrec and 10001 == tNachislVodSecr.tip))
+      {
+        if mes <> tNachislVodSecr.mes or VodSecTabnum <> tNachislVodSecr.tabnum
+        {
+          counter++;
+          xlsetcellstringvalue(tNachislVodSecr.tabnum, counter, 1, counter, 1);
+          xlsetcellstringvalue(tNachislVodSecr.fio, counter, 2, counter, 2);
+          xlsetcellstringvalue(tNachislVodSecr.podr, counter, 3, counter, 3);
+          xlsetcellstringvalue(tNachislVodSecr.mes, counter, 4, counter, 4);
+          xlsetcellNumberValue(round(tNachislVodSecr.summa/1000, 2), counter, 5, counter, 5);
+          xlsetcellnumbervalue(0, counter, 6, counter, 6);
+          xlsetcellnumbervalue(0, counter, 7, counter, 7);
+          xlsetcellnumbervalue(0, counter, 8, counter, 8);
+
+          _loop tPerevodtekVodSecr where ((tNachislVodSecr.zgdnrec == tPerevodtekVodSecr.zgdnrec and 10001 == tPerevodtekVodSecr.tip
+          and tNachislVodSecr.mes == tPerevodtekVodSecr.mes and tNachislVodSecr.tabnum == tPerevodtekVodSecr.tabnum))
+          {
+            xlsetcellNumberValue(round(tPerevodtekVodSecr.s1/1000, 2), counter, 6, counter, 6);
+            xlsetcellNumberValue(round(tPerevodtekVodSecr.s2/1000, 2), counter, 7, counter, 7);
+            xlsetcellNumberValue(round((tPerevodtekVodSecr.s1 + tPerevodtekVodSecr.s2)/1000, 2), counter, 8, counter, 8);
+          }
+        }
+
+        mes:= tNachislVodSecr.mes;
+        VodSecTabnum:= tNachislVodSecr.tabnum;
+      }
+
+      counter++;
+      xlsetfontstyle(1, counter, 1, counter, 8);
+      xlmergecells(counter, 1, counter, 4);
+      xlAlignCells(-4152, counter, 1, counter, 1);
+      xlsetcellstringvalue('Итого водители: ', counter, 1, counter, 1);
+      xlsetcellNumberValue(round(ZpVod/1000, 2), counter, 5, counter, 5);
+      xlsetcellNumberValue(round(s1Vod/1000, 2), counter, 6, counter, 6);
+      xlsetcellNumberValue(round(s2Vod/1000, 2), counter, 7, counter, 7);
+      xlsetcellNumberValue(round(NalogVod/1000, 2), counter, 8, counter, 8);
+
+      xlAddSheet;
+      xlRunMacro('PrintParam');
+      xlSetSheetName(countSheets, sFIO);
+      xlGetUsedRange(1, 1, 36, 4);
+      xlSetColumnWidth(21, 1, 1, 1, 1);
+      xlSetColumnWidth(35, 1, 2, 1, 2);
+      xlSetRowHeight(20, 2, 1, 2, 1);
+      xlSetFontStyle(1, 2, 2, 2, 2);
+      xlSetFontSize(12, 2, 2, 2, 2);
+      xlSetColumnWidth(21, 1, 3, 1, 3);
+      xlSetRowHeight(33, 3, 1, 3, 1);
+      xlSetFontStyle(1, 4, 1, 4, 4);
+      xlWrapText(3, 2, 3, 2);
+      xlSetColumnWidth(21, 1, 4, 1, 4);
+      xlAlignCellsEx(-4108, -4108, 1, 1, 4, 4);
+      xlMergeCells(1, 1, 1, 4);
+      xlMergeCells(2, 2, 2, 4);
+      xlMergeCells(3, 2, 3, 4);
+      xlMergeCells(5, 1, 13, 1);
+      xlAlignCellsEx(-4131, -4160, 5, 1, 5, 1);
+      xlMergeCells(15, 1, 15, 4);
+      xlSetFontStyle(1, 5, 1, 13, 1);
+      xlSetFontStyle(1, 14, 1, 15, 4);
+      xlAlignCells(-4152, 14, 1, 14, 1);
+      xlMergeCells(18, 1, 18, 4);
+      xlSetFontStyle(1, 17, 1, 18, 4);
+      xlAlignCells(-4152, 17, 1, 17, 1);
+      xlMergeCells(28, 1, 28, 4);
+      xlSetFontStyle(1, 27, 1, 28, 4);
+      xlAlignCells(-4152, 27, 1, 27, 1);
+      xlMergeCells(31, 1, 31, 4);
+      xlSetFontStyle(1, 30, 1, 31, 4);
+      xlAlignCells(-4152, 30, 1, 30, 1);
+      xlMergeCells(35, 1, 35, 4);
+      xlSetFontStyle(1, 34, 1, 37, 4);
+      xlAlignCells(-4152, 34, 1, 34, 1);
+      xlAlignCells(-4152, 36, 1, 37, 1);
+      xlSetFontSize(14, 37, 1, 37, 4);
+
+      xlframecells(1+2+4+8+16+32, 3, 1, 1, 1, 1, 37, 4);
+
+      xlCreateMatrix(37, 4);
+      xlStWriteToMatrix(2, 1, 'ФИО');
+      xlStWriteToMatrix(3, 1, 'ДОЛЖНОСТЬ');
+      xlStWriteToMatrix(4, 1, 'Вид затрат');
+      xlStWriteToMatrix(4, 2, 'Статья затрат');
+      xlStWriteToMatrix(4, 3, 'Сумма (тыс. руб.)');
+      xlStWriteToMatrix(4, 4, 'Примечание');
+      xlStWriteToMatrix(5, 1, 'Зарплата');
+      xlStWriteToMatrix(5, 2, 'Зарплата');
+      xlStWriteToMatrix(5, 4, 'Руководитель');
+      xlStWriteToMatrix(6, 2, 'Налоги на ЗП (от ФОТ)');
+      xlStWriteToMatrix(7, 2, 'Медицинское страхование ФМС');
+      xlStWriteToMatrix(8, 2, 'Зарплата');
+      xlStWriteToMatrix(8, 4, 'Водитель');
+      xlStWriteToMatrix(9, 2, 'Налоги на ЗП (от ФОТ)');
+      xlStWriteToMatrix(10, 2, 'Медицинское страхование ФМС');
+      xlStWriteToMatrix(11, 2, 'Зарплата');
+      xlStWriteToMatrix(11, 4, 'Секретарь');
+      xlStWriteToMatrix(12, 2, 'Налоги на ЗП (от ФОТ)');
+      xlStWriteToMatrix(13, 2, 'Медицинское страхование ФМС');
+      xlStWriteToMatrix(14, 1, 'ИТОГО:');
+      xlStWriteToMatrix(15, 1, 'Профессиональные услуги');
+      xlStWriteToMatrix(16, 2, 'Тренинги и семинары');
+      xlStWriteToMatrix(17, 1, 'ИТОГО:');
+      xlStWriteToMatrix(18, 1, 'Командировки');
+      xlStWriteToMatrix(19, 2, 'Командировочные (суточные)');
+      xlStWriteToMatrix(20, 2, 'Гостиница (проживание)');
+      xlStWriteToMatrix(21, 2, 'Авиаперелеты');
+      xlStWriteToMatrix(22, 2, 'Ж/д перевозки');
+      xlStWriteToMatrix(23, 2, 'Трансфер');
+      xlStWriteToMatrix(24, 2, 'Визовый сбор');
+      xlStWriteToMatrix(25, 2, 'Представительские расходы');
+      xlStWriteToMatrix(26, 2, 'Страховка');
+      xlStWriteToMatrix(27, 1, 'ИТОГО:');
+      xlStWriteToMatrix(28, 1, 'Аренда');
+      xlStWriteToMatrix(29, 2, 'Аренда жилья');
+      xlStWriteToMatrix(30, 1, 'ИТОГО:');
+      xlStWriteToMatrix(31, 1, 'Связь');
+      xlStWriteToMatrix(32, 2, 'Интернет (перс.)');
+      xlStWriteToMatrix(33, 2, 'Мобильная связь');
+      xlStWriteToMatrix(34, 1, 'ИТОГО:');
+      xlStWriteToMatrix(35, 1, 'Прочие услуги');
+      xlStWriteToMatrix(36, 1, 'ИТОГО:');
+      xlStWriteToMatrix(37, 1, 'ВСЕГО:');
+
+      xlStWriteToMatrix(1, 1, kvartal + ' квартал ' + god + ' года');
+      xlStWriteToMatrix(2, 2, sFIO);
+      xlStWriteToMatrix(3, 2, sPost);
+      xlDoWriteToMatrix(5, 3, round(itogzp/1000, 2));
+      xlDoWriteToMatrix(6, 3, round(itognalog/1000, 2));
+      xlDoWriteToMatrix(7, 3, 0);
+      xlDoWriteToMatrix(8, 3, round(ZpVod/1000, 2));
+      xlDoWriteToMatrix(9, 3, round(NalogVod/1000, 2));
+      xlDoWriteToMatrix(10, 3, 0);
+      xlDoWriteToMatrix(11, 3, round(ZpSecr/1000, 2));
+      xlDoWriteToMatrix(12, 3, round(NalogSecr/1000, 2));
+      xlDoWriteToMatrix(13, 3, 0);
+
+      _loop tOborot where ((cPersNrec == toborot.persnrec))
+      {
+        case tOborot.analitika of
+
+          'Командировочные (суточные)': xlDoWriteToMatrix(19, 3, round(tOborot.summa/1000, 2));
+
+          'Гостиница (проживание)': xlDoWriteToMatrix(20 , 3, round(tOborot.summa/1000, 2));
+
+          'Авиаперелеты': xlDoWriteToMatrix(21, 3, round(tOborot.summa/1000, 2));
+
+          'Ж/д перевозки': xlDoWriteToMatrix(22, 3, round(tOborot.summa/1000, 2));
+
+          'Трансфер': xlDoWriteToMatrix(23, 3, round(tOborot.summa/1000, 2));
+
+          'Визовый сбор': xlDoWriteToMatrix(24, 3, round(tOborot.summa/1000, 2));
+
+          'Представительские расходы': xlDoWriteToMatrix(25, 3, round(tOborot.summa/1000, 2));
+
+          'Страховка': xlDoWriteToMatrix(26, 3, round(tOborot.summa/1000, 2));
+
+          'Интернет (перс.)': xlDoWriteToMatrix(32, 3, 0);
+
+          'Мобильная связь': xlDoWriteToMatrix(33, 3, round(tOborot.summa/1000, 2));
+
+        end;
+      }
+
+      xlWriteMatrixToExcel(1, 1);
+      xlFreeMatrix;
+      xlSetCellFormula('=СУММ(C5:C13)', 14, 3, 14, 3);
+      xlSetCellFormula('=СУММ(C16)', 17, 3, 17, 3);
+      xlSetCellFormula('=СУММ(C19:C26)', 27, 3, 27, 3);
+      xlSetCellFormula('=СУММ(C29)', 30, 3, 30, 3);
+      xlSetCellFormula('=СУММ(C32:C33)', 34, 3, 34, 3);
+      xlSetCellFormula('=СУММ(C14;C17;C27;C30;C34;C36)', 37, 3, 37, 3);
+
+      countSheets++;
+      xlSetActiveSheet(countSheets);
+
+      itogzp:= tNachisl.summa;
+      itogs1:= 0;
+      itogs2:= 0;
+      itogs3:= 0;
+      itognalog:= 0;
+      ptabnum:= tNachisl.tabnum;
+      sFIO:= tNachisl.fio;
+      sPost:= tNachisl.post;
+      cPersNrec:= tNachisl.persnrec;
+      counter++;
+
+      xlsetcellstringvalue(tNachisl.podr, counter, 3, counter, 3);
+      xlsetcellstringvalue(tNachisl.tabnum, counter, 1, counter, 1);
+      xlsetcellstringvalue(tNachisl.fio, counter, 2, counter, 2);
+      xlsetcellstringvalue(tNachisl.mes, counter, 4, counter, 4);
+      xlsetcellNumberValue(round(tNachisl.summa/1000, 2), counter, 5, counter, 5);
+      xlsetcellnumbervalue(0, counter, 6, counter, 6);
+      xlsetcellnumbervalue(0, counter, 7, counter, 7);
+      xlsetcellnumbervalue(0, counter, 8, counter, 8);
+
+      _loop tPerevodtek where ((tNachisl.tabnum == tPerevodtek.tabnum and tNachisl.mes == tPerevodtek.mes and tNachisl.podr == tPerevodtek.podr))
+      {
+        itogs1:= itogs1 + tPerevodtek.s1;
+        itogs2:= itogs2 + tPerevodtek.s2;
+        itogs3:= itogs3 + tPerevodtek.s3;
+        itognalog:= itogs1 + itogs2;
+
+        xlsetcellNumberValue(round(tPerevodtek.s1/1000, 2), counter, 6, counter, 6);
+        xlsetcellNumberValue(round(tPerevodtek.s2/1000, 2), counter, 7, counter, 7);
+        xlsetcellNumberValue(round((tPerevodtek.s1 + tPerevodtek.s2)/1000, 2), counter, 8, counter, 8);
+      }
+    }
+  }
+
+  counter++;
+  xlsetfontstyle(1, counter, 1, counter, 8);
+  xlmergecells(counter, 1, counter, 4);
+  xlAlignCells(-4152, counter, 1, counter, 1);
+  xlsetcellstringvalue('Итого руководитель: ', counter, 1, counter, 1);
+  xlsetcellNumberValue(round(itogzp/1000, 2), counter, 5, counter, 5);
+  xlsetcellNumberValue(round(itogs1/1000, 2), counter, 6, counter, 6);
+  xlsetcellNumberValue(round(itogs2/1000, 2), counter, 7, counter, 7);
+  xlsetcellNumberValue(round(itognalog/1000, 2), counter, 8, counter, 8);
+
+  ZpSecr:= 0; ZpVod:= 0; NalogSecr:= 0; NalogVod:= 0; s1Secr:= 0; s2Secr:= 0; s1Vod:= 0; s2Vod:= 0;
+
+  if getlast tNachisl = tsok
+  {
+    _loop tNachislVodSecr where ((tNachisl.persnrec == tNachislVodSecr.zgdnrec and 10002 == tNachislVodSecr.tip))
+    {
+      if (month(tNachislVodSecr.fromdate) > tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) >= tNachislVodSecr.year) delete current tNachislVodSecr
+
+      else if (month(tNachislVodSecr.todate) < tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) <= tNachislVodSecr.year and tNachislVodSecr.todate <> 0) delete current tNachislVodSecr
+
+      else if (month(tNachislVodSecr.todate) = tNachislVodSecr.mes and year(tNachislVodSecr.todate) = tNachislVodSecr.year and tNachislVodSecr.todate <> tNachislVodSecr.PersDisDate)
+      ZpSecr:= ZpSecr + (tNachislVodSecr.summa/Last_day(tNachislVodSecr.todate)*Day(tNachislVodSecr.todate))
+
+      else if (month(tNachislVodSecr.fromdate) = tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) = tNachislVodSecr.year and tNachislVodSecr.todate = tNachislVodSecr.PersDisDate)
+      ZpSecr:= ZpSecr + (tNachislVodSecr.summa/Last_day(tNachislVodSecr.fromdate)*(Last_day(tNachislVodSecr.fromdate)-Day(tNachislVodSecr.fromdate)+1))
+
+      else ZpSecr:= ZpSecr + tNachislVodSecr.summa;
+    }
+
+    _loop tPerevodtekVodSecr where ((tNachisl.persnrec == tPerevodtekVodSecr.zgdnrec and 10002 == tPerevodtekVodSecr.tip))
+    {
+      if (month(tPerevodtekVodSecr.fromdate) > tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) >= tPerevodtekVodSecr.year) delete current tPerevodtekVodSecr
+
+      else if (month(tPerevodtekVodSecr.todate) < tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) <= tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate <> 0) delete current tPerevodtekVodSecr
+
+      else if (month(tPerevodtekVodSecr.todate) = tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.todate) = tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate <> tPerevodtekVodSecr.PersDisDate)
+      {
+        NalogSecr:= NalogSecr + ((tPerevodtekVodSecr.s1+tPerevodtekVodSecr.s2)/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+        s1Secr:= s1Secr + (tPerevodtekVodSecr.s1/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+        s2Secr:= s2Secr + (tPerevodtekVodSecr.s2/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+      }
+
+      else if (month(tPerevodtekVodSecr.fromdate) = tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) = tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate = tPerevodtekVodSecr.PersDisDate)
+      {
+        NalogSecr:= NalogSecr + ((tPerevodtekVodSecr.s1+tPerevodtekVodSecr.s2)/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+        s1Secr:= s1Secr + (tPerevodtekVodSecr.s1/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+        s2Secr:= s2Secr + (tPerevodtekVodSecr.s2/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+      }
+
+      else
+      {
+        NalogSecr:= NalogSecr + tPerevodtekVodSecr.s1 + tPerevodtekVodSecr.s2;
+        s1Secr:= s1Secr + tPerevodtekVodSecr.s1;
+        s2Secr:= s2Secr + tPerevodtekVodSecr.s2;
+      }
+    }
+
+    _loop tNachislVodSecr where ((tNachisl.persnrec == tNachislVodSecr.zgdnrec and 10001 == tNachislVodSecr.tip))
+    {
+      if (month(tNachislVodSecr.fromdate) > tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) >= tNachislVodSecr.year) delete current tNachislVodSecr
+
+      else if (month(tNachislVodSecr.todate) < tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) <= tNachislVodSecr.year and tNachislVodSecr.todate <> 0) delete current tNachislVodSecr
+
+      else if (month(tNachislVodSecr.todate) = tNachislVodSecr.mes and year(tNachislVodSecr.todate) = tNachislVodSecr.year and tNachislVodSecr.todate <> tNachislVodSecr.PersDisDate)
+      ZpVod:= ZpVod + (tNachislVodSecr.summa/Last_day(tNachislVodSecr.todate)*Day(tNachislVodSecr.todate))
+
+      else if (month(tNachislVodSecr.fromdate) = tNachislVodSecr.mes and year(tNachislVodSecr.fromdate) = tNachislVodSecr.year and tNachislVodSecr.todate = tNachislVodSecr.PersDisDate)
+      ZpVod:= ZpVod + (tNachislVodSecr.summa/Last_day(tNachislVodSecr.fromdate)*(Last_day(tNachislVodSecr.fromdate)-Day(tNachislVodSecr.fromdate)+1))
+
+      else ZpVod:= ZpVod + tNachislVodSecr.summa;
+    }
+
+    _loop tPerevodtekVodSecr where ((tNachisl.persnrec == tPerevodtekVodSecr.zgdnrec and 10001 == tPerevodtekVodSecr.tip))
+    {
+      if (month(tPerevodtekVodSecr.fromdate) > tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) >= tPerevodtekVodSecr.year) delete current tPerevodtekVodSecr
+
+      else if (month(tPerevodtekVodSecr.todate) < tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) <= tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate <> 0) delete current tPerevodtekVodSecr
+
+      else if (month(tPerevodtekVodSecr.todate) = tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.todate) = tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate <> tPerevodtekVodSecr.PersDisDate)
+      {
+        NalogVod:= NalogVod + ((tPerevodtekVodSecr.s1+tPerevodtekVodSecr.s2)/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+        s1Vod:= s1Vod + (tPerevodtekVodSecr.s1/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+        s2Vod:= s2Vod + (tPerevodtekVodSecr.s2/Last_day(tPerevodtekVodSecr.todate)*Day(tPerevodtekVodSecr.todate));
+      }
+
+      else if (month(tPerevodtekVodSecr.fromdate) = tPerevodtekVodSecr.mes and year(tPerevodtekVodSecr.fromdate) = tPerevodtekVodSecr.year and tPerevodtekVodSecr.todate = tPerevodtekVodSecr.PersDisDate)
+      {
+        NalogVod:= NalogVod + ((tPerevodtekVodSecr.s1+tPerevodtekVodSecr.s2)/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+        s1Vod:= s1Vod + (tPerevodtekVodSecr.s1/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+        s2Vod:= s2Vod + (tPerevodtekVodSecr.s2/Last_day(tPerevodtekVodSecr.fromdate)*(Last_day(tPerevodtekVodSecr.fromdate)-Day(tPerevodtekVodSecr.fromdate)+1));
+      }
+
+      else
+      {
+        NalogVod:= NalogVod + tPerevodtekVodSecr.s1 + tPerevodtekVodSecr.s2;
+        s1Vod:= s1Vod + tPerevodtekVodSecr.s1;
+        s2Vod:= s2Vod + tPerevodtekVodSecr.s2;
+      }
+    }
+  }
+
+  if getlast tNachisl = tsok
+  {
+    mes:= 0; VodSecTabnum:= '';
+
+    _loop tNachislVodSecr where ((cPersNrec == tNachislVodSecr.zgdnrec and 10002 == tNachislVodSecr.tip))
+    {
+      if mes <> tNachislVodSecr.mes or VodSecTabnum <> tNachislVodSecr.tabnum
+      {
+        counter++;
+        xlsetcellstringvalue(tNachislVodSecr.tabnum, counter, 1, counter, 1);
+        xlsetcellstringvalue(tNachislVodSecr.fio, counter, 2, counter, 2);
+        xlsetcellstringvalue(tNachislVodSecr.podr, counter, 3, counter, 3);
+        xlsetcellstringvalue(tNachislVodSecr.mes, counter, 4, counter, 4);
+        xlsetcellNumberValue(round(tNachislVodSecr.summa/1000, 2), counter, 5, counter, 5);
+        xlsetcellnumbervalue(0, counter, 6, counter, 6);
+        xlsetcellnumbervalue(0, counter, 7, counter, 7);
+        xlsetcellnumbervalue(0, counter, 8, counter, 8);
+
+        _loop tPerevodtekVodSecr where ((tNachislVodSecr.zgdnrec == tPerevodtekVodSecr.zgdnrec and 10002 == tPerevodtekVodSecr.tip
+        and tNachislVodSecr.mes == tPerevodtekVodSecr.mes and tNachislVodSecr.tabnum == tPerevodtekVodSecr.tabnum))
+        {
+          xlsetcellNumberValue(round(tPerevodtekVodSecr.s1/1000, 2), counter, 6, counter, 6);
+          xlsetcellNumberValue(round(tPerevodtekVodSecr.s2/1000, 2), counter, 7, counter, 7);
+          xlsetcellNumberValue(round((tPerevodtekVodSecr.s1 + tPerevodtekVodSecr.s2)/1000, 2), counter, 8, counter, 8);
+        }
+      }
+
+      mes:= tNachislVodSecr.mes;
+      VodSecTabnum:= tNachislVodSecr.tabnum;
+    }
+
+    counter++;
+    xlsetfontstyle(1, counter, 1, counter, 8);
+    xlmergecells(counter, 1, counter, 4);
+    xlAlignCells(-4152, counter, 1, counter, 1);
+    xlsetcellstringvalue('Итого секретари: ', counter, 1, counter, 1);
+    xlsetcellNumberValue(round(ZpSecr/1000, 2), counter, 5, counter, 5);
+    xlsetcellNumberValue(round(s1Secr/1000, 2), counter, 6, counter, 6);
+    xlsetcellNumberValue(round(s2Secr/1000, 2), counter, 7, counter, 7);
+    xlsetcellNumberValue(round(NalogSecr/1000, 2), counter, 8, counter, 8);
+
+    mes:= 0; VodSecTabnum:= '';
+
+    _loop tNachislVodSecr where ((cPersNrec == tNachislVodSecr.zgdnrec and 10001 == tNachislVodSecr.tip))
+    {
+      if mes <> tNachislVodSecr.mes or VodSecTabnum <> tNachislVodSecr.tabnum
+      {
+        counter++;
+        xlsetcellstringvalue(tNachislVodSecr.tabnum, counter, 1, counter, 1);
+        xlsetcellstringvalue(tNachislVodSecr.fio, counter, 2, counter, 2);
+        xlsetcellstringvalue(tNachislVodSecr.podr, counter, 3, counter, 3);
+        xlsetcellstringvalue(tNachislVodSecr.mes, counter, 4, counter, 4);
+        xlsetcellNumberValue(round(tNachislVodSecr.summa/1000, 2), counter, 5, counter, 5);
+        xlsetcellnumbervalue(0, counter, 6, counter, 6);
+        xlsetcellnumbervalue(0, counter, 7, counter, 7);
+        xlsetcellnumbervalue(0, counter, 8, counter, 8);
+
+        _loop tPerevodtekVodSecr where ((tNachislVodSecr.zgdnrec == tPerevodtekVodSecr.zgdnrec and 10001 == tPerevodtekVodSecr.tip
+        and tNachislVodSecr.mes == tPerevodtekVodSecr.mes and tNachislVodSecr.tabnum == tPerevodtekVodSecr.tabnum))
+        {
+          xlsetcellNumberValue(round(tPerevodtekVodSecr.s1/1000, 2), counter, 6, counter, 6);
+          xlsetcellNumberValue(round(tPerevodtekVodSecr.s2/1000, 2), counter, 7, counter, 7);
+          xlsetcellNumberValue(round((tPerevodtekVodSecr.s1 + tPerevodtekVodSecr.s2)/1000, 2), counter, 8, counter, 8);
+        }
+      }
+
+      mes:= tNachislVodSecr.mes;
+      VodSecTabnum:= tNachislVodSecr.tabnum;
+    }
+
+    counter++;
+    xlsetfontstyle(1, counter, 1, counter, 8);
+    xlmergecells(counter, 1, counter, 4);
+    xlAlignCells(-4152, counter, 1, counter, 1);
+    xlsetcellstringvalue('Итого водители: ', counter, 1, counter, 1);
+    xlsetcellNumberValue(round(ZpVod/1000, 2), counter, 5, counter, 5);
+    xlsetcellNumberValue(round(s1Vod/1000, 2), counter, 6, counter, 6);
+    xlsetcellNumberValue(round(s2Vod/1000, 2), counter, 7, counter, 7);
+    xlsetcellNumberValue(round(NalogVod/1000, 2), counter, 8, counter, 8);
+  }
+
+  xlSetActiveSheet(1);
+
+  xlAddSheet;
+  xlRunMacro('PrintParam');
+  xlSetSheetName(1, sFIO);
+  xlGetUsedRange(1, 1, 36, 4);
+  xlSetColumnWidth(21, 1, 1, 1, 1);
+  xlSetColumnWidth(35, 1, 2, 1, 2);
+  xlSetRowHeight(20, 2, 1, 2, 1);
+  xlSetFontStyle(1, 2, 2, 2, 2);
+  xlSetFontSize(12, 2, 2, 2, 2);
+  xlSetColumnWidth(21, 1, 3, 1, 3);
+  xlSetRowHeight(33, 3, 1, 3, 1);
+  xlSetFontStyle(1, 4, 1, 4, 4);
+  xlWrapText(3, 2, 3, 2);
+  xlSetColumnWidth(21, 1, 4, 1, 4);
+  xlAlignCellsEx(-4108, -4108, 1, 1, 4, 4);
+  xlMergeCells(1, 1, 1, 4);
+  xlMergeCells(2, 2, 2, 4);
+  xlMergeCells(3, 2, 3, 4);
+  xlMergeCells(5, 1, 13, 1);
+  xlAlignCellsEx(-4131, -4160, 5, 1, 5, 1);
+  xlMergeCells(15, 1, 15, 4);
+  xlSetFontStyle(1, 5, 1, 13, 1);
+  xlSetFontStyle(1, 14, 1, 15, 4);
+  xlAlignCells(-4152, 14, 1, 14, 1);
+  xlMergeCells(18, 1, 18, 4);
+  xlSetFontStyle(1, 17, 1, 18, 4);
+  xlAlignCells(-4152, 17, 1, 17, 1);
+  xlMergeCells(28, 1, 28, 4);
+  xlSetFontStyle(1, 27, 1, 28, 4);
+  xlAlignCells(-4152, 27, 1, 27, 1);
+  xlMergeCells(31, 1, 31, 4);
+  xlSetFontStyle(1, 30, 1, 31, 4);
+  xlAlignCells(-4152, 30, 1, 30, 1);
+  xlMergeCells(35, 1, 35, 4);
+  xlSetFontStyle(1, 34, 1, 37, 4);
+  xlAlignCells(-4152, 34, 1, 34, 1);
+  xlAlignCells(-4152, 36, 1, 37, 1);
+  xlSetFontSize(14, 37, 1, 37, 4);
+
+  xlframecells(1+2+4+8+16+32, 3, 1, 1, 1, 1, 37, 4);
+
+  xlCreateMatrix(37, 4);
+  xlStWriteToMatrix(2, 1, 'ФИО');
+  xlStWriteToMatrix(3, 1, 'ДОЛЖНОСТЬ');
+  xlStWriteToMatrix(4, 1, 'Вид затрат');
+  xlStWriteToMatrix(4, 2, 'Статья затрат');
+  xlStWriteToMatrix(4, 3, 'Сумма (тыс. руб.)');
+  xlStWriteToMatrix(4, 4, 'Примечание');
+  xlStWriteToMatrix(5, 1, 'Зарплата');
+  xlStWriteToMatrix(5, 2, 'Зарплата');
+  xlStWriteToMatrix(5, 4, 'Руководитель');
+  xlStWriteToMatrix(6, 2, 'Налоги на ЗП (от ФОТ)');
+  xlStWriteToMatrix(7, 2, 'Медицинское страхование ФМС');
+  xlStWriteToMatrix(8, 2, 'Зарплата');
+  xlStWriteToMatrix(8, 4, 'Водитель');
+  xlStWriteToMatrix(9, 2, 'Налоги на ЗП (от ФОТ)');
+  xlStWriteToMatrix(10, 2, 'Медицинское страхование ФМС');
+  xlStWriteToMatrix(11, 2, 'Зарплата');
+  xlStWriteToMatrix(11, 4, 'Секретарь');
+  xlStWriteToMatrix(12, 2, 'Налоги на ЗП (от ФОТ)');
+  xlStWriteToMatrix(13, 2, 'Медицинское страхование ФМС');
+  xlStWriteToMatrix(14, 1, 'ИТОГО:');
+  xlStWriteToMatrix(15, 1, 'Профессиональные услуги');
+  xlStWriteToMatrix(16, 2, 'Тренинги и семинары');
+  xlStWriteToMatrix(17, 1, 'ИТОГО:');
+  xlStWriteToMatrix(18, 1, 'Командировки');
+  xlStWriteToMatrix(19, 2, 'Командировочные (суточные)');
+  xlStWriteToMatrix(20, 2, 'Гостиница (проживание)');
+  xlStWriteToMatrix(21, 2, 'Авиаперелеты');
+  xlStWriteToMatrix(22, 2, 'Ж/д перевозки');
+  xlStWriteToMatrix(23, 2, 'Трансфер');
+  xlStWriteToMatrix(24, 2, 'Визовый сбор');
+  xlStWriteToMatrix(25, 2, 'Представительские расходы');
+  xlStWriteToMatrix(26, 2, 'Страховка');
+  xlStWriteToMatrix(27, 1, 'ИТОГО:');
+  xlStWriteToMatrix(28, 1, 'Аренда');
+  xlStWriteToMatrix(29, 2, 'Аренда жилья');
+  xlStWriteToMatrix(30, 1, 'ИТОГО:');
+  xlStWriteToMatrix(31, 1, 'Связь');
+  xlStWriteToMatrix(32, 2, 'Интернет (перс.)');
+  xlStWriteToMatrix(33, 2, 'Мобильная связь');
+  xlStWriteToMatrix(34, 1, 'ИТОГО:');
+  xlStWriteToMatrix(35, 1, 'Прочие услуги');
+  xlStWriteToMatrix(36, 1, 'ИТОГО:');
+  xlStWriteToMatrix(37, 1, 'ВСЕГО:');
+
+  xlStWriteToMatrix(1, 1, kvartal + ' квартал ' + god + ' года');
+  xlStWriteToMatrix(2, 2, sFIO);
+  xlStWriteToMatrix(3, 2, sPost);
+  xlDoWriteToMatrix(5, 3, round(itogzp/1000, 2));
+  xlDoWriteToMatrix(6, 3, round(itognalog/1000, 2));
+
+
+
+  xlDoWriteToMatrix(7, 3, 0);
+  xlDoWriteToMatrix(8, 3, round(ZpVod/1000, 2));
+  xlDoWriteToMatrix(9, 3, round(NalogVod/1000, 2));
+  xlDoWriteToMatrix(10, 3, 0);
+  xlDoWriteToMatrix(11, 3, round(ZpSecr/1000, 2));
+  xlDoWriteToMatrix(12, 3, round(NalogSecr/1000, 2));
+  xlDoWriteToMatrix(13, 3, 0);
+
+  _loop tOborot where ((cPersNrec == toborot.persnrec))
+  {
+    case tOborot.analitika of
+
+      'Командировочные (суточные)': xlDoWriteToMatrix(19, 3, round(tOborot.summa/1000, 2));
+
+      'Гостиница (проживание)': xlDoWriteToMatrix(20 , 3, round(tOborot.summa/1000, 2));
+
+      'Авиаперелеты': xlDoWriteToMatrix(21, 3, round(tOborot.summa/1000, 2));
+
+      'Ж/д перевозки': xlDoWriteToMatrix(22, 3, round(tOborot.summa/1000, 2));
+
+      'Трансфер': xlDoWriteToMatrix(23, 3, round(tOborot.summa/1000, 2));
+
+      'Визовый сбор': xlDoWriteToMatrix(24, 3, round(tOborot.summa/1000, 2));
+
+      'Представительские расходы': xlDoWriteToMatrix(25, 3, round(tOborot.summa/1000, 2));
+
+      'Страховка': xlDoWriteToMatrix(26, 3, round(tOborot.summa/1000, 2));
+
+      'Интернет (перс.)': xlDoWriteToMatrix(32, 3, 0);
+
+      'Мобильная связь': xlDoWriteToMatrix(33, 3, round(tOborot.summa/1000, 2));
+
+    end;
+  }
+
+  xlWriteMatrixToExcel(1, 1);
+  xlFreeMatrix;
+  xlSetCellFormula('=СУММ(C5:C13)', 14, 3, 14, 3);
+  xlSetCellFormula('=СУММ(C16)', 17, 3, 17, 3);
+  xlSetCellFormula('=СУММ(C19:C26)', 27, 3, 27, 3);
+  xlSetCellFormula('=СУММ(C29)', 30, 3, 30, 3);
+  xlSetCellFormula('=СУММ(C32:C33)', 34, 3, 34, 3);
+  xlSetCellFormula('=СУММ(C14;C17;C27;C30;C34;C36)', 37, 3, 37, 3);
+
+  countSheets++;
+  xlSetActiveSheet(countSheets);
+  xlSetSheetName(countSheets, 'Общая информация');
+
+  xlframecells(1+2+4+8+16+32, 3, 1, 1, 2, 1, counter, 8);
+
+  xlRunMacro('ChangeFont');
+
+  StopVisual('',0);
+  xlkillExcel;
+}
+
+end;
+
+windowevent wnSelPers;
+
+cmDefault:
+{
+  if pMarkerpers.count = 0
+  {
+    Filtr_persons:= 'Не выбраны';
+  }
+
+  SubBounds(tbRmtSelPers1);
+  AddBounds(tbRmtSelPers2);
+
+  _loop pMarkerpers
+  {
+    if pMarkerpers.count = 1
+    {
+      Filtr_persons:= tSelPers.fio;
+    }
+  }
+
+  SubBounds(tbRmtSelPers2);
+  AddBounds(tbRmtSelPers1);
+
+  if pMarkerpers.count > 1
+  {
+    Filtr_persons:= 'Выбрано ' + pMarkerpers.count;
+  }
+
+  rescanpanel(scr);
+}
+
+end;
+
+end.
+
+VipInterface UserReport_rasnarukapp Implements IUserReport;
+Interface UserReport_rasnarukapp;
+
+Procedure Run;
+Begin
+  runinterface(gp_rasnarukapp);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Расходы на руководящий аппарат';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Отчеты по зарплате ПУ';
+  End;
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'menuzarp';
+  end;
+end;
+
+End.

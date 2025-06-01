@@ -1,0 +1,610 @@
+/*************************************************************************************************\
+* Наименование: Контроль событий по подразделениям, например не закрытые нарушения                *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#175          |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include GP_SCUD_PodrCheck.Vih
+#include GP_SCUD_EventsEdit.Vih
+#include GP_EmailRun.Vih
+#include GP_SCUD_Function.Vih
+
+#doc
+Контроль событий по подразделениям, например не закрытые нарушения
+#end
+Interface GP_SCUD_PodrCheck 'Контроль событий по подразделениям' (,,sci1Esc) , EscClose ;
+Show at (,,70,20);
+//--------------------------------------------
+// Для отправки пользователям
+//--------------------------------------------
+Table Struct tmp_user
+(  LoginName :string[50]
+  ,cUser :comp
+  ,Fio :string[50]
+  ,cPersons:comp
+  ,Mail:string
+)
+with index
+( tmp_user01=LoginName
+ ,tmp_user02=Fio
+);
+//--------------------------------------------
+// Для отправки пользователям - расшифровка
+//--------------------------------------------
+Table Struct tmp_user_sp
+(  cUser :comp
+  ,Fio :string[50]
+  ,cPersons:comp
+  ,cKatPodr:comp
+  ,Podr_kod:string[100]
+  ,Podr_name:string
+  ,CMISCONDUCT:comp
+  ,wMISCONDUCT:word
+  ,sMISCONDUCT:string
+  ,YearN:word
+  ,MesN :word
+  ,DT_EV:date
+  ,TM_EV:time
+  ,TDIFF:time
+)
+with index
+( tmp_user_SP01=cUser+YearN+MesN+Podr_kod+FIo+DT_EV+TM_EV
+);
+
+//------------------------
+#include GP_EmailRun.Var
+//------------------------
+var
+//-------------------
+//  iGP_SCUD_EventsEdit :GP_SCUD_EventsEdit New;
+  pGP_SCUD_Function :GP_SCUD_Function;
+//------------------------------
+  wAuto:word;
+  wMesRas  ,wYearRas  :word;
+  wTypeReport: word;
+  DTB,DTE:date;
+//----------------------------------------
+  email_num_row:longint;
+//-------- Настройки
+ NPOEM_OWN_EMAIL_TYPE:word=1;//Тип отправки EMAIL
+//-----------------------------
+#include Excel_var.vpp
+//-----------------------------
+Create view
+var
+ pGP_SCUD_PERS: comp;
+as select GP_SCUD_PERS.Nrec
+  , tmp_user.*,tmp_user_SP.*
+From GP_SCUD_PERS
+  , tmp_user(tmp_user01),tmp_user_SP(tmp_user_SP01)
+where (( pGP_SCUD_PERS == GP_SCUD_PERS.Nrec
+and tmp_user.cUser == tmp_user_sp.cUser
+));
+
+//*****************************************************************************
+
+Parameters
+  wAuto
+#doc
+  1 - автоматический запуск
+#end
+, wYearRas
+#doc
+  Год отбора,
+  если не задан, то год от текущей даты.
+  Если начальная дата отбора меньше, чем отчетный период в зарплате
+  то берется дата отчетного периода в зарплате
+#end
+, wMesRas
+#doc
+  1 - автоматический запуск
+#end
+, wTypeReport
+#doc
+  0 - html
+  1 - Excel
+  2 - CSV ,разделитель ;
+#end
+;
+//**************************************
+create view vSpr_base
+var
+  sUserName_base:string;
+  pUser :comp;
+from Zar_User
+  , X$Users
+where ((
+    sUserName_base ==  Zar_User.OwnName
+and pUser  == X$Users.Atl_nrec
+));
+
+File wOut;
+
+//===============================================================
+#include Sql_func.vpp
+#include Excel_fun.vpp
+//===============================================================
+#doc
+ Окно с паузой. Во избежания вылета галактики при автозапуске нужно сделать паузу
+ Падает NowRun
+#end
+window wnPause 'Пауза' show at (,,10,5);
+ screen scrPause;
+ <<
+    Пауза
+ >>
+ end;
+End;
+
+Procedure MyLog(w:string);
+{ if Logfilenm=''
+  { logfilenm:=GetStringParameter('Files','OutputFilesDirectory',0)+
+      '\SCUD_CALC_SALDO_'+DateToStr(Cur_Date,'YYYY_MM_DD')+TimeToStr(Cur_Time,'HHMM')+'.log';
+     MyLog('Расчет сальдо за '+string(wMEsRas)+'/'+string(wYearRas));
+  }
+  LogStrtofile(logfilenm,w);
+}
+
+//===============================================================
+// Записать текст сообщения
+//===============================================================
+Procedure Write_Mess(w:string);
+{ email_num_row++;
+  pGP_EmailRun.Write_Text(email_num_row,w);
+} //Procedure Write_Mess(w:string);
+
+//===============================================================
+//Запуск отправки почты
+//C:\SQLDB\ERPDB\TASKS\GAL_SCUD_PodrCheck\out\GP_SCUD_PodrCheck.xlsx
+//===============================================================
+Procedure RunEmail;
+var
+  _wMesRas  ,_wYearRas  :word;
+  isAllOk:boolean;
+  _email_attach1:string;
+  maxColCount:word;
+{
+  timelog('GP_SCUD_PodrCheck->RunEmail START wTypeReport='+string(wTypeReport));
+  nmtemplate:='GP_SCUD_PodrCheck.xlsx';
+  maxColCount:=8;
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfconfirm,''#3'Выполнение рассылки'
+     ,LongInt(RecordsInTable(#tmp_user))+LongInt(RecordsInTable(#tmp_user_sp)));
+  isAllOk:=true;
+  _email_attach1:='';
+  _Loop fullcache tmp_user
+  { if not NextVisual then
+    { isAllOk:=false;
+      break;
+    }
+    timelog('GP_SCUD_PodrCheck->RunEmail tmp_user.Fio='+tmp_user.Fio+', mail='+tmp_user.mail);
+    email_num_row:=0;
+    //var lObj:longint=UserOfficeFilial(tmp_user.cUser);
+    if tmp_user.mail='' then continue;
+    Write_Mess('Добрый день, '+tmp_user.Fio);
+    _wMesRas:=0;
+    _wYearRas:=0;
+    Write_Mess('<p><b>Выявлены следующие нарушения в модуле СКУД</b>');
+    case wTypeReport of
+    1:
+    { timelog('GP_SCUD_PodrCheck->RunEmail XlKillExcel');
+      XlKillExcel;
+      _email_attach1:= GetStringParameter('Files','OutputFilesDirectory',0)+nmtemplate;
+      if fileexist(_email_attach1) deletefile(_email_attach1);
+      timelog('GP_SCUD_PodrCheck->RunEmail ExcelInit');
+      //ExcelInit(nmtemplate,true);
+      xlCreateExcel(_email_attach1,false);
+      xlDisplayAlerts(false);
+      timelog('GP_SCUD_PodrCheck->RunEmail xlSetAppVisibleMode');
+      matrixkl:=false;
+      wexrow:=1;wexcol:=1;
+      xlMergeCells(wexrow,wexcol, wexrow,maxColCount); //Объединяем ячейки
+      MyPutExcel('отчет по нарушениям за период с '+DateToStr(DTB,'DD.MM.YYYY')
+        +' по '+DateToStr(DTE,'DD.MM.YYYY') ,10,0,-1,-1);
+      wexrow++;
+      wexcol:=1;
+      MyPutExcel('Год',10,0,-1,-1);
+      MyPutExcel('Месяц',10,0,-1,-1);
+      MyPutExcel('Код подр.',10,0,-1,-1);
+      MyPutExcel('Фио',10,0,-1,-1);
+      MyPutExcel('Дата',10,0,-1,-1);
+      MyPutExcel('Время',10,0,-1,-1);
+      MyPutExcel('Тип',10,0,-1,-1);
+      MyPutExcel('Время нар.',10,0,-1,-1);
+      xlSetColumnWidth(09,1,01,50,01);//01
+      xlSetColumnWidth(09,1,02,50,02);//02
+      xlSetColumnWidth(14,1,03,50,03);//03
+      xlSetColumnWidth(29,1,04,50,04);//04
+      xlSetColumnWidth(08,1,05,50,05);//05
+      xlSetColumnWidth(20,1,06,50,06);//06
+      xlSetColumnWidth(13,1,07,50,07);//07
+
+      HeaderStrCount:=2; // для последующего вывода сетки
+      wexrow:=HeaderStrCount+1;
+      MyXlCreaMatrix(100, maxColCount);
+      wexrow:=wexrow-1;
+      //matrixkl:=true;
+      //matrixsdvig:=wexrow;
+    }//1:
+    2:
+    { _email_attach1:= GetStringParameter('Files','OutputFilesDirectory',0)+'GP_SCUD_PodrCheck.CSV';
+      if fileexist(_email_attach1) deletefile(_email_attach1);
+      wOut.openfile(_email_attach1,stCreate);
+      wOut.WriteLn(Oem2Ansi('отчет по нарушениям за период с '+DateToStr(DTB,'DD.MM.YYYY')
+        +' по '+DateToStr(DTE,'DD.MM.YYYY')) );
+      wOut.WriteLn(Oem2Ansi('Год;Месяц;Код подр.;Фио;Дата;Время;Тип;Время нар.'));
+    } //2:
+    end;
+    timelog('GP_SCUD_PodrCheck->RunEmail write spec');
+    _Loop tmp_user_sp
+    { if not NextVisual then
+      { isAllOk:=false;
+        break;
+      }
+      //if timelog_status>1 timelog(' '+tmp_user_sp.Fio);
+      case wTypeReport of
+      0:
+      {
+        if _wMesRas  <>tmp_user_sp.MesN
+        or _wYearRas <>tmp_user_sp.YearN
+        { if _wMesRas<>0
+          { Write_Mess('</tbody></Table></div>');
+
+          }
+          _wMesRas :=tmp_user_sp.MesN;
+          _wYearRas:=tmp_user_sp.YearN;
+          Write_Mess('<div><p><b>за '+string(_wMesRas)+'мес. '+string(_wYearRas)+' год </b>');
+          Write_Mess('<table><thead><tr><th style="width:30px;">Подразд.</th>'
+            +'<th>Фио</th>'
+            +'<th>Дата</th>'
+            +'<th>Время</th>'
+            +'<th>Нарушение</th>'
+            +'<th>Время нар.</th></tr></thead><tBody>'
+            );
+        } //if _wMesRas<>wMesRas
+
+        Write_Mess('<tr><td>'+tmp_user_sp.podr_kod+'</td>'
+          +'<td>'+tmp_user_sp.Fio+'</td>'
+          +'<td>'+DateToStr(tmp_user_sp.DT_EV,'DD.MM.YYYY')+'</td>'
+          +'<td>'+TimeToStr(tmp_user_sp.TM_EV,'HH:MM:SS')+'</td>'
+          +'<td>'+tmp_user_sp.sMISCONDUCT+'</td>'
+          +'<td>'+TimeToStr(tmp_user_sp.tDiff,'HH:MM:SS')+'</td>'
+          +'</tr>'
+          );
+      } //0
+      1:
+      { _wMesRas :=tmp_user_sp.MesN;
+        _wYearRas:=tmp_user_sp.YearN;
+        wexrow++;
+        wexcol:=1;
+        MyPutExcel(String(_wYearRas)      ,10,0,-1,-1); //
+        MyPutExcel(String(_wMesRas)         ,10,0,-1,-1); //
+        MyPutExcel(tmp_user_sp.podr_kod,10,0,-1,-1); //
+        MyPutExcel(tmp_user_sp.Fio,10,0,-1,-1); //
+        MyPutExcel(chr(39)+DateToStr(tmp_user_sp.DT_EV,'DD.MM.YYYY'),10,0,-1,-1); //
+        MyPutExcel(chr(39)+TimeToStr(tmp_user_sp.TM_EV,'HH:MM:SS'),10,0,-1,-1); //
+        MyPutExcel(tmp_user_sp.sMISCONDUCT,10,0,-1,-1); //
+        MyPutExcel(chr(39)+TimeToStr(tmp_user_sp.tDiff,'HH:MM:SS'),10,0,-1,-1); //
+      }
+      2:
+      { _wMesRas :=tmp_user_sp.MesN;
+        _wYearRas:=tmp_user_sp.YearN;
+        wOut.WriteLn(Oem2Ansi(String(_wYearRas)+';'+String(_wMesRas)
+         +';'+tmp_user_sp.podr_kod+';'+tmp_user_sp.Fio
+         +';'+DateToStr(tmp_user_sp.DT_EV,'DD.MM.YYYY')
+         +';'+TimeToStr(tmp_user_sp.TM_EV,'HH:MM:SS')
+         +';'+tmp_user_sp.sMISCONDUCT
+         +';'+TimeToStr(tmp_user_sp.tDiff,'HH:MM:SS')
+        ));
+      }
+      end;
+      //if timelog_status>1 timelog(' '+tmp_user_sp.Fio+' end');
+    }//_Loop tmp_user_sp
+    timelog('GP_SCUD_PodrCheck->RunEmail write spec finish');
+    //---------------------------
+    if not isAllOk then break;
+    //---------------------------
+    case wTypeReport of
+    1:
+    {
+      MyxlWriteMatrix(wexrow);
+      xlFreeMatrix;
+      matrixkl:=False;
+      MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount ,1,wexrow,maxColCount); //Обрамление
+      xlWrapText(HeaderStrCount, 1, wexrow, maxColCount);
+      /*
+      var wPictBook:string='';
+      if not XLGETACTIVEWORKBOOKNAME(wPictBook)
+      { timelog('GP_SCUD_PodrCheck->RunEmail ошибка получения имени книги='+xlGetLastError);
+      }
+      else
+      { timelog('GP_SCUD_PodrCheck->RunEmail пишем в Excel,книга='+wPictBook);
+      }
+      if wPictBook=''
+      { wPictBook:='Книга1';
+        timelog('GP_SCUD_PodrCheck->RunEmail по имени шаблона,книга='+wPictBook);
+
+      }
+      timelog('GP_SCUD_PodrCheck->RunEmail сохраняем в '+_email_attach1);
+      xlSaveAsWorkBookByName(wPictbook, _email_attach1);
+      if not XLGETACTIVEWORKBOOKNAME(wPictBook)
+      { timelog('GP_SCUD_PodrCheck->RunEmail ошибка получения имени книги='+xlGetLastError);
+      }
+      else
+      { timelog('GP_SCUD_PodrCheck->RunEmail закрываем книгу '+wPictBook);
+      }
+      if wPictBook=''
+      { wPictBook:=_email_attach1;
+        timelog('GP_SCUD_PodrCheck->RunEmail закрываем книгу по имени выходного файла '+wPictBook);
+      }
+      xlCloseWorkBookByName(wPictbook);
+      xlSetAppVisibleMode(False);
+      */
+      var _wCount:longint=0;
+      xlGetWorkBooksCount(_wCount);
+      xlSaveWorkBook(_wCount);
+      xlCloseWorkBook(_wCount);
+      if _wCount>0
+      { xlSaveWorkBook(_wCount-1);
+        xlCloseWorkBook(_wCount-1);
+      }
+      XlKillExcel;
+      timelog('GP_SCUD_PodrCheck->RunEmail закрываем Excel _wCount='+string(_wCount));
+    }
+    2:
+    { wOut.Close;
+    }
+    else
+    { Write_Mess('</tbody></Table></div>');
+    }
+    end;
+    timelog('GP_SCUD_PodrCheck->RunEmail отправляем почту ');
+
+    if not pGP_EmailRun.EmailSend
+     ( NPOEM_OWN_EMAIL_TYPE// : word ;
+       ,tmp_user.mail // _email_addr :string ;
+       ,'СКУД нарушения на утро '+DateToStr(Cur_Date,'DD.MM.YYYY') // _email_subject :string ;
+       ,'' //_email_text :string ;
+       ,_email_attach1 //_email_attach1 :string ;
+       ,'' //_email_attach2 :string ;
+       ,'' //_email_attach3 :string ;
+       ,'' //_email_attach4 :string ;
+       ,''//'"INTERFACE Z_StaffOrders::OrdersList('+string(TitleDoc.Nrec,0,0)+')"' //_email_attach5 :string ;
+       ,'' //_email_addr_copy :string='';
+       ,'' //_email_addr_from :string=''
+      ) then break;
+    timelog('GP_SCUD_PodrCheck->RunEmail отправили');
+
+  } //_Loop tmp_user
+  StopVisual('',0);
+  timelog('GP_SCUD_PodrCheck->RunEmail Finish');
+} //Procedure RunEmail;
+
+//-----------------------------------------
+//
+//-----------------------------------------
+Function FormDoc:boolean;//
+Var ii:word;
+{ Result:=false;
+  timelog('GP_SCUD_PodrCheck->FormDoc START');
+
+  delete all tmp_user;
+  ResetBounds(#tmp_user_sp);
+  delete all tmp_user_sp;
+  SetBounds(#tmp_user_sp);
+  StartNewVisual(vtNumericVisual, vfTimer + vfBreak + vfconfirm,'Сбор данных',0);
+  vSpr_base.sUserName_base:=UserName();
+  var boPODRSHARE:boolean=false;
+  if vSpr_base.Getfirst Zar_User=tsok
+  { boPODRSHARE:=vSpr_base.ZAR_USER.PODRSHARE = '+';
+  };
+  var sDomain:string='';
+  vSpr_base.pUser:=UserID();
+  if vSpr_base.getfirst x$users=tsok
+  { sDomain:=Replace(vSpr_base.X$Users.XU$LoginName,vSpr_base.sUserName_base,'');
+  }
+  TimeLog('FormDoc sDomain='+sDomain);
+  For(ii:=1;ii<=2;ii++)
+  { if not nextvisual then break;
+    stmt:=0;
+    CreateTempVib;
+    ClearQuery(vliSQLCommand);
+    //==================сам запрос ===================
+    PrepareSQLQuery('select DISTINCT ');
+    Case ii of
+    1:
+    { //--------------------------------------------
+      // Для отправки пользователям  tmp_user
+      //--------------------------------------------
+      PrepareSQLQuery(' Zar_User.OwnName as LoginName');// :string[50]
+      PrepareSQLQuery(',X$Users.Atl_Nrec as cUser');// :comp
+      PrepareSQLQuery(',X$Users.XU$FullName as Fio');// :string[50]
+      PrepareSQLQuery(',TuneValP.COMPVAL as cPersons');//:comp
+      PrepareSQLQuery(',COMMUNICATIONS.Email as Mail');//:string
+    } //1
+    2://
+    {
+      //--------------------------------------------
+      // Для отправки пользователям - расшифровка tmp_user_sp
+      //--------------------------------------------
+      PrepareSQLQuery('  X$Users.Atl_Nrec as cUser');// :comp
+      PrepareSQLQuery(', GP_Scud_Pers.Fio as Fio');// :string[50]
+      PrepareSQLQuery(', GP_Scud_Pers.cPersons as cPersons');//:comp
+      PrepareSQLQuery(', KatPodr.nrec as cKatPodr');//:comp
+      PrepareSQLQuery(', Katpodr.Kod as Podr_kod');//:string[100]
+      PrepareSQLQuery(', Katpodr.Name as Podr_name');//:string
+      PrepareSQLQuery(', GP_SCUD_MISCONDUCT.Nrec as CMISCONDUCT');//:comp
+      PrepareSQLQuery(', GP_SCUD_MISCON_D.wMISCONDUCT as wMISCONDUCT');//:word
+      PrepareSQLQuery(', GP_SCUD_MISCONDUCT.Name as sMISCONDUCT');//:string
+      PrepareSQLQuery(', GP_SCUD_MISCON_D.YearN as YearN');//:word
+      PrepareSQLQuery(', GP_SCUD_MISCON_D.MesN  as MesN ');// :word
+      PrepareSQLQuery(', GP_SCUD_MISCON_D.DT_EV as DT_EV');//:date
+      PrepareSQLQuery(', GP_SCUD_MISCON_D.TM_EV as TM_EV');//:time
+      PrepareSQLQuery(', GP_SCUD_MISCON_D.TDIFF as TDIFF');//:time
+
+    } //2
+    end; // Case ii of
+    PrepareSQLQuery('From Zar_User');
+    PrepareSQLQuery('inner join X$Users on X$Users.XU$LoginName='''+sDomain+'''+ ZAR_USER.OWNNAME');
+    PrepareSQLQuery('inner join GP_USERRIGHTS on GP_USERRIGHTS.OWNNAME = ZAR_USER.OWNNAME');
+    PrepareSQLQuery(' and GP_USERRIGHTS.wType =2');
+    PrepareSQLQuery('inner join Katpodr on KatPodr.Nrec = GP_USERRIGHTS.cRecDs ');
+    if boPODRSHARE
+    { PrepareSQLQuery(' inner join USERRIGHTS on USERRIGHTS.OWNNAME='''+UserName()+'''');
+      PrepareSQLQuery(' and USERRIGHTS.cRecDs= Katpodr.Nrec');
+    }
+    PrepareSQLQuery('inner join GP_SCUD_Pers on GP_SCUD_Pers.cKatpodr = KatPodr.Nrec');
+    if ii=1
+    { PrepareSQLQuery('inner join TuneDef TuneDefP on TuneDefP.Code=''USER.PERSON'' ');
+      PrepareSQLQuery('inner join TuneVal TuneValP on TuneValP.cUser=X$Users.Atl_nrec');
+      PrepareSQLQuery('    and TuneValP.cTune =TuneDefP.Nrec');
+      PrepareSQLQuery('inner join Persons PersonsP on PersonsP.Nrec = TuneValP.COMPVAL');
+      PrepareSQLQuery('inner join COMMUNICATIONS on COMMUNICATIONS.Person = PersonsP.Nrec');
+      PrepareSQLQuery('   and 3 = COMMUNICATIONS.OBJTYPE and  ''''<COMMUNICATIONS.Email');
+    } //if ii=1
+    PrepareSQLQuery('inner join Persons on Persons.Nrec = GP_SCUD_Pers.cPersons');
+    PrepareSQLQuery('inner join Appointments on Appointments.Nrec = '
+       +'CASE WHEN Persons.AppointCur=#Comp(0) THEN Persons.AppointLast ELSE Persons.AppointCur END');
+    PrepareSQLQuery('inner join GP_SCUD_MISCON_D on GP_SCUD_MISCON_D.CGP_SCUD_PERS = GP_SCUD_PERS.Nrec');
+    PrepareSQLQuery(' and GP_SCUD_MISCON_D.DT_EV>=#date('+DateToStr(DTB,'DD,MM,YYYY')+')');
+    PrepareSQLQuery(' and GP_SCUD_MISCON_D.DT_EV<=#date('+DateToStr(DTE,'DD,MM,YYYY')+')');
+    PrepareSQLQuery(' and GP_SCUD_MISCON_D.cMISCONDUCT=#comp(0)');
+    PrepareSQLQuery('inner join GP_SCUD_MISCONDUCT on GP_SCUD_MISCONDUCT.wType =GP_SCUD_MISCON_D.wMISCONDUCT');
+    PrepareSQLQuery('inner join LsTab on LsTab.cLschet = Appointments.cAddNrec2');
+    PrepareSQLQuery('  and LsTab.YearN =GP_SCUD_MISCON_D.YearN');
+    PrepareSQLQuery('  and LsTab.MesN  =GP_SCUD_MISCON_D.MesN ');
+    PrepareSQLQuery('where ');
+    PrepareSQLQuery('CASE WHEN GP_SCUD_MISCON_D.wMISCONDUCT=6 THEN ');
+    PrepareSQLQuery('  CASE DAY(GP_SCUD_MISCON_D.DT_EV) ');
+    PrepareSQLQuery('  WHEN  1 THEN CASE WHEN LSTAB.DAYS[ 1]<>''НН'' THEN 1 ELSE 0 END ');
+    PrepareSQLQuery('  WHEN  2 THEN CASE WHEN LSTAB.DAYS[ 2]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN  3 THEN CASE WHEN LSTAB.DAYS[ 3]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN  4 THEN CASE WHEN LSTAB.DAYS[ 4]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN  5 THEN CASE WHEN LSTAB.DAYS[ 5]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN  6 THEN CASE WHEN LSTAB.DAYS[ 6]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN  7 THEN CASE WHEN LSTAB.DAYS[ 7]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN  8 THEN CASE WHEN LSTAB.DAYS[ 8]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN  9 THEN CASE WHEN LSTAB.DAYS[ 9]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 10 THEN CASE WHEN LSTAB.DAYS[10]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 11 THEN CASE WHEN LSTAB.DAYS[11]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 12 THEN CASE WHEN LSTAB.DAYS[12]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 13 THEN CASE WHEN LSTAB.DAYS[13]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 14 THEN CASE WHEN LSTAB.DAYS[14]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 15 THEN CASE WHEN LSTAB.DAYS[15]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 16 THEN CASE WHEN LSTAB.DAYS[16]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 17 THEN CASE WHEN LSTAB.DAYS[17]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 18 THEN CASE WHEN LSTAB.DAYS[18]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 19 THEN CASE WHEN LSTAB.DAYS[19]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 20 THEN CASE WHEN LSTAB.DAYS[20]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 21 THEN CASE WHEN LSTAB.DAYS[21]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 22 THEN CASE WHEN LSTAB.DAYS[22]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 23 THEN CASE WHEN LSTAB.DAYS[23]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 24 THEN CASE WHEN LSTAB.DAYS[24]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 25 THEN CASE WHEN LSTAB.DAYS[25]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 26 THEN CASE WHEN LSTAB.DAYS[26]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 27 THEN CASE WHEN LSTAB.DAYS[27]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 28 THEN CASE WHEN LSTAB.DAYS[28]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 29 THEN CASE WHEN LSTAB.DAYS[29]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 30 THEN CASE WHEN LSTAB.DAYS[30]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery('  WHEN 31 THEN CASE WHEN LSTAB.DAYS[31]<>''НН'' THEN 1 ELSE 0 END  ');
+    PrepareSQLQuery(' END ELSE ');
+    //здесь добавить проверку заявлений с типом не 1 и не 2
+    //GP_SCUD_REASON.wType>2
+    PrepareSQLQuery(' 1 ' );
+    PrepareSQLQuery(' END >0');
+    stmt := sqlAllocStmt;
+    case ii of
+    1: ExecDSQLex(tntmp_user);
+    2: ExecDSQLex(tntmp_user_sp);
+    end;
+  } //For(ii:=1;ii<=2;ii++)
+  ReReadRecord(#tmp_user);
+  ReReadRecord(#tmp_user_sp);
+  if getfirst tmp_user=tsok {}
+  if getfirst tmp_user_sp=tsok {}
+  StopVisual('',0);
+  Result:=true;
+  timelog('GP_SCUD_PodrCheck->FormDoc Finish');
+
+} //Function FormDoc:boolean;//
+
+Screen scrMain 'Список пользователей'  ;
+Show at (,,,2);
+Fields
+  wTypeReport:[List 0 'Html','Excel','CSV,разделитель ";"'],Protect;
+Buttons
+  cmOk    ,,, 'продолжить выполнение', hcAllBOk, scGalDial;
+<<
+  <.Выполнить рассылку.>  `Тип отчета` .@@@@@@@@@@@@@@@
+>>
+end;
+
+Browse brMain 'Список пользователей'  ;
+Show at (,3,,12);
+Table tmp_user;
+Fields
+ tmp_user.LoginName 'Логин' :[20],Protect,NoDel;
+ tmp_user.Fio       'Фио'   :[20],Protect,NoDel;
+ tmp_user.mail      'eMail' :[20],Protect,NoDel;
+end;
+Browse brMainSp 'Список нарушений'  ;
+Show at (,13,,) ;
+Table tmp_user_sp;
+Fields
+  tmp_user_sp.Podr_kod    'Код подр.' :[10],Protect,NoDel;
+  tmp_user_sp.Podr_name   'Подразделение' :[20],Protect,NoDel;
+  tmp_user_sp.Fio         'ФИО' :[20],Protect,NoDel;
+  tmp_user_sp.sMISCONDUCT 'Тип' :[20],Protect,NoDel;
+  tmp_user_sp.YearN       'Год'   :[5],Protect,NoDel;
+  tmp_user_sp.MesN        'Месяц' :[5],Protect,NoDel;
+  tmp_user_sp.DT_EV       'Дата'  :[11],Protect,NoDel;
+  tmp_user_sp.TM_EV       'Время' :[7],Protect,NoDel;
+  tmp_user_sp.TDIFF       'Нарушено на' :[5],Protect,NoDel;
+end;
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+  HandleEvent
+    //-----------------------------
+    cmInit:
+    { timelog_init;
+      timelog('GP_SCUD_PodrCheck->cmInit wAuto='+string(wAuto)+',wTypeReport='+string(wTypeReport));
+      var boDefPeriod:boolean=false;
+      if wYearRas=0
+      { wYearRas:=year (Cur_Date);
+        boDefPeriod:=true;
+      }
+      if wMesRas =0 wMesRas :=month(Cur_Date);
+      //----- Настройки
+      NPOEM_OWN_EMAIL_TYPE:=wGetTune('NPOEM_OWN.EMAIL_TYPE');//Тип отправки EMAIL
+      //---------------------
+      DTB:=Date(1,wMesRas,wYearRas);
+      if boDefPeriod
+      { if DTB>dGetTune('UP.DatOtch')
+         DTB:=dGetTune('UP.DatOtch');
+      }
+      DTE:=Date(1,wMesRas,wYearRas);
+      DTE:=Date(Last_Day(DTE),wMesRas,wYearRas);
+      if DTE>Cur_Date then DTE:=Cur_Date;
+      //PutCommand(cmValue1);
+      FormDoc;
+      if wAuto=1
+      { timelog('GP_SCUD_PodrCheck->cmInit:автозапуск RunEmail');
+        RunEmail;
+        RunWindow(wnPause);
+        StartTimer(cmValue2,2,False);
+      }
+    }
+    cmValue2:
+    { timelog('GP_SCUD_PodrCheck->cmValue2');
+
+      StopTimer(cmValue2);
+      closeinterface(cmDone) ;
+    }
+    cmOk: RunEmail;
+  end;
+
+end.

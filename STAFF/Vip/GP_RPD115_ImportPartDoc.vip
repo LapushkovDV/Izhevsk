@@ -1,0 +1,343 @@
+/*************************************************************************************************\
+* Наименование: Реализация интерфейса заполнения РПД-115 по данным доптаблицы                     *
+*               "Проценты по ипотеке к возмещению"                                                *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1330         |29/11/17|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include CatFunc.vih
+#include AppFuncs.vih
+#include AtlProtocol.vih
+#include Query.vih
+
+#include GP_RPD115_ImportPartDoc.vih
+interface GP_RPD115_ImportPartDoc;
+
+const
+  DOPTABLES_STBLNAME_MORTGAGE_COMPENSATION: string = 'Проценты по ипотеке к возмещению';
+end;
+
+var
+  _catalogsFunctions: CatalogsFunctions;
+  _appointmentsFunctions: AppointmentsFunctions;
+
+  _partDocNrec   : comp;
+  _personsNrec   : comp;
+  _raiseTypeNrec : comp;
+  _appNrec       : comp;
+  _startDate     : date;
+  _endDate       : date;
+  _raiseStartDate: date;
+  _raiseEndDate  : date;
+
+create view
+as select PartDoc.Nrec
+from PartDoc, TitleDoc, ContDoc, ContDoc ContDocLastWRec (ContDoc05),
+     Appointments, Raise, RaiseHist
+where ((
+  _partDocNrec == PartDoc.Nrec and
+
+  PartDoc.cDoc == TitleDoc.Nrec and
+
+  _personsNrec == ContDoc.Person and
+  _partDocNrec == ContDoc.cPart and
+
+  _partDocNrec == ContDocLastWRec.cPart and
+  1            == ContDocLastWRec.SeqNmb and
+
+  _appNrec     == Appointments.Nrec and
+
+  ContDoc.Nrec == Raise.cRDop and
+  _personsNrec == Raise.Person and
+  ( Raise.RaiseType = _raiseTypeNrec and
+    Raise.FromDate  = _raiseStartDate and
+    Raise.ToDate    = _raiseEndDate) and
+
+  Raise.Nrec   == RaiseHist.cRaise and
+  ContDoc.Nrec == RaiseHist.cContDoc
+));
+
+//#region Обертки для IAtlProtocol
+
+procedure MyLogStartVisual(protocol: IAtlProtocol; aStr: string; aCount: longInt);
+{
+  if protocol != nullref protocol.LogStartVisual(aStr, aCount);
+}
+
+procedure MyLogStopVisual(protocol: IAtlProtocol);
+{
+  if protocol != nullref protocol.LogStopVisual;
+}
+
+function MyLogNextVisual(protocol: IAtlProtocol; aStr: string): boolean;
+{
+  if protocol = nullref
+    result := true;
+  else
+    result := protocol.LogNextVisual(aStr);
+}
+
+procedure MyLogMessage(protocol: IAtlProtocol; aType: byte; aStr: string);
+{
+  if protocol != nullref protocol.LogMessage(aType, aStr);
+}
+
+procedure MyLogLine(protocol: IAtlProtocol; aType: byte; aStr: string);
+{
+  if protocol != nullref protocol.LogLine(aType, aStr);
+}
+
+procedure MyLogCommit(protocol: IAtlProtocol);
+{
+  if protocol != nullref protocol.LogCommit;
+}
+
+//#endregion Обертки для IAtlProtocol
+
+
+window wUI 'Параметры' escClose, doAccept;
+show (,,40, 5);
+screen sc1;
+fields
+  _startDate: noprotect;
+  _endDate: noprotect;
+buttons
+  cmDoOk, default;
+  cmCancel;
+<<
+
+ `Период с`.@@@@@@@@@@ `по`.@@@@@@@@@@
+
+          <. Продолжить .> <. Отмена .>
+>>
+end;
+
+handleevent
+  cmDoOk: PutCommand(cmDefault);
+end;
+
+end; //window wUI
+
+//Возвращает нрек доплаты:
+//Ищет утвержденные приказы с РПД-114 выбирает в них доплаты, действующие на дату d
+//Возвращает нрек вида первой найденной доплаты
+function GetVidDoplNrec(personNrec: comp; d: date): comp;
+{
+  var vidDoplNrec: comp = 0;
+  sql_loop
+    select top 1 Raise.RaiseType
+    from ContDoc
+    join PartDoc on PartDoc.Nrec = ContDoc.cPart
+    join TitleDoc on TitleDoc.Nrec = PartDoc.cDoc and TitleDoc.wStatus = 1
+    join Raise on Raise.cRDop = ContDoc.Nrec and Raise.Person = :(PersonNrec) and
+                  Raise.FromDate <= :(d) and Raise.ToDate >= :(d) and Raise.RaiseType <> #comp(0)
+    where ContDoc.Person = :(PersonNrec) and
+          ContDoc.TypeOper = 114
+    into (vidDoplNrec) {};
+
+  result := vidDoplNrec;
+}
+
+function ShowUI: word;
+{
+  result := RunWindowModal(wUI);
+}
+
+//#region query queryDopInfo
+//Выборка записей из доптаблицы сотрудников :ExtraTableName с суммами компенсации
+//ипотеки по месяцам. Отбор по периоду.
+sql query queryDopInfo =
+    select Persons.Nrec            as PersonsNrec,
+           Persons.FIO             as PersonsFio,
+           DopInfo.fFldSum[1]      as Year,
+           DopInfo.fFldSum[2]      as Month,
+           DopInfo.fFldSum[3]      as SumContribution,
+           DopInfo.fFldSum[4]      as PercentCompensation
+    from DopTables
+    join DopInfo
+         on DopInfo.cDopTbl = DopTables.Nrec and
+            (DopInfo.fFldSum[1] * 12 + DopInfo.fFldSum[2]) between :YearMonth1 and :YearMonth2
+    join Persons
+         on Persons.Nrec = DopInfo.cPerson and
+            Persons.IsEmployee = 'С'
+    where DopTables.StaffObj = 1 and
+          DopTables.sTblName = :ExtraTableName
+    order by Persons.FIO, DopInfo.fFldSum[1], DopInfo.fFldSum[2]
+;
+//#endregion query queryDopInfo
+
+procedure ImportData(protocol: IAtlProtocol = nullref);
+{
+  var yearMonth1, yearMonth2: longint;
+  yearMonth1 := year(_startDate) * 12 + month(_startDate);
+  yearMonth2 := year(_endDate) * 12 + month(_endDate);
+
+  var rs: IResultSet;
+  rs := queryManager.createQuery(queryDopInfo)
+                    .setParam('YearMonth1', yearMonth1)
+                    .setParam('YearMonth2', yearMonth2)
+                    .setParam('ExtraTableName', DOPTABLES_STBLNAME_MORTGAGE_COMPENSATION)
+                    .getResultSet;
+
+  MyLogStartVisual(protocol, 'Отбор сумм возмещения из доп. таблиц.', rs.Count);
+
+  if rs.getFirst = tsOk do
+  {
+
+    if not MyLogNextVisual(protocol, '')
+    {
+      MyLogLine(protocol, APE_WARNING, 'Прервано пользователем');
+      break;
+    }
+
+    MyLogMessage(protocol, APE_MESSAGE, 'Сотрудник ' + rs.row.Val('PersonsFIO') + ', ' +
+                 DateToStr(Date(1, rs.row.Val('Month'), rs.row.Val('Year')), 'Month YYYY года'));
+
+    _personsNrec := rs.row.Val('PersonsNrec');;
+
+    _raiseStartDate := date(1, rs.row.Val('Month'), rs.row.Val('Year'));
+    _raiseEndDate   := date(last_day(_raiseStartDate), Month(_raiseStartDate), Year(_raiseStartDate));
+
+    _raiseTypeNrec := GetVidDoplNrec(_personsNrec, _raiseEndDate);
+    if _raiseTypeNrec = 0
+    {
+      MyLogLine(protocol, APE_WARNING, 'Не найден утвержденный приказ "Компенсация процентов по ипотеке. Доп.соглашение" по сотруднику. Не определен вид доплаты. Сумма не добавлена.');
+      MyLogCommit(protocol);
+      Continue;
+    }
+
+    if getfirst ContDoc != tsOk
+    {
+      ClearBuffer(tnContDoc);
+      ContDoc.cPart    := PartDoc.Nrec;
+
+      if getlast ContDocLastWRec = tsOk
+        ContDoc.wRec   := ContDocLastWRec.wRec + 1;
+      else
+        ContDoc.wRec   := 1;
+
+      ContDoc.NumPart  := 1;
+      ContDoc.TypeOper := PartDoc.TypeOper;
+      ContDoc.Person   := _personsNrec;
+      ContDoc.ObjType  := 1;
+      ContDoc.ObjNrec  := 0;
+      ContDoc.SeqNmb   := 1;
+
+      _appNrec := _appointmentsFunctions.GetAppNrec_OnDate(ContDoc.Person, TitleDoc.DocDate);
+      if getfirst Appointments = tsOk
+      {
+        ContDoc.cStr     := Appointments.Nrec;
+        ContDoc.cDopRef  := Appointments.Department;
+      }
+
+      insert current ContDoc;
+      MyLogLine(protocol, APE_MESSAGE, 'Сотрудник добавлен в приказ');
+    }
+    else
+      MyLogLine(protocol, APE_MESSAGE, 'Сотрудник найден в приказе');
+
+    if not IsValidAll(tnContDoc)
+    {
+      MyLogLine(protocol, APE_ERROR, 'Ошибка при определении сотрудника в приказе');
+      MyLogCommit(protocol);
+      Continue;
+    }
+
+    if getfirst Raise != tsOk
+    {
+      ClearBuffer(tnRaise);
+      Raise.cRDop     := ContDoc.Nrec;
+      Raise.Person    := _personsNrec;
+      Raise.RaiseType := _raiseTypeNrec;
+      Raise.FromDate  := _raiseStartDate;
+      Raise.ToDate    := _raiseEndDate;
+      Raise.Sum       := double(rs.row.Val('SumContribution')) * double(rs.row.Val('PercentCompensation')) / 100;
+      insert current Raise;
+      MyLogLine(protocol, APE_MESSAGE, 'Добавлена надбавка "' + _catalogsFunctions.GetCatalogsName(Raise.RaiseType) +
+                '" с ' + Raise.FromDate + ' по ' + Raise.ToDate + ' на сумму ' + Raise.Sum);
+    }
+    else
+    {
+      Raise.Sum       := double(rs.row.Val('SumContribution')) * double(rs.row.Val('PercentCompensation')) / 100;
+      update current Raise;
+      MyLogLine(protocol, APE_MESSAGE, 'Найдена надбавка ' + _catalogsFunctions.GetCatalogsName(Raise.RaiseType) +
+                ' с ' + Raise.FromDate + ' по ' + Raise.ToDate + '. Установлена сумма ' + Raise.Sum);
+    }
+
+    if not IsValidAll(tnRaise)
+    {
+      MyLogLine(protocol, APE_ERROR, 'Ошибка при установке надбавки');
+      MyLogCommit(protocol);
+      Continue;
+    }
+
+    if getfirst RaiseHist != tsOk
+    {
+      ClearBuffer(tnRaiseHist);
+      RaiseHist.cRaise     := Raise.Nrec;
+      RaiseHist.cContDoc   := Raise.cRDop;
+      RaiseHist.cPsn       := Raise.Person;
+      RaiseHist.wTypeOper  := 9;
+      RaiseHist.dRec       := Raise.FromDate;
+      RaiseHist.dDat2      := Raise.ToDate;
+      RaiseHist.DocNmb     := TitleDoc.DocNmb;
+      RaiseHist.DocDate    := TitleDoc.DocDate;
+      RaiseHist.RhSum      := Raise.Sum;
+      RaiseHist.cRaiseType := Raise.RaiseType;
+      insert current RaiseHist;
+      MyLogLine(protocol, APE_MESSAGE, 'Добавлена запись в историю надбавок');
+    }
+    else
+    {
+      RaiseHist.cRaiseType := Raise.RaiseType;
+      RaiseHist.dRec       := Raise.FromDate;
+      RaiseHist.dDat2      := Raise.ToDate;
+      RaiseHist.DocNmb     := TitleDoc.DocNmb;
+      RaiseHist.DocDate    := TitleDoc.DocDate;
+      RaiseHist.RhSum      := Raise.Sum;
+      update current RaiseHist;
+      MyLogLine(protocol, APE_MESSAGE, 'Изменена запись истории надбавок');
+    }
+
+    if not IsValidAll(tnRaiseHist)
+    {
+      MyLogLine(protocol, APE_ERROR, 'Ошибка при изменении записи истории надбавок');
+      MyLogCommit(protocol);
+      Continue;
+    }
+
+    MyLogCommit(protocol);
+
+  } while rs.getNext = tsOk;
+
+  MyLogStopVisual(protocol);
+
+}
+
+Constructor Init;
+{
+  result := false;
+}
+
+Constructor GP_RPD115_ImportPartDoc(cPartDoc: comp; dStartDate: date = 0; dEndDate: date = 0);
+{
+  _partDocNrec := cPartDoc;
+  _startDate := dStartDate;
+  _endDate := dEndDate;
+  result := (getfirst PartDoc = tsOk);
+  result := result and (getfirst TitleDoc = tsOk);
+  if _startDate = 0 and _endDate = 0
+  {
+    _startDate := date(1, Month(TitleDoc.DocDate), Year(TitleDoc.DocDate));
+    _endDate := date(Last_Day(_startDate), Month(_startDate), Year(_startDate));
+  }
+}
+
+property StartDate: date absolute _startDate;
+property EndDate: date absolute _endDate;
+
+end.

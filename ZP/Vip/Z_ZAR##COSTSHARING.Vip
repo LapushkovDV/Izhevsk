@@ -1,0 +1,442 @@
+/*************************************************************************************************\
+* Наименование:  Доработка интерфейса =Настройка распределения затрат                             *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    требуется начинать выбор распределения с номера заказа с последующим             *
+*                автоматическим формированием счета бухгалтерского учета.                         *
+*                Собирать перед Z_WT##WTCOSTSHARING.vip                                           *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#768          |10/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#767          |30/10/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include GetKau.Vih
+#component "z_zar"
+//******************************************************************************
+Alter Interface COSTSHARING;
+//******************************************************************************
+#include GetKau.Var
+#include GP_Func_ZP.Var
+
+var wKodAnalitik :word;//код "избранная аналитика"
+var pTmp         :comp;
+//------------------------------------
+//=======================================
+Function GetDoubleFromChasF(ww_str:string):double;forward;
+Function Calc_ChasF_Sum(ww_new,ww_old:double):double;forward;
+Function Calc_ChasF_Proc(ww_new,ww_old:double):double;forward;
+//=======================================
+var
+      EditMode:                  boolean;
+      IsEmbedded:                boolean;
+      // информация об итогах доступна
+      IsAvailable:               boolean;
+      // установленный извне режим "только чтение"
+      IsReadOnly:                boolean; // почему не объединено с EditMode?
+      //---------- ссылка на табель
+      pWorkingTable              :comp;
+      bDayOfMonth                :byte;
+      //-------------------
+      DBeg :date;
+      DEnd :date;
+      //----------------- Для просмотра из табеля
+      SelectedRange:longint; //выбранный диапазон в табеле
+      pChange     :comp;// Perexod.nrec  - при вводе в табелях
+      Chasf_Period:double;// часы за период
+      Chasf_IT    :double;// часы за период
+      boPeriod    :boolean;// установлен фильт по
+      boModeLsTab :boolean=false;// вызов из табеля
+      //EnhancedTimeFormat:boolean;
+create view
+as Select LsTab.Nrec
+From
+  LsTab
+  , PrVidopl PrVidopl_F
+  , PrVidopl PrVidopl_IT
+  where ((
+        pWorkingTable == LSTAB.NREC
+    and pChange == Perexod.Nrec
+    and pcCostSharing == PRVIDOPL_F.CHOICE
+    and PersonalAccount == PRVIDOPL_F.CLSCH
+    and PeriodBeginning == PRVIDOPL_f.DATAN (noindex)
+    and brPrvidopl.Dataf  == PRVIDOPL_F.DataF(noindex)
+    // возможно нужно еще фильтр по дате окончания
+    //  and   DEnd==PrVidopl.Datok(noindex)
+
+    and (brPrvidopl.Nrec<>Prvidopl_F.Nrec)
+    // итоги
+    and pcCostSharing == PRVIDOPL_IT.CHOICE
+    and PersonalAccount == PRVIDOPL_IT.CLSCH
+    and PeriodBeginning == PRVIDOPL_IT.DATAN (noindex)
+    and (brPrvidopl.Nrec<>Prvidopl_IT.Nrec)
+));
+
+
+
+
+
+//------------------------------------
+// Установить параметры по плану
+//------------------------------------
+Function SetFieldsByMnPlan(_pMnPlan:comp):boolean;
+var ii:word;
+{ Result:=false;
+  #FUNC_ZP_Fill_To_SchKauParam(brPrvidopl,cSchetD,cSubSchD,cKaud,Tbld)
+  if pGP_Func_ZP.SetFieldsByMnPlan(_pMnPlan,PSchKauParam)
+  { #FUNC_ZP_Fill_From_SchKauParam(brPrvidopl,cSchetD,cSubSchD,cKaud,Tbld)
+    Result:=true;
+    SetModified(true);
+    UpdateTable;
+  }
+}//Function SetFieldsByMnPlan(_pMnPlan:comp);
+
+
+
+//-------------------------------
+//проверим субсчет по заказу, если не совпадает поменяем
+Procedure Check_Analitic_MnPlan;
+{ #FUNC_ZP_Fill_To_SchKauParam(brPrvidopl,cSchetD,cSubSchD,cKaud,Tbld)
+  if pGP_Func_ZP.Check_Analitic_MnPlan(PSchKauParam)
+  { #FUNC_ZP_Fill_From_SchKauParam(brPrvidopl,cSchetD,cSubSchD,cKaud,Tbld)
+    SetModified(true);
+    UpdateTable;
+  }
+} //Procedure Check_Analitic_MnPlan;
+
+Function GetDoubleFromChasF(ww_str:string):double;
+{ Result:=0;
+  Result:= if(EnhancedTimeFormat,Str2TimeSep(ww_str,':'),double(ww_str));
+}
+
+//----------------------------------
+// рассчитаем за период или за месяц
+//----------------------------------
+Function Calc_ChasF_Sum(ww_new,ww_old:double):double;
+{ Result:=ww_new;//-ww_old;
+  if false //будем всегда к итогу boPeriod
+  { _Loop PrVidopl_F
+      Result+=PrVidopl_F.Chasf;
+  }
+  else
+  { _Loop PrVidopl_IT
+      Result+=PrVidopl_IT.Chasf;
+  }
+}
+
+//----------------------------------
+// рассчитаем за месяц
+//----------------------------------
+Function Calc_ChasF_Sum_IT(ww_new,ww_old:double):double;
+{ Result:=ww_new;//-ww_old;
+  _Loop PrVidopl_IT
+    Result+=PrVidopl_IT.Chasf;
+}
+
+Function Calc_ChasF_Proc(ww_new,ww_old:double):double;
+var ww_val:double;
+{ Result:=Calc_ChasF_Sum(ww_new,ww_old);
+  //Calc_ChasF_Proc(GetDoubleFromChasF(ACTUALTIMESTR),0);
+  if Result<>0
+  { Result:=100*ww_new/Result;
+  }
+}
+
+  //------------------------------------------
+  //#767.#19
+  //'Z_WT::ZLSTAB.WORKINGTABLEWINDOW.WTCONTAINEREMBEDDED.
+  //Z_WT::WTCONTAINER.PAGE10.Z_WT::WTCOSTSHARING.SCRPARAM.ITCHAS_IT'
+  //Необходимо изменить расчет итогового значения в поле "К распределению": включать помимо явок
+  //отклонения К,КП, РВ,РО,С. Остальные включать "К распределению" не нужно.
+  Function Calc_Absence(_DBEG:Date=ZeroDate;_DEND:date=ZeroDate):double;
+  {
+    var I: integer;
+    var AbsenceType: byte=0;
+    //var _MARK: string[5]=''
+    //var _DESCRIPTION: string='';
+    //var _DAYS: byte-0;
+    var _HOURS: double=0;
+    var _BEGINNING:date=ZeroDate;
+    var _ENDING: date=ZeroDate;
+    var _KIND: word=0;
+    var _aaMark:string;
+    _aaMark:='';
+
+    if _DBEG=ZeroDate
+    { _DBEG :=DBEG;
+      _DEND :=DEND;
+    }
+    Result:=0;
+    WT_LoadSystemAbsences(0, 0);
+    //AbsenceType := atSystem; atMonthly
+    for (I := 0; I < WT_GetAbsenceCount(atMonthly); I := I + 1)
+    { // выбрать значения атрибутов неявки
+      //if WT_GetAbsenceAttribute(AbsenceType, I, aaKind, _KIND)
+      if WT_GetAbsenceAttribute(atMonthly, I, aaMark, _aaMark) //then continue;
+      { //case _KIND of
+        //akBusinessTrip:
+        case _aaMark of
+        'К','КП', 'РВ','РО'
+        ,'С' //
+        :
+        { if  WT_GetAbsenceAttribute(atMonthly, I, aaBeginning, _BEGINNING)
+          and WT_GetAbsenceAttribute(atMonthly, I, aaEnding, _ENDING)
+          { _HOURS:=0;
+            WT_GetAbsenceAttribute(atMonthly, I, aaHours, _HOURS) ;
+            if _HOURS=0
+            { _HOURS:=WT_GetDaysBwDatesEx(hkWorking, stPlanned,_BEGINNING,_ENDING, cfDisregardFilters);
+            }
+            if  _BEGINNING<=_DEnd
+            and _Ending >=_DBeg
+             Result:=Result+_HOURS;
+          }
+        }
+        end;
+      } //if WT_GetAbsenceAttribute(AbsenceType, I, aaKind, _KIND)
+    } //for (I := 0; I < WT_GetAbsenceCount(AbsenceType); I := I + 1)
+    //Нужно добавить сверхурочку и работу в выходной
+    //убираем итоги по СВ с табеля
+    //Result:=Result+WT_GetHours(hkOverwork,stActual)+WT_GetHours(hkOverworkRest,stActual)
+  } //Function Calc_Absence:double;
+
+
+//----------------------------------------------
+// Рассчитаем часы за период
+//----------------------------------------------
+Function Calc_Chasf_Period(_DTB,_DTE:date): double;
+{ Result:=0;
+  if _DTB>_DTE exit;
+  // WT_GetHoursBwDates
+  //Result:=WT_GHBD(1,0,0,1,_DTB,_DTE);// актуальные часы
+  //оплачиваемые часы (рабочие часы плюс часы приходящегося на день оплачиваемого отклонения)
+  //Result:=WT_GHBD(hkPaid,0,0,1,_DTB,_DTE);// актуальные часы
+  Result:=WT_GHBD(hkWorking,0,0,1,_DTB,_DTE);// актуальные часы
+              + Calc_Absence(_DTB,_DTE);
+  if Result=0
+  { Result:=WT_GHBD(1,0,0,0,_DTB,_DTE);// плановые часы
+  }
+
+} //Function Calc_Chasf_Period(_DTB,_DTE:date): double;
+
+
+
+Function Check_Chas_By_Period :boolean;
+{ Result:=false;
+  if brPrvidopl.ChasF=0
+  { if message('Часы не введены!'
+     +'Заменить на часы за период?',YesNo )=cmYes
+    { Set brPrvidopl.ChasF:=Calc_Chasf_Period(brPrvidopl.DATAF,brPrvidopl.DATOK);
+      Result:=true;
+    }
+  }
+
+} //Function Check_Chas_By_Period :boolean;
+
+//----------------------------------------------
+// Рассчитаем часы в распределении
+//----------------------------------------------
+Function Calc_ChasF(ww_new,ww_old:double):boolean;
+var ww_it:double;
+{ Result:=true;
+  if not boModeLsTab then exit;
+  ww_it:=Calc_ChasF_Sum(ww_new,ww_old);
+  if ww_it>Chasf_period
+  { if message('Часов в распределении '+string(ww_it,0,2)+'ч. больше, чем '
+      +if(SelectedRange=-1,' за месяц '
+          ,chr(13)+'за период с '+DateToStr(Dbeg,'DD.MM.YYYY')+' по '+DateToStr(DEnd,'DD.MM.YYYY'))
+          +'  '+string(Chasf_period,0,2)+'ч.'
+      +chr(13)+'Продолжить?' ,YesNo)<>cmYes
+    { Result:=false;
+    }
+  } //if ww_it>Chasf_period
+} //Function Calc_ChasF(ww_new,ww_old:double):boolean;
+
+ExtendFormats CostSharingBrowse;
+browse CostSharingBrowse (,, sci1378Esc);
+table brPrvidopl;
+Fields
+  brPrvidopl.DATAF 'Дата с' : [11],NoProtect; // DATAN - PeriodBegining
+  brPrvidopl.Datok 'Дата по' : [11],NoProtect;
+  [Procent] Calc_ChasF_Proc(GetDoubleFromChasF(ACTUALTIMESTR),0) '%' :[6,2],Protect, NoAutoSize ;
+end;
+
+//******************************************************************************
+TableEvent table brPrvidopl;
+cmSetDefault:
+{ //Забираем if  inherited :: handleEvent (cmSetDefault)=heAbort then Abort;
+    if PersonalAccount <> 0
+    {
+      FilltpPrvidopl;
+      var T: double;
+      T := 0;
+      _loop brPrvidopl novisual
+        T := T + brPrvidopl.CHASF;
+
+      ClearBuffer(#brPrvidopl);
+
+      brPrvidopl.TABN := LSCHET.TABN;
+      brPrvidopl.StrTABN := LSCHET.StrTABN;
+      brPrvidopl.cLsch := LSCHET.Nrec;
+      brPrvidopl.TPERSON := LSCHET.TPERSON;
+      brPrvidopl.CEX := LSCHET.CEX;
+      brPrvidopl.CEXOZ := LSCHET.CEX;
+
+      // ШПЗ из лицевого счета по умолчанию
+      #CopyInfo_GP(brPrvidopl,LSCHET)
+
+      var ActualHours: double;
+
+      //GP ActualHours := WT_GetHours(hkWorking, stActual);
+      //ActualHours := WT_GetHours(hkPaid, stActual);
+      ActualHours := WT_GetHours(hkWorking, stActual)+Calc_Absence;
+      if (T < ActualHours)
+        brPrvidopl.CHASF := ActualHours - T;
+     //GP
+     brPrvidopl.Dataf:=DBeg;
+     brPrvidopl.Datok:=DEnd;
+     if pChange>0
+       brPrvidopl.Cexoz:=Perexod.CEXP
+     //GP
+    }
+
+}
+cmCheckRecord: //Забираем полностью
+{
+  if (SchetDeb = '')
+  {
+    SelectField(#SchetDeb);
+    Message('Не задан счет для отнесения затрат'
+      +chr(13)+'введите счет или удалите запись' , Error + OkButton);
+    //GP abort;
+  }
+  else
+    if (PersonalAccount <> 0) and (brPrvidopl.CHASF = 0)
+    {
+      SelectField(#ActualTimeStr);
+      Message('Не задано количество часов', Error + OkButton);
+      //GP прерывать не будем abort;
+    }
+}
+
+cmCheckField:
+{ case CurField of
+  #brPrvidopl.DATAF:
+  { if brPrvidopl.DATAF<DBeg
+    { message('Дата начала меньше установленного периода');
+      brPrvidopl.DATAF:=DBeg;
+    }
+    if brPrvidopl.DATAF>DEnd
+    { message('Дата начала больше установленного периода');
+      brPrvidopl.DATAF:=DEnd;
+    }
+    if brPrvidopl.DatOk<>Date(0,0,0)
+    { if brPrvidopl.DatOk<brPrvidopl.DataF
+      { Message('Дата окончания меньше даты начала');
+        set brPrvidopl.DatOk:=brPrvidopl.DATAF
+      }
+    }
+    Check_Chas_By_Period;
+  }
+  #brPrvidopl.DatOk:
+  { if brPrvidopl.DATOK<DBeg
+    { message('Дата окончания меньше установленного периода');
+      brPrvidopl.DATOK:=DBeg;
+    }
+    if brPrvidopl.DATOK>DEnd
+    { message('Дата окончания больше установленного периода');
+      brPrvidopl.DATOK:=DEnd;
+    }
+
+    if brPrvidopl.DatOk<>ZeroDate
+    { if brPrvidopl.DatOk<brPrvidopl.DataF
+      { Message('Дата окончания меньше даты начала');
+            set brPrvidopl.DatOk:=brPrvidopl.DataF;
+      }
+      else
+      { set brPrvidopl.DatOk:=brPrvidopl.DatOk;
+      }
+    } //GP_KPI_Raise_Sts.ToDate
+    Check_Chas_By_Period;
+  }
+  end;
+
+}
+cmExprFieldChanged:
+{ case CurField of
+  #ACTUALTIMESTR:
+  { var ww_val:double=0;
+    var ww_str:string;
+    ww_str:=ExprFieldValue;//GetViewerData();
+
+    ww_val:= GetDoubleFromChasF(ww_str);
+    //message(ww_str+' '+string(ww_val,0,2));
+
+    if not Calc_ChasF(ww_val,brPrvidopl.chasf)
+    { ReReadRecord(#brPrvidopl);
+      Abort;
+    }
+  }
+  end;
+  if  inherited :: handleEvent (cmExprFieldChanged)=heAbort then Abort;
+}
+end;
+
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+  HandleEvent
+  //------------------------
+  cmInit:
+  { //"Настройки Галактики \ Управление персоналом \ Расчеты с персоналом \ Избранная аналитика"
+    wKodAnalitik:=wGetTune('UP.ZAR.FAVORITEANALYTICS');
+    //----------------------
+    if  inherited :: handleEvent (cmInit)=heAbort then Abort;
+    //----------------------
+    DEnd:=date(Last_day(PeriodBeginning),Month(PeriodBeginning),year(PeriodBeginning));
+    DBeg:=PeriodBeginning;
+
+    boPeriod:=false;
+  }
+  //------------------------
+  cmPick:
+  {   if not IsInEditMode
+      {
+        abort;
+        exit;
+      }
+      var need_Pick:boolean=true;
+      case curField of
+      #Schetdeb, #SubSchdeb, #NamKaud:
+      { if curField=#NamKaud or Schetdeb=''
+        { if (QuickChoiceName <> '')  QuickChoiceName := 'qcKau_Needed'
+        }
+        if Schetdeb='' or (QuickChoiceName<>'' and curField=#NamKaud )
+        { pTmp:=0;
+          if iGetKau.GetCodeKau(cgiPick, cgKau_Zakaz, pTmp)<>0 //cmCancel
+          { if  SetFieldsByMnPlan(pTmp)
+            { case curField of
+              #Schetdeb, #SubSchdeb: need_Pick:=false;
+              end;
+            }
+          }
+          else
+          { message('Задайте счет');
+            SelectField(#Schetdeb);
+          }
+
+
+        } //if Schetdeb=''
+
+      } //#Schetdeb, #SubSchdeb, #NamKaud
+      end; //case curField of
+      //----------------------
+      if need_Pick
+      { if  inherited :: handleEvent (cmPick)=heAbort then Abort;
+        if curField=#NamKaud //and QuickChoiceName=''
+        { Check_Analitic_MnPlan;
+        }
+      }
+      //----------------------
+
+  }
+  end;
+end.

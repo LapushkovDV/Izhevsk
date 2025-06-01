@@ -1,0 +1,362 @@
+/*************************************************************************************************\
+* Наименование: Реализация класса GP_KPI_Statements "Ведомости оценки выполнения KPI"             *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#195          |06/09/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_Status.vih
+#include GP_Log.vih
+
+#include GP_KPI_Statements.vih
+#doc
+Реализация класса GP_KPI_Statements "Ведомости оценки выполнения KPI"
+#end
+interface GP_KPI_Statements;
+
+var
+  Status:GP_Status NoAuto;
+  pGP_KPI_Statements,pGP_KPI_StatementSpec:comp;
+  oGP_Log : GP_Log;
+
+create view ltKPI_Statements
+as select
+   GP_KPI_Statements.Nrec
+ , if(GP_KPI_StatementSpec.ImplProc<100,GP_KPI_StatementSpec.ImplProc/100,1)*GP_KPI_StatementSpec.UdVes (fieldname=ItKoef)
+
+from
+  GP_KPI_Statements,
+  GP_KPI_StatementSpec,
+  GP_StatusChangeLog,
+  GP_KPI_Chief,
+  Persons EXECUTOR ,
+  GP_KPI_Plan,
+  GP_KPI,
+  KatEd,
+  Catalogs PodrOc,
+  Catalogs PostOc,
+  Catalogs UcPeriod
+
+where ((
+    GP_KPI_Statements.cChiefStaffStr== GP_KPI_Chief.cStaffStr
+and GP_KPI_Statements.cExecutor     == GP_KPI_Chief.cExecutor
+and GP_KPI_Chief.NRec               == GP_KPI_Plan.cChiefKPI
+and GP_KPI_Chief.CEXECUTOR          == EXECUTOR.Nrec
+and coGP_KPI_Statements             == GP_StatusChangeLog.wTbl
+and GP_KPI_Statements.Nrec          == GP_StatusChangeLog.cDoc
+and GP_KPI_Statements.Nrec          == GP_KPI_StatementSpec.cStatement
+//--------------------------------------------------
+and GP_KPI_StatementSpec.cKPI       == GP_KPI.NRec
+and GP_KPI.cKatEd                   == KatEd.NRec
+and GP_KPI_StatementSpec.cPodr      == PodrOc.NRec
+and GP_KPI_StatementSpec.cPost      == PostOc.NRec
+and  GP_KPI_StatementSpec.cUcPeriod == UcPeriod.NRec
+
+));
+
+function GetNextDocNumber(InYear:word):string;
+var d1,d2:date;
+{
+  result:='';
+
+  d1:=date(1,1,InYear);
+  d2:=date(31,12,InYear);
+
+  sql
+    select max(GP_KPI_Statements.DocNumber)
+    from GP_KPI_Statements
+    where(:(d1)<=GP_KPI_Statements.DocDate and :(d2)>=GP_KPI_Statements.DocDate)
+    into (result);
+
+  if (Trim(result)='')
+    result:='000001'
+  else
+    result:=NextNumStr(result);
+}
+
+function CreateSpec:boolean;
+var PosNum:longint;
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Формирование спецификации ведомости...', 0);
+  var _DTE:date=date(Last_Day(GP_KPI_Statements.DocDate)
+               , Month(GP_KPI_Statements.DocDate), Year(GP_KPI_Statements.DocDate) );
+  result:=true;
+  PosNum:=0;
+  _loop GP_KPI_Chief
+  {
+    NextVisual;
+    // проверим по дате увольнения
+    if getfirst EXECUTOR=tsok //isValidAll(#EXECUTOR)
+    {  if (EXECUTOR.DisDate<>ZeroDate and EXECUTOR.DisDate<GP_KPI_Statements.DocDate)
+       { oGP_Log.Write('Исполнитель '+EXECUTOR.Fio+' уволен '+DateToStr(EXECUTOR.DisDate,'DD/MM/YYYY')
+          +' и не может создавать ведомость от '+DateToStr(GP_KPI_Statements.DocDate,'MM/YYYY'));
+         continue;
+       }
+    }
+    if (GP_KPI_Chief.dBegin>_DTE)
+    { oGP_Log.Write('Дата начала оценки показателя '+DateToStr(GP_KPI_Chief.dBegin,'DD/MM/YYYY')
+      +' меньше даты ведомости  '+DateToStr(GP_KPI_Statements.DocDate,'MM/YYYY'));
+      continue;
+    }
+    if (GP_KPI_Chief.dEnd<>ZeroDate  )
+      if GP_KPI_Chief.dEnd<GP_KPI_Statements.DocDate
+    { oGP_Log.Write('Дата окончания оценки показателя '+DateToStr(GP_KPI_Chief.dEnd,'DD/MM/YYYY')
+          +' меньше даты ведомости  '+DateToStr(GP_KPI_Statements.DocDate,'MM/YYYY'));
+      continue;
+    }
+    _loop GP_KPI_Plan //where((GP_KPI_Chief.NRec==GP_KPI_Plan.cChiefKPI))
+    {
+      NextVisual;
+      if (GP_KPI_Plan.dBegin>_DTE)
+      { oGP_Log.Write('Дата начала оценки показателя по подразделению '+DateToStr(GP_KPI_Plan.dBegin,'DD/MM/YYYY')
+         +' меньше даты ведомости  '+DateToStr(GP_KPI_Statements.DocDate,'MM/YYYY'));
+        continue;
+      }
+      if (GP_KPI_Plan.dEnd<>ZeroDate)
+        if GP_KPI_Plan.dEnd<GP_KPI_Statements.DocDate
+      { oGP_Log.Write('Дата окончания оценки показателя  по подразделению '+DateToStr(GP_KPI_Plan.dEnd,'DD/MM/YYYY')
+          +' меньше даты ведомости  '+DateToStr(GP_KPI_Statements.DocDate,'MM/YYYY'));
+         continue;
+      }
+
+      ClearBuffer(tnGP_KPI_StatementSpec);
+      GP_KPI_StatementSpec.cStatement:=GP_KPI_Statements.NRec;
+      GP_KPI_StatementSpec.DocDate:=GP_KPI_Statements.DocDate;
+      GP_KPI_StatementSpec.PosNumber:=++PosNum;
+      GP_KPI_StatementSpec.cKPI:=GP_KPI_Chief.cKPI;
+      GP_KPI_StatementSpec.cStaffStr:=GP_KPI_Plan.cStaffStr;
+      GP_KPI_StatementSpec.cPodr:=GP_KPI_Plan.cPodr;
+      GP_KPI_StatementSpec.cPost:=GP_KPI_Plan.cPost;
+      GP_KPI_StatementSpec.cUcPeriod:=GP_KPI_Plan.UcPeriod;
+      GP_KPI_StatementSpec.UdVes:=GP_KPI_Plan.UdVes;
+      GP_KPI_StatementSpec.LowLimit:=GP_KPI_Plan.LowLimit;
+      GP_KPI_StatementSpec.HighLimit:=GP_KPI_Plan.HighLimit;
+      GP_KPI_StatementSpec.Plan:=GP_KPI_Plan.Plan;
+      result:=insert current GP_KPI_StatementSpec = tsok;
+      if (not result) {
+        message('Ошибка вставки записи в таблицу GP_KPI_StatementSpec.',error);
+        break;
+      }
+    }
+
+    if (not result) break;
+  }//_loop GP_KPI_Chief
+
+  StopVisual;
+}
+
+function CreateStatement(var buf:type$GP_KPI_Statements):boolean;
+{
+
+  oGP_Log.Init('GP_KPI_Statement.log', true, true, true);
+  result:=false;
+
+  if (Status=NullRef)
+    Status:=New(GP_Status,InitForTypeDoc('Оценка по показателям премирования'));
+  if (Status=NullRef)
+    exit;
+
+  buf.DocNumber:=GetNextDocNumber(Year(buf.DocDate));
+  buf.cStatus:=Status.GetDefault;
+
+  GP_KPI_Statements.buffer:=buf;
+  GP_KPI_Statements.NRec:=0;
+  result:=insert current GP_KPI_Statements = tsok;
+  if (result) {
+    buf:=GP_KPI_Statements.buffer;
+    CreateSpec;
+  }
+  else
+    message('Ошибка вставки записи в таблицу GP_KPI_Statements.',error);
+  oGP_Log.Done(true);
+
+}
+
+function ChangeStatus(cStatement:comp;StatusChangeLog:type$GP_StatusChangeLog):boolean;
+var Rez:integer;
+{
+  result:=false;
+
+  //Начало транзакции
+  Rez:=BeginConcurrentTransaction(trNoLock);
+  if (Rez<>tsok)
+    message('Ошибка открытия транзакции - '+string(Rez),error);
+  else {
+    GP_StatusChangeLog.buffer:=StatusChangeLog;
+    GP_StatusChangeLog.NRec:=0;
+    GP_StatusChangeLog.wTbl:=coGP_KPI_Statements;
+    GP_StatusChangeLog.cDoc:=cStatement;
+    GP_StatusChangeLog.DateOper:=_CurDateTime;
+    GP_StatusChangeLog.cUser:=UserId;
+    Rez:=insert current GP_StatusChangeLog;
+    if (Rez<>tsok)
+      message('Ошибка вставки записи в таблицу GP_StatusChangeLog - '+string(Rez),error);
+
+    if (Rez=tsok) {
+      Rez:=update GP_KPI_Statements where((cStatement==GP_KPI_Statements.NRec)) set
+             GP_KPI_Statements.cStatus:=StatusChangeLog.cStatusTo;
+      if (Rez<>tsok)
+        message('Ошибка модификации записи в таблице GP_KPI_Statements - '+string(Rez),error);
+    }
+
+    if (Rez=tsok) {//Запись в БД
+      Rez:=EndTransaction;
+      if (Rez<>tsOK)
+        message('Ошибка завершения транзакции - '+string(Rez),error);
+      result:=Rez=tsok;
+    } else {//Откат
+      Rez:=AbortTransaction;
+      if (Rez<>tsOK)
+        message('Ошибка отката транзакции - '+string(Rez),error);
+    }
+  }
+}
+
+Function GetDefaultStatus:comp;
+{ Result:=0;
+  if (Status=NullRef)
+    Status:=New(GP_Status,InitForTypeDoc('Оценка по показателям премирования'));
+  if (Status=NullRef)
+    exit;
+
+  Result:=Status.GetDefault;
+
+}
+
+
+function DeleteStatement(cStatement:comp):boolean;
+var Rez:integer;
+{
+  result:=false;
+
+  //Начало транзакции
+  Rez:=BeginConcurrentTransaction(trNoLock);
+  if (Rez<>tsok)
+    message('Ошибка открытия транзакции - '+string(Rez),error);
+  else {
+    Rez:=delete GP_KPI_StatementSpec where((cStatement==GP_KPI_StatementSpec.cStatement));
+    if (Rez<>tsOK)
+      message('Ошибка удаления записи в таблице GP_KPI_StatementSpec - '+string(Rez),error);
+
+    if (Rez=tsok) {
+      Rez:=delete GP_StatusChangeLog
+           where((coGP_KPI_Statements==GP_StatusChangeLog.wTbl and cStatement==GP_StatusChangeLog.cDoc));
+      if (Rez<>tsOK)
+        message('Ошибка удаления записи в таблице GP_StatusChangeLog - '+string(Rez),error);
+    }
+
+    if (Rez=tsok) {
+      Rez:=delete GP_KPI_Statements where((cStatement==GP_KPI_Statements.NRec));
+      if (Rez<>tsOK)
+        message('Ошибка удаления записи в таблице GP_KPI_Statements - '+string(Rez),error);
+    }
+
+    if (Rez=tsok) {//Запись в БД
+      Rez:=EndTransaction;
+      if (Rez<>tsOK)
+        message('Ошибка завершения транзакции - '+string(Rez),error);
+      result:=Rez=tsok;
+    } else {//Откат
+      Rez:=AbortTransaction;
+      if (Rez<>tsOK)
+        message('Ошибка отката транзакции - '+string(Rez),error);
+    }
+  }
+}
+//-------------------------------------
+#doc
+ Установить позицию
+#end
+Function SetDocPosition(_wTypeDoc:word;_cDoc:comp;_cDocSp:comp):boolean;
+{ Result:=false;
+  set _wTypeDoc:=_wTypeDoc;
+
+  if pGP_KPI_Statements<>_cDoc
+  { set pGP_KPI_Statements:=_CDoc;
+    if getfirst GP_KPI_Statements where (( pGP_KPI_Statements ==GP_KPI_Statements.Nrec )) <>tsok
+    { pGP_KPI_Statements:=0;
+      Exit;
+    }
+  }
+  if pGP_KPI_StatementSpec<>_cDocSp
+  { set pGP_KPI_StatementSpec:=_cDocSp;
+    if getfirst GP_KPI_StatementSpec where (( pGP_KPI_StatementSpec == GP_KPI_StatementSpec.Nrec )) <>tsok
+    { pGP_KPI_StatementSpec:=0;
+      Exit;
+    }
+  }
+  Result:=true;
+}//Function SetDocPosition(_wTypeDoc:word;_cDoc:comp;_cDocSp:comp):boolean;
+
+//===============================================
+// Получить значение полей - строка
+//===============================================
+Function GetFieldValS(wTp:word; wwNum:word) : string;
+{ Result:='';
+  case wTp of
+  03: // Спецификация
+  {
+    case wwNum of
+    01: Result:=GP_KPI_StatementSpec.PosNumber; //'№'
+    02: Result:=PodrOc.Code; //  'Номер','подразделения'
+    03: Result:=PodrOc.Name; //  'Наименование','подразделения': [25], Protect, NoDel;
+    04: Result:=PostOc.Name; //  Должность': [25], Protect, NoDel;
+    05: Result:=GP_KPI.Name; //  'Показатель премирования', ('Наименование показателя премирования',,): [100], Protect, NoDel;
+    06: Result:=string(GP_KPI_StatementSpec.UdVes    ,0,10);//     'Удельный','вес':[10.2], Protect, NoAutoSize;
+    07: Result:=string(GP_KPI_StatementSpec.LowLimit ,0,10); // 'Нижняя','граница':[10.2], Protect, NoAutoSize;
+    08: Result:=string(GP_KPI_StatementSpec.HighLimit,0,10);// 'Верхняя','граница':[10.2], Protect, NoAutoSize;
+    09: Result:=KatEd.Name;//    'Ед.изм.', ('Ед.изм.'): [10], Centered, Protect, NoDel, NoAutoSize;
+    10: Result:=string(GP_KPI_StatementSpec.Plan,0,10);// 'Плановое','значение':[12.2], Protect, NoAutoSize;
+    11: Result:=string(GP_KPI_StatementSpec.Fact,0,10);// 'Фактическое','значение':[12.2], Protect, NoAutoSize;
+    12: Result:=string(GP_KPI_StatementSpec.ImplProc,0,10);// 'Процент','выполнения','показателя','премир-я' ('Процент выполнения показателя премирования',,):[12.2], Protect, NoAutoSize;
+    13: Result:=UcPeriod.name;// 'Учетный','период':[10], Protect, NoDel;
+    14: Result:=string(ItKoef,0,10);// 'Итоговый', 'коэффициент',
+    end;
+
+  }
+  end;//03 Спецификация
+} //Function GetFieldValS(wTp:word; wwNum:word) : Variant;
+
+
+//===============================================
+// Получить получить значение полей
+//===============================================
+Function GetFieldVal(wTp:word; wwNum:word) : Variant;
+{ Result:='';
+  Result:=GetFieldVals(wTp,wwNum);
+} //Function GetFieldVal(wTp:word; wwNum:word) : Variant;
+
+//===============================================
+// Установить значение полей
+//===============================================
+Function SetFieldVal(wTp:word; wwNum:word; _Value: Variant;_ClearManual:boolean=false):boolean ;
+{ #__UNUSED__(wTp,wwNum,_Value,_ClearManual)
+  Result:=False;
+  case wTp of
+  03: // Спецификация
+  {
+
+  }
+  end;//03 Спецификация
+ // Result:=True;
+} //Function SetFieldVal(wTp:word; wwNum:word) ;
+
+//-------------------------------------
+#doc
+ Установить режим обновления спецификации
+#end
+Procedure SetUpdateMode(_Immediately_SP:boolean);
+{ _Immediately_SP:=_Immediately_SP;
+}
+//-------------------------------------
+#doc
+ Сохранить спецификация
+#end
+Function Update_SP:longint;
+{ Result:=0;
+}
+
+end.

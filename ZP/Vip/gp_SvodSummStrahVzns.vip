@@ -1,0 +1,1382 @@
+/*************************************************************************************************\
+* Наименование: Сводка расчетных сумм и взносов во внебюджетные фонды                             *
+* Контур/Модуль: ЗП                                                                               *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1922         |05/03/18|Синяк Е.П.             |НПО Энергомаш                      *
+* Разработка  |#1922         |12/04/18|Синяк Е.П.             |НПО Энергомаш                      *
+\*************************************************************************************************/
+
+
+#include PAFilter.vih
+
+interface gp_SvodSummStrahVzns 'Сводка расчетных сумм и взносов во внебюджетные фонды' EscClose, Gray;
+  show at (,,80,10);
+
+table struct Svod
+(
+kod    : integer, //номер строки шаблона
+type   : integer, //с нарастающим итогом или текущий месяц
+sumper : double, //сумма
+isArh  :integer //по текщему месяцу, по архиву, 1-архив, 2 -текущий месяц, 3 - неначисляемые суммы
+)
+with index
+(
+SvodVneBud1 = Kod+type+isArh
+)
+;
+
+
+const
+  xlBold      = 1;
+  xlItalic    = 2;
+  xlUnderline = 4;
+  xlLandscape=  2;
+  xlPaperA4=    9;
+  xlBorderL   = 1;
+  xlBorderR   = 2;
+  xlBorderT   = 4;
+  xlBorderB   = 8;
+  xlInsideH   = 16;
+  xlInsideV   = 32;
+  xlDiagonalD = 64;
+  xlDiagonalU = 128;
+  xlThin     = 2;
+  xlContinuous    =  1;
+
+end;
+
+create view SvodSummStrahVzns
+
+var
+  ExcelPath: string;
+  i: integer;
+  YearFill    : integer;
+  MonthBeg,
+  MonthEnd   : word;
+
+
+Summ4000:double;//narast itog
+Summ4000_1:double;
+Summ50000:double;
+Summ50000_1:double;
+SummPrev:double;//Narast Itog
+SummPrev_1:double;
+SummDo:double;//Narast Itog
+SummDo_1:double;
+SummPosle:double;
+SummPosle_1:double;
+
+
+from 
+ Svod, prmonth, katpodr, katpodr katpodr1, sumulsoc, svod svod1 , HelpTabn
+where 
+((prmonth.cex==katpodr.nrec
+and sumulsoc.cex==katpodr1.nrec))
+;
+
+screen scr ('Параметры отчета',,sci178EnEscInsPM);
+!  show at (,,,1)
+  fields
+  YearFill:         NoProtect, spinbutton [1, 1900, 2100];
+  MonthBeg('Отчетный месяц', ,sci13Esc):
+                 [LIST 1
+                 'Январь',
+                 'Февраль',
+                 'Март',
+                 'Апрель',
+                 'Май',
+                 'Июнь',
+                 'Июль',
+                 'Август',
+                 'Сентябрь',
+                 'Октябрь',
+                 'Ноябрь',
+                 'Декабрь'
+                 ] Protect;
+  MonthEnd('Отчетный месяц',,sci13Esc):
+                 [LIST 1
+                 'Январь',
+                 'Февраль',
+                 'Март',
+                 'Апрель',
+                 'Май',
+                 'Июнь',
+                 'Июль',
+                 'Август',
+                 'Сентябрь',
+                 'Октябрь',
+                 'Ноябрь',
+                 'Декабрь'
+                 ] Protect;
+
+buttons
+    cmGo, ,, 'Сформировать отчет' ,,;
+    <<
+   `Год`.@@@@@`Месяц с`.@@@@@@@@@@`Месяц по`.@@@@@@@@@@
+
+    <.Сформировать отчет.>
+
+    >>
+
+end;
+
+handleevent
+
+cmInit:
+{
+!ExcelPath:='\\dep968-terminal\User_disk\Galaktika\WorkFolder\ERPDB\Nikolai.Plinda\';
+
+  ExcelPath:= TranslatePath('%ClientStartPath%');
+
+  xlCreateExcelWithTemplate(ExcelPath+'XLS_ЭМ\gp_SvodSummStrahVzns.xlsx',true);
+  if (xlIsExcelValid)   xlSetActiveSheet(1);//активный лист
+
+
+  // Инициализация отчетных дат данными из настроек
+  InitCurrentPeriodDates();
+
+  if (not ReadMyDSK(YearFill, 'YearFill_SvodVneBud', false))
+          YearFill := YearRas;
+  if (not ReadMyDSK(MonthBeg, 'MonthBeg_SvodVneBud', false))
+          MonthBeg := MonthRas;
+  if (not ReadMyDSK(MonthEnd, 'MonthEnd_SvodVneBud', false))
+          MonthEnd := MonthRas;
+
+}
+
+cmCheckField:
+{
+  if CurField = #MonthBeg
+  {
+     if MonthBeg > MonthEnd
+       MonthBeg := MonthEnd
+  }
+  if CurField = #MonthEnd
+  {
+     if MonthBeg > MonthEnd
+       MonthEnd := MonthBeg
+  }
+}
+
+cmGo:
+{
+
+
+StartNewVisual(vtRotateVisual, vfTimer + vfConfirm, 'Обработка информации', 1);
+
+delete all Svod;
+
+//Сумма облагаемых видов оплат без материальной помощи
+sql 
+select 1,1,sum(sumvidop.summa),1 from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+KLVIDOPL.VHVOE[34]='+' 
+and klvidopl.VHVOE[35]='' 
+and (sumvidop.vidoplp<152 or sumvidop.vidoplp>159)
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 
+1,2,sum(sumvidop.summa),1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+KLVIDOPL.VHVOE[34]='+' 
+and klvidopl.VHVOE[35]='' 
+and (sumvidop.vidoplp<152 or sumvidop.vidoplp>159)
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn >= :(MonthBeg) and sumvidop.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 
+2,1,sum(sumvidop.summa) as sum,1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+
+klvidopl.VHVOE[35]='4'
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 2,2,sum(sumvidop.summa) as sum,1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='4'
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn >= :(MonthBeg) and sumvidop.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 3,1,sum(sumvidop.summa) as sum,1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='3'
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 3,2,sum(sumvidop.summa) as sum,1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='3' 
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn >= :(MonthBeg) and sumvidop.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+//неначисляемые суммы
+sql 
+select 1,1,sum(nenach.summa),3 
+from nenach
+left join klvidopl on nenach.vidopls=klvidopl.vidopl
+left join katpodr on nenach.cexoz=katpodr.nrec
+where
+KLVIDOPL.VHVOE[34]='+' 
+and klvidopl.VHVOE[35]='' 
+
+and nenach.yearn=:(YearFill) and nenach.mesn = :(MonthEnd)
+and katpodr.kod<>'446'  and katpodr.kod<>'Вет'
+into Svod
+;
+
+
+sql
+select 
+1,2,sum(nenach.summa),3
+from nenach
+left join klvidopl on nenach.vidopls=klvidopl.vidopl
+left join katpodr on nenach.cexoz=katpodr.nrec
+where
+KLVIDOPL.VHVOE[34]='+' 
+and klvidopl.VHVOE[35]='' 
+and nenach.yearn=:(YearFill) and nenach.mesn >= :(MonthBeg) and nenach.mesn <= :(MonthEnd)
+and katpodr.kod<>'446'  and katpodr.kod<>'Вет'
+into Svod
+;
+
+sql
+select 
+2,1,sum(nenach.summa),3
+from nenach
+left join klvidopl on nenach.vidopls=klvidopl.vidopl
+left join katpodr on nenach.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='4' 
+and nenach.yearn=:(YearFill) and nenach.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 2,2,sum(nenach.summa),3
+from nenach
+left join klvidopl on nenach.vidopls=klvidopl.vidopl
+left join katpodr on nenach.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='4' 
+and nenach.yearn=:(YearFill) and nenach.mesn >= :(MonthBeg) and nenach.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 3,1,sum(nenach.summa),3
+from nenach
+left join klvidopl on nenach.vidopls=klvidopl.vidopl
+left join katpodr on nenach.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='3'
+and nenach.yearn=:(YearFill) and nenach.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 3,2,sum(nenach.summa),3
+from nenach
+left join klvidopl on nenach.vidopls=klvidopl.vidopl
+left join katpodr on nenach.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='3'
+and nenach.yearn=:(YearFill) and nenach.mesn >= :(MonthBeg) and nenach.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+//материальные помощи
+sql
+select 4,1,sum(sumvidop.summa),1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+(sumvidop.vidoplp>153 and sumvidop.vidoplp<158)
+and sumvidop.vidoplp not in(155,156,157) //20210525 Борисова Светлана Алексеевна сказала исключаить эти ВО из мат помощи
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 4,2,sum(sumvidop.summa),1
+from sumvidop
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+(sumvidop.vidoplp>153 and sumvidop.vidoplp<158)
+and sumvidop.vidoplp not in(155,156,157) //20210525 Борисова Светлана Алексеевна сказала исключаить эти ВО из мат помощи
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn >= :(MonthBeg) and sumvidop.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 5,1,sum(sumvidop.summa),1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+sumvidop.vidoplp=158
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 5,2,sum(sumvidop.summa),1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+sumvidop.vidoplp=158
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn >= :(MonthBeg) and sumvidop.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+//блок начисл
+sql 
+select 1,1,sum(nachisl.summa),2 from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+KLVIDOPL.VHVOE[34]='+' 
+and klvidopl.VHVOE[35]='' 
+and (nachisl.vidopl<152 or nachisl.vidopl>159)
+and nachisl.yearn=:(YearFill) and nachisl.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 
+1,2,sum(nachisl.summa),2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+KLVIDOPL.VHVOE[34]='+' 
+and klvidopl.VHVOE[35]='' 
+and (nachisl.vidopl<152 or nachisl.vidopl>159)
+and nachisl.yearn=:(YearFill) and nachisl.mesn >= :(MonthBeg) and nachisl.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 
+2,1,sum(nachisl.summa) as sum,2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+
+klvidopl.VHVOE[35]='4'
+and nachisl.yearn=:(YearFill) and nachisl.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 2,2,sum(nachisl.summa) as sum,2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='4'
+and nachisl.yearn=:(YearFill) and nachisl.mesn >= :(MonthBeg) and nachisl.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 3,1,sum(nachisl.summa) as sum,2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='3'
+and nachisl.yearn=:(YearFill) and nachisl.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 3,2,sum(nachisl.summa) as sum,2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+klvidopl.VHVOE[35]='3' 
+and nachisl.yearn=:(YearFill) and nachisl.mesn >= :(MonthBeg) and nachisl.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+//материальные помощи
+sql
+select 4,1,sum(nachisl.summa),2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+(nachisl.vidopl>153 and nachisl.vidopl<158)
+and nachisl.vidopl not in(155,156,157) //20210525 Борисова Светлана Алексеевна сказала исключаить эти ВО из мат помощи
+and nachisl.yearn=:(YearFill) and nachisl.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 4,2,sum(nachisl.summa),2
+from nachisl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+(nachisl.vidopl>153 and nachisl.vidopl<158)
+and nachisl.vidopl not in(155,156,157) //20210525 Борисова Светлана Алексеевна сказала исключаить эти ВО из мат помощи
+and nachisl.yearn=:(YearFill) and nachisl.mesn >= :(MonthBeg) and nachisl.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 5,1,sum(nachisl.summa),2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+nachisl.vidopl=158
+and nachisl.yearn=:(YearFill) and nachisl.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 5,2,sum(nachisl.summa),2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+nachisl.vidopl=158
+and nachisl.yearn=:(YearFill) and nachisl.mesn >= :(MonthBeg) and nachisl.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+
+
+
+
+
+Summ4000:=0;//narast itog
+Summ4000_1:=0;
+Summ50000:=0;
+Summ50000_1:=0;
+var _year:word = if(MonthEnd+1=13,1,0)+YearFill;
+var _Mes :word = if(MonthEnd+1=13,1,MonthEnd+1);
+_loop PRMONTH where ((_year==PRMONTH.yearn and _Mes ==Prmonth.mesn))//учесть декабрь
+{
+  nextvisual;
+	_loop HELPTABN where ((prmonth.nrec==Helptabn.CPRMONTH))
+	{
+	if helptabn.filialno<>0 continue;
+
+	if katpodr.kod='446' or katpodr.kod='Вет' continue;
+
+		if CKLSHLG=000A000000000001h
+		{
+		Summ4000:=Summ4000+HELPTABN.MONFOT-HELPTABN.MONOHELP;
+		Summ4000_1:=Summ4000_1+HELPTABN.MFOT-HELPTABN.MOFOT;
+		}
+
+		if CKLSHLG=000A000000000002h
+		{
+		Summ50000:=Summ50000+HELPTABN.MONFOT-HELPTABN.MONOHELP;
+		Summ50000_1:=Summ50000_1+HELPTABN.MFOT-HELPTABN.MOFOT;
+		}
+	}
+}
+
+clearbuffer(#svod);
+svod.kod:=9;
+svod.type:=2;
+svod.sumper:=Summ4000_1;
+insert current svod;
+
+clearbuffer(#svod);
+svod.kod:=9;
+svod.type:=1;
+svod.sumper:=Summ4000;
+insert current svod;
+
+clearbuffer(#svod);
+svod.kod:=10;
+svod.type:=2;
+svod.sumper:=Summ50000_1;
+insert current svod;
+
+clearbuffer(#svod);
+svod.kod:=10;
+svod.type:=1;
+svod.sumper:=Summ50000;
+insert current svod;
+
+
+SummPrev:=0;//Narast Itog
+SummPrev_1:=0;
+SummDo:=0;//Narast Itog
+SummDo_1:=0;
+SummPosle:=0;
+SummPosle_1:=0;
+
+
+_loop sumulsoc where ((YearFill==sumulsoc.year and 5==sumulsoc.vidper))
+{
+
+	if katpodr1.kod='446' or katpodr1.kod='Вет' continue;
+
+	if (sumulsoc.strtabn='001101' and MonthEnd<3) continue;//дубровина. думать
+
+i:=1;
+
+	if sumulsoc.strtabn='001101' i:=3;//дубровина. думать
+
+SummPrev_1:=SummPrev_1+sumulsoc.SUMma4[MonthEnd];
+SummDo_1:=SummDo_1+sumulsoc.Summa9[MonthEnd];
+SummPosle_1:=SummPosle_1+sumulsoc.SNAL[MonthEnd]-sumulsoc.Summa9[MonthEnd];
+
+
+	do
+	{
+	SummPrev:=SummPrev+sumulsoc.SUMma4[i];
+	SummDo:=SummDo+sumulsoc.Summa9[i];
+	SummPosle:=SummPosle+sumulsoc.SNAL[i]-sumulsoc.Summa9[i];
+	i++;
+	}
+	while i<=MonthEnd
+
+}
+
+
+
+sql
+select 12,1,sum(sumvidop.summa),1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+inner join lschet on sumvidop.CLSCH = lschet.nrec and d_month(lschet.dat7) <= :(MonthEnd) and d_month(lschet.dat7) <> 0
+where
+KLVIDOPL.VHVOE[34]='+'
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn=:(MonthEnd) and sumvidop.mesn >= d_month(lschet.dat7)
+and sumvidop.vidopl<>106 and sumvidop.vidopl<>107 and sumvidop.vidopl<>83 and sumvidop.vidopl<>84
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod;
+
+sql
+select 12,2,sum(sumvidop.summa),1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+inner join lschet on sumvidop.CLSCH = lschet.nrec and d_month(lschet.dat7) <= :(MonthEnd) and d_month(lschet.dat7) <> 0
+where
+KLVIDOPL.VHVOE[34]='+'
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn<=:(MonthEnd) and sumvidop.mesn >= d_month(lschet.dat7)
+and sumvidop.vidopl<>106 and sumvidop.vidopl<>107 and sumvidop.vidopl<>83 and sumvidop.vidopl<>84
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod;
+
+
+sql
+select 12,1,sum(NACHISL.summa),2
+from NACHISL
+left join klvidopl on NACHISL.vidopl=klvidopl.vidopl
+left join katpodr on NACHISL.cexoz=katpodr.nrec
+inner join lschet on NACHISL.CLSCH = lschet.nrec and d_month(lschet.dat7) <= :(MonthEnd) and d_month(lschet.dat7) <> 0
+where
+KLVIDOPL.VHVOE[34]='+'
+and NACHISL.yearn=:(YearFill) and NACHISL.mesn=:(MonthEnd) and NACHISL.mesn >= d_month(lschet.dat7)
+and NACHISL.vidopl<>106 and NACHISL.vidopl<>107 and NACHISL.vidopl<>83 and NACHISL.vidopl<>84
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod;
+
+sql
+select 12,2,sum(NACHISL.summa),2
+from NACHISL
+left join klvidopl on NACHISL.vidopl=klvidopl.vidopl
+left join katpodr on NACHISL.cexoz=katpodr.nrec
+inner join lschet on NACHISL.CLSCH = lschet.nrec and d_month(lschet.dat7) <= :(MonthEnd) and d_month(lschet.dat7) <> 0
+where
+KLVIDOPL.VHVOE[34]='+'
+and NACHISL.yearn=:(YearFill) and NACHISL.mesn<=:(MonthEnd) and NACHISL.mesn >= d_month(lschet.dat7)
+and NACHISL.vidopl<>106 and NACHISL.vidopl<>107 and NACHISL.vidopl<>83 and NACHISL.vidopl<>84
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod;
+
+
+clearbuffer(#svod);
+svod.kod:=15;
+svod.type:=1;
+svod.sumper:=SummPrev_1;
+insert current svod;
+
+clearbuffer(#svod);
+svod.kod:=15;
+svod.type:=2;
+svod.sumper:=SummPrev;
+insert current svod;
+
+clearbuffer(#svod);
+svod.kod:=17;
+svod.type:=1;
+svod.sumper:=SummDo_1;
+insert current svod;
+
+clearbuffer(#svod);
+svod.kod:=17;
+svod.type:=2;
+svod.sumper:=SummDo;
+insert current svod;
+
+clearbuffer(#svod);
+svod.kod:=18;
+svod.type:=1;
+svod.sumper:=SummPosle_1;
+insert current svod;
+
+clearbuffer(#svod);
+svod.kod:=18;
+svod.type:=2;
+svod.sumper:=SummPosle;
+insert current svod;
+
+
+
+sql
+select 19,1,sum(perevod.sumper),1
+from perevod 
+left join katpodr on perevod.cexoz=katpodr.nrec
+where perevod.yearn=:(YearFill) and perevod.mesn = :(MonthEnd) and perevod.vidper=3
+and katpodr.kod<>'446'  and katpodr.kod<>'Вет'
+into Svod;
+
+sql
+select 19,2,sum(perevod.sumper),1
+from perevod 
+left join katpodr on perevod.cexoz=katpodr.nrec
+where perevod.yearn=:(YearFill) and perevod.mesn >= :(MonthBeg) and perevod.mesn <= :(MonthEnd) and perevod.vidper=3 
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod;
+
+sql
+select 20,1,sum(sumvidop.summa) as sum,1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+(klvidopl.vidoplp=19 or klvidopl.vidoplp=20 or klvidopl.vidoplp=160) 
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 20,2,sum(sumvidop.summa) as sum,1
+from sumvidop
+left join klvidopl on sumvidop.vidopl=klvidopl.vidopl
+left join katpodr on sumvidop.cexoz=katpodr.nrec
+where
+(klvidopl.vidoplp=19 or klvidopl.vidoplp=20 or klvidopl.vidoplp=160)
+and sumvidop.yearn=:(YearFill) and sumvidop.mesn >= :(MonthBeg) and sumvidop.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+//блок начисл
+sql
+select 19,1,sum(perevodtek.sumper),2
+from perevodtek 
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where perevodtek.yearn=:(YearFill) and perevodtek.mesn = :(MonthEnd) and perevodtek.vidper=3
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod;
+
+sql
+select 19,2,sum(perevodtek.sumper),2
+from perevodtek 
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where perevodtek.yearn=:(YearFill) and perevodtek.mesn >= :(MonthBeg) and perevodtek.mesn <= :(MonthEnd) and perevodtek.vidper=3 
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod;
+
+sql
+select 20,1,sum(nachisl.summa) as sum,2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+(klvidopl.vidoplp=19 or klvidopl.vidoplp=20 or klvidopl.vidoplp=160) 
+and nachisl.yearn=:(YearFill) and nachisl.mesn = :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 20,2,sum(nachisl.summa) as sum,2
+from nachisl
+left join klvidopl on nachisl.vidopls=klvidopl.vidopl
+left join katpodr on nachisl.cexoz=katpodr.nrec
+where
+(klvidopl.vidoplp=19 or klvidopl.vidoplp=20 or klvidopl.vidoplp=160)
+and nachisl.yearn=:(YearFill) and nachisl.mesn >= :(MonthBeg) and nachisl.mesn <= :(MonthEnd)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+
+SummPrev_1:=0;
+SummPrev:=0;
+_loop sumulsoc where ((YearFill==sumulsoc.year and 2==sumulsoc.vidper))
+{
+
+	if katpodr1.kod='446' or katpodr1.kod='Вет' continue;
+
+	if (sumulsoc.strtabn='001101' and MonthEnd=1) continue;//дубровина. думать
+
+i:=1;
+SummPrev_1:=SummPrev_1+sumulsoc.SUMma10[MonthEnd]-sumulsoc.SUMV[MonthEnd];
+
+	do
+	{
+	SummPrev:=SummPrev+sumulsoc.SUMma10[i]-sumulsoc.SUMV[i];
+	i++;
+	}
+	while i<=MonthEnd
+}
+
+clearbuffer(#svod);
+svod.kod:=23;
+svod.type:=1;
+svod.sumper:=SummPrev_1;
+insert current svod;
+
+clearbuffer(#svod);
+svod.kod:=23;
+svod.type:=2;
+svod.sumper:=SummPrev;
+insert current svod;
+
+
+
+sql
+select 25,1,sum(perevod.sumper),1
+from perevod 
+left join katpodr on perevod.cexoz=katpodr.nrec
+where perevod.yearn=:(YearFill) and perevod.mesn = :(MonthEnd) and perevod.vidper=2 
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod;
+
+sql
+select 25,2,sum(perevod.sumper),1
+from perevod 
+left join katpodr on perevod.cexoz=katpodr.nrec
+where perevod.yearn=:(YearFill) and perevod.mesn >= :(MonthBeg) and perevod.mesn <= :(MonthEnd) and perevod.vidper=2 
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod;
+
+
+//база травматизм полный
+sql
+select 26,1,sum(case when round(perevod.sumper*100/PEREVOD.OBLAGSO,2)=0.2 then PEREVOD.OBLAGSO else 0 end),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn = :(MonthEnd)
+and perevod.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 26,2,sum(case when round(perevod.sumper*100/PEREVOD.OBLAGSO,2)=0.2 then PEREVOD.OBLAGSO else 0 end),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn >= :(MonthBeg) and perevod.mesn <= :(MonthEnd)
+and perevod.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+//налог травматизм полный
+sql
+select 27,1,sum(case when round(perevod.sumper*100/PEREVOD.OBLAGSO,2)=0.2 then perevod.sumper else 0 end),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn = :(MonthEnd)
+and perevod.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod
+;
+
+sql
+select 27,2,sum(case when round(perevod.sumper*100/PEREVOD.OBLAGSO,2)=0.2 then perevod.sumper else 0 end),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn >= :(MonthBeg) and perevod.mesn <= :(MonthEnd)
+and perevod.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+//база травматизм льготный
+sql
+select 
+28,
+1,
+sum(case when round(perevod.sumper*100/PEREVOD.OBLAGSO,2)=0.12 then PEREVOD.OBLAGSO else 0 end),
+1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn = :(MonthEnd)
+and perevod.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod
+;
+
+sql
+select 
+28,
+2,
+sum(case when round(perevod.sumper*100/PEREVOD.OBLAGSO,2)=0.12 then PEREVOD.OBLAGSO else 0 end),
+1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn >= :(MonthBeg) and perevod.mesn <= :(MonthEnd)
+and perevod.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+//налог травматизм льготный
+sql
+select 
+29,
+1,
+sum(case when round(perevod.sumper*100/PEREVOD.OBLAGSO,2)=0.12 then perevod.sumper else 0 end),
+1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn = :(MonthEnd)
+and perevod.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 29,2,sum(case when round(perevod.sumper*100/PEREVOD.OBLAGSO,2)=0.12 then perevod.sumper else 0 end),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn >= :(MonthBeg) and perevod.mesn <= :(MonthEnd)
+and perevod.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+
+
+sql
+select 30,1,sum(perevod.oblagso),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn = :(MonthEnd)
+and (perevod.vidper=11 or perevod.vidper=12 or perevod.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 30,2,sum(perevod.oblagso),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn >= :(MonthBeg) and perevod.mesn <= :(MonthEnd)
+and (perevod.vidper=11 or perevod.vidper=12 or perevod.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 31,1,sum(perevod.sumper),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn = :(MonthEnd)
+and (perevod.vidper=11)// or perevod.vidper=12 or perevod.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 31,2,sum(perevod.sumper),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn >= :(MonthBeg) and perevod.mesn <= :(MonthEnd)
+and (perevod.vidper=11)// or perevod.vidper=12 or perevod.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 32,1,sum(perevod.sumper),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn = :(MonthEnd)
+and (perevod.vidper=12 or perevod.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod
+;
+
+sql
+select 32,2,sum(perevod.sumper),1
+from perevod
+left join katpodr on perevod.cexoz=katpodr.nrec
+where
+perevod.yearn=:(YearFill) and perevod.mesn >= :(MonthBeg) and perevod.mesn <= :(MonthEnd)
+and (perevod.vidper=12 or perevod.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+//блок переводтек
+
+sql
+select 25,1,sum(perevodtek.sumper),2
+from perevodtek 
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where perevodtek.yearn=:(YearFill) and perevodtek.mesn = :(MonthEnd) and perevodtek.vidper=2 
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod;
+
+sql
+select 25,2,sum(perevodtek.sumper),2
+from perevodtek 
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where perevodtek.yearn=:(YearFill) and perevodtek.mesn >= :(MonthBeg) and perevodtek.mesn <= :(MonthEnd) and perevodtek.vidper=2 
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod;
+
+
+//база травматизм полный
+sql
+select 26,1,sum(case when round(perevodtek.sumper*100/perevodtek.OBLAGSO,2)=0.2 then perevodtek.OBLAGSO else 0 end),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn = :(MonthEnd)
+and perevodtek.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 26,2,sum(case when round(perevodtek.sumper*100/perevodtek.OBLAGSO,2)=0.2 then perevodtek.OBLAGSO else 0 end),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn >= :(MonthBeg) and perevodtek.mesn <= :(MonthEnd)
+and perevodtek.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+//налог травматизм полный
+sql
+select 27,1,sum(case when round(perevodtek.sumper*100/perevodtek.OBLAGSO,2)=0.2 then perevodtek.sumper else 0 end),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn = :(MonthEnd)
+and perevodtek.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod
+;
+
+sql
+select 27,2,sum(case when round(perevodtek.sumper*100/perevodtek.OBLAGSO,2)=0.2 then perevodtek.sumper else 0 end),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn >= :(MonthBeg) and perevodtek.mesn <= :(MonthEnd)
+and perevodtek.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+//база травматизм льготный
+sql
+select 
+28,
+1,
+sum(case when round(perevodtek.sumper*100/perevodtek.OBLAGSO,2)=0.12 then perevodtek.OBLAGSO else 0 end),
+2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn = :(MonthEnd)
+and perevodtek.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod
+;
+
+sql
+select 
+28,
+2,
+sum(case when round(perevodtek.sumper*100/perevodtek.OBLAGSO,2)=0.12 then perevodtek.OBLAGSO else 0 end),
+2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn >= :(MonthBeg) and perevodtek.mesn <= :(MonthEnd)
+and perevodtek.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+//налог травматизм льготный
+sql
+select 
+29,
+1,
+sum(case when round(perevodtek.sumper*100/perevodtek.OBLAGSO,2)=0.12 then perevodtek.sumper else 0 end),
+2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn = :(MonthEnd)
+and perevodtek.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 29,2,sum(case when round(perevodtek.sumper*100/perevodtek.OBLAGSO,2)=0.12 then perevodtek.sumper else 0 end),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn >= :(MonthBeg) and perevodtek.mesn <= :(MonthEnd)
+and perevodtek.vidper=8
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+
+
+sql
+select 30,1,sum(perevodtek.oblagso),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn = :(MonthEnd)
+and (perevodtek.vidper=11 or perevodtek.vidper=12 or perevodtek.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 30,2,sum(perevodtek.oblagso),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn >= :(MonthBeg) and perevodtek.mesn <= :(MonthEnd)
+and (perevodtek.vidper=11 or perevodtek.vidper=12 or perevodtek.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 31,1,sum(perevodtek.sumper),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn = :(MonthEnd)
+and (perevodtek.vidper=11)// or perevodtek.vidper=12 or perevodtek.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+sql
+select 31,2,sum(perevodtek.sumper),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn >= :(MonthBeg) and perevodtek.mesn <= :(MonthEnd)
+and (perevodtek.vidper=11)// or perevodtek.vidper=12 or perevodtek.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ... and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+sql
+select 32,1,sum(perevodtek.sumper),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn = :(MonthEnd)
+and (perevodtek.vidper=12 or perevodtek.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+into Svod
+;
+
+sql
+select 32,2,sum(perevodtek.sumper),2
+from perevodtek
+left join katpodr on perevodtek.cexoz=katpodr.nrec
+where
+perevodtek.yearn=:(YearFill) and perevodtek.mesn >= :(MonthBeg) and perevodtek.mesn <= :(MonthEnd)
+and (perevodtek.vidper=12 or perevodtek.vidper=14)
+and katpodr.kod<>'446' and katpodr.kod<>'Вет'
+// что за костыль неведомый галактика нам подарила ...  and substring(katpodr.kod,1,1)<>'_'
+into Svod
+;
+
+
+
+              XlSetCellStringValue(' '+Case(MonthEnd;
+                                                                    1 : 'Январь',
+                                                                    2 : 'Февраль',
+                                                                    3 : 'Март',
+                                                                    4 : 'Апрель',
+                                                                    5 : 'Май',
+                                                                    6 : 'Июнь',
+                                                                    7 : 'Июль',
+                                                                    8 : 'Август',
+                                                                    9 : 'Сентябрь',
+                                                                    10 : 'Октябрь',
+                                                                    11 : 'Ноябрь',
+                                                                    12 : 'Декабрь'
+                                                                ) +' '+String(YearFill) + ' года.'
+                                 ,2,3,2,3);
+
+
+
+
+!message(RecordsInTable(#Svod));
+
+	_loop svod 
+	{
+		_loop svod1 where ((svod.kod==svod1.kod and svod.type==svod1.type and svod.isArh<<svod1.isArh))
+		{
+		svod.sumper:=svod.sumper+svod1.sumper;
+		update current svod;
+		delete current svod1;
+		}
+
+	}
+
+
+_loop svod
+{
+xlSetCellNumberValue(Svod.sumper,5+Svod.Kod,3+Svod.type,5+Svod.Kod,3+Svod.type);
+}
+
+!puttabletodbf(#Svod,ExcelPath+'Svod.xls',ptfFullTable);
+xlKillExcel;
+
+
+
+
+StopVisual('',0);
+
+
+
+
+
+}
+
+cmClose:
+{
+  SaveMyDSK(YearFill, 'YearFill_SvodVneBud');
+  SaveMyDSK(MonthBeg, 'MonthBeg_SvodVneBud');
+  SaveMyDSK(MonthEnd, 'MonthEnd_SvodVneBud');
+}
+
+cmDone:
+{
+  SaveMyDSK(YearFill, 'YearFill_SvodVneBud');
+  SaveMyDSK(MonthBeg, 'MonthBeg_SvodVneBud');
+  SaveMyDSK(MonthEnd, 'MonthEnd_SvodVneBud');
+}
+end;
+end.
+
+#include UserReport.vih
+
+VipInterface UserReport_Gp_SvodSummStrahVzns Implements IUserReport;
+Interface UserReport_Gp_SvodSummStrahVzns;
+
+Procedure Run;
+Begin
+  runinterface(gp_SvodSummStrahVzns);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Сводка расчетных сумм и взносов';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Отчеты по зарплате ПУ';
+  End;
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'menuzarp';
+  end;
+end;
+
+End.

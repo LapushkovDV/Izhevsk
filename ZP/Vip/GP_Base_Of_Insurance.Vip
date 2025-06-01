@@ -1,0 +1,2012 @@
+/*************************************************************************************************\
+* Наименование: Расшифровка базы страховых взносов                                                *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание: для начисления страховых взносов на обязательное пенсионное(медицинское) страхование*
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#809          |09/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+//---------------------------------
+#include CLSFUNCS.VIH // ф-ии пересканирования текущих л/с
+#include PAFILTER.VIH // функц-л работы с подразделениями и тек. лицевыми счетами
+#include ChoiseYourPersons.vih
+#include Query.vih
+#include CatFunc.Vih
+#include GP_QueryBuilder.vih
+
+#doc
+Расшифровка базы страховых взносов
+для начисления страховых взносов на обязательное пенсионное(медицинское) страхование
+#end
+
+Interface GP_Base_Of_Insurance 'Расшифровка базы страховых взносов', EscClose;
+Show at (,,50,14);
+
+//---------------------------------------------
+Table struct tmp_sbor
+(  Pa:word      // "1 - начисления,2 перечисления, 3 удержания"
+  ,VidoplP :word
+  ,Summa :double
+  ,PR    :word
+  ,StrTabn:string[30]
+  ,Fio    :string[100]
+)
+with index
+( tmp_sbor01 = PA+VidoplP
+ ,tmp_sbor02 = Fio+StrTabn
+);
+
+//---------------------------------------------
+Table struct tmp_su12
+(  Pa:word
+  ,Summa :array [1..12] of double
+
+)
+with index
+( tmp_su12 = PA
+);
+
+Table struct Tmp_Report
+(  TBL:string[10]
+  ,Row:string[10]
+  ,sRow:string
+  ,sVidOplP:string
+  ,Summa: Double
+)
+with index
+( Tmp_Report01=TBL+ROW
+);
+//--------------------------------------
+Var
+  //---------------
+  iCatFunc            : CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+  iQBuilder:GP_QueryBuilder new;
+  //для стандартного фильтра по подразделению
+  PAF:  TraditionalPersonalAccountFilter;
+  CLSF:      CurLSFunctions;
+  //-----------------------
+  viCYPersons         : ChoiseYourPersons;
+  //-----------------------
+  wMesB,wMesE, wYear:word;
+  wTypeSB :word  ;//0 - за который, 1 в котором
+  All_Su   :double;// итоговая сумма
+  sPopdis  :string;// подпись отчета
+  sDolg    :string;// подпись отчета
+  sUserName:string;// пользователь
+  ExecuteErrorCode:longint; //код ошибки SQL запросов
+  dm_su:array[1..20] of double;
+  wVidPer  :longint;
+  wPodrR   :word;//наличие фильтра по подразделению
+#include Excel_Var.vpp
+  //-----------------------------------------
+  // Фильтры - базовые
+  //-----------------------------------------
+   wFilter:word;
+   Marker_Count :longint;
+   isFilterRun  :boolean;////признак работы ограничений
+   wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   KauMarkerName:string;
+   Marker_Tmp :longint;
+   #mrkfld_(KatPodr)
+   DepList:longint;
+
+Create view
+var
+ sTbl:string;
+as select KlVidopl.Nrec, Tmp_Sbor.*, Tmp_report.*,tmp_su12.*
+, (PAF.GetDepartmentFilterStr)  (fieldname = FiltrPodr)
+
+from KlVidopl
+  , Tmp_Sbor, Tmp_report(Tmp_Report01),tmp_su12
+  , Perech
+where
+((  sTbl == Tmp_report.TBL
+and sUserName    == ZAR_USER.OWNNAME
+
+));
+//------------------------------------
+Create view vSpr
+var
+  pPerson :comp;
+From Persons, Appointments
+where
+((  pPerson == Persons.Nrec
+and Persons.Appointcur == Appointments.Nrec
+));
+
+//--------------------------------
+Create  view vZar_User
+var
+   pPodr:comp;
+as select Zar_User.Nrec
+From
+   Zar_User
+  ,USERRIGHTS
+where
+((   sUserName  == Zar_User.OwnName
+and  sUserName  == USERRIGHTS.OWNNAME
+));
+//------------------------------------
+#include Excel_Fun.vpp
+#include SQL_Func.Vpp
+//------------------------------------
+
+
+//------------------------------------
+//
+//------------------------------------
+Procedure SaveParam;
+{ SaveMyDsk(wMesB ,'GP_Base_Of_Insurance_wMesB' );
+  SaveMyDsk(wMesE ,'GP_Base_Of_Insurance_wMesE' );
+  SaveMyDsk(wYear,'GP_Base_Of_Insurance_wYear' );
+  SaveMyDsk(wTypeSB,'GP_Base_Of_Insurance_wTypeSB' );//0 - за который, 1 в котором
+  SaveMyDsk(sPopdis,'GP_Base_Of_Insurance_sPopdis' );//
+  SaveMyDsk(sDolg  ,'GP_Base_Of_Insurance_sDolg  ' );
+  SaveMyDsk(wFilter,'GP_Base_Of_Insurance_wFilter' );
+
+} //Procedure SaveParam;
+
+//------------------------------------
+//
+//------------------------------------
+Procedure ReadParam;
+{ if not ReadMyDsk(wMesB  ,'GP_Base_Of_Insurance_wMesB'  ,false) wMesB  :=MonthRas;
+  if not ReadMyDsk(wMesE  ,'GP_Base_Of_Insurance_wMesE'  ,false) wMesE  :=MonthRas;
+  if not ReadMyDsk(wYear  ,'GP_Base_Of_Insurance_wYear'  ,False) wYear  :=YearRas;
+  if not ReadMyDsk(wTypeSB,'GP_Base_Of_Insurance_wTypeSB',False) wTypeSB:=1;//0 - за который, 1 в котором
+  if not ReadMyDsk(sPopdis,'GP_Base_Of_Insurance_sPopdis',False) sPopdis:=sGetTune('USER.FIO');//
+  if not ReadMyDsk(sDolg  ,'GP_Base_Of_Insurance_sDolg  ',False) sDolg  :='Начальник отдела расчетов с персоналом';
+  if not ReadMyDsk(wFilter,'GP_Base_Of_Insurance_wFilter',False) wFilter:=0;
+
+} //Procedure ReadParam;
+
+//--------------------------------
+// Создадим и наполним временную таблицу фильтром по подразделению
+//--------------------------------
+Procedure FillTempVib;
+{     stmt:=0;
+    CreateTempVib;
+    wPodrR:=0;
+    if IsBitCTW(wFilter,1)
+    { wPodrR:=wPodrR+2;
+      InsTempVibByMarker(01,DepList       );// Подразделения
+    }
+    else
+    if vZar_User.getfirst ZAR_USER=tsok
+     if vZar_User.ZAR_USER.PODRSHARE = '+'
+     { wPodrR:=wPodrR+1;
+       vZar_User._Loop USERRIGHTS
+         InsTempVibOne(01,vZar_User.USERRIGHTS.crecds);//
+     }
+
+
+} //Procedure FillTempVib;
+
+//------------------------------------------------------------------------------
+// обработка изменения фильтра по подразделениям  - см CompSrc\Z\Z_PayRep\vip\VIEWREES.VIP
+//------------------------------------------------------------------------------
+  procedure SetupDepartments(Change: comp);
+  {
+    var p2: double;    // для компиляции
+    var PrCex: comp;
+    PrCex := ZAR_USER.CURCEX;
+    RunInterface('GetPodaln', Change, prCex, p2);
+  }
+
+//=======================================
+  SQL QUERY SqlTmp_Nach =
+       SELECT
+          COALESCE(SubString(EXCLASSSEG.NAME,1,1),'')  TBL//:word
+         ,COALESCE(SubString(EXCLASSSEG.NAME,3,2),'')  Row//:word
+         ,COALESCE(SubString(EXCLASSSEG.NAME,6,200),'') sRow
+         ,COALESCE(EXCLASSSEG.Value,'') sVidOplP
+         ,Sum(Nachisl.Summa) as Summa
+       From  KlVidopl
+       Inner join ExClassName on  ExClassName.wTable=15010 //57 Classcode
+                                      and  ExClassName.Name  ='Налогооблагаемая база по страховым взносам'
+       Inner join exclassval on exclassval.classcode = EXCLASSNAME.classcode
+                            and exclassval.wtable    = ExClassName.wTable
+                            and exclassval.crec      = KlVidopl.Nrec
+       Inner join exclassseg on exclassseg.nrec = exclassval.cclassseg
+       inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName) ) //Filter_User
+       Left Outer join Nachisl on Nachisl.Vidopls = KlVidopl.Vidopl
+       and  (ZU.POdrShare <> '+'
+          or (Nachisl.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+          )
+       %Filter_Nach
+       %FilterP_Nach
+       Group by
+          COALESCE(SubString(EXCLASSSEG.NAME,1,1),'')
+         ,COALESCE(SubString(EXCLASSSEG.NAME,3,2),'')
+         ,COALESCE(SubString(EXCLASSSEG.NAME,6,200),'')
+         ,COALESCE(EXCLASSSEG.Value,'')
+       ;
+//=======================================
+  SQL QUERY SqlTmp_NeNach =
+        SELECT
+          COALESCE(SubString(EXCLASSSEG.NAME,1,1),'')  TBL//:word
+         ,COALESCE(SubString(EXCLASSSEG.NAME,3,2),'')  Row//:word
+         ,COALESCE(SubString(EXCLASSSEG.NAME,6,200),'') sRow
+         ,COALESCE(EXCLASSSEG.Value,'') sVidOplP
+         ,Sum(NeNach.Summa) as Summa
+       From NeNach
+       inner join KlVidopl on KlVidopl.Vidopl = NeNach.Vidopls
+       Inner join ExClassName on  ExClassName.wTable=15010 //57 Classcode
+                                      and  ExClassName.Name  ='Налогооблагаемая база по страховым взносам'
+       Inner join exclassval on exclassval.classcode = EXCLASSNAME.classcode
+                            and exclassval.wtable    = ExClassName.wTable
+                            and exclassval.crec      = KlVidopl.Nrec
+       Inner join exclassseg on exclassseg.nrec = exclassval.cclassseg
+       inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName))
+       //тут записей мало чего плодить Left Outer
+       and
+          (ZU.POdrShare <> '+'
+          or (NeNach.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+          )
+       %Filter_NeNach
+       %FilterP_NeNach
+       Group by
+          COALESCE(SubString(EXCLASSSEG.NAME,1,1),'')
+         ,COALESCE(SubString(EXCLASSSEG.NAME,3,2),'')
+         ,COALESCE(SubString(EXCLASSSEG.NAME,6,200),'')
+         ,COALESCE(EXCLASSSEG.Value,'')
+       ;
+//=======================================
+  SQL QUERY SqlTmp_SumVidop =
+        SELECT
+          COALESCE(SubString(EXCLASSSEG.NAME,1,1),'')  TBL//:word
+         ,COALESCE(SubString(EXCLASSSEG.NAME,3,2),'')  Row//:word
+         ,COALESCE(SubString(EXCLASSSEG.NAME,6,200),'') sRow
+         ,COALESCE(EXCLASSSEG.Value,'') sVidOplP
+         ,Sum(SumVidop.Summa) as Summa
+       //From SumVidop
+       //Inner join KlVidopl on KlVidopl.Vidopl = SumVidop.Vidopl
+       From  SumVidop
+       inner join KlVidopl on KlVidopl.Vidopl = SumVidop.Vidopl
+       Inner join ExClassName on  ExClassName.wTable=15010 //57 Classcode
+                                      and  ExClassName.Name  ='Налогооблагаемая база по страховым взносам'
+       Inner join exclassval on exclassval.classcode = EXCLASSNAME.classcode
+                            and exclassval.wtable    = ExClassName.wTable
+                            and exclassval.crec      = KlVidopl.Nrec
+       Inner join exclassseg on exclassseg.nrec = exclassval.cclassseg
+       inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName))
+       //left outer
+       //inner join SumVidop on KlVidopl.Vidopl = SumVidop.Vidopl
+       where
+          (ZU.POdrShare <> '+'
+          or (SumVidop.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+          )
+       %Filter_SumVidop
+       %FilterP_SumVidop
+       Group by
+          COALESCE(SubString(EXCLASSSEG.NAME,1,1),'')
+         ,COALESCE(SubString(EXCLASSSEG.NAME,3,2),'')
+         ,COALESCE(SubString(EXCLASSSEG.NAME,6,200),'')
+         ,COALESCE(EXCLASSSEG.Value,'')
+       ;
+//=======================================
+
+
+//------------------------------------
+//
+//------------------------------------
+Function SborDoc:boolean;
+{ Result:=false;
+  stmt:=0;
+  Timelog('GP_Base_of..->SborData START');
+  //=======================================
+  // Nachisl
+  _try
+  {
+    stmt:=0;
+    Timelog('GP_Base_of..->SborData Nach 001');
+    //sqlSetMacro('Filter_User',''''+sUserName+'''');
+    case wTypeSB of
+    0: sqlSetMacro('Filter_Nach', ' and Nachisl.YearK='+String(wYear)
+                     +' and Nachisl.Mes>=' +string(wMesB)
+                     +' and Nachisl.Mes<=' +string(wMesE)
+                );
+    1: sqlSetMacro('Filter_Nach', ' and Nachisl.YearV='+String(wYear)
+                     +' and Nachisl.MesV>=' +string(wMesB)
+                     +' and Nachisl.MesV<=' +string(wMesE)
+                );
+    end;
+    var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { //sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and platved.cex ',Marker_KatPodr));
+      sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and Nachisl.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlsetMacro('FilterP_Nach',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_Nach','');
+    }
+    Timelog('GP_Base_of..->SborData Nach 002');
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_Nach);
+    if timelog_Status>1  Timelog('GP_Base_of..->SborData 001:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->SborData 002:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Report);
+              Timelog('GP_Base_of..->SborData 003:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Report)));
+      }
+    } // ExecuteError
+  } // _try
+  _finally
+  { if (ExecuteErrorCode <> 0)
+      TimeLog('Ошибка при выполнении SQL-сценария '
+       +chr(13) +'(Сбор фондов за тек.месяц): код = ' + String(ExecuteErrorCode)
+       );
+  } // _finally
+
+
+  //=======================================
+  // NeNach
+  _try
+  {
+    stmt:=0;
+    case wTypeSB of
+    0: sqlSetMacro('Filter_NeNach', ' and NeNach.YearK='+String(wYear)
+                     +' and NeNach.Mes>=' +string(wMesB)
+                     +' and NeNach.Mes<=' +string(wMesE)
+                );
+    1: sqlSetMacro('Filter_NeNach', ' and NeNach.YearN='+String(wYear)
+                     +' and NeNach.MesN>=' +string(wMesB)
+                     +' and NeNach.MesN<=' +string(wMesE)
+                );
+    end;
+    var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { //sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and platved.cex ',Marker_KatPodr));
+      sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and NeNach.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_NeNach',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_NeNach','');
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_NeNach);
+    if timelog_Status>1  Timelog('GP_Base_of..->SborData 011:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->SborData 012:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Report);
+              Timelog('GP_Base_of..->SborData 013:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Report)));
+      }
+    } // ExecuteError
+  } // _try
+  _finally
+  { if (ExecuteErrorCode <> 0)
+      TimeLog('Ошибка при выполнении SQL-сценария '
+       +chr(13) +'(Сбор "неначисляемых сумм"): код = ' + String(ExecuteErrorCode)
+       );
+  } // _finally
+
+
+
+  //=======================================
+  // sumVidop
+  _try
+  {
+    stmt:=0;
+    case wTypeSB of
+    0: sqlSetMacro('Filter_SumVidop', ' and SumVidop.YearK='+String(wYear)
+                     +' and SumVidop.Mes>=' +string(wMesB)
+                     +' and SumVidop.Mes<=' +string(wMesE)
+                );
+    1: sqlSetMacro('Filter_SumVidop', ' and SumVidop.YearN='+String(wYear)
+                     +' and SumVidop.MesN>=' +string(wMesB)
+                     +' and SumVidop.MesN<=' +string(wMesE)
+                );
+    end;
+    var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and Sumvidop.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_SumVidop',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_SumVidop','');
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_SumVidop);
+    if timelog_Status>1  Timelog('GP_Base_of..->SborData 021:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->SborData 022='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Report);
+              Timelog('GP_Base_of..->SborData 023:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Report)));
+      }
+    } // ExecuteError
+  } // _try
+  _finally
+  { if (ExecuteErrorCode <> 0)
+      timelog('Ошибка при выполнении SQL-сценария '
+       +chr(13) +'(Сбор фондов за тек.месяц): код = ' + String(ExecuteErrorCode)
+       );
+  } // _finally
+
+  Result:=true;
+} //Function PrintDoc:boolean;
+
+
+//-----------------
+  SQL QUERY SqlTmp_SumUlSoc =
+    select
+      0 as PA
+    , sum(SUMULSOC.SUMV[01]) as su01
+    , sum(SUMULSOC.SUMV[02]) as su02
+    , sum(SUMULSOC.SUMV[03]) as su03
+    , sum(SUMULSOC.SUMV[04]) as su04
+    , sum(SUMULSOC.SUMV[05]) as su05
+    , sum(SUMULSOC.SUMV[06]) as su06
+    , sum(SUMULSOC.SUMV[07]) as su07
+    , sum(SUMULSOC.SUMV[08]) as su08
+    , sum(SUMULSOC.SUMV[09]) as su09
+    , sum(SUMULSOC.SUMV[10]) as su10
+    , sum(SUMULSOC.SUMV[11]) as su11
+    , sum(SUMULSOC.SUMV[12]) as su12
+    From sumulsoc
+    inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName) )
+    where SumUlSoc.VidPer=:wVidPer and SumUlSoc.Year =:wYear
+    %FilterP_SumUlSoc
+    and ( ZU.POdrShare <> '+'
+    or (SumUlSoc.cex in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+       )
+    ;
+
+
+//----------------------------------------
+// получить вид налога
+//----------------------------------------
+Function GetSumUlSocBase_VidPer(_w:word):word;
+{ wVidper:=0;
+
+  case _w of
+  1:
+  { //Страховые взносы в ПФР
+    if getfirst Perech where (( 'Л'== PERECH.PARAM(noindex) )) =tsok
+       wVidper:=Perech.VidPer
+  }
+  2:
+  { //ФФОМС (Федеральный фонд обязат.мед.страхования)
+    if getfirst Perech where (( 3== Perech.NomGraf(NoIndex) )) =tsok
+       wVidper:=Perech.VidPer
+  }
+  3:
+  { //ФСС (Фонд социального страхования)
+    if getfirst Perech where (( 2== Perech.NomGraf(noindex) )) =tsok
+       wVidper:=Perech.VidPer
+  }
+  end;
+  Result:=wVidPer;
+} //Function GetSumUlSocBase_VidPer(_w:word):word;
+
+//----------------------------------------
+// получить базу по sumulsoc
+//----------------------------------------
+Function GetSumUlSocBase(_w:word):double;
+var
+  ii:word;
+{ Result:=0;
+  delete all tmp_su12;
+  wVidPer:=GetSumUlSocBase_VidPer(_w);
+  timelog('GetSumUlSocBase _w='+string(_w)+',wVidper='+string(wVidper) );
+  //ФСС (Фонд социального страхования)
+  _Try
+  {
+    var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and SumUlSoc.cex ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_SumUlSoc',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_SumUlSoc','');
+    }
+
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_SumUlSoc);
+    if timelog_Status>1  Timelog('GP_Base_of..->GetSumUlSocSum 001:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      sqlBindParamByName(stmt,'wVidPer'  , wVidPer  );
+      sqlBindParamByName(stmt,'wYear'    , wYear    );
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->GetSumUlSocSum 001:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#tmp_su12);
+        Timelog('GP_Base_of..->GetSumUlSocSum 001:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_su12)));
+      }
+    } // ExecuteError
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса GetSumUlSocBase '+ExploreException+', тип='+string(_w));
+  }
+  _finally
+  {
+  }
+  for(ii:=wMesB;ii<=wMesE;ii++)
+  { Result:=Result+Tmp_su12.Summa[ii];
+    //Result:=Result+dm_su[ii];
+    timelog('GetSumUlSocBase '+string(ii)+', '+string(Result)+',wVidper='+string(wVidper) );
+  } //for(ii:=wMesB;ii<=wMesE;ii++)
+
+} //Function GetSumUlSocBase(_w:word):double;
+
+//------------------------
+
+Function GetSumUlSocBase_New(_w:word):double;
+var
+  ii:word;
+{ Result:=0;
+  delete all tmp_su12;
+  wVidPer:=GetSumUlSocBase_VidPer(_w);
+  timelog('GetSumUlSocBase _w='+string(_w)+',wVidper='+string(wVidper) );
+  //ФСС (Фонд социального страхования)
+  _Try
+  { //-----------------------------
+    // Отберем данные
+    // см FillTempVib
+    //==================сам запрос ===================
+    PrepareSQLQuery('select  0 as PA');
+    for(ii:=1;ii<=12;ii++)
+    { if ii<wMesB or ii>wMesE
+      { PrepareSQLQuery(', 0.00  as su'+LPadCh(string(ii),'0',2));
+      }
+      else
+      { PrepareSQLQuery(' ,sum(SUMULSOC.SUMV['+string(ii)+']');
+        if wPodrR>0
+        { PrepareSQLQuery('* CASE WHEN Nach'+string(ii)+'.Su_all=0 then 1.00 '
+          +' else Nach'+string(ii)+'.Su/Nach'+string(ii)+'.Su_all end ');
+        }
+        PrepareSQLQuery(') as su'+LPadCh(string(ii),'0',2));
+      } //if ii<wMesB or ii>wMesE
+    } //for(ii:=1;ii<=12;ii++)
+    PrepareSQLQuery('From sumulsoc');
+    if wPodrR>0
+    { for(ii:=wMesB;ii<=wMesE;ii++)
+      { PrepareSQLQuery('inner join ( select n.clsch,sum(case when vib.cRec is Null then 0.00 else n.summa end) as su '
+          +', sum(n.summa) as su_all');
+        PrepareSQLQuery('from');
+        if YearRas<wYear
+        or (YearRas=wYear and ii>=MonthRas)
+        { PrepareSQLQuery(' Nachisl N');
+          PrepareSQLQuery(' inner join klPeropl on KlPerOpl.VidPer='+string(wVidPer)+' and klperopl.vidopl = n.vidopls');
+        }
+        else
+        { PrepareSQLQuery(' SumVidop N');
+          PrepareSQLQuery(' inner join klPeropl on KlPerOpl.VidPer='+string(wVidPer)+' and klperopl.vidopl = n.vidopl');
+        }
+        PrepareSQLQuery('left outer join tempvib Vib on Vib.wlist=01 and Vib.crec = n.cexoz ');
+        if YearRas<wYear
+        or (YearRas=wYear and ii>=MonthRas)
+        { PrepareSQLQuery('where N.YearV='+string(wYear)+' and N.MesV='+string(ii) );
+        }
+        else
+        { PrepareSQLQuery('where N.YearN='+string(wYear)+' and N.MesN='+string(ii) );
+        }
+        PrepareSQLQuery('group by N.cLsch');
+        PrepareSQLQuery(') Nach'+string(ii) +' on Nach'+string(ii) +'.cLsch =sumulsoc.cLsch ');
+      }//for(ii:=wMesB;ii<=wMesE;ii++)
+    }//if _wPodr>0
+    PrepareSQLQuery('where SumUlSoc.VidPer='+string(wVidPer)+' and SumUlSoc.Year ='+string(wYear));
+    stmt:=0;
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=ExecDSQLex(#Tmp_su12);
+    NextVisual;
+    Timelog('GP_Base_of..->GetSumUlSocSum 001:ExecuteErrorCode='+string(ExecuteErrorCode));
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса GetSumUlSocBase '+ExploreException+', тип='+string(_w));
+  }
+  _finally
+  {
+  }
+  for(ii:=wMesB;ii<=wMesE;ii++)
+  { Result:=Result+Tmp_su12.Summa[ii];
+    //Result:=Result+dm_su[ii];
+    timelog('GetSumUlSocBase_New '+string(ii)+', '+string(Result)+',wVidper='+string(wVidper) );
+  } //for(ii:=wMesB;ii<=wMesE;ii++)
+
+} //Function GetSumUlSocBase_new(_w:word):double;
+
+//----------------------------
+// Запросы по травматизму
+//----------------------------
+//004130 льготник ,000243 - отмена льгота
+  SQL QUERY SqlTmp_T01 =
+    select
+      CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 1 ELSE 0 END as PA      // "1 - начисления,2 перечисления, 3 удержания"
+     ,0 as VidoplP // :word
+     ,Sum(Nachisl.Summa) as Summa// :double
+     ,0 as PR   // :word
+     %FLD_DET
+    From KLPEROPL
+    Inner join Nachisl on Nachisl.Vidopls = KLPEROPL.Vidopl
+    inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName) ) //Filter_User
+    // в ходимость в льготу
+    Left Outer join KLVXOD on  KLVXOD.Vidopl = Nachisl.Vidopls and KLVXOD.NOMER=4
+    // Здесь надо как то поймать отмену
+    // or LGNALLSZ.VIDPER=0?
+    Left outer join LGNALLSZ on (LGNALLSZ.VIDPER = :wVidPer)
+      and LGNALLSZ.CLSCHET =Nachisl.clsch
+    and LGNALLSZ.Nrec in (select Max(LGNALLSZ1.Nrec) from LGNALLSZ LGNALLSZ1
+      where LGNALLSZ1.CLSCHET =Nachisl.clsch
+      and ( LGNALLSZ1.VIDPER = :wVidPer or
+        ((LGNALLSZ1.VIDPER = 0) and (LGNALLSZ1.PROC = 100) and (LgNalLsZ1.NomScale = 0))
+       )
+      and ( LGNALLSZ1.YEAR<Nachisl.YearV
+         or (LGNALLSZ1.YEAR=Nachisl.YearV and LGNALLSZ1.MES<=Nachisl.MesV)
+          )
+    )
+    left outer join Lschet  on Lschet.Nrec = Nachisl.cLsch
+    left outer join Persons on Persons.Nrec = Lschet.tPerson
+    where  KlPerOpl.VidPer = :wVidPer
+     and   (ZU.POdrShare <> '+'
+            or (Nachisl.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+            )
+    and Nachisl.YearV=:wYear
+    and Nachisl.MesV>=:wMesB
+    and Nachisl.MesV<=:wMesE
+    and (KLVXOD.Nrec is Null) // без льготируемых налогов
+    %FilterP_Travm01
+    Group by CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 1 ELSE 0 END
+    %FLD_DET_GR
+  ;
+
+  SQL QUERY SqlTmp_T02 =
+    select
+      CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 1 ELSE 0 END as PA      // "1 - начисления,2 перечисления, 3 удержания"
+     ,0 as VidoplP // :word
+     ,Sum(Nachisl.Summa) as Summa// :double
+     ,0 as PR   // :word
+     %FLD_DET
+    From KLPEROPL
+    Inner join Nenach Nachisl on Nachisl.Vidopls = KLPEROPL.Vidopl
+    inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName) ) //Filter_User
+    // в ходимость в льготу
+    Left Outer join KLVXOD on  KLVXOD.Vidopl = Nachisl.Vidopls and KLVXOD.NOMER=4
+    // Здесь надо как то поймать отмену
+    Left outer join LGNALLSZ on LGNALLSZ.VIDPER = :wVidPer
+      and LGNALLSZ.CLSCHET =Nachisl.clsch
+    and LGNALLSZ.Nrec in (select Max(LGNALLSZ1.Nrec) from LGNALLSZ LGNALLSZ1
+      where LGNALLSZ1.CLSCHET =Nachisl.clsch
+      and ( LGNALLSZ1.VIDPER = :wVidPer or
+        ((LGNALLSZ1.VIDPER = 0) and (LGNALLSZ1.PROC = 100) and (LgNalLsZ1.NomScale = 0))
+       )
+      and ( LGNALLSZ1.YEAR<Nachisl.YearV
+         or (LGNALLSZ1.YEAR=Nachisl.YearV and LGNALLSZ1.MES<=Nachisl.MesV)
+          )
+    )
+    left outer join Lschet  on Lschet.Nrec = Nachisl.cLsch
+    left outer join Persons on Persons.Nrec = Lschet.tPerson
+    where  KlPerOpl.VidPer = :wVidPer
+     and   (ZU.POdrShare <> '+'
+            or (Nachisl.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+            )
+    and Nachisl.YearN=:wYear
+    and Nachisl.MesN>=:wMesB
+    and Nachisl.MesN<=:wMesE
+    and (KLVXOD.Nrec is Null) // без льготируемых налогов
+    %FilterP_Travm02
+    Group by CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 1 ELSE 0 END
+    %FLD_DET_GR
+  ;
+
+  SQL QUERY SqlTmp_T03 =
+    select
+      CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 1 ELSE 0 END as PA      // "1 - начисления,2 перечисления, 3 удержания"
+     ,0 as VidoplP // :word
+     ,Sum(SumVidop.Summa) as Summa// :double
+     ,0 as PR   // :word
+     %FLD_DET
+    From KLPEROPL
+    Inner join SumVidop on SumVidop.Vidopl = KLPEROPL.Vidopl
+    // в ходимость в льготу
+    Left Outer join KLVXOD on  KLVXOD.Vidopl = SumVidop.Vidopl and KLVXOD.NOMER=4
+    inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName) ) //Filter_User
+    // Здесь надо как то поймать отмену
+    Left outer join LGNALLSZ on LGNALLSZ.VIDPER = :wVidPer
+      and LGNALLSZ.CLSCHET =SumVidop.clsch
+    and LGNALLSZ.Nrec in (select Max(LGNALLSZ1.Nrec) from LGNALLSZ LGNALLSZ1
+      where LGNALLSZ1.CLSCHET =SumVidop.clsch
+      and ( LGNALLSZ1.VIDPER = :wVidPer or
+        ((LGNALLSZ1.VIDPER = 0) and (LGNALLSZ1.PROC = 100) and (LgNalLsZ1.NomScale = 0))
+       )
+      and ( LGNALLSZ1.YEAR<SumVidop.YearN
+         or (LGNALLSZ1.YEAR=SumVidop.YearN and LGNALLSZ1.MES<=SumVidop.MesN)
+          )
+    )
+    left outer join Lschet  on Lschet.Nrec = SumVidop.cLsch
+    left outer join Persons on Persons.Nrec = Lschet.tPerson
+    where  KlPerOpl.VidPer = :wVidPer
+     and   (ZU.POdrShare <> '+'
+            or (SumVidop.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+            )
+    and SumVidop.YearN=:wYear
+    and SumVidop.MesN>=:wMesB
+    and SumVidop.MesN<=:wMesE
+    and (KLVXOD.Nrec is Null) // без льготируемых налогов
+    %FilterP_Travm03
+    Group by CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 1 ELSE 0 END
+    %FLD_DET_GR
+  ;
+  SQL QUERY SqlTmp_T04 =
+    select
+      CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 1 ELSE 0 END as PA      // "1 - начисления,2 перечисления, 3 удержания"
+     ,0 as VidoplP // :word
+     ,Sum(HELPTABN.MONOHELP) as Summa// :double
+     ,0 as PR   // :word
+     %FLD_DET
+    From HELPTABN
+    Inner join PrMonth on prmonth.nrec = HelpTabn.cPrmonth
+      and ( (:wMesE=12 and PRMONTH.YEARN =:wYear+1 and PRMONTH.MESN=1
+            )
+       or   ( PRMONTH.YEARN =:wYear and PRMONTH.MESN>:wMesB
+                 and PRMONTH.MESN<=:wMesE+1
+            )
+          )
+    inner join Lschet on Lschet.Nrec = PRMONTH.CLSCH
+    left outer join Persons on Persons.Nrec = Lschet.tPerson
+    inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName) ) //Filter_User
+    // Здесь надо как то поймать отмену
+    Left outer join LGNALLSZ on LGNALLSZ.VIDPER = :wVidPer
+      and LGNALLSZ.CLSCHET =PRMONTH.CLSCH
+    and LGNALLSZ.Nrec in (select Max(LGNALLSZ1.Nrec) from LGNALLSZ LGNALLSZ1
+      where LGNALLSZ1.CLSCHET =PRMONTH.CLSCH
+      and ( LGNALLSZ1.VIDPER = :wVidPer or
+        ((LGNALLSZ1.VIDPER = 0) and (LGNALLSZ1.PROC = 100) and (LgNalLsZ1.NomScale = 0))
+       )
+      and ( (LGNALLSZ1.YEAR<(PRMONTH.YEARN+1) and PRMONTH.MESN=1)
+         or (LGNALLSZ1.YEAR<PRMONTH.YEARN)
+         or (LGNALLSZ1.YEAR=PRMONTH.YEARN and LGNALLSZ1.MES<=PRMONTH.MESN+1)
+          )
+    )
+    where  //HELPTABN.VidPer = :(wVidPer)
+          HelpTabn.FilialNo = :wVidPer
+     and   (ZU.POdrShare <> '+'
+            or (Lschet.cex in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+            )
+    %FilterP_Travm04
+    Group by CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 1 ELSE 0 END
+    %FLD_DET_GR
+  ;
+  SQL QUERY SqlTmp_T05 =
+    select
+      CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 3 ELSE 2 END as PA      // "1 - начисления,2 перечисления, 3 удержания"
+     ,0 as VidoplP // :word
+     ,Sum(Perevod.SumPer) as Summa// :double
+     ,0 as PR   // :word
+     %FLD_DET
+    From PerevodTek Perevod
+    inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName) ) //Filter_User
+    // Здесь надо как то поймать отмену
+    Left outer join LGNALLSZ on LGNALLSZ.VIDPER = :wVidPer
+      and LGNALLSZ.CLSCHET =Perevod.clsch
+    and LGNALLSZ.Nrec in (select Max(LGNALLSZ1.Nrec) from LGNALLSZ LGNALLSZ1
+      where LGNALLSZ1.CLSCHET =Perevod.clsch
+      and ( LGNALLSZ1.VIDPER = :wVidPer or
+        ((LGNALLSZ1.VIDPER = 0) and (LGNALLSZ1.PROC = 100) and (LgNalLsZ1.NomScale = 0))
+       )
+      and ( LGNALLSZ1.YEAR<Perevod.YearN
+         or (LGNALLSZ1.YEAR=Perevod.YearN and LGNALLSZ1.MES<=Perevod.MesN)
+          )
+    )
+    left outer join Lschet  on Lschet.Nrec = Perevod.cLsch
+    left outer join Persons on Persons.Nrec = Lschet.tPerson
+    where  Perevod.VidPer = :wVidPer
+     and   (ZU.POdrShare <> '+'
+            or (Perevod.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+            )
+    and Perevod.YearN=:wYear
+    and Perevod.MesN>=:wMesB
+    and Perevod.MesN<=:wMesE
+    %FilterP_Travm05
+    Group by CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 3 ELSE 2 END
+    %FLD_DET_GR
+  ;
+
+  SQL QUERY SqlTmp_T06 =
+      select
+      CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 3 ELSE 2 END as PA      // "1 - начисления,2 перечисления, 3 удержания"
+     ,0 as VidoplP // :word
+     ,Sum(Perevod.SumPer) as Summa// :double
+     ,0 as PR   // :word
+     %FLD_DET
+    From Perevod
+    inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName) ) //Filter_User
+    // Здесь надо как то поймать отмену
+    Left outer join LGNALLSZ on LGNALLSZ.VIDPER = :wVidPer
+      and LGNALLSZ.CLSCHET =Perevod.clsch
+    and LGNALLSZ.Nrec in (select Max(LGNALLSZ1.Nrec) from LGNALLSZ LGNALLSZ1
+      where LGNALLSZ1.CLSCHET =Perevod.clsch
+      and ( LGNALLSZ1.VIDPER = :wVidPer or
+        ((LGNALLSZ1.VIDPER = 0) and (LGNALLSZ1.PROC = 100) and (LgNalLsZ1.NomScale = 0))
+       )
+      and ( LGNALLSZ1.YEAR<Perevod.YearN
+         or (LGNALLSZ1.YEAR=Perevod.YearN and LGNALLSZ1.MES<=Perevod.MesN)
+          )
+    )
+    left outer join Lschet  on Lschet.Nrec = Perevod.cLsch
+    left outer join Persons on Persons.Nrec = Lschet.tPerson
+    where  Perevod.VidPer = :wVidPer
+     and   (ZU.POdrShare <> '+'
+            or (Perevod.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+            )
+    and Perevod.YearN=:wYear
+    and Perevod.MesN>=:wMesB
+    and Perevod.MesN<=:wMesE
+    %FilterP_Travm06
+    Group by CASE WHEN COALESCE(LGNALLSZ.PROC,100) in (0.12,0.1224) THEN 3 ELSE 2 END
+    %FLD_DET_GR
+   ;
+
+//------------
+// Получить базу по травматизму 004295
+//------------
+Function GetTravmBase(_Need_Detail:boolean=False) :boolean;
+{ Result:=false;
+  wVidPer:=0;
+  //Страховые взносы в ПФР
+  if getfirst Perech where (( 'Т'== PERECH.PARAM(noindex) )) =tsok
+    wVidper:=Perech.VidPer;
+  timelog('GetTravmBase wVidPer='+string(wVidPer));
+  delete all tmp_sbor;
+  //----------------------------
+  ResetBounds(#tmp_Report);
+  Delete all tmp_Report;
+  SetBounds(#tmp_Report);
+  if _Need_Detail
+  { SqlSetMacro('FLD_DET'   ,', Lschet.StrTabn, Persons.Fio');
+    SqlSetMacro('FLD_DET_GR',', Lschet.StrTabn, Persons.Fio');
+  }
+  else
+  { SqlSetMacro('FLD_DET'   ,', '' '', '' '' ');
+    SqlSetMacro('FLD_DET_GR','');
+  }
+  //-----------------  1
+  _try
+  { var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and Nachisl.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_Travm01',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_Travm01','');
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_T01);
+    if timelog_Status>1  Timelog('GP_Base_of..->GetTravmSum 001:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      sqlBindParamByName(stmt,'wVidPer'  , wVidPer  );
+      sqlBindParamByName(stmt,'wYear'    , wYear    );
+      sqlBindParamByName(stmt,'wMesB'    , wMesB    );
+      sqlBindParamByName(stmt,'wMesE'    , wMesE    );
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->GetTravmSum 001:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Sbor);
+        Timelog('GP_Base_of..->GetTravmSum 001:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Sbor)));
+      }
+    } // ExecuteError
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса GetTravmBase 01 '+ExploreException);
+  }
+  _finally
+  { timelog('GetTravmBase 001 отобрано '+String(RecordsInTable(#tmp_sbor)));
+
+  }
+  //---------------------------
+  // Nenach
+  //-----------------  2
+  _try
+  { var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and Nachisl.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_Travm02',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_Travm02','');
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_T02);
+    if timelog_Status>1  Timelog('GP_Base_of..->GetTravmSum 002:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      sqlBindParamByName(stmt,'wVidPer'  , wVidPer  );
+      sqlBindParamByName(stmt,'wYear'    , wYear    );
+      sqlBindParamByName(stmt,'wMesB'    , wMesB    );
+      sqlBindParamByName(stmt,'wMesE'    , wMesE    );
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->GetTravmSum 002:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Sbor);
+        Timelog('GP_Base_of..->GetTravmSum 002:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Sbor)));
+      }
+    } // ExecuteError
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса GetTravmBase 02 '+ExploreException);
+  }
+  _finally
+  { timelog('GetTravmBase 001 отобрано '+String(RecordsInTable(#tmp_sbor)));
+
+  }
+  //--------------------------- 3
+  _Try
+  { var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and SumVidop.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_Travm03',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_Travm03','');
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_T03);
+    if timelog_Status>1  Timelog('GP_Base_of..->GetTravmSum 003:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      sqlBindParamByName(stmt,'wVidPer'  , wVidPer  );
+      sqlBindParamByName(stmt,'wYear'    , wYear    );
+      sqlBindParamByName(stmt,'wMesB'    , wMesB    );
+      sqlBindParamByName(stmt,'wMesE'    , wMesE    );
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->GetTravmSum 003:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Sbor);
+        Timelog('GP_Base_of..->GetTravmSum 003:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Sbor)));
+      }
+    } // ExecuteError
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса GetTravmBase 03 '+ExploreException);
+  }
+  _finally
+  { timelog('GetTravmBase 003 отобрано '+String(RecordsInTable(#tmp_sbor)));
+  }
+  //----------------------------
+  // Собираем обложение со льготами
+  //---------------------------- 4
+  // со в ходимостью в льготы Left Outer join KLVXOD on  KLVXOD.Vidopl = SumVidop.Vidopl and KLVXOD.NOMER=4
+  //  HELPTABN.MONOHELP
+  _Try
+  { var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and Lschet.cex ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_Travm04',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_Travm04','');
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_T04);
+    if timelog_Status>1  Timelog('GP_Base_of..->GetTravmSum 004:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      sqlBindParamByName(stmt,'wVidPer'  , wVidPer  );
+      sqlBindParamByName(stmt,'wYear'    , wYear    );
+      sqlBindParamByName(stmt,'wMesB'    , wMesB    );
+      sqlBindParamByName(stmt,'wMesE'    , wMesE    );
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->GetTravmSum 004:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Sbor);
+        Timelog('GP_Base_of..->GetTravmSum 004:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Sbor)));
+      }
+    } // ExecuteError
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса GetTravmBase 04 '+ExploreException);
+  }
+  _finally
+  { timelog('GetTravmBase 004 отобрано '+String(RecordsInTable(#tmp_sbor)));
+  }
+
+
+
+  //----------------------------
+  // Собираем перечисления
+  //---------------------------- 5
+  _try
+  { var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and Perevod.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_Travm05',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_Travm05','');
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_T05);
+    if timelog_Status>1  Timelog('GP_Base_of..->GetTravmSum 005:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      sqlBindParamByName(stmt,'wVidPer'  , wVidPer  );
+      sqlBindParamByName(stmt,'wYear'    , wYear    );
+      sqlBindParamByName(stmt,'wMesB'    , wMesB    );
+      sqlBindParamByName(stmt,'wMesE'    , wMesE    );
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->GetTravmSum 005:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Sbor);
+        Timelog('GP_Base_of..->GetTravmSum 005:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Sbor)));
+      }
+    } // ExecuteError
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса GetTravmBase 05 '+ExploreException);
+  }
+  _finally
+  { timelog('GetTravmBase 005 отобрано '+String(RecordsInTable(#tmp_sbor)));
+  }
+  //--------------------------- 6
+  _try
+  { var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and Perevod.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_Travm06',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_Travm06','');
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_T06);
+    if timelog_Status>1  Timelog('GP_Base_of..->GetTravmSum 006:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      sqlBindParamByName(stmt,'wVidPer'  , wVidPer  );
+      sqlBindParamByName(stmt,'wYear'    , wYear    );
+      sqlBindParamByName(stmt,'wMesB'    , wMesB    );
+      sqlBindParamByName(stmt,'wMesE'    , wMesE    );
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->GetTravmSum 006:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Sbor);
+        Timelog('GP_Base_of..->GetTravmSum 006:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Sbor)));
+      }
+    } // ExecuteError
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса GetTravmBase 05 '+ExploreException);
+  }
+  _finally
+  { timelog('GetTravmBase 006 отобрано '+String(RecordsInTable(#tmp_sbor)));
+  }
+  //-----------------------------------
+
+  //KLPEROPL
+  dm_su[2]:=0.00;//база 0.20
+  dm_su[5]:=0.00;//база  (0.12,0.1224)
+
+  dm_su[3]:=0.00;//налог 0.20
+  dm_su[6]:=0.00;//налог (0.12,0.1224)
+  _Loop tmp_sbor
+  { case tmp_sbor.PA of
+    0: dm_su[2]:=dm_su[2]+tmp_sbor.Summa;
+    1: dm_su[5]:=dm_su[5]+tmp_sbor.Summa;
+    2: dm_su[3]:=dm_su[3]+tmp_sbor.Summa;
+    3: dm_su[6]:=dm_su[6]+tmp_sbor.Summa;
+    end;
+  }
+  Result:=true;
+} //Function GetTravmBase :boolean;
+
+
+//----------------------------
+// Запросы по удержаниям
+//----------------------------
+  SQL QUERY SqlTmp_Uder =
+        SELECT
+           0 as Pa//:word      // "1 - начисления,2 перечисления, 3 удержания"
+          ,0 as VidoplP // :word
+          ,Sum(Uder.Sumud) Summa //:double
+          ,0 PR  //  :word
+       From  Uder
+       inner join Lschet L on L.Nrec = Uder.cLsch
+       inner join katpodr P on P.Nrec = Uder.cexoz
+       left outer join katpodr P1 on P1.Nrec = P.cPodr
+       left outer join katpodr P2 on P2.Nrec = P1.cPodr
+       inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName))
+       //left outer
+       //inner join SumVidop on KlVidopl.Vidopl = SumVidop.Vidopl
+       where
+          (ZU.POdrShare <> '+'
+          or (Uder.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+          )
+       %Filter_Uder
+       %Filter_Uder_P
+       %FilterP_Uder
+       ;
+
+  SQL QUERY SqlTmp_SumVidUd =
+        SELECT
+           0 as Pa//:word      // "1 - начисления,2 перечисления, 3 удержания"
+          ,0 as VidoplP // :word
+          ,Sum(S.Sumud) Summa //:double
+          ,0 PR  //  :word
+       From  SumVidUd S
+       inner join Lschet L on L.Nrec = S.cLsch
+       inner join katpodr P on P.Nrec = S.cexoz
+       left outer join katpodr P1 on P1.Nrec = P.cPodr
+       left outer join katpodr P2 on P2.Nrec = P1.cPodr
+       inner join ZAR_USER ZU on (upper(ZU.OWNNAME) = upper(:sUserName))
+       //left outer
+       //inner join SumVidop on KlVidopl.Vidopl = SumVidop.Vidopl
+       where
+          (ZU.POdrShare <> '+'
+          or (S.cexoz in (Select UR.crecds from USERRIGHTS UR  where ZU.OWNNAME = UR.OWNNAME ) )
+          )
+       %Filter_SumVidUd
+       %Filter_SumVidUd_P
+       %FilterP_SumVidUD
+       ;
+
+//==================================
+//
+//==================================
+Function GetFilterNDFL(_wTp:word):string;
+{ Result:='';
+  case _wTp of
+  //НДФЛ
+  1:
+  {
+
+  }
+  //НДФЛ с обособленных предприятий
+  2:
+  { Result:=' ';
+  }
+  //НДФЛ с вознаграждений по
+  //гражданско-правовому договору - иностранным гражданам
+  3:
+  { Result:=' and (L.SUMMA10 in (2.0,3.0,4.0) or L.Sovm in (1,2))' ;
+  }
+  end;
+} //Function GetFilterNDFL(_wTp:word):string;
+
+//==================================
+Function GetFilterNDFL_P(_wTp:word):string;
+{ Result:='';
+  case _wTp of
+  //НДФЛ
+  1:
+  {
+
+  }
+  //НДФЛ с обособленных предприятий
+  2:
+  { Result:=' and (Trim(P.LastUser)=''2'' or trim(P1.LastUser)=''2'' or trim(P2.LastUser)=''2'' ) ';
+  }
+  //НДФЛ с вознаграждений по
+  //гражданско-правовому договору - иностранным гражданам
+  3:
+  { // строку "НДФЛ с вознаграждений по ДГПХ с иностранным гражданином" должен выводится 183 системный код удержания.
+    // отфильтруем просто по коду
+    //Result:=' and (Trim(P.LastUser)<>''2'' and trim(P1.LastUser)<>''2'' and trim(P2.LastUser)<>''2'' )';
+  }
+  end;
+} //Function GetFilterNDFL(_wTp:word):string;
+
+//=========================================
+// Получить суммы удержаний
+//=========================================
+Function GetUderSum(_wtp:word;_wVidUd:word):double;
+var
+  _filter  :string;
+  _filter_P:string;
+{ Result:=0;
+  delete all tmp_sbor;
+
+  _try
+  {
+    _filter  :=GetFilterNDFL  (_wTp);
+    _filter_P:=GetFilterNDFL_P(_wTp);
+
+    case  _wTp of
+    4: _filter:=_filter+' and Uder.VidUds=197'
+    3: _filter:=_filter+' and Uder.VidUds=183'
+    else
+    { _filter:=_filter+' and (Uder.VidUds in (182,184))';
+    }
+    end;
+    stmt:=0;
+    Timelog('GP_Base_of..->GetUderSum uder 001 '+string(_wtp)+', Ву='+string(_wVidUd));
+    //sqlSetMacro('Filter_User',''''+sUserName+'''');
+    case wTypeSB of
+    0: _filter:=_filter+ ' and Uder.YearK='+String(wYear)
+                     +' and Uder.Mes>=' +string(wMesB)
+                     +' and Uder.Mes<=' +string(wMesE)
+                ;
+    1: _filter:= _filter+' and Uder.YearV='+String(wYear)
+                     +' and Uder.MesV>=' +string(wMesB)
+                     +' and Uder.MesV<=' +string(wMesE)
+                ;
+    end;
+    sqlSetMacro('Filter_Uder'  , _filter);
+    sqlSetMacro('Filter_Uder_P', _filter_P);
+    Timelog('GP_Base_of..->GetUderSum Uder 002');
+    if timelog_Status>1
+    { Timelog(_filter);
+      Timelog(_filter_P);
+    }
+    var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and Uder.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_Uder',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_Uder','');
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_Uder);
+    if timelog_Status>1  Timelog('GP_Base_of..->GetUderSum 001:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->GetUderSum 002:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Sbor);
+              Timelog('GP_Base_of..->GetUderSum 003:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Sbor)));
+      }
+    } // ExecuteError
+  } // _try
+  _finally
+  { if (ExecuteErrorCode <> 0)
+      TimeLog('Ошибка при выполнении SQL-сценария '
+       +chr(13) +'(Сбор удержаний за тек.месяц): код = ' + String(ExecuteErrorCode)
+       );
+  } // _finally
+
+  _try
+  {
+    _filter:=GetFilterNDFL(_wTp);
+    _filter_P:=GetFilterNDFL_P(_wTp);
+
+    case  _wTp of
+    4: _filter:=_filter+' and S.VidUd=197'
+    3: _filter:=_filter+' and S.VidUd=183'
+    else
+    { _filter:=_filter+' and (S.VidUd in (182,184))';
+    }
+    end;
+    stmt:=0;
+    Timelog('GP_Base_of..->GetUderSum SumVidUD 001');
+    //sqlSetMacro('Filter_User',''''+sUserName+'''');
+    case wTypeSB of
+    0: _filter:=_filter+' and S.YearK='+String(wYear)
+                     +' and S.Mes>=' +string(wMesB)
+                     +' and S.Mes<=' +string(wMesE)
+                ;
+    1: _filter:=_filter+' and S.YearN='+String(wYear)
+                     +' and S.MesN>=' +string(wMesB)
+                     +' and S.MesN<=' +string(wMesE)
+                ;
+    end;
+    sqlSetMacro('Filter_SumVidUd'  , _filter  );
+    sqlSetMacro('Filter_SumVidUd_P', _filter_P);
+    var hStrFilter:longint=0;
+    if IsBitCTW(wFilter,1)
+    { sqlAddStr(hStrFilter,iQBuilder.MakeCriteriaFromMarker(' and S.cexoz ',DepList));
+    }
+    if (hStrFilter<>0)
+    { SqlSetMacro('FilterP_SumVidUD',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { SqlsetMacro('FilterP_SumVidUD','');
+    }
+    if timelog_Status>1
+    { Timelog(_filter);
+      Timelog(_filter_P);
+    }
+    stmt := sqlAllocStmt;
+    ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_SumVidUd);
+    if timelog_Status>1  Timelog('GP_Base_of..->GetUderSum 011:ExecuteErrorCode='+string(ExecuteErrorCode));
+    NextVisual;
+    if ExecuteErrorCode=0
+    { sqlBindParamByName(stmt,'sUserName', sUserName);
+      ExecuteErrorCode:=SqlExecute(stmt);
+      if timelog_Status>1    Timelog('GP_Base_of..->GetUderSum 012:ExecuteErrorCode='+string(ExecuteErrorCode));
+      if ExecuteErrorCode=0
+      { ExecuteErrorCode:=SqlFetchInto(stmt,#Tmp_Sbor);
+              Timelog('GP_Base_of..->GetUderSum 013:ExecuteErrorCode='+string(ExecuteErrorCode)
+              +', Отобрали '+String(RecordsInTable(#Tmp_Sbor)));
+      }
+    } // ExecuteError
+  } // _try
+  _finally
+  { if (ExecuteErrorCode <> 0)
+      TimeLog('Ошибка при выполнении SQL-сценария '
+       +chr(13) +'(Сбор удержаний : код = ' + String(ExecuteErrorCode)
+       );
+  } // _finally
+
+  //-----------------------------------
+  _Loop tmp_sbor
+  { Result+=tmp_sbor.Summa;
+  }
+} //Function GetuderSum((_wtp:word;_wVidUd:word);
+
+
+
+Procedure PrintRow(_row:word; _sRow:string; _sVidOplP:string; _su:double);
+{      wexrow++;
+      wexcol:=1;
+      MyPutExcelNumber(_Row,0,12,0,-1,-1); //4
+      MyPutExcel(_sRow,12,0,-1,-1); //4
+      MyPutExcel(chr(39)+_sVidOplP,12,0,-1,-1); //4
+      MyPutExcelNumber(_Su,2,12,0,-1,-1); //4
+}
+
+//------------------------------------
+// Печать таблицы
+//------------------------------------
+Function PrintTable(_Table:string):boolean;
+var
+    it_su:double;
+    it_row:double;
+    _row:word;
+
+    ww_str:string;
+    wexrow_start:longint;
+   _sRow:string; _sVidOplP:string;
+   _su:double;
+{   Result:=false;
+    set sTbl:=_Table;
+    it_su:=0;
+    it_row:=0;
+    if not NextVisual then exit;
+    wexrow++;// Последняя строка в шапке должна быть на 3 колонки
+    wexcol:=4;
+    ww_str:='Таблица '+string(_Table);
+    MyPutExcel(ww_Str,12,0,-1,-1); //
+    wexrow++;
+    wexcol:=1;
+    wexrow_start:=wexrow;
+    MyPutExcel('№'+chr(10)+'п/п ',12,0,-1,-1); //1
+    MyPutExcel('Наименование вида оплат',12,0,-1,-1); //2
+    MyPutExcel('Шифр вида'+chr(10)+'оплат',12,0,-1,-1); //3
+    MyPutExcel('Сумма'+chr(10)+'(в рублях)',12,0,-1,-1); //4
+    xlSetFontStyle(xlbold, wexrow,1, wexrow,4); //Bold
+    xlAlignCellsEx(xlCenter,xlCenter,wexrow,1, wexrow,4);
+    it_row:=0;
+    _row:=0;
+    _su:=0;
+    _sRow:='';
+    _sVidOplP:='';
+    _loop Tmp_report where (( _Table == Tmp_report.TBL ))
+    { //Добавляем промежуточные итоги
+      if _row<>word(Tmp_report.Row) and _sRow<>''
+      { PrintRow(_row,_sRow,_sVidOplP, _su);
+        _su:=0;
+      }
+
+      if _table=3
+      { if Word(Tmp_report.Row)>8 and _row<9
+        { wexrow++;
+          wexcol:=2;
+          MyPutExcel('И Т О Г О  1-8',12,0,-1,-1); //4
+          wexcol:=4;
+          MyPutExcelNumber(it_row,2,12,0,-1,-1); //4
+          xlSetFontStyle(xlbold, wexrow,1, wexrow,4); //Bold
+          it_row:=0;
+        } //if Tmp_report.Row>8 and _row<9
+        if word(Tmp_report.Row)>10 and _row<11
+        { wexrow++;
+          wexcol:=2;
+          MyPutExcel('И Т О Г О  9-10',12,0,-1,-1); //4
+          wexcol:=4;
+          MyPutExcelNumber(it_row,2,12,0,-1,-1); //4
+          xlSetFontStyle(xlbold, wexrow,1, wexrow,4); //Bold
+          it_row:=0;
+        } //if Tmp_report.Row>8 and _row<9
+
+      } //if _table=3
+      _sRow    :=Tmp_report.sRow;
+      _sVidOplP:=Tmp_report.sVidOplP;
+      _su   :=_su+ Tmp_report.Summa;
+      it_su :=it_su+Tmp_report.Summa;
+      it_row:=it_row+Tmp_report.Summa;
+      _row:=word(Tmp_report.Row);
+    } //_loop Tmp_report where (( _Table == Tmp_report.TBL ))
+    PrintRow(_row,_sRow,_sVidOplP, _su);
+    wexrow++;
+    xlMergeCells(wexrow,1, wexrow,2); //Объединяем ячейки
+    wexcol:=1;
+    ww_str:='И Т О Г О  Таблица '+string(_Table);
+    MyPutExcel(ww_Str,12,0,-1,-1); //
+    wexcol:=4;
+    MyPutExcelNumber(it_su,2,12,0,-1,-1); //4
+    MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH
+       , xlThin, 0, 0, wexrow_start ,1,wexrow,4); //Обрамление
+    xlWrapText(wexrow_start, 1, wexrow, 4);
+    xlSetFontStyle(xlbold, wexrow,1, wexrow,4); //Bold
+
+
+    Result:=true;
+    all_su:=all_su+it_su;
+} //Function PrintTable(_Table:word):boolean;
+
+
+//------------------------------------
+// Печать документа
+//------------------------------------
+Function PrintDoc:boolean;
+var ww_str:string;
+    ii:word;
+{ Result:=false;
+  wexrow:=3;
+  wexcol:=1;
+  xlSetFontStyle(xlBold, wexrow,wexcol,wexrow,wexcol);
+  if wMesB=wMese
+  { MyPutExcel(DateToStr(Date(1,wMesB,wYear),'MONTH')+'  '+string(wYear)+' года',12,0,-1,-1); //
+  }
+  else
+  { MyPutExcel('за '+DateToStr(Date(1,wMesB,wYear),'MONTH')
+                    +DateToStr(Date(1,wMesE,wYear),'- MONTH')
+                    +string(wYear)+' года',12,0,-1,-1); //
+  }
+
+  HeaderStrCount:=5; // для последующего вывода сетки
+  wexrow:=HeaderStrCount;
+
+//IFDEF _XLSMATRIX_
+  MyXlCreaMatrix(1000, 4);
+  matrixkl:=true;
+  matrixsdvig:=wexrow;
+//ENDIF
+  excel_Null_Need:=true;
+  all_su:=0;
+  //************* Таблица 1 ****************
+  wexrow++;  wexcol:=1;
+  ww_str:='Объектом обложения страховыми взносами для плательщика';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,3); //Объединяем ячейки
+  wexrow++;  wexcol:=1;
+  ww_str:='страховых взносов признаются выплаты:';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  xlSetFontStyle(xlBold+xlItalic, wexrow-1,1,wexrow,4);
+
+  PrintTable(1);
+  wexrow++;    wexcol:=1;
+  MyPutExcel('*) кроме ФСС',12,0,-1,-1); //
+
+  //************** Таблица 2 ******************
+  wexrow+=3;  wexcol:=1;
+  ww_str:='Выплаты, не подлежащие обложению страховыми взносами в';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  //-------------------
+  wexrow++;  wexcol:=1;
+  //ww_str:='соответствии с частями 1,п 2 Ст.9 Федерального закона';
+  ww_str:='соответствии с ч. 1, п.2 ст 422 Гл. 34 НК РФ';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  //-------------------
+  /*
+  wexrow++;  wexcol:=1;
+  ww_str:='от 24.07.2009г. №212 ФЗ';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,3); //Объединяем ячейки
+  */
+  xlSetFontStyle(xlBold+xlItalic, wexrow-2,1,wexrow,4);
+  PrintTable(2);
+
+  //************ вставляем разрыв **********************
+  XlRunMacro('New_Page'+chr(40)+string(wexrow+1)+chr(41));
+
+
+  //************** Таблица 3 ******************
+  wexrow+=3;  wexcol:=1;
+  ww_str:='Выплаты, не подлежащие обложению страховыми взносами в';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  //-------------------
+  wexrow++;  wexcol:=1;
+  //ww_str:='соответствии с частями 1,п 1 Ст.9 Федерального закона';
+  ww_str:='соответствии с ч. 1, п.1. Ст.422 Гл. 34 НК РФ';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  //-------------------
+  /*
+  wexrow++;  wexcol:=1;
+  ww_str:='от 24.07.2009г. №212 ФЗ';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,3); //Объединяем ячейки
+  */
+  xlSetFontStyle(xlBold+xlItalic, wexrow-2,1,wexrow,4);
+  PrintTable(3);
+
+  //************** Таблица 4 ******************
+  wexrow+=3;  wexcol:=1;
+  ww_str:='Выплаты и иные вознаграждения, относящиеся к объекту обложения';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  //-------------------
+  wexrow++;  wexcol:=1;
+  ww_str:='страховыми взносами, которые относятся к расходам, уменьшающих';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,3); //Объединяем ячейки
+  //-------------------
+  wexrow++;  wexcol:=1;
+  // так написано в ТЗ
+  ww_str:='базу(и не уменьшающим) по налогу на прибыль:';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  xlSetFontStyle(xlBold+xlItalic, wexrow-2,1,wexrow,4);
+  PrintTable(4);
+  wexrow++;  wexcol:=1;
+  MyPutExcel('*) кроме ФСС',12,0,-1,-1); //
+
+
+  //************ вставляем разрыв **********************
+  XlRunMacro('New_Page'+chr(40)+string(wexrow+1)+chr(41));
+
+  //************** Таблица 5 ******************
+  wexrow+=3;  wexcol:=1;
+  ww_str:='Выплаты и иные вознаграждения, не относящиеся к объекту обложения';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  //-------------------
+  wexrow++;  wexcol:=1;
+  ww_str:='страховыми взносами, которые относятся к расходам, уменьшающих';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,3); //Объединяем ячейки
+  //-------------------
+  wexrow++;  wexcol:=1;
+  // так написано в ТЗ
+  ww_str:='базу(и не уменьшающим) по налогу на прибыль:';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  xlSetFontStyle(xlBold+xlItalic, wexrow-2,1,wexrow,4);
+  PrintTable(5);
+
+  //************** Таблица 6 ******************
+  wexrow+=3;  wexcol:=1;
+  ww_str:='Выплаты не подлежащие обложению страховыми взносами в';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  //-------------------
+  wexrow++;  wexcol:=1;
+  //ww_str:='соответствии с п.15 Ст.9 Федерального закона ';
+  ww_str:='соответствии с .п. 15 Ст. 422 Гл. 34 НК РФ';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,4); //Объединяем ячейки
+  //-------------------
+  /*
+  wexrow++;  wexcol:=1;
+  // так написано в ТЗ
+  ww_str:='от 24.07.2009г. №212 ФЗ';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,3); //Объединяем ячейки
+  */
+  xlSetFontStyle(xlBold+xlItalic, wexrow-2,1,wexrow,4);
+  PrintTable(6);
+  wexrow++;  wexcol:=1;
+  ww_str:='Всего по сводной';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  xlMergeCells(wexrow,1, wexrow,3); //Объединяем ячейки
+  wexcol:=4;
+  MyPutExcelNumber(all_su,2,12,0,-1,-1); //
+  MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH
+       , xlThin, 0, 0, wexrow ,1,wexrow,4); //Обрамление
+  xlSetFontStyle(xlBold, wexrow,1,wexrow,4);
+
+
+  //***************************************************
+  // Данные для формирования отчетности по страховым взносам
+  //***************************************************
+  //************ вставляем разрыв **********************
+  XlRunMacro('New_Page'+chr(40)+string(wexrow+2)+chr(41));
+  wexrow:=wexrow+3;  wexcol:=1;
+  ww_str:='Данные для формирования отчетности по страховым взносам';
+  MyPutExcel(ww_Str,12,0,-1,-1); //
+  MyxlFrameCells( xlBorderB  , xlThin, 0, 0, wexrow ,1,wexrow,4); //Обрамление
+  xlSetFontStyle(xlBold, wexrow,1,wexrow,4);
+  //------ 1.
+  wexrow:=wexrow+2;  wexcol:=1;
+  MyPutExcel('1. Базовая сумма для начисления страховых взносов на обязательное ',12,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=1;
+  MyPutExcel('   пенсионное страхование (ПФР) *',12,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=4;
+  // здесь же рассчитаем
+  all_su:=GetSumUlSocBase_New(1);
+  MyPutExcelNumber(all_su,2,12,0,-1,-1); //
+  xlSetFontStyle(xlBold, wexrow-2,1,wexrow,4);
+  //------ 2.
+  wexrow:=wexrow+2;  wexcol:=1;
+  MyPutExcel('2. Базовая сумма для начисления страховых взносов на обязательное ',12,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=1;
+  MyPutExcel('   медицинское страхование (ФФОМС) *',12,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=4;
+  // здесь же рассчитаем
+  all_su:=GetSumUlSocBase_New(2);
+  MyPutExcelNumber(all_su,2,12,0,-1,-1); //
+  xlSetFontStyle(xlBold, wexrow-2,1,wexrow,4);
+
+  //-------- 3.
+  wexrow:=wexrow+2;  wexcol:=1;
+  MyPutExcel('3. Базовая сумма для начисления страховых взносов на обязательное ',12,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=1;
+  MyPutExcel('   социальное страхование (ФСС) *',12,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=4;
+  // здесь же рассчитаем
+  all_su:=GetSumUlSocBase_New(3);
+  MyPutExcelNumber(all_su,2,12,0,-1,-1); //
+  xlSetFontStyle(xlBold, wexrow-2,1,wexrow,4);
+
+  //-------- 4.
+  wexrow:=wexrow+2;  wexcol:=1;
+  MyPutExcel('4. Налогооблагаемая база для начисления ФСС( по травматизму)',12,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=1;
+  MyPutExcel('   пенсионное страхование ФСС) *',12,0,-1,-1); //
+  xlSetFontStyle(xlBold, wexrow-1,1,wexrow,4);
+  // здесь же рассчитаем
+  for(ii:=1;ii<=20;ii++) dm_su[ii]:=0;
+  dm_su[1]:=0.2;
+  dm_su[4]:=if(wYear < 2020, 0.12, 0.1224);
+  //--------------------
+  GetTravmBase;
+  //--------------------
+  wexrow:=wexrow+1;  wexcol:=1;
+  MyPutExcel('Процент',10,0,-1,-1); //
+  MyPutExcel('Наименование',10,0,-1,-1); //
+  MyPutExcel('Облагаемая сумма',10,0,-1,-1); //
+  MyPutExcel('Взнос',10,0,-1,-1); //
+  xlWrapText(wexrow, 1, wexrow, 4);
+
+  wexrow:=wexrow+1;  wexcol:=1;
+  MyPutExcelNumber(dm_su[1],2,10,0,-1,-1); //
+  MyPutExcel('Облагается полностью',10,0,-1,-1); //
+  xlWrapText(wexrow, 2, wexrow, 2);
+  MyPutExcelNumber(dm_su[2],2,10,0,-1,-1); //
+  MyPutExcelNumber(dm_su[3],2,10,0,-1,-1); //
+
+  wexrow:=wexrow+1;  wexcol:=1;
+  MyPutExcelNumber(dm_su[4],2,10,0,-1,-1); //
+  MyPutExcel('Инвалиды',10,0,-1,-1); //
+  xlWrapText(wexrow, 2, wexrow, 2);
+  MyPutExcelNumber(dm_su[5],2,10,0,-1,-1); //
+  MyPutExcelNumber(dm_su[6],2,10,0,-1,-1); //
+
+  MyxlFrameCells( xlBorderB  , xlThin, 0, 0, wexrow ,1,wexrow,4); //Обрамление
+
+  wexrow++; wexcol:=2;
+  MyPutExcel('Всего',10,0,-1,-1); //
+  MyPutExcelNumber(dm_su[2]+dm_su[5],2,10,0,-1,-1); //
+  MyPutExcelNumber(dm_su[3]+dm_su[6],2,10,0,-1,-1); //
+  xlSetFontStyle(xlBold, wexrow,1,wexrow,4);
+
+  //**************************************
+  //  Данные для перечисления удержанных из з/п работников предприятия
+  //**************************************
+  wexrow:=wexrow+3;  wexcol:=1;
+  MyPutExcel('Данные для перечисления удержанных из з/п работников предприятия',10,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=1;
+  MyPutExcel('налогов и взносов',10,0,-1,-1); //
+  xlSetFontStyle(xlBold, wexrow-1,1,wexrow,4);
+
+  wexrow:=wexrow+2;  wexcol:=2;
+  MyPutExcel('НДФЛ за '+DateToStr(date(1,wMese,wYear),'month YYYY г.' ),10,0,-1,-1); //
+  xlWrapText(wexrow, 2, wexrow, 2);
+  MyPutExcel('в сумме ',10,0,-1,-1); //
+  dm_su[1]:=GetuderSum(1,182);
+  dm_su[2]:=GetuderSum(2,182);
+  dm_su[3]:=GetuderSum(3,183);
+  dm_su[1]:=dm_su[1]-(dm_su[2]+dm_su[3]);
+  MyPutExcelNumber(dm_su[1],2,10,0,-1,-1); //
+
+  wexrow:=wexrow+2;  wexcol:=2;
+  //MyPutExcel('НДФЛ с обособленных предприятий',10,0,-1,-1); //
+  MyPutExcel('НДФЛ с обособленных предприятий за '+DateToStr(date(1,wMese,wYear),'month YYYY г.' ),10,0,-1,-1); //
+  xlWrapText(wexrow, 2, wexrow, 2);
+  MyPutExcel('в сумме ',10,0,-1,-1); //
+  MyPutExcelNumber(dm_su[2],2,10,0,-1,-1); //
+
+  wexrow:=wexrow+2;  wexcol:=2;
+  //MyPutExcel('НДФЛ с вознаграждений по гражданско-правовому договору - иностранным гражданам',10,0,-1,-1); //
+  MyPutExcel('НДФЛ с вознаграждений по гражданско-правовому договору - иностранным гражданам за '+DateToStr(date(1,wMese,wYear),'month YYYY г.' ),10,0,-1,-1); //
+  xlWrapText(wexrow, 2, wexrow, 2);
+  MyPutExcel('в сумме ',10,0,-1,-1); //
+  MyPutExcelNumber(dm_su[3],2,10,0,-1,-1); //
+
+  wexrow:=wexrow+2;  wexcol:=2;
+  //MyPutExcel('Профсоюзные взносы',10,0,-1,-1); //
+  MyPutExcel('Профсоюзные взносы за '+DateToStr(date(1,wMese,wYear),'month YYYY г.' ),10,0,-1,-1); //
+  xlWrapText(wexrow, 2, wexrow, 2);
+  MyPutExcel('в сумме ',10,0,-1,-1); //
+  all_su:=0;
+  all_su:=GetuderSum(4,197);
+  MyPutExcelNumber(all_su,2,10,0,-1,-1); //
+
+
+  //******************************************
+  // Подписи
+  //******************************************
+  wexrow:=wexrow+2;  wexcol:=1;
+  MyPutExcel(sDolg,10,0,-1,-1); //
+  wexrow:=wexrow+1;  wexcol:=1;
+  MyPutExcel(MyGetInitial(sPopdis,true),10,0,-1,-1); //
+  wexcol:=4;
+  MyPutExcel('подпись',8,0,-1,-1); //
+  MyxlFrameCells( xlBorderT  , xlThin, 0, 0, wexrow ,3,wexrow,4); //Обрамление
+
+
+
+//IFDEF _XLSMATRIX_
+  MyxlWriteMatrix(wexrow);
+  xlFreeMatrix;
+  matrixkl:=False;
+//ENDIF
+
+  Result:=true;
+  //----------------------------------------
+  //при включенной отладке сформируем лист
+  //----------------------------------------
+  if not LogfileKL then exit;
+  //----------------------------------------
+
+  xlSetActiveSheet(1);
+  xlAddSheet;
+  xlSetActiveSheet(1);
+  xlSetSheetName(1,'Детализация' );
+  HeaderStrCount:=1; // для последующего вывода сетки
+  wexrow:=HeaderStrCount;
+  wexcol:=1;
+  MyPutExcel('ФИО',10,0,-1,-1); //
+  MyPutExcel('Таб.номер',10,0,-1,-1); //
+  MyPutExcel('Раздел',10,0,-1,-1); //
+  MyPutExcel('Поле',10,0,-1,-1); //
+  MyPutExcel('Тип',10,0,-1,-1); //
+  MyPutExcel('Сумма',10,0,-1,-1); //
+
+//IFDEF _XLSMATRIX_
+  MyXlCreaMatrix(1000, 6);
+  matrixkl:=true;
+  matrixsdvig:=wexrow;
+//ENDIF
+  if Not INextVisual('Формирование расшифровки') exit;
+  GetTravmBase(true);
+
+  _Loop tmp_sbor ordered by index tmp_sbor02
+  { wexrow++;
+    if wexrow mod 100=0
+    { if not NextVisual then exit;
+    }
+    wexcol:=1;
+    MyPutExcel(tmp_sbor.Fio,10,0,-1,-1); //
+    MyPutExcel(chr(39)+tmp_sbor.StrTabn,10,0,-1,-1); //
+    MyPutExcel('2.4 Травматизм',10,0,-1,-1); //
+    MyPutExcel(if(tmp_sbor.pa<2,'База','Налог'),10,0,-1,-1); //
+    MyPutExcel(if(tmp_sbor.pa=1 or tmp_sbor.pa=3,'Льгота','-'),10,0,-1,-1); //
+    MyPutExcelNumber(tmp_sbor.Summa,2,10,0,-1,-1); //
+  } //_Loop tmp_sbor ordered by index tmp_sbor02
+
+  MyxlWriteMatrix(wexrow);
+  xlFreeMatrix;
+  matrixkl:=False;
+
+  //xlWrapText(wexrow, 2, wexrow, 2);
+
+
+  Result:=true;
+} //Function PrintDoc:boolean;
+
+//------------------------------------
+//
+//------------------------------------
+Function FormDoc:boolean;
+var
+   werr:word;
+{ Delete all tmp_sbor;
+  if IsBitCTW(wFilter,1)
+  { if DepList <> 0
+      DoneMarker(DepList, '');
+    DepList := CLSF.LoadCurrentDepartmentList;
+  }
+
+  //werr:=ExcelInit('GP_Base_Of_Insurance.xlsx',true);
+  werr:=ExcelInit('GP_Base_Of_Insurance.xlsm',true);
+  if FileExist(LogFileNm) DeleteFile(LogFileNm);
+  MyLogWrite(true,'START');
+  matrixkl:=false;
+  //----------------------------
+  ResetBounds(#tmp_Report);
+  Delete all tmp_Report;
+  SetBounds(#tmp_Report);
+  //----------------------------
+  // Инициализация
+  all_su:=0;
+  //добавим фильтры
+  FillTempVib;
+  //----------------------------
+  Result:=SborDoc;
+
+  if Result
+  {  Result:=PrintDoc;
+  }
+  MyXlEnd;
+} //Function FormDoc:boolean;
+
+//-------------------------------------
+Screen scrParam 'Параметры формирования' (,,sci1Esc);
+Table Klvidopl;
+Fields
+  wYear:noProtect;
+  wMesB :#Month_List
+  wMese :#Month_List
+  sPopdis  :NoProtect,PickButton;// подпись отчета
+  sDolg    :NoProtect,PickButton;// подпись отчета
+
+  wTypeSB: NoProtect;//0 - за который, 1 в котором
+  logfilekl:NoProtect;
+  wFilter:NoProtect;
+  //FILTR_KatPodr : Protect,PickButton;
+  FiltrPodr: Protect,PickButton;
+Buttons
+  cmOk,default,,'Сформировать отчет', hcOplTrudhlp, sci1Esc;
+  cmCancel,,,'Выход', hcOplTrudhlp, sci1Esc;
+<<
+  `Период` .@@@@@@ `год`
+  `c` .@@@@@@@@@@@@@ `по` .@@@@@@@@@@@@@
+  `Фио подписанта`
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Должность подписанта`
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Тип сбора по месяцу ...`
+  (.) за который`
+  (.) в котором`
+  `Фильтры`                 [.] Отладка`
+  [.] По подразделению`.@@@@@@@@@@@@@@@@@@@@@
+
+  <.~С~формировать.>   <.  ~О~тмена  .>
+>>
+end; //scrParam 'Параметры формирования' (,,sci1Esc), Cyan;
+//--------------------------------------------
+// Обработчик событий интерфейса
+//--------------------------------------------
+HandleEvent
+cmInit:
+{ TimeLog_Init;
+  ReadParam;
+  sUserName:=UserName();
+}
+cmDone:
+{ SaveParam;
+}
+
+cmPick:
+{
+
+   case CurField of
+   //----------------------------
+   #sPopdis,#sDolg :
+   {
+      var wK:word;
+      var DummyMarker1, DummyMarker2: TPtr;
+      var _pTmp:comp=0;
+      var _cRec:comp;
+      DummyMarker1 := InitMarker('', 8, 10, 10);
+      DummyMarker2 := InitMarker('', 8, 1, 1);
+      wK:=0;
+      _pTmp:=0;
+
+      if (viCYPersons.Choice(DummyMarker1, 3, vfCanSelect, wK, _cRec, DummyMarker2))
+      {
+        set _pTmp:=viCYPersons.GetPsnByKindChoice(wK, _cRec);
+        vSpr.pPerson :=_pTmp;
+        if vSpr.Getfirst Persons=tsok
+        { sPopdis:=vSpr.Persons.Fio;
+          if vSpr.Getfirst Appointments=tsok
+           sDolg:=iCatFunc.GetCatalogsName(vSpr.Appointments.Post);
+        }
+      }
+      DoneMarker(DummyMarker1, '');
+      DoneMarker(DummyMarker2, '');
+   }
+
+   //------------
+   #FiltrPodr:
+   {
+     SetupDepartments(comp(11));
+     //UpdateFilter;
+    if PAF.IsDepartmentFilterSet <> IsBitCtW(wFilter,1)
+      BitOnW(wFilter,1);
+   }
+   end;
+} //cmPick:
+cmDelOnProtect:
+{
+case CurField of
+   //--------------
+   #FiltrPodr:
+   {
+     PAF.ClearDepartmentFilter;
+     ReReadRecord(#ZAR_USER);
+     BitOffW(wFilter,1);
+     //   UpdateFilter;
+   }
+   end;
+} //cmDelOnProtect:
+
+cmOk:
+{  StartNewVisual(vtNumericVisual,vfTimer + vfBreak + vfConfirm,'Подготовка данных для отчета',0);
+   if not FormDoc then message('Ошибки при формировании');
+   StopVisual('',0);
+   //CloseInterFace(cmDone);
+}
+end;
+end.

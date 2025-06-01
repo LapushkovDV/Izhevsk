@@ -1,0 +1,168 @@
+/*************************************************************************************************\
+* Наименование: Объектный интерфейс для работы с табельными номерами                              *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечания:                                                                                     *
+*   Оптимизация поиска свободного табельного номера.                                              *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#000          |03/11/17|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#component "Z_Staff"
+
+
+//*********************************************************
+Alter interface AboutTabN;
+//*********************************************************
+
+overload
+ procedure MarkerParam;
+ function objAboutTABN.Next: variant;
+end;
+
+//=========================================================
+//#region query queryGetUsedTabNmb
+sql query queryGetUsedTabNmb =
+select distinct
+#IFDEF _2019_02_13_
+// Для заливки в InMem_AllTabn
+  COALESCE(cast(trim(t.StrTabn) as longint),0) as lUseNum
+, Persons.DisDate as DisDate
+, 0 as wSource
+, Persons.Nrec as Person
+From (Select distinct persons.strtabn,persons.nrec as nrec from persons
+      Where isemployee in ('У', 'С', 'Ю', 'К', 'Р')
+      Union
+      Select distinct contdoc.StTabN as strtabn,contdoc.person as Nrec  from contdoc
+      Where contdoc.typeoper in (1, 211, 300)
+      Union
+      Select distinct app.StrTabN,app.person  as Nrec from appointments app
+      Union
+      Select distinct lschet.StrTabN,lschet.tPerson as Nrec from lschet
+     ) t
+   inner join Persons on Persons.Nrec = t.Nrec
+#ELSE
+  strtabn
+from (select distinct strtabn from persons
+      where isemployee in ('У', 'С', 'Ю', 'К', 'Р')
+      union
+      select distinct StTabN as strtabn from contdoc
+      where typeoper in (1, 211, 300)
+      union
+      select distinct StrTabN from appointments
+      union
+      select distinct StrTabN from lschet
+     ) t
+#endif
+where t.strtabn like '[0-9][0-9][0-9][0-9][0-9][0-9]' and t.strtabn <> '000000'
+#IFDEF _2019_02_13_
+order by COALESCE(cast(trim(t.StrTabn) as longint),0);
+#ELSE
+order by t.strtabn;
+#ENDIF
+;
+//#endregion
+
+//******************************************************************************
+// Совокупная процедура заполнения маркера занятыми числовыми табельными
+//******************************************************************************
+procedure MarkerParam;
+{
+#IFDEF _2019_02_13_
+//procedure Ins_InMem_AllTabn(tmpTabN: longint; DisDate: date; wSource: word; Person: tNRec);
+  delete all InMem_AllTabn;
+#ELSE
+  TabNMarker := InitMarker('', 4, 20000, 10000);
+  LastTabN := 0;
+#endif
+  var s: string='';
+  var stmt: longint;
+  stmt := 0;
+  stmt := sqlAllocStmt;
+  _try
+  { sqlPrepare(stmt, queryGetUsedTabNmb);
+  }
+  _except
+  else
+  { timelog('AboutTabN->MarkerParam ошибка sqlPrepare '+ExploreException);
+  }
+#IFDEF _2019_02_13_
+  _try
+  { if sqlExecute(stmt) = tsOk
+      sqlFetchIntoByName(stmt, #InMem_AllTabn);
+  }
+  _except
+  else
+  { timelog('AboutTabN->MarkerParam ошибка sqlFetchIntoByName '+ExploreException);
+  }
+  timelog('AboutTabN->MarkerParam отобрали  '+String(RecordsInTable(#InMem_AllTabn)));
+  //--------------
+  // стандартная функция
+  // убирает по настройке
+  // wGetTune('UP.ReuseTabN'); -разрешить повторное использование табельных номеров лицевых счетов
+  // Не было в прежней доработке и не будем дальше использовать!!!!
+  // FreeBannedTabN;
+  //--------------
+  timelog('AboutTabN->MarkerParam осталось  '+String(RecordsInTable(#InMem_AllTabn)));
+#ELSE
+  sqlBindCol(stmt, 1, s);
+  if sqlExecute(stmt) = tsOk
+    while sqlFetch(stmt) = tsOk do
+    {
+      _try
+      {
+        tmpTabN := longint(s);
+        InsertMarker(TabNMarker, tmpTabN);
+      }
+      _except
+        on ExNumberConvert: {}
+    }
+#endif
+  sqlFreeStmt(stmt);
+} //procedure MarkerParam;
+
+//******************************************************************************
+// Следующий свободный табельный номер
+//******************************************************************************
+function Next: variant;
+{
+  if wFormatClockNumber != cn_ClockNumber_Numeric and
+     wAlgForNewTabN = cn_Alg_UseFirstFree
+  {
+    var rslt: string;
+    rslt := '000001';
+    timelog('AboutTabN->Next wAlgForNewTabN = cn_Alg_UseFirstFree  ');
+#IFDEF _2019_02_13_
+    MarkerParam;
+    _Loop InMem_AllTabn ordered by InMem_AllTabn.lUseNum
+    { if longint(rslt) = InMem_AllTabn.lUseNum
+      {  rslt := nextnumstr(rslt);
+      }
+      else
+      { //могут задвоиться - надо дойти до следующего номера
+        if longint(rslt) < InMem_AllTabn.lUseNum
+          break;
+      }
+    }//_Loop InMem_AllTabn ordered by InMem_AllTabn.lUseNum
+#ELSE
+    var s: string='';
+    var stmt: longint;
+    stmt:=0;
+    stmt := sqlAllocStmt;
+    sqlPrepare(stmt, queryGetUsedTabNmb);
+    sqlBindCol(stmt, 1, s);
+    if sqlExecute(stmt) = tsOk
+      while sqlFetch(stmt) = tsOk do
+      {
+        if rslt = s
+          rslt := nextnumstr(rslt);
+      }
+    sqlFreeStmt(stmt);
+#ENDIF
+    result := rslt;
+  }
+  else
+    result := inherited::Next;
+}
+
+end.

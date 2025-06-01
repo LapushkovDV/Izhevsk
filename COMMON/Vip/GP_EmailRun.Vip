@@ -1,0 +1,1066 @@
+/*************************************************************************************************\
+* Наименование:  для отправки письма стандартными средствами                                      *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#175          |28/10/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#1410         |07/03/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#doc
+
+для отправки письма стандартными средствами
+#end
+#define GP_EMAIL_FONT_SIZE 4
+/* Еще пример
+    SetEMail(vtmp_rep_ops.tmp_shap.name1)
+    if EMail <> ''
+    {
+      if not SetCurMailEncodingTable(AMAIL_1251)
+        Message('Ошибка установки таблицы кодировки;'+GetMailErrorString)
+      else
+        if not CreateMail(EMail, '', 'Шаблон по переводам '+DateToStr(MaxRepDate, 'Month/YYYY')+' ('+PeriodName+')')
+          Message('Ошибка создания почтового сообщения:'+GetMailErrorString)
+        else
+          if not AddAttachFrom(FullFileNameOPS)
+            Message('Ошибка вложения файлов:'+GetMailErrorString)
+          else
+            if not SendMail
+              Message('Ошибка отправки почтового сообщения:'+GetMailErrorString)
+    }
+
+*/
+
+#include GP_EmailRun.Vih
+//------------------------------------------
+Interface GP_EmailRun 'Проверка отправки почты',EscClose ;
+var 
+  email_type : word ;
+  email_addr :string ;
+  email_addr_temp :string ;
+  email_subject :string ;
+  email_text :string ;
+  email_attach1 : string ;
+  email_attach2 : string ;
+  email_attach3 : string ;
+  email_attach4 : string ;
+  email_attach5 : string ;
+  email_addr_copy :string ;
+  email_body     :string ;
+  email_body_Win :string ;
+  email_addr_from:string;
+  //--------------------
+  EMAIL_FONT_SIZE:longint;
+  //-------------------
+  MAPIMessage:longint ;
+  Marker: longint ;
+  sLastError:string;
+create view vEmailRun
+var
+   pGP_EMAIL:comp;
+   pKatPodr :comp;
+   pEMAIL_signscope:comp;
+as select
+   katpodr.name
+from
+    katpodr
+   ,X$RESOURCES
+#IFDEF _GP_
+   ,GP_EMAIL
+#ENDIF
+where ((
+      userId == x$users.atl_nrec
+  and userid == X$RESOURCES.XR$CODE
+  and 58 == X$RESOURCES.XR$TYPE
+  and pKatPodr == KatPodr.Nrec
+  and pEMAIL_signscope == AllMemo.Nrec
+#IFDEF _GP_
+and pGP_EMAIL == GP_EMAIL.Nrec
+#ENDIF
+)) ;
+//----------------------
+Create view vPersons
+var
+ pPersons:comp;
+from Persons ,COMMUNICATIONS
+where (( pPersons == Persons.Nrec
+and pPersons == COMMUNICATIONS.Person
+and 3 == COMMUNICATIONS.OBJTYPE
+and ''<< COMMUNICATIONS.Email(noindex)
+
+));
+//----------------------
+
+parameters
+   email_type
+  ,email_addr 
+  ,email_subject 
+  ,email_text 
+  ,email_attach1 
+  ,email_attach2 
+  ,email_attach3 
+  ,email_attach4
+  ,email_attach5
+  ,email_addr_copy
+  ,email_addr_from
+ ;  
+file EmailMemo;        // Файл для копирования мемо-поля контакта в EMail-письмо
+File WinBody;
+File RDPBody;
+var DM_email_text :array[1..1] of string;
+
+//-------------------------------------------
+Function MyOem2Ansi(w:string) :string ;
+{ MyOem2Ansi:=w ;
+} 
+
+//-------------------------------------------
+Function MyOem2Ansi2(w:string) :string ;
+{ MyOem2Ansi2:=Oem2Ansi(w) ;
+}
+
+
+
+
+
+#IFDEF _GP_
+//-------------------------------
+// Скопировать файл в папку на сервере
+//-------------------------------
+Function GetFileNameToSend(_sFile:string):string;
+var _path:string;
+    _sfileTo:string;
+    _ext:string;
+{ Result:='';
+  if not FileExist(_sFile) Exit;
+  _path:=TranslatePath(sGetTune('NPOEM_OWN.EMAIL_F_Path'));
+  if SubStr(_path,Length(_path),1)<>'\'
+     _path:=_path+'\';
+  _Ext:=substr(_sfile,PosR('.',_sFile),100);
+  _sfileTo:=_path+DateToStr(Cur_Date,'YYYY_MM_DD_')
+       +TimeToStr(Cur_Time,'HH_MM_SS_SSS_')+OleGenerateGUID+_Ext;
+  CopyMoveFile(_sfile,_sfileTo,false ,ecmfServerFrom+ecmfClientTo);
+  Result:=_sfileTo;
+} //Function GetFileNameToSend(_sFile:string):string;
+
+
+//------------------------------------
+// Получить имя базы
+//------------------------------------
+Function GetDBName:string;
+{ Result:=UpCase(GetStringParameter('DataBase','DataBaseName',0));
+} //Function GetDBName;
+
+//-----------------------------------
+#doc
+  получить почту по ссылке на сотрудника
+#end
+Function GetEmailByPers(_pPersons:comp):string;
+{ Result:='';
+  vPersons.pPersons:=_pPersons;
+  if vPersons.pPersons>0
+  { if vPersons.Getfirst COMMUNICATIONS=tsok
+       Result:=vPersons.COMMUNICATIONS.Email;
+  }
+} //Function GetEmailByPers(_pPersons:comp):string;
+//-----------------------------------
+#doc
+  получить почту по ссылке на пользователя
+#end
+Function GetEmailByUserID(_UserID:comp;_UserName:string):string;
+{
+  Result:=GetEmailByPers(GetPersonsByUser(_UserID));
+  if Result='' then
+  {
+    if (wGetTune('UP.FAKELGAL.FAKEL') = 1) then
+    {
+      _UserName := Replace(UpCase(_UserName), 'FAKEL\', '');
+    }
+    else
+    {
+      _UserName := Replace(UpCase(_UserName), 'CB\', '');
+    }
+    Result:=_UserName + '@' + sGetTune('NPOEM_OWN.EMAIL_DOM'); //'@npoem.ru';
+  }
+}//Function GetEmailByUserID(_pPersons:comp):string;
+
+ //------------------------------------
+ // Создание файла для гиперссылки
+ //------------------------------------
+ Function CreateRDPHiperLink(_sCommand:string) :string;
+ var _sFile:string;
+     _path:string;
+     _DBName:string;
+ { Result:='';
+   _path:=TranslatePath(sGetTune('NPOEM_OWN.EMAIL_F_Path'));
+   if SubStr(_path,Length(_path),1)<>'\'
+     _path:=_path+'\';
+   _sFile:=_path+DateToStr(Cur_Date,'YYYY_MM_DD_')
+       +TimeToStr(Cur_Time,'HH_MM_SS_SSS_')+OleGenerateGUID+'.RDP';
+   Result:=_sFile;
+   _DBName:=GetDBName;
+   RDPBody.openfile(_sFile,stCreate);
+
+   if (wGetTune('UP.FAKELGAL.FAKEL') = 1) then
+   {
+     RDPBody.WriteLN('redirectclipboard:i:1');
+     RDPBody.WriteLN('redirectprinters:i:1');
+     RDPBody.WriteLN('redirectcomports:i:1');
+     RDPBody.WriteLN('redirectsmartcards:i:0');
+     RDPBody.WriteLN('devicestoredirect:s:');
+     RDPBody.WriteLN('drivestoredirect:s:*');
+     RDPBody.WriteLN('redirectdrives:i:1');
+     RDPBody.WriteLN('session bpp:i:32');
+     RDPBody.WriteLN('prompt for credentials on client:i:1');
+     RDPBody.WriteLN('span monitors:i:1');
+     RDPBody.WriteLN('use multimon:i:1');
+     RDPBody.WriteLN('remoteapplicationmode:i:1');
+     RDPBody.WriteLN('server port:i:3389');
+     RDPBody.WriteLN('allow font smoothing:i:1');
+     RDPBody.WriteLN('promptcredentialonce:i:1');
+     RDPBody.WriteLN('gatewayusagemethod:i:1');
+     RDPBody.WriteLN('gatewayprofileusagemethod:i:1');
+     RDPBody.WriteLN('gatewaycredentialssource:i:0');
+     RDPBody.WriteLN('full address:s:ERPTERMSRV.FAKEL.NET');
+     RDPBody.WriteLN('alternate shell:s:||Run_Gal_'+_DBName+'_2');
+     RDPBody.WriteLN('remoteapplicationprogram:s:||Run_Gal_'+_DBName+'_2');
+     RDPBody.WriteLN('gatewayhostname:s:terminal.fakel.net');
+     RDPBody.WriteLN('remoteapplicationname:s:AtlHyperLink_'+_DBName+'_2');
+     RDPBody.WriteLN('remoteapplicationcmdline:s:gal://'+_DBName+'/'+_sCommand);
+     RDPBody.WriteLN('workspace id:s:erptermsrv.fakel.net');
+     RDPBody.WriteLN('use redirection server name:i:1');
+     RDPBody.WriteLN('loadbalanceinfo:s:tsv://MS Terminal Services Plugin.1.Galaktika');
+     RDPBody.WriteLN('alternate full address:s:ERPTERMSRV.FAKEL.NET');
+     RDPBody.WriteLine('signscope:s:Full Address,Alternate Full Address,Use Redirection Server Name,');
+     RDPBody.WriteLine('Server Port,GatewayHostname,GatewayUsageMethod,GatewayProfileUsageMethod,');
+     RDPBody.WriteLine('GatewayCredentialsSource,PromptCredentialOnce,Alternate Shell,RemoteApplicationProgram,');
+     RDPBody.WriteLine('RemoteApplicationMode,RemoteApplicationName,RemoteApplicationCmdLine,RedirectDrives,');
+     RDPBody.WriteLine('RedirectPrinters,RedirectCOMPorts,RedirectSmartCards,RedirectClipboard,DevicesToRedirect,');
+     RDPBody.WriteLN('DrivesToRedirect,LoadBalanceInfo');
+   }
+   else
+   {
+     RDPBody.WriteLN('redirectclipboard:i:1');
+     RDPBody.WriteLN('redirectprinters:i:1');
+     RDPBody.WriteLN('redirectcomports:i:0');
+     RDPBody.WriteLN('redirectsmartcards:i:0');
+     RDPBody.WriteLN('devicestoredirect:s:');
+     RDPBody.WriteLN('drivestoredirect:s:*');
+     RDPBody.WriteLN('redirectdrives:i:1');
+     RDPBody.WriteLN('session bpp:i:32');
+     RDPBody.WriteLN('prompt for credentials on client:i:1');
+     RDPBody.WriteLN('span monitors:i:1');
+     RDPBody.WriteLN('use multimon:i:1');
+     RDPBody.WriteLN('remoteapplicationmode:i:1');
+     RDPBody.WriteLN('server port:i:3389');
+     RDPBody.WriteLN('allow font smoothing:i:1');
+     RDPBody.WriteLN('promptcredentialonce:i:1');
+     RDPBody.WriteLN('videoplaybackmode:i:0');
+     RDPBody.WriteLN('audiocapturemode:i:0');
+     RDPBody.WriteLN('gatewayusagemethod:i:2');
+     RDPBody.WriteLN('gatewayprofileusagemethod:i:1');
+     RDPBody.WriteLN('gatewaycredentialssource:i:0');
+     RDPBody.WriteLN('full address:s:TERMINAL.NPOEM.RU');
+     RDPBody.WriteLN('alternate shell:s:||AtlHyperLink_'+_DBName+'_RUN');
+     RDPBody.WriteLN('remoteapplicationprogram:s:||AtlHyperLink_'+_DBName+'_RUN');
+     RDPBody.WriteLN('gatewayhostname:s:terminal.npoem.ru');
+     RDPBody.WriteLN('remoteapplicationname:s:AtlHyperLink_'+_DBName+'_RUN');
+     RDPBody.WriteLN('remoteapplicationcmdline:s:gal://'+_DBName+'/'+_sCommand);
+     RDPBody.WriteLN('workspace id:s:TERMINAL.NPOEM.RU');
+     RDPBody.WriteLN('use redirection server name:i:1');
+     RDPBody.WriteLN('loadbalanceinfo:s:tsv://MS Terminal Services Plugin.1.Galaktika');
+     RDPBody.WriteLN('alternate full address:s:TERMINAL.NPOEM.RU');
+     //---------------------------
+     RDPBody.WriteLine('signscope:s:Full Address,Alternate Full Address,Use Redirection Server Name,');
+     RDPBody.WriteLine('Server Port,GatewayHostname,GatewayUsageMethod,GatewayProfileUsageMethod,');
+     RDPBody.WriteLine('GatewayCredentialsSource,PromptCredentialOnce,Alternate Shell,RemoteApplicationProgram,');
+     RDPBody.WriteLine('RemoteApplicationMode,RemoteApplicationName,RemoteApplicationCmdLine,RedirectDrives,');
+     RDPBody.WriteLine('RedirectPrinters,RedirectCOMPorts,RedirectSmartCards,RedirectClipboard,DevicesToRedirect,');
+     RDPBody.WriteLn('DrivesToRedirect,LoadBalanceInfo');
+   }
+   //переделать на NPOEM_OWN.EMAIL_signscope.
+   pEMAIL_signscope :=coGetTune('NPOEM_OWN.EMAIL_signscope');// 'RDP, строка с signscope'
+   if not boGetTune('NPOEM_OWN.EMAIL_signscope_use')
+      pEMAIL_signscope :=0;
+   if pEMAIL_signscope>0
+   { if getfirst AllMemo<>tsok
+     { pEMAIL_signscope:=0;
+     }
+     else
+     {  var ww_hfile : longint;
+        var ww_sMem  :string;
+        var ww_first:boolean;
+        ww_hfile := CreateFileHandle('');
+        ww_first:=True;
+        var ww_s100:string[80];
+
+        //после разделения на настройку и печать иначе затираем в настройке
+        //Update current AllMemo;
+        if File_OpenMemo(AllMemo.mem, ww_hfile)
+        { File_Seek(ww_hfile,1);
+          while not(File_EOF(ww_hfile))
+          { ww_s100:='';
+            File_Read(ww_s100, ww_hfile);
+            ww_sMem:=ww_s100;
+            if File_EOF(ww_hfile)
+            { RDPBody.WriteLN(ww_sMem);
+            }
+            else
+            { RDPBody.WriteLine(ww_sMem);
+            }
+          } //while not(File_EOF(ww_hfile))
+          File_Close(ww_hfile);
+        }
+        else pEMAIL_signscope:=0
+     } //else if getfirst AllMemo<>tsok
+
+   } //if pEMAIL_signscope>0
+   if pEMAIL_signscope=0
+   case _DBName of
+   'ERPDB_PROD':
+   {
+     RDPBody.WriteLine('signature:s:AQABAAEAAADTBAAAMIIEzwYJKoZIhvcNAQcCoIIEwDCCBLwCAQExDzANBglghkgB  ZQ');
+     RDPBody.WriteLine('MEAgEFADALBgkqhkiG9w0BBwGgggM3MIIDMzCCAhugAwIBAgIQTBc8WpoyXrVM  GeH4J/dYxTANBgkq');
+     RDPBody.WriteLine('hkiG9w0BAQsFADAdMRswGQYDVQQDDBJ0ZXJtaW5hbC5mYWtl  bC5uZXQwHhcNMjIwNzE0MDgzOTEyWh');
+     RDPBody.WriteLine('cNMjMwNzE0MDg1OTEyWjAdMRswGQYDVQQD  DBJ0ZXJtaW5hbC5mYWtlbC5uZXQwggEiMA0GCSqGSIb3');
+     RDPBody.WriteLine('DQEBAQUAA4IBDwAwggEK  AoIBAQDKUrsLpJchUqOZUogAr0tLcD0b4d2M9Mqr6cKbBZZHlnhAM7eLaT');
+     RDPBody.WriteLine('6vFhki  SjwuWKl02xNxDZxeekgGomqGJ4e9xNYfkBoQbXp+pvxvMcpqvcw43VQ6t55rvb3w  7VXZMB');
+     RDPBody.WriteLine('GccB0bpYMy7v2C303GRQYsnF26th2FGPzIP2lZhRKDooNJzdExgUqVCydV  LNQJqXq2yokNY+hn6qBz');
+     RDPBody.WriteLine('1Gn+kqe2+OQHyMOnKZYOJWMjDbg3wgMDP5fvrqABXH7y  LqUl3I9+e5h0noEYa2XFUyQYQihhX4FThF');
+     RDPBody.WriteLine('f79fankBA3q6BboAYyBjS+WSHiEGch  KwHtEs7l6mR9t8XKH/LpMUcENkRfAgMBAAGjbzBtMA4GA1Ud');
+     RDPBody.WriteLine('DwEB/wQEAwIFoDAd  BgNVHSUEFjAUBggrBgEFBQcDAgYIKwYBBQUHAwEwHQYDVR0RBBYwFIISdGVybW');
+     RDPBody.WriteLine('lu  YWwuZmFrZWwubmV0MB0GA1UdDgQWBBSlee6oUMXff4bA3mDxoxsZ+oibzDANBgkq  hkiG9w0BAQ');
+     RDPBody.WriteLine('sFAAOCAQEAZPxddozVw7TUYg3RlrPkn0RXWWgSICpRR0MO/HhqQzWq  JvSuIXjGlkhJjRWulF6B9uix');
+     RDPBody.WriteLine('isTDVvJQXLW6vLjWTrKvwTN5MJGoCxAmc2cUupkP  kK3vPX8bNxSOd5YlPWoPNdKg54extRn2eMb2ST');
+     RDPBody.WriteLine('gL/K9DgA/cpGzpO70WZiAHF59L  QS3luQHbydz8MijzgAHTUzAAGXITf+xGb8TajEsCzFb7O321JOjX');
+     RDPBody.WriteLine('tf3QTlsKuvAw  AdSsfdrPpHYlEwjnRvDclE5aKi4tiOVi8m2XDhLFe9yfuDDfBPifAsocJEh8DxVY');
+     RDPBody.WriteLine('VYhJG/A7gd/W25jOKRH1kYsevoFArta9LB7TKWBe8jGCAVwwggFYAgEBMDEwHTEb  MBkGA1UEAwwSdG');
+     RDPBody.WriteLine('VybWluYWwuZmFrZWwubmV0AhBMFzxamjJetUwZ4fgn91jFMA0G  CWCGSAFlAwQCAQUAMA0GCSqGSIb3');
+     RDPBody.WriteLine('DQEBAQUABIIBAIpn6BaypRi1rT/PcmUZV31v  JjJBqkVSv6KAfhEDFPj1VPDkn/t8FddPjyBdJDoPAA');
+     RDPBody.WriteLine('ncsohthRlR0mHRAsBhMNCq  xNFIzf/xGC1KGmH2v8IT1LeLrJBnPOb3LQut0/3H8ObW262FUrJI9+2X');
+     RDPBody.WriteLine('EyGj/TTl  6OViL6xeNYCnd4sYxqyoq/wWZcV8ExtcwbM1zz39FNqcU0LiGqfVUiIOGFgIv3fr  wd6i');
+     RDPBody.WriteLine('sAIPjEGYgvazzqn0O/w3jpR2DnGX93b/u17mbO41joxa5TyEn2+dpMlM8/2y  P1z3vLvA5URSxqjgw3');
+     RDPBody.WriteLN('aMc6LFRV1bVZGZc5BZuPADavCFMcAtEc9uWXCQjtLnulY=');
+   }
+   'ERPDEV':
+   {
+     RDPBody.WriteLine('signature:s:AQABAAEAAAC2CgAAMIIKsgYJKoZIhvcNAQcCoIIKozCCCp8CAQExDzANBglghkgB  ZQ');
+     RDPBody.WriteLine('MEAgEFADALBgkqhkiG9w0BBwGgggj6MIIDeTCCAmGgAwIBAgIQYMwnx6lbPJpN  AXSoWTVJcDANBgkq');
+     RDPBody.WriteLine('hkiG9w0BAQUFADBDMRMwEQYKCZImiZPyLGQBGRYDbnBvMRIw  EAYKCZImiZPyLGQBGRYCY2IxGDAWBg');
+     RDPBody.WriteLine('NVBAMTD2NiLURFUDk2OC1DUy1DQTAeFw0x  MzEyMjYwNjQ0MTFaFw0xODEyMjYwNjU0MDlaMEMxEzAR');
+     RDPBody.WriteLine('BgoJkiaJk/IsZAEZFgNu  cG8xEjAQBgoJkiaJk/IsZAEZFgJjYjEYMBYGA1UEAxMPY2ItREVQOTY4LU');
+     RDPBody.WriteLine('NTLUNB  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2+ZnTMwDyutlXi2NWx6I  xMekMG');
+     RDPBody.WriteLine('SbPkT+noFiE0HanEaBvmOU1cX6RwQi8172eK8FNt2HDTDf369XTtEcisol  f5EBw6nimmBv8alGtpgI');
+     RDPBody.WriteLine('chVmVKKcViO/k0W9qtmI4WtO5m2f06Bt8J4qHD/ax7hM  fSDJIteTMFUv6/Lfhct9p1iXxk1qdY9EYr');
+     RDPBody.WriteLine('mTkiMjYPYv5UIJYVLhbc325Rk07MVm  lvFczSBjP0G1XOOokbkGcZgrlOMmC/r1j467c5rOwvEnU6Gi');
+     RDPBody.WriteLine('NGj4zRPqOG0aBkSr  B0Ge/6+8Vr+Sr9PIPte0OmL+hIfY5+iQDG3ZSns4bzjQH7xm9mW9EXI2mVa9u7');
+     RDPBody.WriteLine('Ds  9wIDAQABo2kwZzATBgkrBgEEAYI3FAIEBh4EAEMAQTAOBgNVHQ8BAf8EBAMCAYYw  DwYDVR0TAQ');
+     RDPBody.WriteLine('H/BAUwAwEB/zAdBgNVHQ4EFgQUnHPXxvkP+nTJOaiM1zGFFOpnw4Aw  EAYJKwYBBAGCNxUBBAMCAQAw');
+     RDPBody.WriteLine('DQYJKoZIhvcNAQEFBQADggEBAM92uqCnxlIq4RlS  z6BBgg8oK8FJUtdrl6w80TbzkjrknjkbiqaS+3');
+     RDPBody.WriteLine('Y/7ylt0FSyOcUP/5If00QYzVPu  AFlONzlhXRZ7NhrJ68OzJVPRMdk/dIn8H/CnQdnDuYiQR7rYmNd3');
+     RDPBody.WriteLine('r/bEeWz6QjPB  erPAL+PV+NXOuY6dbrPdOXaoBVV7UCgnpYHEvuQSI2ai+cNK2So1sNJiTW');
+     RDPBody.WriteLine('Ha2T4f  8Ee9m8ujKPKseDl7ALwP85zby2iJuebmk7aXufXUlJXGxaL5C+6GUCZCmaX4e+3j  932ogF');
+     RDPBody.WriteLine('EVSVPFujaZf+9AaPKaFwdSwkWrNbyDtgsTeipJRrkhpdIWHbMhou7lw+1o  AzN0rNgwggV5MIIEYaAD');
+     RDPBody.WriteLine('AgECAgo/nf+7AAAAAAFhMA0GCSqGSIb3DQEBBQUAMEMx  EzARBgoJkiaJk/IsZAEZFgNucG8xEjAQBg');
+     RDPBody.WriteLine('oJkiaJk/IsZAEZFgJjYjEYMBYGA1UE  AxMPY2ItREVQOTY4LUNTLUNBMB4XDTE3MTIyMDA5MTY1M1oX');
+     RDPBody.WriteLine('DTE4MTIyNjA2NTQw  OVowdjELMAkGA1UEBhMCUlUxGDAWBgNVBAgTD01vc2NvdyBEaXN0cmljdDEPMA');
+     RDPBody.WriteLine('0G  A1UEBxMGS2hpbWtpMRMwEQYDVQQKEwpFbmVyZ29tYXNoMQswCQYDVQQLEwJJVDEa  MBgGA1UEAx');
+     RDPBody.WriteLine('MRdGVybWluYWwubnBvZW0ucnUwggEiMA0GCSqGSIb3DQEBAQUAA4IB  DwAwggEKAoIBAQDcj4jMChOc');
+     RDPBody.WriteLine('6mW8IbpbjesMCYfjd9MKesgNy2Fe80FJqLa44nnH  LhS5pYJNM9+wKNV6arGbMjIQQuytQlW+qZlVa5');
+     RDPBody.WriteLine('WvRpFIKrHN4ri8wm0u7BZ68y9C  TIYlI9gJC678tXSZuCWTjR+8Dcad+58KWyaKB9Xbi5YOQTskNX4k');
+     RDPBody.WriteLine('r7GO5YfB1r9O  UMieFky8Fn3DYcjx2F9Z6SycY2wN1W0N9yTQBbefKXWm4nMg90lgE+2qiSzPB');
+     RDPBody.WriteLine('QT1  m6LUrJemkZB1d9ZlC///tPhMOn6eBJHwfG8YBNRKocjIOdA03wmPoP6JpKBQ5L0A  0CvuL5mK7');
+     RDPBody.WriteLine('mg4jS8f53NXp8m1CjgeOA/E05/DAgMBAAGjggI6MIICNjAOBgNVHQ8B  Af8EBAMCBaAwEwYDVR0lBAw');
+     RDPBody.WriteLine('wCgYIKwYBBQUHAwEweAYJKoZIhvcNAQkPBGswaTAO  BggqhkiG9w0DAgICAIAwDgYIKoZIhvcNAwQCA');
+     RDPBody.WriteLine('gCAMAsGCWCGSAFlAwQBKjALBglg  hkgBZQMEAS0wCwYJYIZIAWUDBAECMAsGCWCGSAFlAwQBBTAHBgU');
+     RDPBody.WriteLine('rDgMCBzAKBggq  hkiG9w0DBzAdBgNVHQ4EFgQUwtbSYvxnGxl8Etmx2D9xa09HBdswHwYDVR0jB');
+     RDPBody.WriteLine('Bgw  FoAUnHPXxvkP+nTJOaiM1zGFFOpnw4AwegYDVR0fBHMwcTBvoG2ga4Y2aHR0cDov  L2RlcDk2O');
+     RDPBody.WriteLine('C1jcy5jYi5ucG8vQ2VydEVucm9sbC9jYi1ERVA5NjgtQ1MtQ0EuY3Js  hjFodHRwOi8vY2EubnBvZW0');
+     RDPBody.WriteLine('ucnUvQ2VydEVucm9sbC9jYi1ERVA5NjgtQ1MtQ0Eu  Y3JsMIG1BggrBgEFBQcBAQSBqDCBpTBTBggrB');
+     RDPBody.WriteLine('gEFBQcwAoZHaHR0cDovL2RlcDk2  OC1jcy5jYi5ucG8vQ2VydEVucm9sbC9kZXA5NjgtY3MuY2IubnB');
+     RDPBody.WriteLine('vX2NiLURFUDk2  OC1DUy1DQS5jcnQwTgYIKwYBBQUHMAKGQmh0dHA6Ly9jYS5ucG9lbS5ydS9DZ');
+     RDPBody.WriteLine('XJ0  RW5yb2xsL2RlcDk2OC1jcy5jYi5ucG9fY2ItREVQOTY4LUNTLUNBLmNydDAhBgkr  BgEEAYI3F');
+     RDPBody.WriteLine('AIEFB4SAFcAZQBiAFMAZQByAHYAZQByMA0GCSqGSIb3DQEBBQUAA4IB  AQB8UWXUzLLn0/L6HYXgWVz');
+     RDPBody.WriteLine('vZ6PDXE1jQicckpOI4tlX3KqFS4bg/hQfLckDOR3C  wTjbT3u4gqkn+rqeJwg1wrS0pJaCQnc2j1R0Z');
+     RDPBody.WriteLine('hIoSUnUL4kbZ2nKJY/zzBQyZ8/6  nAKtwO+Dj6ImbN3u8TQ79Hg6x9hYyPvesWZoRGAqj3sAX5c7BxM');
+     RDPBody.WriteLine('xXzC0St0cMLX  BOSRWFANymIzKC9AYPU1bM7fU78Hf1V5mE13Wv1B/3GcBrEFv7huUhyQlyvLe');
+     RDPBody.WriteLine('ZoN  zZQzmr/YcC5IXW5Y4aLo3rxsXYE1urhkdb75zUU/EHzSGxnN5hRM6ht7xqhegoYd  x8bCi9G2s');
+     RDPBody.WriteLine('/0n0um5NYCjCY0gMYIBfDCCAXgCAQEwUTBDMRMwEQYKCZImiZPyLGQB  GRYDbnBvMRIwEAYKCZImiZP');
+     RDPBody.WriteLine('yLGQBGRYCY2IxGDAWBgNVBAMTD2NiLURFUDk2OC1D  Uy1DQQIKP53/uwAAAAABYTANBglghkgBZQMEA');
+     RDPBody.WriteLine('gEFADANBgkqhkiG9w0BAQEFAASC  AQCqnAF7iTmpVyxulaA1GQSFR6U9ghQienqzolzoWQOkF6wFc9V');
+     RDPBody.WriteLine('Y2r2adc16xf/y  6emGZyfmOy7llD4dpn0rWI5isEwgBshQOu+qcST6qr0w3/m3YujLJSKN8PLX');
+     RDPBody.WriteLine('RNSf  gzBEfMvs6bYS58IdzNMhdVI3nLzeGQjEXhK/EyVxSaY+GSmrz519i0RuZCScRdOT  tSxK+Epo');
+     RDPBody.WriteLine('Rznqc7BpOF8FCCd2DpRbpk65Oyiw7ccTDS60SjBBA2zbqz+UzyxBKskh  O2aFFgeX3ozeeLMP8qMp7K');
+     RDPBody.WriteLN('CKk8RsSNyRIal3FX8BykFYgVbRUoB/hD6qSUDsLSxA  k00MzLImBL0cXD5TmpWYYtvX');
+
+   }
+   else
+   { //---------------------------
+     // ERPDB
+     //---------------------------
+     RDPBody.WriteLine('signature:s:AQABAAEAAAC2CgAAMIIKsgYJKoZIhvcNAQcCoIIKozCCCp8CAQExDzA');
+     RDPBody.WriteLine('NBglghkgB  ZQMEAgEFADALBgkqhkiG9w0BBwGgggj6MIIDeTCCAmGgAwIBAgIQYMwn');
+     RDPBody.WriteLine('x6lbPJpN  AXSoWTVJcDANBgkqhkiG9w0BAQUFADBDMRMwEQYKCZImiZPyLGQBGRYDb');
+     RDPBody.WriteLine('nBvMRIw  EAYKCZImiZPyLGQBGRYCY2IxGDAWBgNVBAMTD2NiLURFUDk2OC1DUy1DQT');
+     RDPBody.WriteLine('AeFw0x  MzEyMjYwNjQ0MTFaFw0xODEyMjYwNjU0MDlaMEMxEzARBgoJkiaJk/IsZAE');
+     RDPBody.WriteLine('ZFgNu  cG8xEjAQBgoJkiaJk/IsZAEZFgJjYjEYMBYGA1UEAxMPY2ItREVQOTY4LUNT');
+     RDPBody.WriteLine('LUNB  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2+ZnTMwDyutlXi2NW');
+     RDPBody.WriteLine('x6I  xMekMGSbPkT+noFiE0HanEaBvmOU1cX6RwQi8172eK8FNt2HDTDf369XTtEcis');
+     RDPBody.WriteLine('ol  f5EBw6nimmBv8alGtpgIchVmVKKcViO/k0W9qtmI4WtO5m2f06Bt8J4qHD/ax7h');
+     RDPBody.WriteLine('M  fSDJIteTMFUv6/Lfhct9p1iXxk1qdY9EYrmTkiMjYPYv5UIJYVLhbc325Rk07');
+     RDPBody.WriteLine('MVm  lvFczSBjP0G1XOOokbkGcZgrlOMmC/r1j467c5rOwvEnU6GiNGj4zRPqOG0');
+     RDPBody.WriteLine('aBkSr  B0Ge/6+8Vr+Sr9PIPte0OmL+hIfY5+iQDG3ZSns4bzjQH7xm9mW9EXI2mVa9');
+     RDPBody.WriteLine('u7Ds  9wIDAQABo2kwZzATBgkrBgEEAYI3FAIEBh4EAEMAQTAOBgNVHQ8BAf8EBAMCA');
+     RDPBody.WriteLine('YYw  DwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUnHPXxvkP+nTJOaiM1zGFFOpnw4');
+     RDPBody.WriteLine('Aw  EAYJKwYBBAGCNxUBBAMCAQAwDQYJKoZIhvcNAQEFBQADggEBAM92uqCnxlIq4Rl');
+     RDPBody.WriteLine('S  z6BBgg8oK8FJUtdrl6w80TbzkjrknjkbiqaS+3Y/7ylt0FSyOcUP/5If00QYzVPu  AFlO');
+     RDPBody.WriteLine('NzlhXRZ7NhrJ68OzJVPRMdk/dIn8H/CnQdnDuYiQR7rYmNd3r/bEeWz6QjPB  erPAL+PV+NX');
+     RDPBody.WriteLine('OuY6dbrPdOXaoBVV7UCgnpYHEvuQSI2ai+cNK2So1sNJiTWHa2T4f  8Ee9m8ujKPKseDl7AL');
+     RDPBody.WriteLine('wP85zby2iJuebmk7aXufXUlJXGxaL5C+6GUCZCmaX4e+3j  932ogFEVSVPFujaZf+9AaPKaF');
+     RDPBody.WriteLine('wdSwkWrNbyDtgsTeipJRrkhpdIWHbMhou7lw+1o  AzN0rNgwggV5MIIEYaADAgECAgo/nf+7');
+     RDPBody.WriteLine('AAAAAAFhMA0GCSqGSIb3DQEBBQUAMEMx  EzARBgoJkiaJk/IsZAEZFgNucG8xEjAQBgoJkia');
+     RDPBody.WriteLine('Jk/IsZAEZFgJjYjEYMBYGA1UE  AxMPY2ItREVQOTY4LUNTLUNBMB4XDTE3MTIyMDA5MTY1M1');
+     RDPBody.WriteLine('oXDTE4MTIyNjA2NTQw  OVowdjELMAkGA1UEBhMCUlUxGDAWBgNVBAgTD01vc2NvdyBEaXN0c');
+     RDPBody.WriteLine('mljdDEPMA0G  A1UEBxMGS2hpbWtpMRMwEQYDVQQKEwpFbmVyZ29tYXNoMQswCQYDVQQLEwJJ');
+     RDPBody.WriteLine('VDEa  MBgGA1UEAxMRdGVybWluYWwubnBvZW0ucnUwggEiMA0GCSqGSIb3DQEBAQUAA4IB  D');
+     RDPBody.WriteLine('wAwggEKAoIBAQDcj4jMChOc6mW8IbpbjesMCYfjd9MKesgNy2Fe80FJqLa44nnH  LhS5pYJN');
+     RDPBody.WriteLine('M9+wKNV6arGbMjIQQuytQlW+qZlVa5WvRpFIKrHN4ri8wm0u7BZ68y9C  TIYlI9gJC678tXS');
+     RDPBody.WriteLine('ZuCWTjR+8Dcad+58KWyaKB9Xbi5YOQTskNX4kr7GO5YfB1r9O  UMieFky8Fn3DYcjx2F9Z6S');
+     RDPBody.WriteLine('ycY2wN1W0N9yTQBbefKXWm4nMg90lgE+2qiSzPBQT1  m6LUrJemkZB1d9ZlC///tPhMOn6eB');
+     RDPBody.WriteLine('JHwfG8YBNRKocjIOdA03wmPoP6JpKBQ5L0A  0CvuL5mK7mg4jS8f53NXp8m1CjgeOA/E05/D');
+     RDPBody.WriteLine('AgMBAAGjggI6MIICNjAOBgNVHQ8B  Af8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEweAY');
+     RDPBody.WriteLine('JKoZIhvcNAQkPBGswaTAO  BggqhkiG9w0DAgICAIAwDgYIKoZIhvcNAwQCAgCAMAsGCWCGSA');
+     RDPBody.WriteLine('FlAwQBKjALBglg  hkgBZQMEAS0wCwYJYIZIAWUDBAECMAsGCWCGSAFlAwQBBTAHBgUrDgMCB');
+     RDPBody.WriteLine('zAKBggq  hkiG9w0DBzAdBgNVHQ4EFgQUwtbSYvxnGxl8Etmx2D9xa09HBdswHwYDVR0jB');
+     RDPBody.WriteLine('Bgw  FoAUnHPXxvkP+nTJOaiM1zGFFOpnw4AwegYDVR0fBHMwcTBvoG2ga4Y2aHR0cDov  L2');
+     RDPBody.WriteLine('RlcDk2OC1jcy5jYi5ucG8vQ2VydEVucm9sbC9jYi1ERVA5NjgtQ1MtQ0EuY3Js  hjFodHRwO');
+     RDPBody.WriteLine('i8vY2EubnBvZW0ucnUvQ2VydEVucm9sbC9jYi1ERVA5NjgtQ1MtQ0Eu  Y3JsMIG1BggrBgEF');
+     RDPBody.WriteLine('BQcBAQSBqDCBpTBTBggrBgEFBQcwAoZHaHR0cDovL2RlcDk2  OC1jcy5jYi5ucG8vQ2VydEV');
+     RDPBody.WriteLine('ucm9sbC9kZXA5NjgtY3MuY2IubnBvX2NiLURFUDk2  OC1DUy1DQS5jcnQwTgYIKwYBBQUHMA');
+     RDPBody.WriteLine('KGQmh0dHA6Ly9jYS5ucG9lbS5ydS9DZXJ0  RW5yb2xsL2RlcDk2OC1jcy5jYi5ucG9fY2ItR');
+     RDPBody.WriteLine('EVQOTY4LUNTLUNBLmNydDAhBgkr  BgEEAYI3FAIEFB4SAFcAZQBiAFMAZQByAHYAZQByMA0G');
+     RDPBody.WriteLine('CSqGSIb3DQEBBQUAA4IB  AQB8UWXUzLLn0/L6HYXgWVzvZ6PDXE1jQicckpOI4tlX3KqFS4b');
+     RDPBody.WriteLine('g/hQfLckDOR3C  wTjbT3u4gqkn+rqeJwg1wrS0pJaCQnc2j1R0ZhIoSUnUL4kbZ2nKJY/zzB');
+     RDPBody.WriteLine('QyZ8/6  nAKtwO+Dj6ImbN3u8TQ79Hg6x9hYyPvesWZoRGAqj3sAX5c7BxMFxXzC0St0c');
+     RDPBody.WriteLine('MLX  BOSRWFANymIzKC9AYPU1bM7fU78Hf1V5mE13Wv1B/3GcBrEFv7huUhyQlyvLeZoN  zZ');
+     RDPBody.WriteLine('Qzmr/YcC5IXW5Y4aLo3rxsXYE1urhkdb75zUU/EHzSGxnN5hRM6ht7xqhegoYd  x8bCi9G2s');
+     RDPBody.WriteLine('/0n0um5NYCjCY0gMYIBfDCCAXgCAQEwUTBDMRMwEQYKCZImiZPyLGQB  GRYDbnBvMRIwEAYK');
+     RDPBody.WriteLine('CZImiZPyLGQBGRYCY2IxGDAWBgNVBAMTD2NiLURFUDk2OC1D  Uy1DQQIKP53/uwAAAAABYTA');
+     RDPBody.WriteLine('NBglghkgBZQMEAgEFADANBgkqhkiG9w0BAQEFAASC  AQAYxAbczcvKOQIPagFaCGP7e42Qbn');
+     RDPBody.WriteLine('Jj2ZViO/YDUO3HIBSPfGh3YPFwM1JxCH+I  TfVNdHqDAIm2nOdswfHNPnoJd619UZeLwPt48');
+     RDPBody.WriteLine('dCUKIRplNHkWl7aIJqZMfM6S16h  0fG+7HaA2+jB1+OecEtLKCWq3YQaGiZHOfnMBqvLgiEE');
+     RDPBody.WriteLine('/2OcT6IX32WcSDcOaSG3  Lm5K3DO0g3ETSBcgvchXXpdH7OZgjGNc0O9MUpWcTrnMzP5Wsic');
+     RDPBody.WriteLine('JgiAQJCbNHGJK  W9iKP7D0SSHpa76ZGoSAkrQpqsbppp+1/shQXaqbnNIEfgY09tFFheUG9K');
+     RDPBody.WriteLN('q/gPs9  8Je55330FjBYdzFitPUEhKSP');
+   }
+   end;
+   //RDPBody.WriteLN('');
+   RDPBody.Close;
+
+ } //Function CreateRDPHiperLink(_sCommand:string) :string;
+
+
+#ENDIF
+
+Function ReplTxt2Html(const s:string):string;
+{ Result:=Replace(s,'"','&quot');
+  Result:=Replace(s,'>','&gt');
+  Result:=Replace(s,'<','&lt');
+  Result:=Replace(s,'&','&amp');
+}
+Function ReplHtml2Txt(const s:string):string;
+{ Result:=Replace(s,'&quot','"');
+  Result:=Replace(s,'&gt'  ,'>');
+  Result:=Replace(s,'&lt'  ,'<');
+  Result:=Replace(s,'&amp' ,'&');
+}
+
+//-------------------------------------------
+Function MySendMail :boolean ;
+var ii:longint;
+   _chet:longint;
+{ Result:=True ;
+  email_addr:=trim(email_addr);
+  email_addr_copy:=trim(email_addr_copy);
+  //var email_addr_from:string;
+  StartNewVisual(vtIndicatorVisual, vfTimer,'Отправка письма...', 20);
+  _chet:=0;
+  EMAIL_FONT_SIZE:=0;
+  if not NextVisual
+  {
+
+  }
+  if ExistTune('NPOEM_OWN.EMAIL_FONT_SIZE')
+    EMAIL_FONT_SIZE:=lGetTune('NPOEM_OWN.EMAIL_FONT_SIZE');// 'Размер шрифта для отправки'
+  do {
+  #IFDEF _GP_
+    if email_addr_from=''
+      email_addr_from:=GetEmailByUserID(UserID(),username());
+  #ENDIF
+    if not NextVisual then break;
+    case email_type of
+    0:
+    {
+      MAPIMessage := InitMAPIMessage;
+      if not NextVisual then break;
+
+      AddRecipientToMail(DocBasFn866to1251(email_addr),
+                       DocBasFn866to1251('SMTP:' + email_addr), MAPIMessage);
+      if email_addr_copy<>''
+       AddRecipientToMail(DocBasFn866to1251(email_addr_copy),
+                       DocBasFn866to1251('SMTP:' + email_addr_copy), MAPIMessage);
+      // Тема письма
+      SetMAPIMessageSubject(DocBasFn866to1251(email_subject), MAPIMessage);
+      AddStringToMailBody(DocBasFn866to1251(
+        'Здравствуйте!' + ''#13#10), MAPIMessage);
+      if email_text<>''
+      { AddStringToMailBody(DocBasFn866to1251(
+        email_text), MAPIMessage);
+      }
+      else
+      { For(ii:=1;ii<=GetLimit(DM_email_text);ii++)
+        { AddStringToMailBody(DocBasFn866to1251(
+             DM_email_text[ii]), MAPIMessage);
+          if (ii mod 100)=0
+          { if not nextvisual
+            { sLastError:=' Прервано формирование текста сообщения ';
+              Result:=false;
+              break;
+            }
+          }
+        }
+      }
+      if not NextVisual then break;
+      if fileexist(email_attach1)
+        AddAttachedFileToMail(email_attach1, email_attach1, MAPIMessage);
+       if not NextVisual then break;
+      if fileexist(email_attach2)
+        AddAttachedFileToMail(email_attach2, email_attach2, MAPIMessage);
+      if not NextVisual then break;
+      if fileexist(email_attach3)
+        AddAttachedFileToMail(email_attach3, email_attach3, MAPIMessage);
+      if not NextVisual then break;
+      if fileexist(email_attach4)
+        AddAttachedFileToMail(email_attach4, email_attach4, MAPIMessage);
+      if not NextVisual then break;
+      if email_attach5<>''
+      { var _sFile:string=CreateRDPHiperLink(email_attach5);
+        if fileexist(_sFile)
+          AddAttachedFileToMail(_sFile, _sFile, MAPIMessage);
+      }
+
+      //if fileexist(email_attach3)
+      //  AddAttachedFileToMail(email_attach3, email_attach3, MAPIMessage);
+      if not NextVisual then break;
+
+      SendGalMail(MAPIMessage);
+      if not NextVisual then break;
+    }
+    1:
+    {
+      //  message('NEW MAIL')
+      NextVisual;
+      email_body:=GetStringParameter('Files','OutputFilesDirectory',0)+
+      '\!email'+username+'.txt';
+      if fileexist(email_body) deletefile(email_body);
+      logstrtofile(email_body,email_addr+'/'+email_addr_from);
+      logstrtofile(email_body,Oem2Ansi('Здравствуйте!'));
+      if email_text<>''
+      { logstrtofile(email_body,Oem2Ansi(email_text));
+      }
+      else
+      { For(ii:=1;ii<=GetLimit(DM_email_text);ii++)
+        { logstrtofile(email_body,Oem2Ansi(DM_email_text[ii]));
+        }
+      }
+      if not NextVisual then break;
+      if email_attach1<>''
+        logstrtofile(email_body,Oem2Ansi(email_attach1));
+      if not NextVisual then break;
+      if email_attach2<>''
+        logstrtofile(email_body,Oem2Ansi(email_attach2));
+      if not NextVisual then break;
+      if email_attach3<>''
+        logstrtofile(email_body,Oem2Ansi(email_attach3));
+      if not NextVisual then break;
+      email_body_Win:=GetStringParameter('Files','OutputFilesDirectory',0)+
+        '\!emailbody.txt';
+      if not NextVisual
+      { Result:=false;
+        break;
+      }
+
+      WinBody.openfile(email_body_Win,stCreate);
+      WinBody.WriteLn('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">');
+      WinBody.WriteLn('<HTML>');
+      WinBody.WriteLn('<HEAD>');
+      WinBody.WriteLn('<TITLE>Atlantis e-mail.</TITLE>');
+      WinBody.WriteLn('<META charset="windows-1251">');
+      WinBody.WriteLn('</HEAD>');
+      WinBody.WriteLn('<BODY BGCOLOR="#EEEFE0"> <FONT SIZE="0">');
+      WinBody.WriteLn(' ');
+      WinBody.WriteLn(MyOem2Ansi(' этот файл HTML - в WIN-кодировке</Font><br>'));
+      WinBody.WriteLn(' <FONT SIZE="-1" >'); //COLOR="#0000FF"
+      WinBody.WriteLn(MyOem2Ansi(' Если сообщение отображается некорректно, откройте'));
+      WinBody.WriteLn(MyOem2Ansi(' его отдельно в браузере.</Font><br>'));
+      if EMAIL_FONT_SIZE<>0
+       WinBody.WriteLn(' <FONT SIZE="'+String(EMAIL_FONT_SIZE)+'" >'); //COLOR="#0000FF"
+      WinBody.WriteLn(MyOem2Ansi('Здравствуйте!<br>'));
+      if email_text<>''
+      { WinBody.WriteLn(MyOem2Ansi(email_text)+'<br>');
+      }
+      else
+      { For(ii:=1;ii<=GetLimit(DM_email_text);ii++)
+        { WinBody.WriteLn(MyOem2Ansi(DM_email_text[ii])+'<br>');
+          if (ii mod 100)=0
+          { if not nextvisual
+            { sLastError:=' Прервано формирование текста сообщения ';
+              Result:=false;
+              break;
+            }
+          }
+        }
+      }
+      if not NextVisual then break;
+      if EMAIL_FONT_SIZE<>0
+        WinBody.WriteLn('</Font>');
+      if email_attach1<>''
+        WinBody.WriteLn(MyOem2Ansi(email_attach1)+'<br>');
+      if email_attach2<>''
+        WinBody.WriteLn(MyOem2Ansi(email_attach2)+'<br>');
+      if email_attach3<>''
+        WinBody.WriteLn(MyOem2Ansi(email_attach3)+'<br>');
+      if email_attach4<>''
+        WinBody.WriteLn(MyOem2Ansi(email_attach4)+'<br>');
+      if email_attach5<>''
+      { var _sFile:string=CreateRDPHiperLink(email_attach5);
+        if fileexist(_sFile)
+          WinBody.WriteLn(MyOem2Ansi(_sFile)+'<br>');
+      }
+
+      WinBody.WriteLn(' </BODY>');
+      WinBody.WriteLn(' </HTML>');
+
+      if not NextVisual then break;
+      if not SetCurMailEncodingTable(AMAIL_1251)
+      { sLastError:=' '+GetMailErrorString;
+        Result:=false ;
+        break;
+      }
+      if not NextVisual then break;
+      if not CreateMail(email_addr, email_addr_copy, email_subject)
+      { sLastError:=' '+GetMailErrorString;
+        Result:=false ;
+        break;
+      }
+      if not NextVisual then break;
+      if true
+      { if not SetBody(WinBody.Handle, 3)
+        {
+          logstrtofile(email_body,GetMailErrorString);
+        }
+      }
+      else
+      { if not AddPartHtmlBinary(WINBody.Handle, 'part 1.html', '1')
+        {
+          logstrtofile(email_body,GetMailErrorString);
+        }
+      }
+      WinBody.close;
+      if not NextVisual then break;
+      if fileexist(email_attach1)
+      { if not  AddAttachFrom(email_attach1)
+        { sLastError:=' '+GetMailErrorString;
+          Result:=false ;
+          break;
+        }
+        else
+          logstrtofile(email_body,Oem2Ansi('Вложили '+email_attach1));
+      }
+
+      if not NextVisual then break;
+      if fileexist(email_attach2)
+      { if not  AddAttachFrom(email_attach2)
+        { sLastError:=' '+GetMailErrorString;
+          Result:=false ;
+          break;
+        }
+        else
+          logstrtofile(email_body,Oem2Ansi('Вложили '+email_attach2));
+      }
+      if not NextVisual then break;
+      if fileexist(email_attach3)
+      { if not  AddAttachFrom(email_attach3)
+        { sLastError:='AddAttachFrom '+GetMailErrorString;
+          exit ;
+        }
+        else
+          logstrtofile(email_body,Oem2Ansi('Вложили '+email_attach3));
+      }
+      if not NextVisual then break;
+      if email_attach5<>''
+      { var _sFile:string=CreateRDPHiperLink(email_attach5);
+        if fileexist(_sFile)
+          AddAttachFrom(_sFile);
+      }
+      if not NextVisual then break;
+      if not SendMail
+      { sLastError:='SendMail '+GetMailErrorString;
+        Result:=false ;
+        break;
+      }
+      /*
+      // не пашет вложение
+      if not SendMailFrom(email_addr,  email_addr_copy, email_subject, email_body, false)
+      { message('SendMailFrom '+GetMailErrorString)
+        Result:=false ;
+        break;
+      }
+     */
+    } //1
+    2://
+    {
+
+    } //2
+    3://pGP_EMAIL
+    {
+  #IFDEF _GP_
+      do
+      { pGP_EMAIL:=GetNextNrec(#GP_EMAIL,0);
+        ClearBuffer(#GP_EMAIL);
+        GP_EMAIL.cUser      :=UserID();// "ссылка на пользователя"
+        //---------------------
+        GP_EMAIL.PrepareDate    :=Cur_Date;// date "Дата подготовки для отправки"
+        GP_EMAIL.PrepareTime    :=Cur_Time;// time "Время подготовки для отправки"
+        GP_EMAIL.SendDate       :=ZeroDate;// date "Дата подготовки для отправки"
+        GP_EMAIL.SendTime       :=ZeroTime;// time "Время подготовки для отправки"
+        //---------------------
+        GP_EMAIL.Email          :=email_addr;// string  "Email 1"
+        GP_EMAIL.Email2         :='';// string  "Email 2"
+        GP_EMAIL.Email_Copy     :=email_addr_Copy;// string  "Email копия"
+        GP_EMAIL.Email_CC       :='';// string  "Email скрытая копия"
+        //---------------------
+        GP_EMAIL.subject        :=email_subject;// string "Тема"
+        GP_EMAIL.email_text     :=email_text;// string "Содержание письма"
+        GP_EMAIL.attach1        :='';// string "Путь на файл 1"
+        GP_EMAIL.attach2        :='';// string "Путь на файл 2"
+        GP_EMAIL.attach3        :='';// string "Путь на файл 3"
+        GP_EMAIL.attach4        :='';// string "Путь на файл 4"
+        GP_EMAIL.attach5        :='';// string "Путь на файл 5"
+        //---------------------
+
+        GP_EMAIL.cKatPodr       :=0; //"ссылка на подразделение"
+        vPersons.pPersons:=GetPersonsByUser(UserID() );//coGetTune('USER.PERS');
+        if vPersons.Getfirst Persons=tsok
+        { GP_EMAIL.cKatPodr:=vPersons.Persons.GalDep;
+
+        }
+        GP_EMAIL.Fio            :=sGetTune('USER.FIO');// string[50]  "Фио отправителя"
+        //---------------------
+        GP_EMAIL.DESCR          :=sGetTune('USER.DESCR');// tDescr     "Дескриптор пользователя"
+        GP_EMAIL.DesGr          :=sGetTune('USER.DESGR');// tDesGr     "Группа Дескрипторов пользователя"
+        GP_EMAIL.Status         :=0;// "0-prepare,1-to send,2-ok,3-err"
+        //GP_EMAIL.LBody          : LVar "Текст письма"
+        //-----------------------
+        Insert current GP_EMAIL;
+        //-----------------------
+        if not NextVisual
+        { Result:=false;
+          break;
+        }
+        //  message('NEW MAIL')
+        email_body:=GetStringParameter('Files','OutputFilesDirectory',0)+
+        '\!email'+username+'.txt';
+        if fileexist(email_body) deletefile(email_body);
+        logstrtofile(email_body,email_addr+'/'+email_addr_from);
+        logstrtofile(email_body,Oem2Ansi('Здравствуйте!'));
+        if email_text<>''
+        { logstrtofile(email_body,Oem2Ansi(email_text));
+        }
+        else
+        { For(ii:=1;ii<=GetLimit(DM_email_text);ii++)
+          { logstrtofile(email_body,Oem2Ansi(DM_email_text[ii]));
+          }
+        }
+        if email_attach1<>''
+          logstrtofile(email_body,Oem2Ansi(email_attach1));
+        if email_attach2<>''
+          logstrtofile(email_body,Oem2Ansi(email_attach2));
+        if email_attach3<>''
+          logstrtofile(email_body,Oem2Ansi(email_attach3));
+        email_body_Win:=GetStringParameter('Files','OutputFilesDirectory',0)+
+             '\!emailbody.txt';
+
+        WinBody.openfile(email_body_Win,stCreate);
+        WinBody.WriteLn('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">');
+        WinBody.WriteLn('<HTML>');
+        WinBody.WriteLn('<HEAD>');
+        WinBody.WriteLn('<TITLE>e-mail</TITLE>');
+        WinBody.WriteLn('<META charset="windows-1251">');
+        WinBody.WriteLn('</HEAD>');
+        WinBody.WriteLn('<BODY BGCOLOR="#EEEFE0"><FONT SIZE="-1">');
+        WinBody.WriteLn(' ');
+        //WinBody.WriteLn(MyOem2Ansi2(' этот файл HTML - в WIN-кодировке</Font><br>'));
+        WinBody.WriteLn(' <FONT SIZE="-1" >');//COLOR="#0000FF"
+        WinBody.WriteLn(' </FONT>');
+        if EMAIL_FONT_SIZE<>0
+          WinBody.WriteLn(' <FONT SIZE="'+String(EMAIL_FONT_SIZE)+'" >');//COLOR="#0000FF"
+        //WinBody.WriteLn(MyOem2Ansi2('Здравствуйте!<br>'));
+        if email_text<>''
+        { WinBody.WriteLn(MyOem2Ansi2(email_text)
+                    +if(pos('<',email_text)>0,'','<br>'));
+        }
+        else
+        { For(ii:=1;ii<=GetLimit(DM_email_text);ii++)
+          { WinBody.WriteLn(MyOem2Ansi2(DM_email_text[ii])
+                   +if(pos('<',DM_email_text[ii])>0,'','<br>'));
+            if (ii mod 100)=0
+            { if not nextvisual
+              { sLastError:=' Прервано формирование текста сообщения ';
+                Result:=false;
+                break;
+              }
+            }
+          }
+        }
+        if not NextVisual then break;
+        GP_EMAIL.attach1:=GetFileNameToSend(email_attach1);
+        if not NextVisual then break;
+        GP_EMAIL.attach2:=GetFileNameToSend(email_attach2);
+        if not NextVisual then break;
+        GP_EMAIL.attach3:=GetFileNameToSend(email_attach3);
+        if not NextVisual then break;
+        GP_EMAIL.attach4:=GetFileNameToSend(email_attach4);
+        if not NextVisual then break;
+        if email_attach5<>''
+        { GP_EMAIL.attach5:=CreateRDPHiperLink(email_attach5);
+        }
+        if not NextVisual then break;
+        if  email_attach1<>'' or email_attach2<>''
+        or  email_attach3<>'' or email_attach4<>''
+        or  email_attach5<>''
+        { WinBody.WriteLn(MyOem2Ansi2('<br><p><b>Есть вложения </b>')+'<br>');
+          if GP_EMAIL.attach1<>''
+            WinBody.WriteLn(MyOem2Ansi2(substr(GP_EMAIL.attach1,PosR('\',GP_EMAIL.attach1)+1,200))+' <br>');
+          if email_attach2<>''
+            WinBody.WriteLn(MyOem2Ansi2(substr(GP_EMAIL.attach2,PosR('\',GP_EMAIL.attach2)+1,200))+' <br>');
+          if email_attach3<>''
+            WinBody.WriteLn(MyOem2Ansi2(substr(GP_EMAIL.attach3,PosR('\',GP_EMAIL.attach3)+1,200))+' <br>');
+          if email_attach4<>''
+            WinBody.WriteLn(MyOem2Ansi2(substr(GP_EMAIL.attach4,PosR('\',GP_EMAIL.attach4)+1,200))+' <br>');
+          if email_attach5<>''
+            WinBody.WriteLn(MyOem2Ansi2('<b>Для просмотра информации в системе'
+                  +' запустите вложение '+substr(GP_EMAIL.attach5,PosR('\',GP_EMAIL.attach5)+1,200))+' </b><br>');
+        }
+        if EMAIL_FONT_SIZE<>0
+          WinBody.WriteLn('</Font>');
+        WinBody.WriteLn(' </BODY>');
+        WinBody.WriteLn(' </HTML>');
+        WinBody.close;
+        if not NextVisual
+        { Result:=false;
+          break;
+        }
+        SetMemoPrefix(#GP_EMAIL,'XML');
+        ImportFileToMemo(GP_EMAIL.LBody,email_body_Win,false);
+        //--
+
+        //-----------------------
+        update current GP_EMAIL
+        //-----------------------
+        //если все хорошо проставим статус, что мы готовы
+        //разнесено, чтобы уменьшить вероятность ошибки при записи мемо поля в xx$memo
+        set GP_EMAIL.Status:=1;
+        //-----------------------
+        update current GP_EMAIL;
+        //-----------------------
+        if not NextVisual then break;
+      } while false;
+  #ENDIF
+    }
+    else
+    { sLastError:='Режим еще не обрабатывается!';
+    }
+    end ;
+    break;
+  } while false
+  StopVisual('',0);
+} //Function MySendMail :boolean ;
+
+//------------------------------------------------------------
+screen scrMain ;
+table katpodr ;
+fields
+   email_addr_from : noProtect;
+   email_type : [list 0
+    'MAPI' // используя почтовый клиент - OutLook и так далее.
+   ,'send direct' // используя настройки и "прав доступа" встроенным средством
+   ,'send sendmail' // используя утилиту из поставки галактики
+   ,'отложенная отправка(SQL)' // будет отправляться позже
+   ],protect ;
+   email_addr : pickbutton,noprotect ;
+   email_addr_copy : pickbutton,noprotect ;
+   email_subject   : noprotect ;
+   email_text      : noprotect ;
+   email_attach1   : pickbutton,noprotect ;
+   email_attach2   : pickbutton,noprotect ;
+   email_attach3   : pickbutton,noprotect ;
+   email_attach4   : pickbutton,noprotect ;
+   email_attach5   : pickbutton,noprotect ;
+   '"INTERFACE L_MCU::KATMC(000A000000000002h)"' : Protect,NoDel;
+buttons
+   cmOk,default,,'Отправить',hcObVedTimParam,sci1Esc;
+   cmCancel,,,'Выход',hcObVedTimParam,sci1Esc;
+   cmValue1,,,'создания файла для RDP',hcObVedTimParam,sci1Esc;
+   cmValue2,,,'Выход',hcObVedTimParam,sci1Esc;
+<<
+ От кого    .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ ТИП        .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Кому       .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Копия      .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Тема       .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Содержание .@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Вложение 1 .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Вложение 2 .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Вложение 3 .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Вложение 4 .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ команда для гиперссылки
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ начало на "INTERFACE" - RunAnyView
+ при наличии пробелов команда должна быть заключена в ""
+ Пример .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ <. Отправить .>  <. ~О~тмена .> <.HYPER.>
+
+ <. ТЕСТ RUNANYVIEW для команды для гиперссылки.>
+>>
+end;
+
+Function GetAddr :string ;
+var i,k :word;
+    witem :comp;
+    wstr:string;
+{ GetAddr:='' ;
+  wstr:='';
+//  message(GetMarkerCount(Marker))
+  for(i:=0;i<GetMarkerCount(Marker);i:=i+1)
+  { GetMarker(Marker, i, witem);
+    message(string(i)+' '+string(witem) );
+    // НЕ ПРАВИЛЬНО конечно
+    /*
+    if getfirst X$RESOURCES where (( witem ==  X$RESOURCES.atl_nrec ))=0 //  58== X$RESOURCES.XR$TYPE
+     GetAddr:=GetAddr+X$RESOURCES.XR$NAME+','
+    */
+    k:=0;
+    _loop X$RESOURCES
+    { inc(k);
+      if k=witem
+      { wstr:=wstr+if(wstr<>'',',','')+X$RESOURCES.XR$NAME;
+        break;
+      }
+    } //_loop X$RESOURCES
+  } //for(i:=0;i<GetMarkerCount(Marker);i:=i+1)
+  GetAddr:=wstr ;
+} // Function GetAddr :string ;
+
+ //-- вызов с 1
+ Function Write_Text(num_row:word;_email_text:string):boolean;
+ { if Num_row=1
+   { SetLimit(DM_email_text,0);
+   }
+   DM_email_text[num_row]:=_email_text;
+   Result:=true;
+ } // Function Write_Text(num_row:word;_email_text:string):boolean;
+
+ Function EmailSend
+ ( _email_type : word ;
+   _email_addr :string ;
+   _email_subject :string ;
+   _email_text :string ;
+   _email_attach1 :string ;
+   _email_attach2 :string ;
+   _email_attach3 :string ;
+   _email_attach4 :string ;
+   _email_attach5 :string ;
+   _email_addr_copy :string='';
+   _email_addr_from :string=''
+ ) :boolean;
+ { email_type     :=_email_type     ;
+   email_addr     :=_email_addr     ;
+   email_subject  :=_email_subject  ;
+   email_text     :=_email_text     ;
+   email_attach1  :=_email_attach1  ;
+   email_attach2  :=_email_attach2  ;
+   email_attach3  :=_email_attach3  ;
+   email_attach4  :=_email_attach4  ;
+   email_attach5  :=_email_attach5  ;
+   email_addr_copy:=_email_addr_copy;
+   email_addr_from:=_email_addr_from;
+   // если на вход подаем строку, то массив очищаем, иначе нужно об этом позаботиться
+   if _email_text<>'' SetLimit(DM_email_text,0);
+
+   Result:=MySendMail;
+ }
+
+
+ //---------------------------
+ Function GetLastError :string;
+ { Result:=sLastError;
+ }
+
+
+//------------------------------------
+HandleEvent
+cmPick:
+{ case curfield of
+  #email_addr :
+  { RunInterFace(SELECTRECIPIENT,Marker) ;
+    email_addr:=GetAddr ;
+//    message(Marker)
+  }
+  #email_addr_copy :
+  { RunInterFace(SELECTRECIPIENT,Marker) ;
+    email_addr_copy:=GetAddr ;
+  }
+  #email_attach1 : email_attach1:= GetFileName('*.*','Выбор файла 1') ;
+  #email_attach2 : email_attach2:= GetFileName('*.*','Выбор файла 2') ;
+  #email_attach3 : email_attach3:= GetFileName('*.*','Выбор файла 3') ;
+  #email_attach4 : email_attach4:= GetFileName('*.*','Выбор файла 4') ;
+  end ;
+  rescanpanel(#katpodr) ;  
+}
+cmInit :
+{ SetLimit(DM_email_text,0);
+  if email_addr<>''
+  { MySendMail ;
+    closeinterface(cmDone) ;
+    abort ;
+  }
+  Marker:=InitMarker('marker_mail', 8, 200, 10) 
+}
+cmOk:
+{ MySendMail  ;
+  if sLastError<>''
+  { Message(sLastError);
+  }
+  CloseInterface(cmDefault)
+}
+cmValue1:
+{ //Message(CreateRDPHiperLink('"TEST_'+Replace(email_subject,' ','_') ));
+  Message(CreateRDPHiperLink('"TEST '+email_attach5+'"' ));
+}
+cmValue2:
+{ var _sCommand:string=email_attach5;
+  if Substr(_sCommand,1,1)='"'
+    _sCommand:=SubStr(_sCommand,2,255);
+  if Substr(_sCommand,length(_sCommand),1)='"'
+    _sCommand:=SubStr(_sCommand,1,length(_sCommand)-1);
+  RunAnyView(_sCommand,false);
+}
+cmDone:
+{ DoneMarker(Marker,'marker_mail')
+}
+
+end;
+end.

@@ -1,0 +1,272 @@
+/*************************************************************************************************\
+* Наименование: Интерфейс Приказ "Дни отдыха и оплачиваемые неявки"                               *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: 1574 - Дополнительные дни отдыха за работу в выходной за отгул                      *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1128         |17/10/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Разработка  |#1574         |05/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#63095        |28/11/23|kurennykh                |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include AttrTablePick.vih
+#include ExtAttr.Vih
+#include ChildDoc.vih        // Функции работы с документами родственников
+
+#component "Z_StaffOrders"
+alter interface RPD_71;
+
+var  refAttrTablePick : AttrTablePick;
+var iExAttr : iExtAttr;
+
+overload
+  Procedure IRPD_Base.EnableDisable;
+  function IRPD_Base.ChildCheckOneOrder(cNrec : comp = 0): boolean;
+  function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+
+end;
+//--------------
+ExtendFormats scrDet71;
+//--------------
+var
+ NPOEM_OWN_SCUD_Order_71DO:boolean; //Контролировать в 71 РПД остаток отгулов за работу в вых.
+//------------------------------------
+create view
+as select
+  Time2StrDef(double(Vacations.LastUser)) (fieldname = GP_CountHours)
+from
+  ContDoc GP_ContDoc,
+  Vacations GP_Vacations,
+  PsnLinks GP_PsnLinks
+where ((
+     ContDoc.TypeOper  == GP_ContDoc.TypeOper
+ and ContDoc.Person    == GP_ContDoc.Person
+ and GP_ContDoc.ObjNrec== GP_Vacations.Nrec
+ and ContDoc.Person    == GP_PsnLinks.FromPerson
+)) ;
+
+//------------------------------------------
+create view vScud
+var
+  pPersons:comp;
+  wMesN :word;
+  wYearN: word;
+from GP_SCUD_Saldo, GP_SCUD_Pers
+where ((
+     pPersons         == GP_SCUD_Pers.cPersons
+and GP_SCUD_Pers.Nrec == GP_SCUD_SALDO.cGP_SCUD_Pers
+and wYearN            == GP_SCUD_SALDO.YearN
+and wMesN             == GP_SCUD_SALDO.MesN
+));
+//------------------------------------------
+
+screen scrDet71 (, hcStaffWinPr, scStaffMyPnl);
+table Vacations;
+fields
+  GP_CountHours ('Количество часов', hcStaffVacationsDuration): [7], noprotect;
+<<
+
+
+                 .@@@@@@@
+>>
+end;
+
+TableEvent table Vacations;
+cmExprFieldChanged:{
+  case inherited :: handleEvent (cmExprFieldChanged) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  case CurField of
+    fnGP_CountHours:{
+      var ValueStr: string;
+      ValueStr := Trim(ExprFieldValue);
+      if ValueStr = ''
+        ValueStr := '0';
+
+      var Value: double=0;
+
+      _try
+      {
+        if boGetTune('UP.ZAR.WT.EnhancedTimeFormat')
+          Value := Str2Time(ValueStr);
+        else
+          Value := double(ValueStr);
+
+        if Value < 0
+          Value := 0;
+
+        set Vacations.LastUser:=string(Value);
+      }
+      _except
+        on ExNumberConvert:
+          set Vacations.LastUser := String(0);
+
+      // рассчитываем максимальное количество часов, которое оплатится сотруднику
+      CalculateMaxGivedHours;
+
+      ReScanPanel(#Vacations);
+    }
+  end;
+}
+end;
+
+//--------------------------------------------
+// Рассчитать кол-во дней остатка выходных
+//--------------------------------------------
+Function CalcDaysHoliday:double;
+{ vScud.pPersons:=ContDoc.Person;
+  Result:=0;
+  if vScud.getfirst GP_Scud_Pers<>tsok then exit;
+  vScud.wYearN:=year(Vacations.FactYearBeg);
+  vScud.wMesN :=month(Vacations.FactYearBeg);
+  if vScud.getfirst GP_SCUD_Saldo<>tsok then exit;
+  Result:=longint(vScud.GP_SCUD_Saldo.CH_Holiday_Ost+vScud.GP_SCUD_Saldo.CH_Holiday_Cur-
+             vScud.GP_SCUD_Saldo.CH_Holiday_Opl) div 10000;
+} //Function CalcDaysHoliday:double;
+
+Procedure EnableDisable;
+{
+  inherited::EnableDisable;
+
+  ToggleFieldSelectable(fnGP_CountHours,fnFieldsOpen);
+}
+
+function ChildCheckOneOrder(cNrec : comp = 0): boolean;
+var CountHours:double;
+    d1,d2:date;
+    iChildDoc:ChildDocFunc;
+    IsLinksInv,IsOver18:boolean;
+{
+  result:=inherited::ChildCheckOneOrder(cNrec);
+  timelog('RPD_71->ChildCheckOneOrder:OsnKlOtpusk.Notpus='+OsnKlOtpusk.Notpus);
+  case OsnKlOtpusk.Notpus of
+  'Доп. отпуск по уходу за детьми инвалидами':
+  {
+    timelog('RPD_71->ChildCheckOneOrder:Доп. отпуск по уходу за детьми инвалидами');
+
+    d1:=Vacations.FactYearBeg;
+    d1:=date(1,Month(d1),Year(d1));
+    d2:=date(Last_Day(d1),Month(d1),Year(d1));
+    CountHours:=0;
+    _loop GP_ContDoc
+    /*
+    where((
+      ContDoc.TypeOper==GP_ContDoc.TypeOper and ContDoc.Person==GP_ContDoc.Person
+      and GP_ContDoc.ObjNrec==GP_Vacations.Nrec
+    ))*/
+     {
+      if (not IsValidAll(tnGP_Vacations)) continue;
+      if (Vacations.VacType<>GP_Vacations.VacType) continue;
+      if (GP_Vacations.FactYearBeg>d2) continue;
+      if (GP_Vacations.FactYearEnd<d1) continue;
+
+      CountHours+=GP_Vacations.Duration;
+    }//_loop GP_ContDoc
+
+    /*
+    //так-то надо как-то переписывать под законодательство
+    if (CountHours>4) {
+      SetErrorOrder('Приказ утвердить нельзя: количество дней отпуска по уходу за детьми инвалидами более 4-х в месяц.');
+      result := false;
+    }*/
+
+    IsLinksInv:=false;
+    IsOver18:=false;
+    _loop GP_PsnLinks //where((ContDoc.Person == GP_PsnLinks.FromPerson))
+    {
+      if (iChildDoc.IsMainCurator(GP_PsnLinks.NRec))
+        if (iChildDoc.IsStatusExistMonth(GP_PsnLinks.NRec,psnLinksInv,Month(d1),Year(d1))) {
+          IsLinksInv:=true;
+          IsOver18:=Add_Months(GP_PsnLinks.RBornDate,18*12)<d1;
+          if (not IsOver18) break;
+        }
+    }//_loop GP_PsnLinks
+
+    if (not IsLinksInv) {
+      SetErrorOrder('Приказ утвердить нельзя: не найден ребенок со статусом "Инвалид" в текущем месяце.');
+      result := false;
+    }
+
+    if (IsOver18) {
+      SetErrorOrder('Приказ утвердить нельзя: ребенку со статусом "Инвалид" уже исполнилось 18 лет.');
+      result := false;
+    }
+  } //'Доп. отпуск по уходу за детьми инвалидами'
+  'Дополнительные дни отдыха (без оплаты)':
+  { if not NPOEM_OWN_SCUD_Order_71DO then exit;
+    timelog('RPD_71->ChildCheckOneOrder:Дополнительные дни отдыха (без оплаты)');
+
+    if month(Vacations.FactYearBeg)<>month(Vacations.FactYearEnd)
+    { SetErrorOrder('Приказ утвердить нельзя: месяц начала должен совпадать с месяцем окончания');
+      result := false;
+    }
+    var _Hours:double=0;
+    _Hours:=CalcDaysHoliday;
+    timelog('RPD_71->ChildCheckOneOrder:_Hours='+string(_Hours,0,2));
+    if _Hours<GP_Vacations.Duration //double(Vacations.LastUser)
+    { SetErrorOrder('Приказ утвердить нельзя: количество часов доп.дней  больше остатка '+string(_Hours,0,2));
+      result := false;
+    }
+  }
+  end;//case OsnKlOtpusk.Notpus of
+}//function ChildCheckOneOrder(cNrec : comp = 0): boolean;
+
+//******************************************************************************
+//  Процедура утверждения приказа по текущему работнику (по таблице ContDoc)
+//******************************************************************************
+function ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+{ Result:=Inherited::ChildConfirmOneOrder(cNrec);
+  if not Result then exit;
+  case OsnKlOtpusk.Notpus of
+  'Дополнительные дни отдыха (без оплаты)':
+  { var _Hours:double=0;
+    _Hours:=CalcDaysHoliday;
+
+    if _Hours>0
+    { vScud.GP_SCUD_Saldo.CH_Holiday_Opl:=vScud.GP_SCUD_Saldo.CH_Holiday_Opl+GP_Vacations.Duration*10000;
+      vScud.update current GP_SCUD_Saldo;
+    }
+  }
+  end;//case OsnKlOtpusk.Notpus of
+} //function ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+
+HandleEvent
+cmPick:
+{
+  Inherited::HandleEvent(cmPick); 
+
+  if CurField = #CONTDOC.SBOTTOM
+  {
+    refAttrTablePick.PickValue(coCONTDOC, iExAttr.AttrID(coCONTDOC, 'Основание'), CONTDOC.nRec);
+    if refAttrTablePick.sGetValue(coCONTDOC, iExAttr.AttrID(coCONTDOC, 'Основание'), CONTDOC.nRec) != ''
+    {
+      CONTDOC.SBOTTOM := refAttrTablePick.sGetValue(coCONTDOC, iExAttr.AttrID(coCONTDOC, 'Основание'), CONTDOC.nRec);
+      update current CONTDOC;
+    }
+    RereadRecord(#CONTDOC);
+    RereadRecord(#Vacations);
+  }
+}
+cmOnVipLoad:{
+  timelog_init;
+  case inherited :: handleEvent (cmOnVipLoad) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+  NPOEM_OWN_SCUD_Order_71DO:=boGetTune('NPOEM_OWN.SCUD.Order_71DO');
+
+  ToggleFieldVisible(fnCountHours,false);
+
+  if wGetTune('UP.FakelGAL.Fakel') = 1
+  {
+
+   cfsSetProp('i_SCRDET71_CONTDOC.SBOTTOM','StatusCtx',sci13Esc); 
+
+  }
+}
+end;
+
+end.

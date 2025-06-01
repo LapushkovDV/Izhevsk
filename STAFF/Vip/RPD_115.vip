@@ -1,0 +1,364 @@
+/*************************************************************************************************\
+* Наименование: Интерфейс для РПД 115. Компенсации и льготы. Компенсация процентов по ипотеке.    *
+*                                      Реестр                                                     *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1330         |28/11/17|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#component "Z_StaffOrders"
+
+#include RPD.vih
+#include GP_RPD115_ImportPartDoc.vih
+#include AtlProtocol.vih
+
+#doc
+  Интерфейс приказа "Компенсации и льготы. Компенсация процентов по ипотеке. Реестр"
+#end
+
+
+VipInterface RPD_115(RPD_Base_Raise)
+  licensed(free);
+public:
+  procedure IRPD_Base.EnableDisable;
+  function  IRPD_Base.ChildCheckOneOrder(cNrec : comp = 0): boolean;
+  procedure IRPD_Base3.PrintRPD(typePrint: TPtr; fcEnter: word);
+end;
+
+Interface RPD_115 '' escclose;
+
+var
+  _gp_rpd115_import: GP_IRPD115_Import;
+  _approveOrderWhenOtherRaisesExist: boolean;
+  _vidDoplNrec: comp;
+  _importProtocol: IAtlProtocol(AtlProtocol) new;
+
+//Для определения признака листа вида доплат из настроек
+create view vVidDopl
+as select catChild.Nrec
+from catalogs catChild
+where ((
+  _vidDoplNrec == catChild.cParent
+));
+
+//*****************************************************************************
+//#region Вспомогательные функции
+
+//Возвращает нрек доплаты:
+//Ищет утвержденные приказы с РПД-114 выбирает в них доплаты, действующие на дату приказа
+//Возвращает нрек вида первой найденной доплаты или нрек вида доплат из настройки
+function GetVidDoplNrec(personNrec: comp; d: date): comp;
+{
+  var vidDoplNrec: comp = 0;
+  sql_loop
+    select top 1 Raise.RaiseType
+    from ContDoc
+    join PartDoc on PartDoc.Nrec = ContDoc.cPart
+    join TitleDoc on TitleDoc.Nrec = PartDoc.cDoc and TitleDoc.wStatus = 1
+    join Raise on Raise.cRDop = ContDoc.Nrec and Raise.Person = :(PersonNrec) and
+                  Raise.FromDate <= :(d) and Raise.ToDate >= :(d) and Raise.RaiseType <> #comp(0)
+    where ContDoc.Person = :(PersonNrec) and
+          ContDoc.TypeOper = 114
+    into (vidDoplNrec) {};
+
+  if vidDoplNrec = 0
+    result := coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD114');
+  else
+    result := vidDoplNrec;
+}
+
+//Обновляет _vidDoplNrec - нрек вида доплат для новых доплат
+procedure RefreshVidDoplNrec;
+{
+  _vidDoplNrec := GetVidDoplNrec(ContDoc.Person, TitleDoc.DocDate);
+}
+
+//Проверяет вид доплаты из настроек = лист
+function VidDoplIsLeaf: boolean;
+{
+  result := vVidDopl.getfirst catChild != tsOk;
+}
+
+//Проверяет наличие надбавок в утвержденных приказах РПД 115,
+//период действия которых пересекается с периодом [d1..d2]
+function OtherRaiseExists115(d1: date; d2: date; personNrec: comp; appNrec: comp;
+                             raiseTypeNrec: comp; raiseAttrNrec: comp): boolean;
+{
+  Result := false;
+
+  var cnt: longint = 0;
+
+  sql
+    select count(*) as cnt
+
+    from ContDoc
+
+    join PartDoc
+         on PartDoc.Nrec = ContDoc.cPart
+
+    join TitleDoc
+         on TitleDoc.Nrec    = PartDoc.cDoc and
+            TitleDoc.wStatus = 1
+
+    join Raise
+         on Raise.cRDop     = ContDoc.Nrec and
+            Raise.Person    = :(personNrec) and
+            Raise.Appoint   = :(appNrec) and
+            Raise.RaiseType = :(raiseTypeNrec) and
+            Raise.RaiseAttr = :(raiseAttrNrec) and
+            Raise.FromDate <= :(d1) and
+            Raise.ToDate   >= :(d2)
+
+    where ContDoc.Person   = :(personNrec) and
+          ContDoc.TypeOper = 115
+
+    into (cnt);
+
+  result := cnt > 0;
+}
+
+//Проверяет наличие аналогичных надбавок в утвержденных приказах в
+//случае, если установлен запрет на утверждение приказа при их наличии.
+//Возвращает true, если приказ валиден
+function CheckOtherRaise115(d1: date; d2: date; personNrec: comp; appNrec: comp; raiseTypeNrec: comp;
+                            raiseAttrNrec: comp; bShowErrorMessage: boolean = true): boolean;
+{
+  if not _approveOrderWhenOtherRaisesExist
+    result := Not OtherRaiseExists115(d1, d2, personNrec, appNrec, raiseTypeNrec, raiseAttrNrec);
+  else
+    result := true;
+  if not result and bShowErrorMessage
+  {
+    Message('В утвержденном приказе найдена аналогичная доплата,'#13'' +
+            'период действия которой пересекается с периодом действия'#13'' +
+            'доплаты в текущем приказе', Warning);
+  }
+}
+
+//Проверяет на валидность данные в записи RaiseHist
+function RaiseHistIsValid: boolean;
+{
+  result := RaiseHist.dRec > 0 and
+            RaiseHist.dDat2 > 0 and
+            RaiseHist.rHSum > 0;
+}
+
+//Возвращает текст сообщения пользователю с детализацией о невалидности записи RaiseHist
+function GetNotValidRaiseHistUserInfo: string;
+{
+  var EmptyRequiredFields: string = ''; //незаполненные обязательные поля
+
+  if RaiseHist.rHSum = 0
+    EmptyRequiredFields += 'Сумма/процент доплаты/надбавки';
+
+  if RaiseHist.dRec = 0
+    EmptyRequiredFields += if(EmptyRequiredFields = '', '', ''#13#3) + 'С даты';
+
+  if RaiseHist.dDat2 = 0
+    EmptyRequiredFields += if(EmptyRequiredFields = '', '', ''#13#3) + 'По дату';
+
+  result := if(EmptyRequiredFields = '', '',
+               ''#3'Не заполнены обязательные поля: '#13 + EmptyRequiredFields);
+}
+
+//#endregion Вспомогательные функции
+//*****************************************************************************
+
+//*****************************************************************************
+//#region Перекрытые методы
+
+//Устанавливает доступность полей приказа
+Procedure EnableDisable;
+{
+  inherited::EnableDisable;
+
+  var sTitle: string = '';
+  cfsSetCurrentContainer('Z_STAFFORDERS::ORDERSLIST');
+  cfsGetProp('WHATISINORDER',cfpTitle, sTitle);
+  cfsSetProp('WHATISINORDER',cfpTitle, replace(sTitle,'Приказ','Список'));
+  cfsSetProp('L_EDITTITLE_N_приказа',cfpTitle,'Номер списка');
+  cfsSetProp('L_EDITTITLE_Дата_приказа',cfpTitle,'Дата списка');
+  RefreshVidDoplNrec;
+  if (fnFieldsOpen and not VidDoplIsLeaf)
+    ToggleFieldSelectable(#RaiseCat.Name, true);
+  else
+    ToggleFieldSelectable(#RaiseCat.Name, false);
+}
+
+//Проверяет корректность приказа
+function ChildCheckOneOrder(cNrec:comp = 0): boolean;
+{
+  cNrec := cNrec;
+  result := true; //inherited::ChildCheckOneOrder;
+  _loop RaiseHist
+    result := result and CheckOtherRaise115(Raise.FromDate, Raise.ToDate, Raise.Person, ContDoc.cStr,
+                                            Raise.RaiseType, Raise.RaiseAttr);
+}
+
+procedure PrintRPD(typePrint: TPtr; fcEnter: word);
+{
+  #__UNUSED__(typePrint,fcEnter)
+  case typePrint of
+    0: RunInterface('GP_Staff::GP_NFormRD115', TitleDoc.Nrec, PartDoc.TypeOper);    //Z_STAFFORDERS::NFormRD09a
+  end;
+}
+
+//#endregion
+//*****************************************************************************
+
+Browse brwRaise115 'Назначение доплаты' (,, sci178Esc);
+  show at (, 9,,17);
+  table RaiseHist;
+  Fields
+    RaiseCat.Name     'Вид доплаты/надбавки', ('Вид доплаты/надбавки.', hcStaffRaiseType, sci1378Esc):[20], protect;
+    RaiseHist.rHSum   'Сумма/процент доплаты/надбавки', ('Сумма/процент доплаты/надбавки', hcStaffRaiseSum): [13.3], noprotect,
+      {Font = {BackColor = if (RaiseHist.rHSum = 0, ColorNeed, 0)}};
+    'Нац.валюта'      'Валюта', ('Валюта оплаты.', hcStaffRaiseCurr, sci1378Esc):[10] , protect;
+    RaiseHist.dRec    'С даты', ('Дата, с которой установлена доплата', hcStaffRaiseFromDate, sci1378Esc): [10,'DD/MM/YYYY'], noprotect, centered,
+      {Font = {BackColor = if (RaiseHist.dRec = 0, ColorNeed, 0)}};
+    RaiseHist.dDat2   'По дату', ('Дата, по которую установлена доплата', hcStaffRaiseFromDate, sci1378Esc): [10,'DD/MM/YYYY'], noprotect, centered,
+      {Font = {BackColor = if (RaiseHist.dDat2 = 0, ColorNeed, 0)}};
+end;
+
+TableEvent table RaiseHist;
+  cmSetDefault:
+  {
+    inherited::HandleEvent(cmSetDefault);
+    //Если вид доплат в настройках не указан - выдаем ошибку
+    RefreshVidDoplNrec;
+    if _vidDoplNrec = 0
+    {
+      message('Ошибка! Не заполнена настройка "Доплата по умолчанию" для РПД 114');
+      abort;
+    }
+    //Если вид доплат в настройках задан и это не папка - устанавливаем его в надбавку
+    else if VidDoplIsLeaf
+    {
+      set RaiseHist.cRaiseType := _vidDoplNrec;
+      set RaiseHist.iHAttr     := CheckTypeRaise(_vidDoplNrec);
+      set Raise.RaiseAttr      := RaiseHist.iHAttr;
+      set Raise.RaiseType      := _vidDoplNrec;
+    }
+  }
+  cmCheckField:
+  {
+    case curfield of
+      //При изменении пользователем дат надбавки
+      //проверяем их валидность
+      #RaiseHist.dRec, #RaiseHist.dDat2:
+        CheckOtherRaise115(RaiseHist.dRec, RaiseHist.DDat2, Raise.Person, ContDoc.cStr,
+                           Raise.RaiseType, Raise.RaiseAttr);
+    end;
+  }
+  cmCheckRecord:
+  {
+    if not RaiseHistIsValid
+    {
+      Message(GetNotValidRaiseHistUserInfo, Error);
+      Abort;
+    }
+    if inherited::handleevent(cmCheckRecord) = heAbort
+      Abort;
+  }
+end;
+
+handleevent
+
+  cmPick:
+  {
+    case CurField of
+      #RaiseCat.Name:
+      {
+        RefreshVidDoplNrec;
+        ParentSav := _vidDoplNrec;
+
+        var wPickResult: word = cmCancel;
+        if VidDoplIsLeaf
+          wPickResult := RunInterface(Z_STAFFCAT::PickCatalog2, 0, ParentSav, 0, 0);
+        else
+          wPickResult := cmDefault;
+
+        if (wPickResult = cmDefault)
+        {
+          //PreviousType := RaiseHist.cRaiseType; // взвести флаг того, что поменяли наименование
+          set RaiseHist.cRaiseType := ParentSav;
+          set RaiseHist.iHAttr := CheckTypeRaise(ParentSav);
+          set Raise.RaiseAttr := RaiseHist.iHAttr;
+          set Raise.RaiseType := ParentSav;
+          ReReadRecord(tnCatalogs);
+        }
+        exit;
+      } //RaiseCat.Name
+    end;
+
+    inherited::HandleEvent(cmPick);
+
+    case CurField of
+      #persons.fio:
+      {
+        //Запрещаем пользователю выбирать умерших сотрудников
+        if isvalidall(#Persons)
+          if (Persons.ddop1 != 0)
+          {
+            message('Запрещено выбирать сотрудников с заполненным полем "Дата смерти"', error);
+            PutCommand(cmDelOnProtect);
+          }
+      }
+    end;
+  }
+
+  cmValue31: //Отбор сумм возмещения из доп.таблиц
+  {
+    _gp_rpd115_import := GP_IRPD115_Import(new(GP_RPD115_ImportPartDoc,
+                         GP_RPD115_ImportPartDoc(PartDoc.Nrec)));
+    if _gp_rpd115_import.ShowUI = cmDefault
+    {
+      _importProtocol.AutoFlush := true;
+      _importProtocol.Visible := true;
+      _gp_rpd115_import.ImportData(_importProtocol);
+      _importProtocol.Refresh;
+    }
+    FreeVipInterface(_gp_rpd115_import);
+    RereadRecord(#ContDoc);
+  }
+
+  cmHotKeys:
+  {
+    //Если приказ не утвержден
+    if fnFieldsOpen
+    {
+      var LocalMenu:longint;
+      //Добавим пункт меню для отбора сумм возмещения из доп.таблиц.
+      LocalMenu := LoadMenu('Rpd_MenuCopy');
+      AddMenuItem(LocalMenu, 'Отбор сумм возмещения из доп.таблиц', cmValue31);
+      PutHotCommand(RunLoadMenu(LocalMenu));
+    }
+  }
+
+  cmCalc:
+  {
+    update current ContDoc set TypeOper = 9;
+    inherited::Handleevent(cmCalc);
+    update ContDoc where ((PartDoc.nrec == contdoc.cPart)) set TypeOper = 115;
+  }
+
+  cmOnVipUnload:
+  {
+    inherited::Handleevent(cmOnVipUnload);
+    cfsSetCurrentContainer('Z_STAFFORDERS::ORDERSLIST');
+    cfsSetProp('L_EDITTITLE_N_приказа', cfpTitle, 'Номер списка');
+    cfsSetProp('L_EDITTITLE_Дата_приказа', cfpTitle, 'Дата списка');
+  }
+
+  cmOnVipLoad:
+  {
+    _approveOrderWhenOtherRaisesExist := boGetTune('UP.STAFF.RPD_9.RPD9_CheckOtherRaises');
+    inherited::Handleevent(cmOnVipLoad);
+  }
+
+end;
+
+end.

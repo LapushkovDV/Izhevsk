@@ -1,0 +1,631 @@
+/*************************************************************************************************\
+* Наименование: Сверка начислений и удержаний из КИС с Галактикой                                 *
+* Контур/Модуль: Зарплата.                                                                        *
+* Примечание:  Нужен только на этапе импорта и сверки данных из КИС. Запускается из АРД отчетов.  *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |              |20/12/17|Ермолов К.Р.             |НПО Энергомаш                    *
+* Разработка  |              |30/12/17|Плинда Н.А.              |НПО Энергомаш                    *
+* Разработка  |#1823         |20/01/18|Шунин А.Г.               |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include CFG_ERR.inc
+end;
+Interface resurs_sumopl_full2   escclose;
+
+table struct SverkaKisGal
+(
+clsch:comp,
+strtabn:string[20],
+tperson:comp,
+vidopl:longint,
+What:string[11],
+metka:string,
+fio:string,
+summaKis:double, //Decimal[31,15],
+summaGal:Decimal[31,15],
+PODR:string[20]
+
+
+) 
+with index (s01=clsch+vidopl, s02=fio, s03=tperson+vidopl);
+
+
+table struct NachislGal
+(
+clsch:comp,
+strtabn:string[20],
+tperson:comp,
+vidopl:longint,
+metka:string,
+What:string[11],
+fio:string,
+PODR:string[20],
+summa: Decimal[31,15]
+) 
+with index (s01=clsch+vidopl);
+
+ 
+create view jView
+
+var
+Counter, MaxLine, MaxCol : longint;
+ExcelPath:string;
+RaiseNrec:longint;
+Nrec_NPO_Z:comp;
+Nrec_NPO_K:comp;
+NrecLS:comp;
+
+NrecPers:longint;  
+KodVid    :string;
+MesVK:integer;
+GodVK:integer;
+SumN:double ;
+dSum :double ;
+SumNLast:double;
+KodVidLast    :string;
+NrecPersLast:longint;
+fSum :double;
+VidNazn :string;
+VidZap:string;
+famil:string;
+
+wMES: word;
+wYEAR: integer;
+
+
+
+as select * 
+from  lschet,persons, NachislGal n, SverkaKisGal s , KatPodr;
+
+#define _TimeLog(_str) LogStrTofile('KGCompare.log', _DateTimeToStr(_CurDateTime,'DD.MM.YY HH:NN:SS:SSS') + ' ' + #_Str)
+
+#include Sql_Func.Vpp
+
+var DBFError : longint;
+var DBFNAME:string;
+procedure LoadFromDBF;
+{
+
+  DBFNAME := 'sverka.DBF';
+
+var NewFileName : string;
+ NewFileName := TranslatePath('%HOMEDRIVE%%HOMEPATH%') + '\Documents\';
+ NewFileName := Replace(NewFileName,'\\','\');
+ NewFileName := NewFileName + DBFNAME;
+
+
+  DBFNAME := NewFileName;
+  DBFError := 0;
+    var ldbf : longint;
+  if not fileexist(DBFNAME) then
+  { //logstrtofile(wlogfilenm,'нет файла '+nmpath+'\'+nmdbf)
+    DBFError:=-1000 ;
+    exit;
+  }
+StartNewVisual(vtNumericVisual,vfTimer,'Загрузка данных КИС из DBF', 1);
+
+    ldbf := DBFOpen(DBFNAME,stOpenRead);
+    if ldbf = 0
+    {
+      DBFError := -10;
+    }
+    else
+    if DBFGetFirst(ldbf) <> 0
+    {
+      DBFError := -100;
+    }
+    do
+    {
+      nextvisual;
+        clearbuffer(#s);
+        s.Metka:=       DBFGetFieldValue(ldbf, 'METKA'); //'По фио';
+
+      IF not (s.Metka = 'Нет в КИС')
+      {
+        s.SummaKis:=DBFGetFieldValue(ldbf, 'SUMMAKIS');//SumN;
+        s.clsch:=  comp(DBFGetFieldValue(ldbf, 'CLSCH')); //0;
+        s.tperson:=comp(DBFGetFieldValue(ldbf, 'TPERSON'));
+        s.strtabn:=     DBFGetFieldValue(ldbf, 'STRTABN');//0;//persons.strtabn;
+        s.fio:=         DBFGetFieldValue(ldbf, 'FIO');//famil;
+        s.vidopl:=longint(DBFGetFieldValue(ldbf, 'VIDOPL'));//KodVid;
+      s.What :=       DBFGetFieldValue(ldbf, 'WHAT');//
+        insert current s;
+      DBFError++;
+      }
+    }
+    while DBFGetNext(ldbf) = 0
+
+    DBFClose(ldbf);
+StopVisual('',0);
+
+}
+
+procedure PoiskS;
+{
+        if getfirst s where ((lschet.nrec==s.clsch and KodVid==s.vidopl))<>tsok
+        {
+        clearbuffer(#s);
+        s.Metka:='По ID';
+        s.tperson:=lschet.tperson;
+        s.strtabn:=lschet.strtabn;
+        s.clsch:=lschet.nrec;
+        s.vidopl:=KodVid;
+        s.SummaKis:=SumN;
+  s.What := VidZap;
+        if getfirst Katpodr where ((lschet.cex==katpodr.nrec ))=tsok
+        {
+        s.PODR := Katpodr.KOD;
+        }
+
+        insert current s;       
+        }
+        else
+        {
+        s.SummaKis:=s.SummaKis+SumN;
+        update current s;       
+        }
+}
+
+procedure PoiskS_fio;
+{
+        if getfirst s where ((NrecPers==s.Tperson and KodVid==s.vidopl))<>tsok
+        {
+        clearbuffer(#s);
+        s.Metka:='По фио';
+        s.clsch:=0;
+        s.tperson:=NrecPers;
+        s.strtabn:=0;//persons.strtabn;
+        s.fio:=famil;
+        s.vidopl:=KodVid;
+        s.SummaKis:=SumN;
+        s.What := VidZap;
+
+        insert current s;
+        }
+        else
+        {
+        s.SummaKis:=s.SummaKis+SumN;
+        update current s;       
+        }
+}
+
+procedure PoiskS_fault;
+{
+        if getfirst s where ((NrecPers==s.Tperson and KodVid==s.vidopl))<>tsok
+        {
+        clearbuffer(#s);
+        s.Metka:='Нет соотв л/с';
+        s.clsch:=0;
+        s.tperson:=NrecPers;
+        s.strtabn:=0;//persons.strtabn;
+        s.fio:=famil;
+        s.vidopl:=KodVid;
+        s.SummaKis:=SumN;
+  s.What := VidZap;
+        insert current s;
+        }
+        else
+        {
+        s.SummaKis:=s.SummaKis+SumN;
+        update current s;       
+        }
+}
+
+
+
+HandleEvent
+
+CmInit:
+{
+
+RaiseNrec:=100000;//для уникальности нреков
+Nrec_NPO_Z:=2814749767106566;
+Nrec_NPO_K:=2814749767342785;
+NrecLS:=2814749767106561;
+
+wMES := 2; // можно из Excel прочитать
+wYEAR:=2018;
+
+#_TimeLog('---начало--');
+  StartNewVisual(vtNumericVisual,vfTimer,'Загрузка начислений', 1);
+
+#_TimeLog('--- beg Load Gal --');
+
+  delete all n;
+  ClearQuery(vliSQLCommand);
+
+  PrepareSQLQuery('select                                                            ');
+  PrepareSQLQuery(' clsch                                                            ');
+  PrepareSQLQuery(',vidopl                                                           ');
+  PrepareSQLQuery(',tperson                                                          ');
+  PrepareSQLQuery(',strtabn                                                          ');
+  PrepareSQLQuery(',Sum(summa0) summa                                                ');
+  PrepareSQLQuery(',What                                                             ');
+  PrepareSQLQuery(',PODR                                                             ');
+  PrepareSQLQuery('from                                                              ');
+  PrepareSQLQuery('(                                                                 ');
+  PrepareSQLQuery('select                                                            ');
+  PrepareSQLQuery('         nachisl.clsch   clsch                                        ');
+  PrepareSQLQuery('        ,nachisl.vidopl  vidopl                                       ');
+  PrepareSQLQuery('        ,nachisl.tperson tperson                                      ');
+  PrepareSQLQuery('        ,nachisl.strtabn strtabn                                      ');
+  PrepareSQLQuery('        ,nachisl.summa summa0                                         ');
+  PrepareSQLQuery('        ,''Начисление'' What                                            ');
+  PrepareSQLQuery('        ,Katpodr.KOD PODR                                             ');
+  PrepareSQLQuery('from nachisl                                                          ');
+  PrepareSQLQuery('left join  Katpodr on nachisl.cexoz=katpodr.nrec                      ');
+  PrepareSQLQuery('where ( :(wYEAR)=nachisl.YEARN and :(wMES)=nachisl.MESN and nachisl.summa <> 0 )');
+  PrepareSQLQuery('union all                                                             ');
+  PrepareSQLQuery('select                                                                ');
+  PrepareSQLQuery('         Nenach.clsch clsch                                           ');
+  PrepareSQLQuery('        ,Nenach.vidopl vidopl                                         ');
+  PrepareSQLQuery('        ,Nenach.tperson tperson                                       ');
+  PrepareSQLQuery('        ,Nenach.strtabn strtabn                                       ');
+  PrepareSQLQuery('        ,Nenach.summa summa0                                          ');
+  PrepareSQLQuery('        ,''Начисление'' What                                            ');
+  PrepareSQLQuery('        ,Katpodr.KOD PODR                                             ');
+  PrepareSQLQuery('from Nenach                                                           ');
+  PrepareSQLQuery('left join  Katpodr on Nenach.cexoz=katpodr.nrec                        ');
+  PrepareSQLQuery('where ( :(wYEAR)=Nenach.YEARN and :(wMES) =Nenach.MESN and Nenach.summa <> 0 )   ');
+  PrepareSQLQuery('union all                                                              ');
+  PrepareSQLQuery('select                                                                 ');
+  PrepareSQLQuery('         UDER.clsch clsch                                              ');
+  PrepareSQLQuery('        ,UDER.vidUD vidopl                                             ');
+  PrepareSQLQuery('        ,UDER.tperson tperson                                          ');
+  PrepareSQLQuery('        ,UDER.strtabn strtabn                                          ');
+  PrepareSQLQuery('        ,UDER.SUMUD summa0                                             ');
+  PrepareSQLQuery('        ,''Удержание'' What                                              ');
+  PrepareSQLQuery('        ,Katpodr.KOD PODR                                              ');
+  PrepareSQLQuery('from UDER                                                        ');
+  PrepareSQLQuery('left join  Katpodr on UDER.cexoz=katpodr.nrec                    ');
+  PrepareSQLQuery('where ( :(wYEAR)=UDER.YEARN and :(wMES)=UDER.MESN and UDER.SUMUD  <> 0 )   ');
+  PrepareSQLQuery(') U_NACH                                                         ');
+  PrepareSQLQuery('Group by    ');
+  PrepareSQLQuery('clsch       ');
+  PrepareSQLQuery(',vidopl     ');
+  PrepareSQLQuery(',tperson    ');
+  PrepareSQLQuery(',strtabn    ');
+  PrepareSQLQuery(',What       ');
+  PrepareSQLQuery(',PODR       ');
+
+  stmt := sqlAllocStmt;
+
+          var _IdTable:longint;
+              _IdTable:=#n;
+  ExecDSQLex2(_IdTable,1);
+
+/*
+// ------------- nachisl -------------------
+_loop nachisl where (( wYEAR==nachisl.YEARN and wMES==nachisl.MESN))
+{
+if nachisl.summa=0 // or nachisl.MESN <> wMES
+{
+continue;
+}
+nextvisual;
+        if getfirst n where ((nachisl.clsch==n.clsch and nachisl.vidopl==n.vidopl))<>tsok
+        {
+        clearbuffer(#n);
+        n.clsch:=nachisl.clsch;
+        n.vidopl:=nachisl.vidopl;
+        n.tperson:=nachisl.tperson;
+        n.strtabn:=nachisl.strtabn;
+        n.summa:=nachisl.summa;
+        n.What := 'Начисление';
+
+        if getfirst Katpodr where ((nachisl.cexoz==katpodr.nrec ))=tsok
+        {
+        n.PODR := Katpodr.KOD;
+        }
+
+
+        insert current n;
+        }
+        else
+        {
+        n.summa:=n.summa+nachisl.summa;
+        update current n;
+        }
+}
+
+// ------------- Nenach -------------------
+_loop Nenach where (( wYEAR==Nenach.YEARN and wMES==Nenach.MESN))
+{
+if Nenach.summa=0  // or nenach.MESN <> wMES
+{
+continue;
+}
+nextvisual;
+        if getfirst n where ((Nenach.clsch==n.clsch and Nenach.vidopl==n.vidopl))<>tsok
+        {
+        clearbuffer(#n);
+        n.clsch:=Nenach.clsch;
+        n.vidopl:=Nenach.vidopl;
+        n.tperson:=Nenach.tperson;
+        n.strtabn:=Nenach.strtabn;
+        n.summa:=Nenach.summa;
+        n.What := 'Начисление';
+
+        if getfirst Katpodr where ((Nenach.cexoz==katpodr.nrec ))=tsok
+        {
+        n.PODR := Katpodr.KOD;
+        }
+        
+        insert current n;
+        }
+        else
+        {
+        n.summa:=n.summa+Nenach.summa;
+        update current n;
+        }
+}
+
+
+
+// ------------- UDER -------------------
+_loop UDER where (( wYEAR==UDER.YEARN and wMES==UDER.MESN))
+{
+if UDER.SUMUD=0  // or UDER.MESN <> wMES
+{
+continue;
+}
+nextvisual;
+        if getfirst n where ((UDER.clsch==n.clsch and UDER.vidUD==n.vidopl))<>tsok
+        {
+        clearbuffer(#n);
+        n.clsch:=UDER.clsch;
+        n.vidopl:=UDER.vidUD;
+        n.tperson:=UDER.tperson;
+        n.strtabn:=UDER.strtabn;
+        n.summa:=UDER.SUMUD;
+  n.What := 'Удержание';
+
+        if getfirst Katpodr where ((UDER.cexoz==katpodr.nrec ))=tsok
+        {
+        n.PODR := Katpodr.KOD;
+        }
+        
+
+
+        insert current n;
+        }
+        else
+        {
+        n.summa:=n.summa+UDER.SUMUD;
+        update current n;
+        }
+}
+*/
+StopVisual('',0);
+#_TimeLog('--- end Load Gal --');
+
+#_TimeLog('--- beg DBF --');
+
+LoadFromDBF;
+#_TimeLog('--- end DBF --');
+if  DBFError < 30000
+{
+  delete all S;
+      /*
+ExcelPath:='d:\Source20112017\';
+
+    xlCreateExcelWithTemplate(ExcelPath+'SUMOPL_2017_+ID_+FIO_11.xlsx',true);
+    if (xlIsExcelValid) xlSetActiveWorkBookByName('1');
+    */
+ExcelPath := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\ZP\';
+
+
+    xlCreateExcelWithTemplate(ExcelPath+'Начисления ЯНВ.xlsx',true);
+    if (xlIsExcelValid) xlSetActiveWorkBookByName('1');
+
+
+
+  xlGetUsedRange(0,0,MaxLine,MaxCol);
+
+StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Выполняется обработка ...', MaxLine div 5);
+
+dSum:=0;
+fSum:=0;
+Counter:=1;
+
+
+
+#_TimeLog('--- beg Excel --');
+
+while counter < maxLine
+do
+{
+  Counter++;
+
+  if Counter mod 5 = 0
+  if not nextvisual break;
+
+  xlgetcellvalue(Counter, 2, NrecPers   );
+  xlgetcellvalue(Counter, 4, KodVid    );
+  xlgetcellvalue(Counter, 5, MesVK   );
+  xlgetcellvalue(Counter, 6, GodVK);
+  xlgetcellvalue(Counter, 9, SumN);
+  xlgetcellvalue(Counter, 13, VidZap);
+  xlgetcellvalue(Counter, 18, VidNazn);
+  xlgetcellvalue(Counter, 20, famil);
+
+                          
+
+
+
+
+
+
+        if getfirst persons where ((NrecPers==persons.nrec))=tsok
+        {
+
+
+                if ((VidNazn='Основное место работы' or VidNazn='Декретный отпуск') ) // and VidZap='Начисление')
+                {
+                 if getfirst lschet where ((persons.nrec==lschet.tperson and 0==lschet.sovm(noindex)))=tsok
+                  {
+                  PoiskS;
+                  }
+                  else
+                  {
+                   xlSetCellStringValue('Не нашел основное!',Counter,24,Counter,24);
+                  PoiskS_fault;
+                  }
+
+                }
+
+
+            if (VidNazn='Совместительство' ) // and VidZap='Начисление')
+                {
+                 if getfirst lschet where ((persons.nrec==lschet.tperson and 0<<lschet.sovm(noindex)))=tsok
+                  {
+                  PoiskS;
+            }
+                  else
+                  {
+                   xlSetCellStringValue('Не нашел совместителя!',Counter,24,Counter,24);
+                  PoiskS_fault;
+                  }
+
+                }
+
+        }
+        else
+        {
+
+            if getfirst persons where (('С'==persons.isemployee and famil==persons.fio(noindex)))=tsok
+            {
+              if ((VidNazn='Основное место работы' or VidNazn='Декретный отпуск') ) //  and VidZap='Начисление')
+                {
+                 if getfirst lschet where ((persons.nrec==lschet.tperson and 0==lschet.sovm(noindex)))=tsok
+                  {
+                  PoiskS;
+                  }
+                  else
+                  {
+                   xlSetCellStringValue('Не нашел основное!',Counter,24,Counter,24);
+                  PoiskS_fault;
+                  }
+
+                }
+
+
+
+            if (VidNazn='Совместительство' ) // and VidZap='Начисление')
+                {
+                 if getfirst lschet where ((persons.nrec==lschet.tperson and 0<<lschet.sovm(noindex)))=tsok
+                  {
+                  PoiskS;
+                  }
+                  else
+                  {
+                   xlSetCellStringValue('Не нашел совместителя!',Counter,24,Counter,24);
+                  PoiskS_fault;
+                  }
+                }
+
+
+           }
+           else
+           {
+           xlSetCellStringValue('Физ. лица нет в базе данных!',Counter,24,Counter,24);
+           PoiskS_fio;
+           }
+
+        }
+
+}
+
+StopVisual('',0);
+xlkillExcel;
+
+#_TimeLog('--- end Excel --');
+
+}
+
+_loop s
+{
+        _loop n where ((s.clsch==n.clsch and s.vidopl==n.vidopl))
+        {
+        s.summaGal:=s.summaGal+n.summa;
+        update current s;
+        delete current n;
+        }
+}
+
+_loop n
+{
+clearbuffer(#s);
+s.clsch:=n.clsch;
+s.strtabn:=n.strtabn;
+s.tperson:=n.tperson;
+s.summaGal:=n.summa;
+s.vidopl:=n.vidopl;
+s.what:=n.what;
+s.PODR:=n.PODR;
+s.Metka:='Нет в КИС';
+insert current s;
+}
+
+_loop s where ((''==s.fio))
+{
+        if getfirst persons where ((s.tperson==persons.nrec))=tsok
+        {
+        s.fio:=persons.fio;
+        update current s;
+        }
+}
+
+var NewFileName : string;
+ NewFileName := TranslatePath('%HOMEDRIVE%%HOMEPATH%') + '\Documents\';
+ NewFileName := Replace(NewFileName,'\\','\');
+ NewFileName := NewFileName + 'sverka';
+var ii: word;
+    ii := 0;
+    While ExistFile(NewFileName + '_'+ if(ii < 10, '0','') + string(ii) + '.xls')
+     ii++;
+
+ NewFileName := NewFileName + '_'+ if(ii < 10, '0','') + string(ii) + '.xls';
+
+
+   puttabletodbf(#s,NewFileName, ptfFullTable);
+
+ExecProgram('start', NewFileName,'', pfDontWait , 0);
+
+        
+
+#_TimeLog('---завершено--');
+}
+
+ 
+end;
+end.
+
+.form resurs_sumopl_full2
+.nameinlist 'resurs_sumopl_full  Сверка начислений с кодом Подразделения за Февраль 2018 DSQL'
+.ard
+.begin
+runinterface(resurs_sumopl_full2);
+end.
+.endform
+/*
+Исходный файл
+       1) d:\Source20112017\SUMOPL_2017_+ID_+FIO_11.xlsx
+
+        или, если есть:     
+       2)                     D:\sverka.DBF
+
+
+Результат
+
+       3)  D:\sverka.xls
+
+           скопируйте его в D:\sverka.DBF
+           в следущий раз отработает быстрее.
+           в случае обновления 1) удалите 2) 
+
+
+
+*/

@@ -1,0 +1,582 @@
+/*************************************************************************************************\
+* Наименование: Банковские реквизиты сотрудников                                                  *
+* Контур/Модуль: Заработная плата                                                                 *
+* Пункт меню: Отчеты / Отчеты пользователя / Документы / Банковские реквизиты сотрудников         *
+* Примечание:                                                                                     *
+* Это интерфейс предназначен для ввода номеров счетов для перечисления заработной платы и аванса. *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1668         |17/01/18|Тищенко Р.Н.             |НПО Энергомаш                    *
+* Разработка  |EM-35         |01/12/19|Торохов А.П.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include PAFilter.vih // Объектный интерфейс Фильтра по лицевым счетам сотрудников
+#include ExtAttr.vih
+#include GP_LSBankReq.vih
+#include Recwin13_LS.vih
+
+#define GPInt GP_BankRequisites // #(GPInt)
+#define GPNam Банковские реквизиты сотрудников // #(GPNam)
+
+interface GP_BankRequisites '#(GPNam)' EscClose;
+  show (,, 163, 32);
+
+  const
+    // Диапазон для перечисления з/п 206...210, 220...230, для перечисления аванса 141...145, 199
+    // На Энергомаше для этих целей используются следующие удержания (используем их для вывода "+" в соответствующих полях):
+    VID_UD_Z = 220; // Системный код постоянного удержания по перечислению з/п (польз.код 999)
+    VID_UD_A = 141; // Системный код постоянного удержания по перечислению аванса (польз.код 226)
+    EXT_ATTR_PER_COMMENT = 'Примечание по перечислению'; // Название внешнего атрибута для хранения примечания по перечислению
+    FT_WORK_ON = 1; // Работающие на дату
+    FT_UV_IN_PER = 2; // Уволенные за период
+  end;
+#IfDef _2019_02_13_
+#include PometkaRP.inc
+#EndIf
+
+  var
+    #include PaFilter.var
+
+  function GetPerAccType(_cKatOrg: tNRec): String; forward; // Тип счёта
+  function GetPerComment(_cLSchet: tNRec): String; forward; // Примечание
+  function GetFlagPer(_cLSchet: tNRec; _VidUd: Word): String; forward; // Признак перечисления аванса / зарплаты
+
+  create view
+    var
+      pMonth: Byte; // Месяц отчётного периода
+      pYear: Word; // Год отчётного периода
+      pFilters: Word; // Дополнительные фильтры
+      pDtWonkOn: Date; // Работающие на дату
+      pDtUvFrom: Date; // Уволенные в период с
+      pDtUvTo: Date; // Уволенные в период по
+      iCard_LS       : ObjRecWin13_LS_Ext;
+    as select
+      PAF.GetDepartmentFilterStr() (fieldName = FiltrPodr), // фильтр по подразделению
+      PAF.GetPersonalAccountFilterStr() (fieldName = FiltrPublic), // фильтр по работникам
+      if(LSchet.Summa27 != 0, GetPerAccType(KatOrg.NRec), '-') (fieldName = PerAccType), // Тип счёта
+      GetPerComment(LSchet.NRec) (fieldName = PerComment), // Примечание
+      if(IsValid(tnPassports), Passports.Ser + ' № ' + Passports.Nmb, '') (fieldName = Passport), // Серия и № паспорта
+      if(LSchet.Summa27 != 0, '+', '-') (fieldName = TransToBank), // Переч. в банк
+      GetFlagPer(LSchet.NRec, VID_UD_A) (fieldName = FlagPerA), // Пер. ав.
+      GetFlagPer(LSchet.NRec, VID_UD_Z) (fieldName = FlagPerZ), // Пер. з/п
+      GetStrTabN(LSchetS.TabN, LSchetS.StrTabN) (fieldName = SmLSTabN) // Таб.№ смежн.л/с
+    from
+      Zar_User,
+      LSchet,
+      Passports,
+      KatOrg,
+      Shtraf,
+      synonym LSchet LSchetS,
+      synonym Passports PassportsS,
+      synonym Shtraf ShtrafZ,
+      synonym Shtraf ShtrafA,
+      synonym KatBank KatBankZ,
+      synonym KatBank KatBankA,
+      KatOrgDescr,
+      synonym KatOrgDescr KatOrgDescrG
+    where ((
+          UserName            == Zar_User.OwnName
+      and 0                   == ForMarks.Choice
+      and ForMarks.cPodr      == LSchet.NRec
+      and LSchet.TPerson      == Persons.NRec
+      // and ForMarks.Field1 == KatPodr.NRec
+      and LSchet.Cex          == KatPodr.NRec
+      // Паспорт гражданина России
+      and Persons.PasspRus    == Passports.NRec
+      // СНИЛС
+      and Persons.Nrec        == PassportsS.Person
+      and 501                 == PassportsS.Syscode
+      // Данные из лицевого счета
+      and LSchet.cPodr        == KatOrg.NRec
+      and LSchet.cLSchDop     == KatBank.NRec
+      // Постоянные удержания по перечислению аванса
+      and LSchet.NRec         == ShtrafA.cLSch
+      and VID_UD_A            == ShtrafA.VidUd
+      and (ShtrafA.Pometka != coInactiveRP and ShtrafA.Pometka != coArchivedRP)
+      and ShtrafA.cBankPol    == KatBankA.NRec
+      // Постоянные удержания по перечислению з/п
+      and LSchet.NRec         == ShtrafZ.cLSch
+      and VID_UD_Z            == ShtrafZ.VidUd
+      and (ShtrafZ.Pometka != coInactiveRP and ShtrafZ.Pometka != coArchivedRP)
+      and ShtrafZ.cBankPol    == KatBankZ.NRec
+      // Смежный лицевой счёт
+      and LSchet.tPerson      == LSchetS.tPerson
+      and (LSchet.NRec != LSchetS.NRec)
+      and KatOrgDescr.cGroup == KatOrgDescrG.NRec
+    ))
+    // Показываем всех с пустой, или ещё не наступившей датой увольнения (в ForMarks.PrBornDate дата увольнения)
+    condition WorkOn = (ForMarks.PrBornDate = ZeroDate or ForMarks.PrBornDate > pDtWonkOn)
+    // Показываем всех с не пустой датой увольнения, попадающей в указанный период (в ForMarks.PrBornDate дата увольнения)
+    condition UvInPer = (ForMarks.PrBornDate != ZeroDate and ForMarks.PrBornDate >= pDtUvFrom and ForMarks.PrBornDate <= pDtUvTo)
+  ;
+
+  var
+    oExtAttr: IExtAttr;
+    PerCommentS: String;
+
+  #include GP_Log.var
+  #include GP_LSBankReq.var
+
+  function GetFlagPer(_cLSchet: tNRec; _VidUd: Word): String; // Признак перечисления аванса / зарплаты
+  begin
+    if getFirst Shtraf where ((_cLSchet == Shtraf.cLSch and _VidUd == Shtraf.VidUd)) = tsOk then
+      result := '+'
+    else
+      result := '-';
+  end;
+
+  // Тип счёта
+  function GetPerAccType(_cKatOrg: tNRec): String; // Тип счёта
+  begin
+    result := '?';
+    // Группы организаций-получателей
+    _loop KatOrgDescr where ((_cKatOrg == KatOrgDescr.cRec))
+    begin
+      //if IsValidAll(tnKatOrgDescrG) then
+      if getFirst KatOrgDescrG = tsOk then
+        // if KatOrgDescrG.Name = 'Зарплатный проект' then
+        if KatOrgDescrG.nrec = coGetTune('NPOEM_OWN.ZP.AccTypeZP') then
+        begin
+          result := 'З/П';
+          exit;
+        end else
+          // if KatOrgDescrG.Name = 'Индивидуальный (зарплатный)' then
+        if KatOrgDescrG.nrec = coGetTune('NPOEM_OWN.ZP.AccTypeIS') then
+          begin
+            result := 'ИС';
+            exit;
+          end;
+     end;
+  end;
+
+  // Примечание
+  function GetPerComment(_cLSchet: tNRec): String;
+  begin
+    result := oExtAttr.sGetAttr(coLSchet, _cLSchet, EXT_ATTR_PER_COMMENT);
+  end;
+
+  // Примечание
+  procedure SetPerComment(_cLSchet: tNRec; CommentTxt: String);
+  begin
+    oExtAttr.sSetAttr(coLSchet, _cLSchet, EXT_ATTR_PER_COMMENT, CommentTxt);
+  end;
+
+  // Применяет дополнительные фильтры
+  procedure ApplyAddFilters;
+  begin
+    // Если включен параметр "Работающие на дату"
+    if (pFilters and FT_WORK_ON) != 0 then
+    begin
+      if not ConditionActiveInLeave(tcWorkOn, #ForMarks)
+        PushConditionForLeave(tcWorkOn, #ForMarks);
+    end else
+    begin
+      if ConditionActiveInLeave(tcWorkOn, #ForMarks)
+        PopConditionForLeave(tcWorkOn, #ForMarks);
+    end;
+
+    // Если включен параметр "Уволенные за период"
+    if (pFilters and FT_UV_IN_PER) != 0 then
+    begin
+      if not ConditionActiveInLeave(tcUvInPer, #ForMarks)
+        PushConditionForLeave(tcUvInPer, #ForMarks);
+    end else
+    begin
+      if ConditionActiveInLeave(tcUvInPer, #ForMarks)
+        PopConditionForLeave(tcUvInPer, #ForMarks);
+    end;
+  end;
+
+  // Минимально необходимый код из PAFilter.vpp для использования стандартных зарплатных фильтров
+  // #include PAFilter.vpp : begin
+  procedure ProcessCheck;
+  begin
+    case Zar_User.GrupStN xor PAF.GetFilterState of // какой фильтр изменился ?
+      1: // по подразделению
+        if (Zar_User.GrupStN and 1) > 0 then
+        begin
+          SelectField(#FiltrPodr);
+          putcommand(cmPick);
+        end else
+        begin
+          PAF.ClearDepartmentFilter;
+          ReReadRecord(#Zar_User);
+        end;
+      2: // по работникам
+        if (Zar_User.GrupStN and 2) > 0 then
+        begin
+          SelectField(#FiltrPublic);
+          putcommand(cmPick);
+        end else
+        begin
+          PAF.ClearPersonalAccountFilter;
+          ReReadRecord(#Zar_User);
+        end;
+    end;
+  end;
+
+  procedure PodrPubCheck;
+  begin
+    if CurField = #Zar_User.GrupsTN then
+      ProcessCheck;
+  end;
+
+  procedure PodrPubPick;
+  begin 
+    case CurField of
+      #FiltrPodr:
+        begin
+          PAF.ChangeDepartmentFilter(true);
+          ReReadRecord(#Zar_User);
+        end;
+      #FiltrPublic:
+        begin
+          PAF.ChangePersonalAccountFilter(0);
+          ReReadRecord(#Zar_User);
+        end;
+    end;
+  end;
+
+  function FillMarks: Boolean;
+  begin
+    result := PAF.CheckPersonalAccountFilter(0);
+    if not result then
+    begin
+      SelectField(#FiltrPublic);
+      Message('Не задан фильтр по работникам', Error + OkButton);
+    end else
+      ApplyAddFilters;
+    ReReadRecord(#Zar_User);
+  end;
+  // #include PAFilter.vpp : end
+
+  procedure UpdateCmdState;
+  begin
+    case CurTable of
+      #ForMarks:
+        begin
+          if IsValid(tnLSchet) then
+          begin
+            EnableCommand(cmEdit);
+            EnableCommand(cmValue2);
+            if IsValid(tnLSchetS) then
+              EnableCommand(cmValue3)
+            else
+              DisableCommand(cmValue3);
+          end else
+          begin
+            DisableCommand(cmEdit);
+            DisableCommand(cmValue2);
+            DisableCommand(cmValue3);
+          end;
+        end;
+    end;
+  end;
+
+  procedure ApplyFilter;
+  begin
+    FillMarks;
+    if getFirst ForMarks = tsOk then
+    begin
+    end;
+    RescanPanel(#ForMarks);
+    UpdateCmdState;
+  end;
+
+  procedure UpdateFieldsState;
+  begin
+    // Если включен параметр "Работающие на дату"
+    if (pFilters and FT_WORK_ON) != 0 then
+      SetFieldOption(#pDtWonkOn, ofSelectable)
+    else
+      ClearFieldOption(#pDtWonkOn, ofSelectable);
+    // Если включен параметр "Уволенные за период"
+    if (pFilters and FT_UV_IN_PER) != 0 then
+    begin
+      SetFieldOption(#pDtUvFrom, ofSelectable);
+      SetFieldOption(#pDtUvTo, ofSelectable);
+    end else
+    begin
+      ClearFieldOption(#pDtUvFrom, ofSelectable);
+      ClearFieldOption(#pDtUvTo, ofSelectable);
+    end;
+    RescanPanel(#Zar_User);
+  end;
+
+  screen scrParam ('',, sci1Esc);
+    show (,,, 4);
+    table Zar_User;
+  fields
+    Zar_User.GrupStN ('Выберите фильтр для расчета',, sci1Esc): noProtect;
+    FiltrPodr ('Заданный фильтр по подразделению',, sci13Esc): protect, pickButton;
+    pFilters ('Дополнительные фильтры',, sci1Esc): noProtect;
+    pDtWonkOn ('Работающие на дату',, sci1Esc): noProtect;
+    FiltrPublic ('Заданный фильтр по работикам',, sci13Esc): protect, pickButton;
+    pDtUvFrom ('Уволенные в период с',, sci1Esc): noProtect;
+    pDtUvTo ('Уволенные в период по',, sci1Esc): noProtect;
+  buttons
+    cmFilterSave,,, 'Ввод - принять выбор',,sci1Esc;
+  <<
+ Фильтры по                                                      Дополнительные фильтры                              
+  [.] подразделению  `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@   [.] работающие на дату`  .@@@@@@@@@@                <. ~П~рименить фильтр .>
+  [.] работникам     `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@   [.] уволенные в период с`.@@@@@@@@@@`по`.@@@@@@@@@@                     
+  >>
+  end;
+
+  browse brwLSchet (,, sci14Esc);
+    show (, 5,,);
+    table ForMarks;
+    fixedLeft (KatPodr.Kod, ForMarks.Field2, ForMarks.StrTabN, SmLSTabN, Passport, Persons.BornDate, ForMarks.FIO);
+    fields
+      KatPodr.Kod 'Код', 'подр.' ('Код подразделения'): [9],protect, noAutoSize;
+      ForMarks.Field2 'Таб.№' ('Табельный номер работника'): [7], protect, noAutoSize; // LSchet.TabN
+      ForMarks.StrTabN 'Таб.№' ('Табельный номер работника'): [7], protect, noAutoSize; // LSchet.StrTabN
+      SmLSTabN 'Таб.№', 'смежн.л/с' ('Табельный номер смежного лицевого счета'): [7], protect, noAutoSize;
+      Passport 'Серия и №', 'паспорта' ('Серия и номер паспорта'): [15], protect, noAutoSize;
+      Persons.BornDate 'Дата', 'рождения' ('Дата рождения'): [11], protect, noAutoSize;
+      ForMarks.FIO 'Работник' ('Фамилия, имя и отчество работника'): [35], protect; // Persons.FIO
+      LSchet.DatPos 'Дата', 'поступ.' ('Дата поступления'): [11], protect, noAutoSize;
+      LSchet.DatUv 'Дата', 'увольн.' ('Дата увольнения'): [11], protect, noAutoSize;
+      TransToBank 'Переч.', 'в банк' ('Перечислять з/п в банк'): [7], protect, noAutoSize, centered;
+      PerAccType 'Тип', 'сч.' ('Тип счёта'): [4], protect, noAutoSize, centered;
+      KatBank.Name 'Банк', 'по умолчанию' ('Банк, указанный на закладке "Банк" лицевого счета сотрудника'): [13], protect;
+      LSchet.Pasport 'Лицевой счет', 'по умолчанию' ('№ лицевого счета, указанный на закладке "Банк" лицевого счета сотрудника'): [21], protect, noAutoSize;
+      FlagPerA 'Пер.', 'ав.' ('Признак перечисления зарплаты в банк'): [4], protect, noAutoSize, centered;
+      KatBankA.Name 'Банк аванс' ('Банк для перечисление аванса'): [13], protect;
+      ShtrafA.NomLsh 'Лицевой счёт', 'аванс' ('Лицевой счет для перечисление аванса'): [21], protect, noAutoSize;
+      FlagPerZ 'Пер.', 'з/п' ('Признак перечисления зарплаты в банк'): [4], protect, noAutoSize, centered;
+      KatBankZ.Name 'Банк з/п' ('Банк для перечисление окончательной зарплаты'): [13], protect;
+      ShtrafZ.NomLsh 'Лицевой счёт', 'з/п' ('Лицевой счет для перечисление окончательной зарплаты'): [21], protect, noAutoSize;
+      PerComment 'Примечание' ('Примечание'): [25], protect;
+      PassportsS.Nmb 'СНИЛС' ('Номер страхового свидетельства'): [15], protect, noAutoSize;
+  end;
+
+  procedure RunPickSh;
+  var
+    CNS: tNomLSch;
+  begin
+    CNS := LSchet.Pasport;
+    if RunInterface('GP_ZP::GP_PickSh', LSchet.NRec, LSchet.cPodr, LSchet.cLSchDop, CNS, LSchet.NomCard, LSchet.Summa27) != cmCancel then
+    begin
+      LSchet.Pasport := CNS;
+      update current LSchet;
+    end;
+    RereadRecord(#ForMarks);
+  end;
+
+  window winEdit 'Данные по перечислению з/п с закладки "Банк" лицевого счета' DoAccept, EscClose, Gray;
+    show at (,, 100, 30);
+    screen BankScreen;
+      show at (,,,1);
+      table LSchet;
+      fields
+        [Summa27Str] if(LSchet.Summa27 = 0, 'нет', 'да')
+          ('Признак перечисления заработной платы в банк', hcZarBANKindication, sclschet1) protect;
+    <<
+    `Перечислять з/п в банк`.@@@@
+    >>
+    end;
+    embedded embCard 'Банковские реквизиты' interface iCard_LS;
+      show at (,2,,);
+    end;
+
+    handleEvent
+      cmInit:{
+        PerCommentS := GetPerComment(LSchet.NRec);
+        }
+      cmDone:
+        begin
+          SetPerComment(LSchet.NRec, PerCommentS);
+          RescanPanel(#ForMarks);
+        end;
+      cmPick:
+        if CurWindow = winEdit then
+          case CurField of
+            #Summa27Str:
+              set LSchet.Summa27 := if(LSchet.Summa27 = 0, 1, 0);
+          end;
+
+    end;
+
+  end;
+
+  procedure CopyFromOtherLS;
+  begin
+    if not IsValid(tnLSchetS) then
+      exit;
+    if Message('Скопировать данные по перечислению з/п и аванса'#13 +
+     'из лицевого счёта с таб.№ ' + GetStrTabN(LSchetS.TabN, LSchetS.StrTabN) + '?', Confirmation + YesNo) != Yes then
+      exit;
+    oGP_LSBankReq.CopyBankReq(LSchetS.NRec, LSchet.NRec, false);
+    RescanPanel(#ForMarks);
+  end;
+
+  function DoInit: Boolean;
+  var
+    pYearRas: Integer;
+    pMonthRas: Integer;
+  begin
+    result := false;
+    pYearRas := 0;
+    pMonthRas := 0;
+    if not GetUserDate(pYearRas, pMonthRas, 0, ZeroDate, ZeroDate) then
+      exit;
+    pMonth := pMonthRas;
+    pYear := pYearRas;
+
+    pFilters := FT_WORK_ON; // Дополнительные фильтры - по-умолчанию выключено
+    pDtWonkOn := Cur_Date; // Работающие на дату
+    pDtUvFrom := To_Date(1, pMonthRas, pYearRas); // Уволенные за период с
+    pDtUvTo := To_Date(Last_Day(pDtUvFrom), pMonthRas, pYearRas); // Уволенные за период по
+    UpdateFieldsState;
+
+    if wGetTune('FormatClockNumber') = 1 then
+      ClearFieldState(#ForMarks.Field2, sfVisible)
+    else
+      ClearFieldState(#ForMarks.StrTabN, sfVisible);
+    PAF.InitFilter(true, false);
+    ApplyFilter;
+    result := true;
+  end;
+
+  tableEvent table LSchet;
+    cmUpdateRecord:
+      update current LSchet;
+  end;
+
+  handleEvent
+    cmInit:
+    {
+      if not DoInit then
+        abort;
+      if ( not GetVipRef(iCard_LS, 'RecWin13_LS'))
+      {
+        message('Ошибка при загрузке интерфейса RecWin13_LS', CancelButton);
+        exit;
+      }
+      iCard_LS.prwTypeRun := 1;
+    }
+    cmCheckField:
+      begin
+        case CurField of
+          #pFilters:
+            UpdateFieldsState;
+        end;
+        PodrPubCheck; // Процедура для фильтров по подразд. и работникам
+      end;
+    cmPick:
+      PodrPubPick; // Процедура для фильтров по подразд. и работникам
+    cmFilterSave:
+      ApplyFilter;
+    cmDefault:
+    {
+
+      case CurTable of
+        #Zar_User:
+          ApplyFilter;
+      end;
+    }
+    cmEdit:
+    {
+      var wUseCard_: word = cnUse_All;
+      var cOrg_, cBank_: comp = 0;
+      case CurField of
+      #KatBankA.Name:
+      {
+        wUseCard_ := cnUse_Avans;
+      }
+      #KatBankZ.Name:
+      {
+        wUseCard_ := cnUse_Salary;
+      }
+      #LSchet.Pasport:
+      {
+        wUseCard_ := cnUse_Bank;
+        cOrg_     := LSchet.cPodr;
+        cBank_    := LSchet.cLSchDop;
+      }
+      end;
+      iCard_LS.pSetRelationAdv(LSchet.tPerson, LSchet.nRec, wUseCard_, cOrg_, cBank_);
+      RunWindowModal(winEdit);
+    }
+    cmValue2:
+      RunPickSh;
+    cmValue3:
+      CopyFromOtherLS;
+    cmHotKeys:
+      case CurTable of
+        #ForMarks:
+          begin
+            UpdateCmdState;
+            PutHotCommand(RunMenu('mnuGP_BankRequisites'));
+          end;
+      end;
+    cmPositionChanged:
+      UpdateCmdState;
+    cmDelOnProtect:
+      begin
+        if CurWindow = winEdit then
+          case CurField of
+            //#Summa27Str:
+              //set LSchet.Summa27 := 0;
+            #KatOrg.Name:
+              set LSchet.cPodr := 0;
+            #KatBank.Name, #KatBank.Schet1:
+              set LSchet.cLschDop := 0;
+          end;
+        abort;
+      end;
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_GP_BankRequisites implements IUserReport;
+
+interface UserReport_GP_BankRequisites;
+
+  procedure Run;
+  begin
+    RunInterfaceNoModal('GP_BankRequisites');
+  end;
+
+  function GetReportName: String;
+  begin
+    result := 'Банковские реквизиты сотрудников';
+  end;
+
+  function GetGroupName(Level: Word): String;
+  begin
+    result := '';
+    case Level of
+      1: result := 'Документы';
+    end;
+  end;
+
+  function GetPriority: Integer;
+  begin
+    result := 0;
+  end;
+
+  function VisibleInModule(Ind: Byte): String;
+  begin
+    result := '';
+    case Ind of
+      1: VisibleInModule := 'MENUZARP';
+      2: result := 'STAFFMAINMENU';
+    end;
+  end;
+
+end.
+
+mnuGP_BankRequisites menu
+{
+ - 'Редактировать данные из л/с', cmEdit, 'Редактировать данные с закладки "Банк" лицевого счета';
+ - 'Перейти в постоянные удержания', cmValue2, 'Перейти в постоянные удержания по перечислению з/п и аванса';
+ - 'Скопировать из смежного л/с', cmValue3, 'Скопировать данные по перечислениям из смежного л/с';
+}

@@ -1,0 +1,1822 @@
+/*************************************************************************************************\
+* Наименование:  Расчетные листки. Отчет на FastReport                                            *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Замечания от 27.10.2017                                                          *
+* Сортировка по кодам видов оплат,а внутри кодов по периодам,189 вид оплат всегда выводить в конце*
+* Замечания от 14.02.2018 - выводить итоги как в табеле                                           *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#803          |10/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#804          |10/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#1786         |31/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#803.#32      |17/07/19|Торохов А.П.             |НПО Энергомаш                    *
+* Разработка  |#803.#33      |31/07/19|Торохов А.П.             |НПО Энергомаш                    *
+* Разработка  |#803.#38      |01/08/19|Торохов А.П.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+//<NONTAXABLE."DOACCOUNTED"> учтено вычетов
+#include FixedAdditionalPayments.vih
+#include BLisNet1.vih
+#include RListPar.vih
+#include frRecordDefinition.Vih
+#include ExtAttr.Vih
+
+//-------------------------------
+#include GP_Viplata_Info.Vih
+
+#component "Z_RLIST"
+#doc
+ Расчетные листки. Отчет на FastReport
+ Сортировка по кодам видов оплат,а внутри кодов по периодам,189 вид оплат всегда выводить в конце
+ AllCode_Vych Deductions."doAllCode_Vych"
+ [Copy(<TP_WORKTIME."STYPETIME">,0,pos('...',<TP_WORKTIME."STYPETIME">))]
+#end
+Alter Interface FR_RLIST;
+OverLoad
+  datastream dsRlist;
+  procedure NachislStore;
+  Procedure GetWorkingTime;
+  function boCheckRecord( _Mes, _VidUd: word; cKAU : comp ) : boolean; // Берем целиком
+  procedure UderStore; // Берем целиком
+  function oFR_Rlist.FillReport(oParam: oRListPar): boolean;
+  Procedure oFR_Rlist.ShowReports;
+  function GetTarif: double;//почему то иногда печатает 24000000 - добавил ограничение
+//------------------------------------------------------------------------------
+  procedure pInsTime ( wType : word; dDays, dHours : double; wRejim : word = 0 );
+#IFDEF _2018_10_19_
+#ELSE
+  Function fAddVichet (typeTable : word) : double;
+#ENDIF
+end;
+
+// Дублируем - не видит
+const
+  NachChoice    = 1;
+  UderChoice    = 2;
+  NenachChoice  = 3;
+
+  cn_Fond = 0;
+  cn_Work = 1;
+  cn_Plan = 2;
+  cn_Paid = 3;
+
+end;
+//----------------------------
+Table Struct Tmp_KlOTpusk
+( Vidopl:word
+  ,IsRabDn:word
+)
+with index
+( Tmp_KlOTpusk01 = Vidopl
+);
+
+//для контроля дубликатов начислений
+table struct tmp_dn
+( clsch  :comp
+ ,vidopl :longint
+ ,datan  :date
+ ,datok  :date
+ ,Znak   :longint
+ ,YearN  :longint
+ ,MesN   :longint
+ ,kolDn  :Double
+ ,kolchs :Double
+ ,summa28:integer //условия  (Round(SUMVIDOP.SUMMA28)) // Спец поле для Листа
+                  //          (fieldName = Fd_Summa28_Uslov),
+
+)
+with index
+( tmp_dn01 = clsch+vidopl+Znak+YearN+MesN+datan+datok+kolDn+kolchs
+);
+//----------------------------
+Var
+  piExtAttr          : iExtAttr;
+  iGP_Viplata_Info   : GP_Viplata_Info;
+  pVA_TYPE_DAY       : comp;//ВА "Выводить в расчетный лист"
+  pVA_Check_Duplicate: comp;
+
+  wPerechFSS:word; //Perech.VidPer Для налога на ФСС
+//--- Настройки
+  NPOEM_OWN_ZP_RList_SortDef:word;
+  NPOEM_OWN_ZP_RList_Vipl_Info:word;
+//------------
+//Дни для отпуска: количество дней, заработанных за месяц (3,00к/2,00р =
+//3 календарных дня / 2 рабочих) принимаемых в расчет.
+//Если, например, работник был в отпуске за свой счет более 14 дней, то дней принимаемых в расчет для отпуска может быть меньше.
+ OTP_KOLDN:string; //
+ OTP_DN_CALEND:double;
+ OTP_DN_WORK:double;
+//Отпуск сумма в/о за месяц, включенных в базу для расчета отпуска (из классификатора Видов оплат и скидок).
+ OTP_OSN    :double;
+//Премия отпуска сумма в/о за месяц, входящих в расчет отпуска с признаком <П>
+//(из классификатора Видов оплат и скидок).
+ OTP_PREM   :double;
+//---------------------------
+//Индекс сумма в/о за месяц, включенных в базу для отпуска и индексируемая при расчете
+//(классификатор Видов оплат и скидок,  значение <+> в поле Индексации закладки <Расчеты>).
+ OTP_INDEX  :double;
+//сумма фонда ФСС по больничным
+ BOLN_YEAR :array[1..2] of word;
+ BOLN_SUM  :array[1..2] of double;
+
+//---------------------------
+create view vRlist_FR
+from
+  // в стандарте с индексом tmpSumms00, в результате с первого раза не применяется сортировка
+  tmpSumms tmpSumms_GP(tmpSumms01)
+ ,tmp_dn
+bounds tmpSummsNach_GP = NachChoice    == tmpSumms_GP.Choice
+              Ordered by  tmpSumms_GP.Vid, tmpSumms_GP.SaveMes
+;
+
+
+//--------------------------------------------
+Create view vSpr
+var
+ pSpKau:comp;
+ wVidopl:word;// системный код вида удержания
+as select  SpKau.Nrec
+From SpKau, KlVidopl
+ , KlOTpusk
+ , Tmp_KlOTpusk
+where
+((   pSpKau  == SpKau.Nrec
+ and wVidopl == KlVidopl.Vidopl
+));
+
+//--------------------------------------------
+create view v_SUMSPREVPLACE
+var
+ pLschet:comp;
+ wYear  :word;
+as select SUMSPREVPLACE.Nrec
+from SUMSPREVPLACE, KlVidopl
+where ((
+     pLschet  == SUMSPREVPLACE.CLSCH
+ and wYear == SUMSPREVPLACE.YEAR
+ and SUMSPREVPLACE.Vidopl /== KlVidopl.Vidopl
+ and wYear == SrednZar.YearS
+));
+//--------------------------------------------
+create view v_WT
+var
+  wMes :word;
+  wYear:word;
+  pLsch :comp;
+  wRejim :word;//UP.ZAR.REJIM5
+as select
+  LsTab.Nrec
+from LsTab, KlNdr
+where  ((
+     pLsch == LsTab.cLschet
+and  wYear == LsTab.Yearn
+and  wMes  == LsTab.MesN
+and  wYear == klndr.YEARK
+and  wMes  == klndr.MONTHK
+and  wRejim     == klndr.rejim //1.12 Восемь часов в день сорок часов в неделю
+and  pLsch == prnaryad.clsch
+and  (  wYear=Year (prnaryad.DataN)
+    and wMes =Month(prnaryad.DataN)
+    )
+
+));
+
+!-----------------------------------
+function CalcWorkDay(_pLsch:comp;_wMes:word;_wYear:word; _DN_CALEND:double):word;
+var
+  ii:word;
+{
+ Result:=0;
+ _DN_CALEND:=0;
+   v_Wt.pLsch:=_pLsch;
+   v_Wt.wMes :=_wMes ;
+   v_Wt.wYear:=_wYear;
+   if v_Wt.getfirst Klndr=tsok
+     if v_Wt.getfirst Lstab=tsok
+     for(ii:=1;ii<=31;ii++)
+     { if (v_wt.LSTAB.DAYCHF[ii]>0 and v_wt.LSTAB.DAYCHF[ii]<25)
+       or v_wt.LSTAB.DAYS[ii]='В'
+       or v_wt.LSTAB.DAYS[ii]='ЛЧ'
+//804 от 19.02.2018
+//804 от 26.02.2018 не нужно   or v_wt.LSTAB.DAYS[ii]='НН'
+       { if v_Wt.KLNDR.DAYCHAS[ii]>0
+         { Result++;
+
+         }
+       }
+     } //for(ii:=1;ii<=31;ii++)
+   // Заберем алгоритм с расчета отпуска
+} //function CalcWorkDay(_pLsch:comp;_wMes:word;_wYear:word):word;
+
+//--------------------------------
+//получить тип вида отпуска по классификатору отпуска
+//--------------------------------
+// заблокировал по #804.39
+Function GetIsRabDn( _wVidopl:word ):word;  Cacheable;
+{ Result:=0;
+  if vSpr.getfirst Tmp_KlOTpusk where (( _wVidopl == Tmp_KlOTpusk.Vidopl ))=tsok
+    Result:=vSpr.Tmp_KlOTpusk.IsRabDn;
+} //Function GetIsRabDn( _wVidopl:word );  Cacheable;
+
+
+//--------------------------------
+// Получить тип вывода дней
+//--------------------------------
+Function GetDayType( _wVidopl:longint ) :word;  Cacheable;
+{ Result:=0;
+  vSpr.wVidopl:=_wVidopl;
+  If vSpr.GetFirst KlVidopl <>tsok then exit;
+  vSpr.pSpkau:=coGetAttrID(coKlVidopl,vSpr.KlVidopl.Nrec,pVA_TYPE_DAY);
+//  timelog('FR_LIST->GetDayType:_wVidopl='+string(_wVidopl)+',vSpr.pSpkau='+string(vSpr.pSpkau));
+  if vSpr.pSpkau=0 then exit;
+  if vSpr.Getfirst Spkau<>tsok exit;
+  case trim(vSpr.SpKau.Code) of
+  '001' : Result:=1;//Только календарные дни
+  '002' : Result:=2;//Только рабочие дни
+  '003' : Result:=3;//Только часы
+  end;
+//  timelog('FR_LIST->GetDayType:_wVidopl='+string(_wVidopl)+','+string(Result));
+} //Function GetDayType( _wVidopl:word ) :word;  Cacheable;
+
+
+//----------------------------------
+// Вставить отработанное время
+//----------------------------------
+procedure pInsTime ( wType : word; dDays, dHours : double; wRejim : word = 0 );
+{ // почему то выводит не тот месяц  - переоткроем табель
+  timelog('FR_LIST->pInsTime:Lschet.StrTabn='+string(Lschet.StrTabn)+',Month1, Yea='+string(Month1)+'.'+string(Yea));
+  LoadWT(tmpForMarks.cPodr, Month1, Yea);
+  case wType of
+  cn_Work : //Делаем как в табеле - итоги - рабочие часы
+  { dDays  := WT_GetDaysBwDays(dkWorking, stActual, 1, 31);
+    dHours := WT_GetHoursBwDays(hkWorking, 0, 0, stActual, 1, 31) ;
+  }
+  end;
+  Inherited::pInsTime ( wType, dDays, dHours, wRejim );
+
+
+}
+
+//------------------------------------------------------------------------------
+// Тариф/оклад работника
+//------------------------------------------------------------------------------
+function GetTarif: double;
+{ Result:=Inherited::GetTarif;
+  if Result>2000000
+    Result:=Lschet.Tarif;
+}
+
+//------------------------------------------------------------------------------
+// Отработанное время, фонд времени, плановое  время, оплачиваемое время
+//------------------------------------------------------------------------------
+Procedure GetWorkingTime;
+{ Inherited::GetWorkingTime;
+  //Здесь надо бы штатную функцию по расчету компенсации, но она наверное долго будет считать
+  OTP_DN_CALEND:=0;
+  OTP_DN_WORK:=0;
+  OTP_KOLDN:=''; //
+
+  OTP_DN_Work  :=CalcWorkDay(Lschet.Nrec,Month1,Yea,OTP_DN_CALEND);
+  OTP_DN_CALEND:=WT_GetDaysBwDaysEx(dkCalendarVacation,stActual,1,31,0 );
+  OTP_KOLDN:=string(OTP_DN_CALEND,0,2)+'к./'+string(OTP_DN_Work,0,2)+'р.';
+} //Procedure GetWorkingTime;
+
+
+//------------------------------------------------------------------------------------------------------------
+#declare pSearchTp_Kau (TableName, VidUdS, cSource, bSource)
+//GP
+var _sDop:string='';
+//GP
+{
+  cRec_tpKau := comp(0);
+
+  if ( mySetDefParam = ccRus ) and
+     ( UderSumFlag = 0 )
+  //GP по алиментам все равно будем разбивать
+  or ( (UderSumFlag=1 or UderSumFlag=2)//prParam.bExtra_UderMonth
+    and (#VidUdS=185 or #VidUdS=186 or #VidUdS=187
+      or #VidUdS=188 or #VidUdS=189 or #VidUdS=190
+      or #VidUdS=191
+      //#803.#19
+      or #VidUdS=208
+        )
+     )
+  {
+    var _SourceLinkUd : comp = 0;
+
+    var _wTbl : word = co#TableName;
+
+    case #VidUdS of
+    185, 186, 187, 188, 189, 190, 191:
+    {
+      _SourceLinkUd := comp(#TableName.prPer);
+//GP
+      _sDop:='('+string(_SourceLinkUd)+')';
+    }
+//GP
+    208:
+    { _SourceLinkUd := #cSource;
+    }
+//GP
+
+    110, 177, 179, 182, 183, 184: // является удержанием налога
+    { }
+    else
+    {
+      case #bSource of
+      // постоянные удержания
+      tuShtraf:
+      {
+        if ( #cSource <> 0 ) and
+           ( GetFirst Shtraf where (( #cSource == Shtraf.nRec )) = tsOk ) and
+           ( #TableName.cLsch = Shtraf.cLsch ) and
+           ( #VidUdS = Shtraf.VidUd )
+        {
+          _SourceLinkUd := #cSource;
+//GP
+          _sDop:='('+string(SHTRAF.PRPER)+')';
+//GP
+
+        }
+      } //tuShtraf
+      // выплаты межпериода
+      tuBlisnet, tuOtpusk, tuPrVidOpl, tuChild, tuChildOne:
+      {
+        _wTbl := case(#bSource; tuBlisnet:  coBlisNet,
+                                tuOtpusk:   coOtpusk,
+                                tuPrVidOpl: coPrVidOpl,
+                                tuChild:    coChild,
+                                tuChildOne: coChildOne; #bSource );
+        _SourceLinkUd := #TableName.NRec;
+      }
+
+      tuSpplBan, tuSpplVed, tuRasOrd:
+      {}
+      end; //case
+    }
+    end;
+//--------------------- GP
+ if UderSumFlag=0
+ {
+    var tKau_: tTabKau;
+    var cKau_: tGetKau;
+    var i_Kau : integer;
+    // обнуление переменных
+    for ( i_Kau := cFirstKAU; i_Kau <= cLastKAU; inc(i_Kau) )
+    {
+      tKau_[i_Kau] := 0;
+      cKau_[i_Kau] := 0;
+    } // for
+
+    // заполняем доп аналитику из OtpDop в tKau_ и cKau_
+    if (oRListPar_02(prParam).bExtra_DivByDopAn)
+      pLoadTKau(#TableName.OldcLsch, #TableName.tblExtr, #TableName.KauExtr, tKau_, cKau_);
+    // если ссылка на источник есть заполняем на место последней допаналитики
+    if ( _SourceLinkUd <> 0 )
+    {
+      tKau_[cLastKAU] := _wTbl;
+
+      case _wTbl of
+       coBlisNet,   // для межпериода группруем только по коду таблицы
+       coOtpusk,    // ссылка на источник у всех записей будет разная
+       coPrVidOpl,
+       coChild,
+       coChildOne:
+       {}
+      else
+        cKau_[cLastKAU] := _SourceLinkUd;
+      end;
+    }
+
+    _loop Tp_Kau
+    {
+      if IsEqualKAU(tKau_, Tp_Kau.wKau, cKau_, Tp_Kau.cKau) and
+         IsEqualDop(#VidUdS, #TableName.cSchetD, #TableName.cSubSchD,
+                             #TableName.cSchetK, #TableName.cSubSchK,
+                             #TableName.ChozOper, #TableName.Param )
+      {
+        cRec_tpKau := Tp_Kau.nRec;
+        break;
+      }
+    }
+
+    if ( cRec_tpKau = comp(0) )
+      cRec_tpKau := fIns_Tp_Kau(tKau_, cKau_, #VidUdS, #TableName.cSchetD, #TableName.cSubSchD,
+                                #TableName.cSchetK, #TableName.cSubSchK,
+                                #TableName.ChozOper, #TableName.Param );
+//--------------------- GP
+ } // UderSumFlag=0
+ else
+ { cRec_tpKau:=_SourceLinkUd;
+ }
+
+  }//if
+}// pSearchTp_Kau
+#end
+
+//------------------------------------------------------------------------------
+function boCheckRecord( _Mes, _VidUd: word; cKAU : comp ) : boolean;
+{
+  Result := true; // по умолчанию всегда запись вставляем
+
+  case UderSumFlag of
+#IFDEF _GP_
+  1,
+#ENDIF
+  0:                 // если не установлено настроек суммировать виды удержаний
+  {
+    if ( mySetDefParam = ccRus )
+    {
+      Result := (GetFirst tmpSumms where (( UderChoice == tmpSumms.Choice and
+                                                  _Mes == tmpSumms.SaveMes and
+                                                _VidUd == tmpSumms.Vid and
+                                                  cKAU == tmpSumms.cRectpKau )) <> tsOk);
+    }
+    else
+      Exit;
+  }
+#IFDEF _GP_
+#ELSE
+  1:
+  {
+    Result := (GetFirst tmpSumms where (( UderChoice == tmpSumms.Choice and
+                                                _Mes == tmpSumms.SaveMes and
+                                              _VidUd == tmpSumms.Vid )) <> tsOk);
+  }
+#ENDIF
+  2:
+  {
+#IFDEF _GP_
+    Result := (GetFirst tmpSumms where (( UderChoice == tmpSumms.Choice and
+                                              _VidUd == tmpSumms.Vid and
+                                              //#803.#19
+                                              cKAU == tmpSumms.cRectpKau(noindex)
+                                              )) <> tsOk);
+#ELSE
+    Result := (GetFirst tmpSumms where (( UderChoice == tmpSumms.Choice and
+                                              _VidUd == tmpSumms.Vid )) <> tsOk);
+#ENDIF
+  }
+
+  3:
+  {
+    Exit;
+  }
+  end;
+
+  if ( UderSumFlag <> 0 ) and
+     ( not FoundMarker(Markers, _VidUd) )
+    Result := true;
+} //boCheckRecord
+
+#IFDEF _2018_10_19_
+#ELSE
+Function fAddVichet (typeTable : word) : double;
+{  Result:=Inherited::fAddVichet (typeTable);
+}
+#ENDIF
+
+//------------------------------------------------------------------------------
+//#803.#38 - в результатах расчета имеются начисления с ВО 1,
+//если в результатах расчета в поле процент проставлено 5, то часы по данной записи необходимо обнулить в Расчетном листке.
+//------------------------------------------------------------------------------
+Function IsNaryad(_VidOpls: word; _proc: Double): Boolean;
+{
+  Result := False;
+  
+  if(_VidOpls = 1)
+  {
+    If(Round(_proc, 2) = 5)
+    {
+      Result := True;
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+//  контроль дубликатов начислений
+//------------------------------------------------------------------------------
+Function Check_tmp_dn(_vidopl:word;_datan:date;_datok:date;_kol_Dn:double;_kol_chs:double;_Summa28:integer):boolean;
+{
+  Result:=False;
+  
+  //#803.#33 - отключить контроль дубликатов начислений для видов оплат, у которых нет внш. атрибута    
+  vSpr.wVidopl:=_Vidopl;
+  If(vSpr.GetFirst KlVidopl <> Tsok)
+  { Exit; }
+  If(Not piExtAttr.bGetAttrID(coKlVidopl, vSpr.KlVidopl.Nrec, pVA_Check_Duplicate))
+  { Exit; }   
+  
+  var _Znak : integer = 0;   
+  
+  if(_kol_Dn  < 0)
+  {_Znak :=  -1;}   
+  if(_kol_chs < 0)
+  {_Znak := -1;}            
+  
+  If(_Znak = 0)
+  {  
+    //контроль дублирования, если полностью совпдают дни и часы
+    Result := true;    
+  
+    if (getfirst tmp_dn where ((
+          Lschet.Nrec  == tmp_dn.clsch
+      and  _vidopl     == tmp_dn.vidopl
+      and _Znak        == tmp_dn.Znak
+      and Yea          == tmp_dn.YearN
+      and month1       == tmp_dn.MesN
+      and _datan       == tmp_dn.datan
+      and _datok       == tmp_dn.datok
+      and Round(_kol_Dn,  2) == tmp_dn.kolDn
+      and Round(_kol_chs, 2) == tmp_dn.kolchs
+      ))=tsok)
+    { Exit; }
+    
+    
+    Result:=false;
+    
+    insert into tmp_dn set
+      tmp_dn.cLsch  := Lschet.Nrec
+     ,tmp_dn.vidopl := _vidopl
+     ,tmp_dn.Znak   := _Znak
+     ,tmp_dn.YearN  := Yea
+     ,tmp_dn.MesN   := month1
+     ,tmp_dn.datan  := _datan
+     ,tmp_dn.datok  := _datok
+     ,tmp_dn.kolDn  := Round(_kol_Dn,  2)
+     ,tmp_dn.kolchs := Round(_kol_chs, 2)    
+     ;
+  }
+  Else
+  {  
+     //контроль дублирования, всех отрицательных значений дней или часов
+    Result := true;
+    
+    if (getfirst tmp_dn where ((
+          Lschet.Nrec  == tmp_dn.clsch
+      and  _vidopl     == tmp_dn.vidopl
+      and _Znak        == tmp_dn.Znak
+      and Yea          == tmp_dn.YearN
+      and month1       == tmp_dn.MesN
+      and _datan       == tmp_dn.datan
+      and _datok       == tmp_dn.datok
+      ))=tsok)
+    { Exit; }
+    
+    
+    Result:=false;
+    
+    insert into tmp_dn set
+      tmp_dn.cLsch  :=Lschet.Nrec
+     ,tmp_dn.vidopl :=_vidopl
+     ,tmp_dn.Znak   :=_Znak
+     ,tmp_dn.YearN  :=Yea
+     ,tmp_dn.MesN   :=month1
+     ,tmp_dn.datan  :=_datan
+     ,tmp_dn.datok  :=_datok
+     ;
+  }   
+}   //Function Check_tmp_dn
+
+//------------------------------------------------------------------------------
+//  сбор начислений текущего работника
+//------------------------------------------------------------------------------
+procedure NachislStore;
+var  ind: word;
+     TsFlag1: word;
+     TsFlag2: word;
+     _Name: string;
+#IFDEF _GP_
+     jj,ii: word;
+#ENDIF
+{ timelog('FR_RLIST->NachislStore: NachSumFlag='+string( NachSumFlag));
+
+  delete all tmp_dn;
+  //inherited::NachislStore;
+  DataType := 1;
+//------------------------------------------------------------------------------
+  if ( NachSumFlag <> 0 )
+  {
+    if ( GetMarkerCount( NachMarkers ) = 0 )
+    {
+      _Loop syn_KlVidopl
+        InsertMarker( NachMarkers, syn_KlVidopl.VIDOPLP );
+    }
+  }
+//------------------------------------------------------------------------------
+  for(ind := Count(sovmnrec); ind >= 1; ind := ind - 1)
+  {
+    if ( lflag[ind] )
+    {
+     Prcex  := sovmcex[ind];
+     PrTabn := sovmtabn[ind];
+     PnRec  := sovmnrec[ind];
+
+     PushBounds(tbNachisl_Future);
+
+     oklad := 0;
+     nachisl := 0;
+     prochnach := 0;
+     namenachisl := '';
+     #IFDEF _GP_
+     var  _wTypeDay:word=0;
+     #ENDIF
+     _Loop NACHISL
+     {
+       if (Nachisl.cexoz = 0) continue;
+// ----------------------------------------------------------------------------
+        // исключаемые виды оплат
+        if RLF.isNoPrintVO(Nachisl.VidOplS)
+          continue;
+      #IFDEF _GP_
+       _wTypeDay:=GetDayType(Nachisl.VidOplS);
+      #ENDIF
+
+        ClearBuffer(#tmpSumms);
+        TSFlag1 := GetFirst syn_tmpSumms where ((
+                                                     NachChoice     == syn_tmpSumms.Choice
+                                                 and Nachisl.Mes    == syn_tmpSumms.SaveMes
+                                                 and Nachisl.VidOpl == syn_tmpSumms.Vid
+      #IFDEF _GP_
+                                                 and Nachisl.VidOpls == syn_tmpSumms.Vids(noindex)
+      #endif
+                                                ));
+        TSFlag2 := GetFirst syn_tmpSumms where ((
+                                                     NachChoice     == syn_tmpSumms.Choice
+                                                 and Nachisl.VidOpl == syn_tmpSumms.Vid
+      #IFDEF _GP_
+                                                 and Nachisl.VidOpls == syn_tmpSumms.Vids(noindex)
+      #endif
+                                               ));
+        _Name   := '';
+//------------------------------------------------------------------------------
+        if (   NachSumFlag = 0 ) or // не нужно суммировать
+           ( ( NachSumFlag = 1 ) and ( TSFlag1 <> tsOk) ) or // нужно суммировать
+           ( ( NachSumFlag = 2 ) and ( TSFlag2 <> tsOk) ) or // но первая запись
+           ( ( NachSumFlag <> 0 )and ( not SearchMarker(NachMarkers, Nachisl.VidOpl, IndexNo) ) )
+        {
+          tmpSumms.Choice   := NachChoice;
+          tmpSumms.cLschet  := Nachisl.cLsch;
+          tmpSumms.LastTime := LongInt(Nachisl.LastTime);
+          tmpSumms.cPodr    := Nachisl.cPodr;
+          tmpSumms.SaveMes  := Nachisl.Mes;
+          tmpSumms.SaveMesZa:= Nachisl.MESN;
+          tmpSumms.SaveMesV := Nachisl.MESV;
+          tmpSumms.YearN    := Nachisl.YearN;
+          tmpSumms.Year     := Nachisl.YearK;
+          tmpSumms.YearV    := Nachisl.YearV;
+          tmpSumms.Vid     := Nachisl.VidOpl;
+          tmpSumms.VidS    := Nachisl.VidOplS;
+          tmpSumms.Summa   := Nachisl.Summa;
+#IFDEF _2018_10_19_
+          tmpSumms.SummaV  := fAddVichet(Nachisl.cpodroz, Nachisl.VidOplS, Nachisl.MinSum);
+#ELSE
+          tmpSumms.SummaV  := fAddVichet(coNachisl);
+#ENDIF
+          TotalNach := TotalNach + Nachisl.Summa;
+          tmpSumms.TecProc := Nachisl.Proc;
+          tmpSumms.TecTarif:= Nachisl.SummaVkl;
+          tmpSumms.DataN   := Nachisl.DataN;
+          tmpSumms.DatOK   := Nachisl.DatOK;
+          if ( IsVHVOE_26( Nachisl.VidOpls, _Name ) )
+          {
+            tmpSumms.KolDn   := Nachisl.KolDn;
+            if TabelFlag
+            {
+              tmpSumms.KolChB  := WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+            }
+            
+            if(Not IsNaryad(Nachisl.VidOpls, Nachisl.proc))
+            {
+              tmpSumms.KolCh   := Nachisl.Chasf;
+            }  
+          }
+#IFDEF _GP_
+          Check_tmp_dn(tmpSumms.VidS,tmpSumms.DataN,tmpSumms.DatOk, Nachisl.KolDn, Nachisl.Chasf, word(Nachisl.Summa28));
+          case _wTypeDay of
+          1: { tmpSumms.KolCh:=0;
+               //KlOtpusk.IsRabDn
+               //заблокировал по #804.39 tmpSumms.KolDN:= OtpKolDn(GetIsRabDn(Nachisl.Vidopls ) ,Nachisl.DataN,Nachisl.DatOk,Nachisl.Clsch);
+               tmpSumms.KolDN:=CalcDaysBetweenDates(Nachisl.DataN,Nachisl.DatOk,false);
+             }
+          2: { tmpSumms.KolCh:=0;
+              //tmpSumms.KolDN:='''; - и так пойдет'
+             }
+          3: { tmpSumms.KolDN:=0;
+             }
+          end;
+#ENDIF
+          tmpSumms.NameVid    := _Name;
+          summformat61(tmpSumms.vidS, tmpSumms.NameVid, tmpSumms.Summa, 0);
+          insert current tmpSumms;
+        }
+        else
+        {
+          case  NachSumFlag of
+            1:
+            {
+              if ( GetFirst syn_tmpSumms where ((
+                                                     NachChoice     == syn_tmpSumms.Choice
+                                                 and Nachisl.Mes    == syn_tmpSumms.SaveMes
+                                                 and Nachisl.VidOpl == syn_tmpSumms.Vid
+      #IFDEF _GP_
+                                                 and Nachisl.VidOpls == syn_tmpSumms.Vids(noindex)
+      #endif
+                                               )) = tsOk )
+              {
+                syn_tmpSumms.Summa := syn_tmpSumms.Summa + Nachisl.Summa;
+#IFDEF _2018_10_19_
+                syn_tmpSumms.SummaV += fAddVichet(Nachisl.cpodroz, Nachisl.VidOplS, Nachisl.MinSum);
+#ELSE
+                syn_tmpSumms.SummaV := syn_tmpSumms.SummaV + fAddVichet(coNachisl);
+#ENDIF
+                TotalNach := TotalNach + Nachisl.Summa;
+
+#IFDEF _GP_
+                  var _KolDn:double=0;
+                  var _Chasf:double=0;
+                  if ( IsVHVOE_26( Nachisl.VidOpls, _Name ) )
+                  {_KolDn:=Nachisl.KolDn;
+                    
+                    if(Not IsNaryad(Nachisl.VidOpls, Nachisl.proc))
+                    {
+                      _Chasf := Nachisl.Chasf;
+                    }  
+                  }
+                  case _wTypeDay of
+                  1: {
+                       _Chasf:=0;
+                       //KlOtpusk.IsRabDn
+                       //заблокировал по #804.39 _KolDN:= OtpKolDn(GetIsRabDN(Nachisl.Vidopls),Nachisl.DataN,Nachisl.DatOk,Nachisl.Clsch);
+                       _KolDN:=CalcDaysBetweenDates(Nachisl.DataN,Nachisl.DatOk,false);
+                     }
+                  2: { _Chasf:=0;
+                      //tmpSumms.KolDN:='''; - и так пойдет'
+                     }
+                  3: { _KolDN:=0;
+                     }
+                  end;
+                  if Check_tmp_dn(Nachisl.Vidopls,Nachisl.DataN,Nachisl.DatOk,Nachisl.KolDn,Nachisl.Chasf,word(Nachisl.Summa28))
+                  { _KolDn:=0;
+                    _Chasf:=0;
+                  }
+                  syn_tmpSumms.KolDn   := syn_tmpSumms.KolDn + _KolDn;
+                  if TabelFlag
+                    syn_tmpSumms.KolChB  := syn_tmpSumms.KolChB + WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+
+                  syn_tmpSumms.KolCh   := syn_tmpSumms.KolCh  + _Chasf;
+#ELSE
+                if ( IsVHVOE_26( Nachisl.VidOpls, _Name ) )
+                { syn_tmpSumms.KolDn   := syn_tmpSumms.KolDn + Nachisl.KolDn;
+                  if TabelFlag
+                    tmpSumms.KolChB  := tmpSumms.KolChB + WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+
+                  syn_tmpSumms.KolCh   := syn_tmpSumms.KolCh  + Nachisl.Chasf;
+                }
+#ENDIF
+                summformat61(syn_tmpSumms.vidS, syn_tmpSumms.NameVid, Nachisl.Summa, 0);
+                update current syn_tmpSumms;
+              }
+            }
+            2:
+            {
+              if ( GetFirst syn_tmpSumms where ((
+                                                       NachChoice     == syn_tmpSumms.Choice
+                                                 and   Nachisl.VidOpl == syn_tmpSumms.Vid
+      #IFDEF _GP_
+                                                 and Nachisl.VidOpls == syn_tmpSumms.Vids(noindex)
+      #endif
+                                               )) = tsOk )
+              {
+                syn_tmpSumms.Summa := syn_tmpSumms.Summa + Nachisl.Summa;
+#IFDEF _2018_10_19_
+                syn_tmpSumms.SummaV += fAddVichet(Nachisl.cpodroz, Nachisl.VidOplS, Nachisl.MinSum);
+#ELSE
+                syn_tmpSumms.SummaV := syn_tmpSumms.SummaV + fAddVichet(coNachisl);
+#ENDIF
+                TotalNach := TotalNach + Nachisl.Summa;
+
+
+#IFDEF _GP_
+                  var _KolDn:double=0;
+                  var _Chasf:double=0;
+                  if ( IsVHVOE_26( Nachisl.VidOpls, _Name ) )
+                  { _KolDn:=Nachisl.KolDn;
+                    if(Not IsNaryad(Nachisl.VidOpls, Nachisl.proc))
+                    {
+                      _Chasf := Nachisl.Chasf;
+                    }  
+                  }
+                  case _wTypeDay of
+                  1: {
+                       _Chasf:=0;
+                       //KlOtpusk.IsRabDn
+                       //заблокировал по #804.39 _KolDN:= OtpKolDn(GetIsRabDN(Nachisl.Vidopl),Nachisl.DataN,Nachisl.DatOk,Nachisl.Clsch);
+                       _KolDN:=CalcDaysBetweenDates(Nachisl.DataN,Nachisl.DatOk,false);
+                     }
+                  2: { _Chasf:=0;
+                      //tmpSumms.KolDN:='''; - и так пойдет'
+                     }
+                  3: { _KolDN:=0;
+                     }
+                  end;
+                  if Check_tmp_dn(Nachisl.Vidopls,Nachisl.DataN,Nachisl.DatOk,Nachisl.KolDn,Nachisl.Chasf,word(Nachisl.Summa28))
+                  { _KolDn:=0;
+                    _Chasf:=0;
+                  }
+                  syn_tmpSumms.KolDn   := syn_tmpSumms.KolDn + _KolDn;
+                  if TabelFlag
+                    syn_tmpSumms.KolChB  := syn_tmpSumms.KolChB + WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+                  syn_tmpSumms.KolCh   := syn_tmpSumms.KolCh  + _Chasf;
+#ELSE
+                if ( IsVHVOE_26( Nachisl.VidOpls, _Name ) )
+                { syn_tmpSumms.KolDn   := syn_tmpSumms.KolDn + Nachisl.KolDn;
+                  if TabelFlag
+                  {
+                    syn_tmpSumms.KolChB  := syn_tmpSumms.KolChB + WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+                  }
+                  syn_tmpSumms.KolCh   := syn_tmpSumms.KolCh  + Nachisl.Chasf;
+                }
+#endif
+                summformat61(syn_tmpSumms.vidS, syn_tmpSumms.NameVid, Nachisl.Summa, 0);
+                update current syn_tmpSumms;
+              }
+            }
+          end; //case
+        } // else SearchMarker
+     }; // Loop Nachisl
+     PopBounds(tbNachisl_Future);
+
+     if ( Yea < YearRas ) or
+        (
+          ( Yea = YearRas ) and
+          ( month1 < MonthRas )
+        )
+     {
+ //------------------------------------------------------------------------------
+ //   SumVidop
+ //------------------------------------------------------------------------------
+       _Loop SumVidop  //ИДЕМ ПО ВСЕМ АРХИВУ??? ОГРАНИЧЕНИЕ ТОЛЬКО ПО ЛИЦЕВОМУ СЧЕТУ!!!!
+       {
+          if (SumVidop.cexoz = 0) continue;
+          // исключаемые виды оплат
+          if RLF.isNoPrintVO(SumVidop.VidOpl)    // походу Саша запутался был с пользовательскими и системными кодами.
+            continue;                             // рефакторинг... хоть и ошибка, но не меняем функциональность
+
+          if ( Yea = SumVidOp.YearN ) and ( SumVidOp.MesN = Month1 )
+          {
+      #IFDEF _GP_
+       _wTypeDay:=GetDayType(SumVidOp.VidOpl);
+      #ENDIF
+
+// ----------------------------------------------------------------------------
+            ClearBuffer(#tmpSumms);
+            TSFlag1 := GetFirst syn_tmpSumms where ((
+                                                         NachChoice      == syn_tmpSumms.Choice
+                                                     and SumVidop.Mes    == syn_tmpSumms.SaveMes
+                                                     and SumVidop.VIDOPLP== syn_tmpSumms.Vid
+      #IFDEF _GP_
+                                                     and SumVidop.VIDOPL == syn_tmpSumms.Vids(noindex)
+      #endif
+                                                    ));
+            TSFlag2 := GetFirst syn_tmpSumms where ((
+                                                         NachChoice       == syn_tmpSumms.Choice
+                                                     and SumVidop.VIDOPLP == syn_tmpSumms.Vid
+      #IFDEF _GP_
+                                                     and SumVidop.VIDOPL == syn_tmpSumms.Vids(noindex)
+      #endif
+                                                   ));
+            _Name   := '';
+  //------------------------------------------------------------------------------
+            if (   NachSumFlag = 0 ) or // не нужно суммировать
+               ( ( NachSumFlag = 1 ) and ( TSFlag1 <> tsOk) ) or // нужно суммировать
+               ( ( NachSumFlag = 2 ) and ( TSFlag2 <> tsOk) ) or // но первая запись
+               ( ( NachSumFlag <> 0 )and ( not SearchMarker(NachMarkers, SumVidop.VIDOPLP, IndexNo) ) )
+            {
+              tmpSumms.Choice   := NachChoice;
+              tmpSumms.cLschet  := SumVidop.cLsch;
+              tmpSumms.LastTime := LongInt(SumVidop.LastTime);
+              tmpSumms.cPodr    := SumVidop.cPodrOZ;
+              tmpSumms.SaveMes  := SumVidop.Mes;
+              tmpSumms.SaveMesZa:= SumVidop.MESN;
+              tmpSumms.SaveMesV := SumVidop.MESV;
+              tmpSumms.YearN    := SumVidop.YearN;
+              tmpSumms.Year     := SumVidop.YearK;
+              tmpSumms.YearV    := SumVidop.YearV;
+              tmpSumms.Vid      := SumVidop.VIDOPLP;
+              tmpSumms.VidS     := SumVidop.VIDOPL;
+              tmpSumms.Summa    := SumVidop.Summa;
+#IFDEF _2018_10_19_
+              tmpSumms.SummaV   := fAddVichet(SumVidOp.cpodr, SumVidop.VIDOPL, SumVidOp.MinSum);
+#ELSE
+              tmpSumms.SummaV   := fAddVichet(coSumVidOp);
+#ENDIF
+              TotalNach := TotalNach + SumVidop.Summa;
+              tmpSumms.TecProc := SumVidOp.Proc;
+              tmpSumms.TecTarif:= Sumvidop.Tarif;
+              tmpSumms.DataN   := Sumvidop.DataN;
+              tmpSumms.DatOK   := Sumvidop.DatOK;
+              if ( IsVHVOE_26( SumVidOp.VidOpl, _Name ) )
+              {
+                tmpSumms.KolDn   := SumVidOp.KolDn;
+                if TabelFlag
+                  tmpSumms.KolChB  := WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+                
+                if(Not IsNaryad(SumVidOp.VidOpl, SumVidOp.proc))
+                {
+                  tmpSumms.KolCh   := SumVidOp.Chasf;
+                }
+              }
+#IFDEF _GP_
+          Check_tmp_dn(Sumvidop.Vidopl,Sumvidop.DataN,SumVidop.DatOk,SumVidop.KolDn,SumVidOp.Chasf,word(SumVidop.Summa28));
+
+          case _wTypeDay of
+          1: { tmpSumms.KolCh:=0;
+               //KlOtpusk.IsRabDn
+               //заблокировал по #804.39tmpSumms.KolDN:= OtpKolDn(GetIsRabDn(SumVidOp.Vidopl ) ,SumVidOp.DataN,SumVidOp.DatOk,SumVidOp.Clsch);
+               tmpSumms.KolDN:=CalcDaysBetweenDates(SumVidOp.DataN,SumVidOp.DatOk,false);
+             }
+          2: { tmpSumms.KolCh:=0;
+              //tmpSumms.KolDN:='''; - и так пойдет'
+             }
+          3: { tmpSumms.KolDN:=0;
+             }
+          end;
+#ENDIF
+
+              tmpSumms.NameVid    := _Name;
+              summformat61(tmpSumms.vidS, tmpSumms.NameVid, tmpSumms.Summa, 0);
+              insert current tmpSumms;
+            }
+            else
+            {
+              case  NachSumFlag of
+                1:
+                {
+                  if ( GetFirst syn_tmpSumms where ((
+                                                         NachChoice       == syn_tmpSumms.Choice
+                                                     and SumVidop.Mes     == syn_tmpSumms.SaveMes
+                                                     and SumVidop.VidOplp == syn_tmpSumms.Vid
+      #IFDEF _GP_
+                                                     and SumVidop.VIDOPL == syn_tmpSumms.Vids(noindex)
+      #endif
+                                                   )) = tsOk )
+                  {
+                    syn_tmpSumms.Summa := syn_tmpSumms.Summa + SumVidop.Summa;
+#IFDEF _2018_10_19_
+                    syn_tmpSumms.SummaV += fAddVichet(SumVidOp.cpodr, SumVidop.VIDOPL, SumVidOp.MinSum);
+#ELSE
+                    syn_tmpSumms.SummaV := syn_tmpSumms.SummaV + fAddVichet(coSumVidOp);
+#ENDIF
+                    TotalNach := TotalNach + SumVidop.Summa;
+#IFDEF _GP_
+                  var _KolDn:double=0;
+                  var _Chasf:double=0;
+                  if ( IsVHVOE_26( SumVidOp.VidOpl, _Name ) )
+                  { _KolDn:=SumVidop.KolDn;
+                    if(Not IsNaryad(SumVidOp.VidOpl, SumVidOp.proc))
+                    {
+                      _Chasf := SumVidop.Chasf;
+                    }  
+                  }
+                  case _wTypeDay of
+                  1: {
+                       _Chasf:=0;
+                       //KlOtpusk.IsRabDn
+                       //заблокировал по #804.39 _KolDN:= OtpKolDn(GetIsRabDN(SumVidop.Vidopl),SumVidop.DataN,SumVidop.DatOk,SumVidop.Clsch);
+                       _KolDN:=CalcDaysBetweenDates(SumVidOp.DataN,SumVidOp.DatOk,false);
+                     }
+                  2: { _Chasf:=0;
+                      //tmpSumms.KolDN:='''; - и так пойдет'
+                     }
+                  3: { _KolDN:=0;
+                     }
+                  end;
+                  if Check_tmp_dn(SumVidop.Vidopl,SumVidop.DataN,SumVidop.DatOk,SumVidop.KolDn,SumVidOp.Chasf,word(SumVidop.Summa28))
+                  { _KolDn:=0;
+                    _Chasf:=0;
+                  }
+                  syn_tmpSumms.KolDn   := syn_tmpSumms.KolDn + _KolDn;
+                  if TabelFlag
+                    syn_tmpSumms.KolChB  := syn_tmpSumms.KolChB + WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+
+                  syn_tmpSumms.KolCh   := syn_tmpSumms.KolCh  + _Chasf;
+#ELSE
+                    if ( IsVHVOE_26( SumVidop.VidOpl, _Name ) )
+                    {
+                      syn_tmpSumms.KolDn   := syn_tmpSumms.KolDn + SumVidop.KolDn;
+                      if TabelFlag
+                        syn_tmpSumms.KolChB  := syn_tmpSumms.KolChB + WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+
+                      syn_tmpSumms.KolCh   := syn_tmpSumms.KolCh  + SumVidop.Chasf;
+                    }
+#ENDIF
+                    summformat61(syn_tmpSumms.vidS, syn_tmpSumms.NameVid, SumVidop.Summa, 0);
+                    update current syn_tmpSumms;
+                  }
+                }
+                2:
+                {
+                  if ( GetFirst syn_tmpSumms where ((
+                                                           NachChoice       == syn_tmpSumms.Choice
+                                                     and   SumVidop.VidOplp == syn_tmpSumms.Vid
+      #IFDEF _GP_
+                                                     and SumVidop.VIDOPL == syn_tmpSumms.Vids(noindex)
+      #endif
+                                                   )) = tsOk )
+                  {
+                    syn_tmpSumms.Summa := syn_tmpSumms.Summa + SumVidop.Summa;
+#IFDEF _2018_10_19_
+                    syn_tmpSumms.SummaV += fAddVichet(SumVidOp.cpodr, SumVidop.VIDOPL, SumVidOp.MinSum);
+#ELSE
+                    syn_tmpSumms.SummaV := syn_tmpSumms.SummaV + fAddVichet(coSumVidOp);
+#ENDIF
+                    TotalNach := TotalNach + SumVidop.Summa;
+#IFDEF _GP_
+                  var _KolDn:double=0;
+                  var _Chasf:double=0;
+                  if ( IsVHVOE_26( SumVidOp.VidOpl, _Name ) )
+                  { _KolDn:=SumVidop.KolDn;
+                    if(Not IsNaryad(SumVidOp.VidOpl, SumVidOp.proc))
+                    {
+                      _Chasf := SumVidop.Chasf;
+                    }  
+                  }
+                  case _wTypeDay of
+                  1: {
+                       _Chasf:=0;
+                       //KlOtpusk.IsRabDn
+                       //заблокировал по #804.39 _KolDN:= OtpKolDn(GetIsRabDN(SumVidop.Vidopl),SumVidop.DataN,SumVidop.DatOk,SumVidop.Clsch);
+                       _KolDN:=CalcDaysBetweenDates(SumVidOp.DataN,SumVidOp.DatOk,false);
+                     }
+                  2: { _Chasf:=0;
+                      //tmpSumms.KolDN:='''; - и так пойдет'
+                     }
+                  3: { _KolDN:=0;
+                     }
+                  end;
+                  if Check_tmp_dn(SumVidop.Vidopl,SumVidop.DataN,SumVidop.DatOk,SumVidop.KolDn,SumVidOp.Chasf,word(SumVidop.Summa28))
+                  { _KolDn:=0;
+                    _Chasf:=0;
+                  }
+
+                  syn_tmpSumms.KolDn   := syn_tmpSumms.KolDn + _KolDn;
+                  if TabelFlag
+                    syn_tmpSumms.KolChB  := syn_tmpSumms.KolChB + WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+
+                  syn_tmpSumms.KolCh   := syn_tmpSumms.KolCh  + _Chasf;
+#ELSE
+                    if ( IsVHVOE_26( SumVidop.VidOpl, _Name ) )
+                    {
+                      syn_tmpSumms.KolDn   := syn_tmpSumms.KolDn + SumVidop.KolDn;
+                      if TabelFlag
+                        syn_tmpSumms.KolChB  := syn_tmpSumms.KolChB + WT_GHBD(hkWorking, 0, 0, stPlanned, PDO_PeriodBeginning, PDO_PeriodEnding);
+
+                      syn_tmpSumms.KolCh   := syn_tmpSumms.KolCh  + SumVidop.Chasf;
+                    }
+#ENDIF
+                    summformat61(syn_tmpSumms.vidS, syn_tmpSumms.NameVid, SumVidop.Summa, 0);
+                    update current syn_tmpSumms;
+                  }
+                }
+              end; //case
+            } // else SearchMarker
+          }
+       }; // Loop SumVidop
+     }
+//------------------------------------------------------------------------------
+    }
+  }
+#IFDEF _GP_
+  //Отпуск сумма в/о за месяц, включенных в базу для расчета отпуска (из классификатора Видов оплат и скидок).
+  OTP_OSN    :=0;
+//Премия отпуска сумма в/о за месяц, входящих в расчет отпуска с признаком <П>
+//(из классификатора Видов оплат и скидок).
+  OTP_PREM   :=0;
+//Индекс сумма в/о за месяц, включенных в базу для отпуска и индексируемая при расчете
+//(классификатор Видов оплат и скидок,  значение <+> в поле Индексации закладки <Расчеты>).
+  OTP_INDEX  :=0;
+//сумма фонда ФСС по больничным
+  BOLN_YEAR[1] :=Yea-1;
+  BOLN_SUM [1] :=0;
+  BOLN_YEAR[2] :=Yea-2;
+  BOLN_SUM [2] :=0;
+
+  // Заполним сумму больничных
+  //if wPerechFSS>0
+  for(ind := Count(sovmnrec); ind >= 1; ind := ind - 1)
+  {
+    if ( lflag[ind] )
+    {
+      PnRec  := sovmnrec[ind];
+      v_SUMSPREVPLACE.pLschet:=PnRec;
+      for(jj:=1;jj<=2;jj++)
+      {
+        //возможно нужно собирать по архиву видов оплат
+        var _wYear:word=Yea-jj;
+        var _wSu  :double=0;
+        /*
+        _loop SumUlSoc where ((PnRec == SumUlSoc.cLsch and Yea-jj == SumUlSoc.YEAR
+           and  wPerechFSS == SumUlSoc.VidPer
+         ))
+        { for(ii:=1;ii<=12;ii++)
+            BOLN_SUM [jj]+=SumULSoc.SUMMA10[ii];
+        }
+        */
+        SQL select sum(SumVidop.Summa)
+        From SumVidop
+        inner join KlVidopl on KlVidopl.Vidopl = SumVidop.Vidopl
+            and KLVIDOPL.VHVO[9]='+'
+        where SumVidop.YearN=:(_wYear) and SumVidop.cLsch=:(PnRec)
+        into (_wsu);
+        BOLN_SUM [jj] +=_wSu;
+        v_SUMSPREVPLACE.wYear:=Yea-jj;
+        v_SUMSPREVPLACE._Loop SUMSPREVPLACE
+        { BOLN_SUM [jj]+=v_SUMSPREVPLACE.SUMSPREVPLACE.FZP;
+        }
+        //---------------------
+        // ограничения
+        if false
+        if v_SUMSPREVPLACE.getlast SrednZar=tsok
+        { var _SummaD:double= if((Minute(v_SUMSPREVPLACE.SrednZar.LASTTIME) = 1)
+             , v_SUMSPREVPLACE.SrednZar.FILIALNO, v_SUMSPREVPLACE.SrednZar.FILIALNO/100);
+          if _SummaD<BOLN_SUM [jj]
+           BOLN_SUM [jj]:=_SummaD;
+        }
+      } //for(jj:=1;jj<=2;jj++)
+    } //for(jj:=1;jj<=2;jj++)
+  } //for(ind := Count(sovmnrec); ind >= 1; ind := ind - 1)
+
+  //Проверим отпуска
+  _Loop tmpSumms where ((  NachChoice    == tmpSumms.Choice ))
+  { //замечание к #804 №21
+    //В табличку "Справочно" включать только информацию текущего отчетного месяца.
+    if tmpSumms.SaveMes =Month1
+    if getfirst KlVidopl where (( tmpSumms.VidS == KlVidopl.Vidopl )) =tsok
+    {  if KLVIDOPL.VHVO[15]='+'
+       {  if  klvidopl.VHVOE[6]='Х'
+          { OTP_PREM  +=tmpSumms.Summa;
+          }
+          else
+          { OTP_OSN   +=tmpSumms.Summa;
+          }
+          if KLVIDOPL.VHVO[8]='+'
+            OTP_INDEX +=tmpSumms.Summa;
+       }
+    } //if getfirst KlVidopl where (( tmpSumms.VidS == KlVidopl.Vidopl )) =tsok
+  } //_Loop tmpSumms where ((  NachChoice    == tmpSumms.Choice ))
+#ENDIF
+} //procedure NachislStore;
+
+//------------------------------------------------------------------------------
+// На базе штатной getNameUder
+//------------------------------------------------------------------------------
+function getNameUderS( _VidUdS : word ) : string;
+{
+  Result := '';
+
+  if ( GetFirst fastfirstrow KLVIDUD  where (( _VidUdS == KlVidUd.VidUd )) <> tsOk )
+    Result := 'Системный код '+ string(_VidUdS)
+  else
+    Result := KlVidUd.NVidUd;
+}//getNameUder
+
+
+//------------------------------------------------------------------------------
+//  сбор начислений текущего работника
+// БЕРЕМ ЦЕЛИКОМ!!!!
+//------------------------------------------------------------------------------
+procedure UderStore;
+var
+  ind      : word;
+  boInsUder: boolean;
+{
+  DataType := 2;
+  SumPen   := 0;
+  SumPen1  := 0;
+
+  fStorePodnal    := 0;
+  fStorePodnalDop := 0;
+
+//------------------------------------------------------------------------------
+  if ( UderSumFlag <> 0 )
+  {
+    if ( GetMarkerCount( Markers ) = 0 )
+    {
+      _Loop syn_KLVIDUD
+        InsertMarker( Markers, syn_KLVIDUD.VIDUDP );
+    }
+  }
+//------------------------------------------------------------------------------
+  for(ind := Count(sovmnrec); ind >= 1; ind := ind - 1)
+  {
+    if ( lflag[ind] )
+    {
+      Prcex  := sovmcex[ind];
+      PrTabn := sovmtabn[ind];
+      PnRec  := sovmnrec[ind];
+      PushBounds(tbUder_Future);
+      podoh := 0;
+      prochud := 0;
+
+     _loop Uder
+     {
+       if (uder.CexOz = 0)  continue;
+// ----------------------------------------------------------------------------
+//     посчитаем совокупный и доп.доход при расчете з.п. за будущий период
+// ----------------------------------------------------------------------------
+        if IsFuturePeriod
+        {
+          case Uder.VIDUDs of
+           182 : fStorePodnal += Uder.SumUd
+           183 : fStoreSumObDop += Uder.SumUd;
+          end;
+        }
+// ----------------------------------------------------------------------------
+        // просьба Василевской А.В. не печатать нулевые суммы удержаний
+        if (Uder.VIDUDs = 182 or Uder.VIDUDs = 183) and (abs(Uder.SumUd) < 0.0001)
+          continue;
+//Ошибка: Нет такой функции, поля или метода : ORLISTPAR_02
+        #pSearchTp_Kau(Uder, Uder.VidUdS, Uder.cPodrOz, Second(Uder.LastTime));
+
+        boInsUder := boCheckRecord( Uder.Mes, Uder.VidUd, cRec_tpKau );
+
+        if ( boInsUder ) // вставляем запись
+        {
+          ClearBuffer(#tmpSumms);
+          tmpSumms.Choice   := UderChoice;
+          tmpSumms.cLschet  := Uder.cLsch;
+          tmpSumms.LastTime := LongInt(Uder.LastTime);
+          tmpSumms.cPodr    := Uder.cPodr;
+          tmpSumms.cPodrOz  := Uder.cPodrOz;
+          tmpSumms.SaveMes  := Uder.Mes;
+          tmpSumms.SaveMesZa:= Uder.MESN;
+          tmpSumms.SaveMesV := Uder.MESV;
+          tmpSumms.YearV    := Uder.YearV;
+          tmpSumms.Year     := AD_Year(UDER.DATAN);
+          tmpSumms.Vid      := Uder.VidUd;
+          tmpSumms.VidS     := Uder.VidUdS;
+          tmpSumms.TypeUd   := if(FoundMarker(mrkViplAndPerech, Uder.VidUdS),2,1);
+          tmpSumms.cRectpKau:= cRec_tpKau;
+#IFDEF _GP_
+          tmpSumms.NameVid  := getNameUderS(Uder.VidUdS)+_sDop;
+#ELSE
+          tmpSumms.NameVid  := getNameUder(Uder.VidUd);
+#ENDIF
+        } // if
+
+        tmpSumms.Summa += Uder.SumUd;
+        TotalUder += Uder.SumUd;
+
+        case Uder.VidUdS of
+        175:  SumPen += Uder.SumUd;
+        176:  SumPen1 += Uder.SumUd;
+        end;
+
+        summformat61(tmpSumms.vidS, tmpSumms.NameVid, tmpSumms.Summa, 1);
+
+        if ( boInsUder )
+          insert current tmpSumms;
+        else
+          update current tmpSumms;
+     }//_loop uder
+     PopBounds(tbUder_Future);
+//------------------------------------------------------------------------------
+     _Loop SumVidUd
+     {
+       //суммы другого филиала пропустим
+       if SumVidUd.cexOz = 0
+         continue;
+
+       // просьба Василевской А.В. не печатать нулевые суммы удержаний
+       if (SumVidUd.VidUd = 182 or SumVidUd.VidUd = 183) and (abs(SumVidUd.SumUd) < 0.0001)
+         continue;
+
+       // Суммы в пенсионный фонд
+       if (Yea = SumVidUd.YearN) and (Month1 >= SumVidUd.MesN)
+       {
+         case SumVidUd.VidUd of
+          175: SumPen += SumVidUd.SumUd;
+          176: SumPen1 += SumVidUd.SumUd;
+         end;
+       }
+
+       if not (( Yea = SumVidUd.YearN ) and ( Month1 = SumVidUd.MesN ) )
+         continue;
+#IFDEF _GP_
+       #pSearchTp_Kau(SumVidUd, SumVidUd.VidUd, SumVidUd.cPodrOZ, Second(SumVidUd.LastTime));
+#ELSE
+       #pSearchTp_Kau(SumVidUd, SumVidUd.VidUd, SumVidUd.cMainDoc, Second(SumVidUd.LastTime));
+#ENDIF
+        boInsUder := boCheckRecord( SumVidUd.Mes, SumVidUd.VidUdP, cRec_tpKau );
+
+       if ( boInsUder )
+       {
+         ClearBuffer(#tmpSumms);
+         tmpSumms.Choice   := UderChoice;
+         tmpSumms.cLschet  := SumVidUd.cLsch;
+         tmpSumms.LastTime := LongInt(SumVidUd.LastTime);
+         tmpSumms.SaveMes  := SumVidUd.Mes;
+         tmpSumms.SaveMesZa:= SumVidUd.MESN;
+         tmpSumms.SaveMesV := SumVidUd.MESV;
+         tmpSumms.YearN    := SumVidUd.YearN;
+         tmpSumms.Year     := SumVidUd.YearK;
+         tmpSumms.YearV    := SumVidUd.YearV;
+         tmpSumms.Vid      := SumVidUd.VidUdP;
+         tmpSumms.VidS     := SumVidUd.VidUd;
+         tmpSumms.SrcNrec  := SumVidUd.NREC;
+         tmpSumms.TypeUd   := if(FoundMarker(mrkViplAndPerech, SumVidUd.VidUd),2,1);
+         tmpSumms.cRectpKau := cRec_tpKau;
+#IFDEF _GP_
+         tmpSumms.NameVid  := getNameUderS(SumVidUd.VidUd)+_sDop;
+#ELSE
+         tmpSumms.NameVid := getNameUder(SumVidUd.VidUdp);
+#ENDIF
+       } // if
+
+       tmpSumms.Summa += SumVidUd.SumUd;
+       TotalUder += SumVidUd.SumUd;
+
+       summformat61(tmpSumms.vidS, tmpSumms.NameVid, tmpSumms.Summa, 1);
+
+       if ( boInsUder )
+         insert current tmpSumms;
+       else
+         update current tmpSumms;
+     } // _Loop SumVidop
+//------------------------------------------------------------------------------
+    }
+  } // for
+} // procedure UderStore
+
+
+// получить информацию о выплатах
+Function GetViplataInfo : string;
+{ Result:='';
+  case NPOEM_OWN_ZP_RList_Vipl_Info of
+  1: Result:=iGP_Viplata_Info.GetViplataInfo(tmpSumms.cLschet
+      , to_Date(1,word(tmpSumms.SaveMesV),word(tmpSumms.YearV))
+      , word(tmpSumms.Vid)
+      , double(tmpSumms.Summa)
+      );
+  end;
+} //Function GetViplataInfo(wwc_lschet :comp;ww_dt :date;ww_vidud:word;ww_sumud:double) : string;
+
+//--------------------------
+// Пересчитать дни по виду оплат
+//--------------------------
+Function GetKolDNByVO(t:double;_VidOpls:word):double;
+var ww_su:double;
+{ Result:=t;
+  case _VidOpls of
+   169//Пособие по беременности и родам
+  ,192//Дотация работникам на проживание в гостинице
+  : //Нужно в календарных днях
+  { ww_su:=0;
+    if ( Yea < YearRas ) or
+    (
+          ( Yea = YearRas ) and
+          ( month1 < MonthRas )
+        )
+    { _Loop fullcache SumVidop where (( tmpSumms_GP.cLschet == SumVidop.cLsch
+       and Yea    == SumVidop.YearN
+       and month1 == SumVidop.MesN
+       and _VidOpls == SumVidop.VidOpl
+       and tmpSumms_GP.SaveMes  == SumVidop.Mes(noindex)
+       ))
+      { ww_su+=CalcDaysBetweenDates(SumVidop.DataN,SumVidop.DatOk,false);
+      }
+    }
+    else
+    { _Loop fullcache Nachisl where (( tmpSumms_GP.cLschet == Nachisl.cLsch
+       and Yea    == Nachisl.YearV
+       and month1 == Nachisl.MesV
+       and _VidOpls == Nachisl.VidOplS(noindex)
+       and tmpSumms_GP.SaveMes  == Nachisl.Mes(noindex)
+       ))
+      { ww_su+=CalcDaysBetweenDates(Nachisl.DataN,Nachisl.DatOk,false);
+      }
+
+    }
+    if ww_su<>0
+      Result:=ww_su;
+  }//169? 192
+  end;
+} //Function GetKolDNByVO(t:double;_VidOpls:word):double;
+
+//--------------------------
+// Пересчитать часы по виду оплат
+//--------------------------
+Function GetChasByVO(t:double;_VidOpls:word):double;
+var ww_su:double;
+{
+  Result:=t;
+
+  //#803.#32 - отключать часы из нарядов
+  Exit;
+  
+  case _VidOpls of
+  1: // наряды
+  { v_Wt.pLsch:=Lschet.Nrec;
+    v_Wt.wMes :=Month1;
+    v_Wt.wYear:=Yea;
+    ww_su:=0;
+    v_Wt._Loop Prnaryad
+       ww_su+= v_Wt.Prnaryad.NRMTIME;
+    if ww_su<>0
+      Result:=ww_su;
+  }
+  end;
+} //Function GetChasByVO(t:double;_vo:word):double;
+
+Function GetChasFVyrabotkaStr(_cLsch : comp; _Year, _mes : word) : string;
+{
+  result := '';
+var _dateBeg : date = to_date(01, _mes, _Year);
+var _dateEnd : date = to_date(last_day(_dateBeg), _mes, _Year);
+var _SumChasNar : double = 0;
+_try
+ {
+  sql
+   select
+     sum(coalesce(Prnaryad.ChasF,0)) as SumChasNar
+   from sys_nar
+   join prnaryad on prnaryad.MNREC = sys_nar.nrec
+   where sys_nar.Choice in ( 3, 203)
+     and prnaryad.clsch = :(_cLsch)
+     and PRNARYAD.VIDOPL in  (7) // Повременная оплата (оклад, мес. тариф)
+     and prnaryad.DataN between :(_dateBeg) and :(_dateEnd)
+   into (_SumChasNar)
+   ;
+ }
+  _Except else {}
+  if _SumChasNar <> 0
+   {
+     Result := '(Выработка '+ string(_SumChasNar) + 'ч.)'
+   }
+}
+
+//-----------------------
+datastream dsRlist
+(  [Type_Sort] NPOEM_OWN_ZP_RList_SortDef;
+//------------------------------------------------------------------------------
+    DataSet NachislSum_GP
+    (
+      [nRec]     string(tmpSumms_GP.cLschet);
+      [LastTime] string(tmpSumms_GP.LastTime);
+      [cPodr]    string(tmpSumms_GP.cPodr);
+      [SaveMes]  tmpSumms_GP.SaveMes;
+      [SaveMesZa]tmpSumms_GP.SaveMesZa;
+      [SaveMesV] tmpSumms_GP.SaveMesV;
+      [YearN]    tmpSumms_GP.YearN;
+      [Year]     tmpSumms_GP.Year;
+      [YearV]    tmpSumms_GP.YearV;
+      [KolDN]    tmpSumms_GP.KolDN;//GetKolDNByVO(tmpSumms_GP.KolDN,tmpSumms_GP.VidS);
+      [KolCh]    ChasVid(GetChasByVO(tmpSumms_GP.KolCh,tmpSumms_GP.VidS));
+      [KolChB]   ChasVid(tmpSumms_GP.KolChB);
+      //[IIF(<NachislSum_GP."VID">='900',189,<NachislSum_GP."VID">)]
+      //GP
+      [Vid]      if(tmpSumms_GP.Vid=900,189,tmpSumms_GP.Vid);
+      [VidS]     tmpSumms_GP.VidS;
+      [NameVid]  tmpSumms_GP.NameVid;
+      [VidProc]  tmpSumms_GP.TecProc;
+      [VidTarif] tmpSumms_GP.TecTarif;
+
+      [Summa]     tmpSumms_GP.Summa;
+      [SummaV]    tmpSumms_GP.SummaV;
+      [NachPer]  GetPaidPeriod(tmpSumms_GP.DataN,tmpSumms_GP.DatOK);
+      [OblNSum]  GetOblNalSum(tmpSumms_GP.cLschet,tmpSumms_GP.SaveMes);
+
+      NSumma;
+
+      //Для ММК
+      WorkingDn;   // фактически отработано: дней
+      [WorkingCh] ChasVid(WorkingCh);
+      FondDn;      // фонд времени: дни
+      [FondCh] ChasVid(FondCh);      // фонд времени: часы
+
+      DneyMesF;
+      ChasMesF;
+    ); // DataSet NachislSum1
+    DataSet inherited::FORMARKS
+    ( [OTP_KOLDN ]  OTP_KOLDN;
+      [OTP_OSN   ]  OTP_OSN;
+      [OTP_PREM  ]  OTP_PREM;
+      [OTP_INDEX ]  OTP_INDEX;
+      [BOLN_YEAR1]  BOLN_YEAR[1];
+      [BOLN_SUM1 ]  BOLN_SUM [1];
+      [BOLN_YEAR2]  BOLN_YEAR[2];
+      [BOLN_SUM2 ]  BOLN_SUM [2];
+      [KEY_SORT  ]  tmpForMarks.FilialNoStr;
+      [VIRABOTKA ]  GetChasFVyrabotkaStr(Lschet.nrec, Yea, Month1);
+      dataset inherited::UderSum
+      ( [UNameVid_Vipl] tmpSumms.NameVid+' '+GetViplataInfo;
+      );
+
+    );//DataSet inherited::FORMARKS
+
+//------------------------------------------------------------------------------
+
+) //datastream dsRlist
+//------------------------------------------------------------------------------
+/* Ошибка: Нельзя задавать обработчик одного события более одного раза
+HandleEvent DataSet NachislSum
+cmOnProcess:
+{
+  if PrintCurrent
+  {
+    if ( Counter = 1)
+    {
+      //GP -- надо 189(долг) сделать последним
+      update tmpSumms where (( NachChoice   == tmpSumms_GP.Choice and 189 == tmpSumms_GP.Vid )) set tmpSumms_GP.Vid:=900;
+      PushBounds(tbtmpSummsNach_EM);
+
+
+      If ( GetFirst tmpSumms = tsOk )
+      {
+        ContinueDataset;
+        Inc( Counter );
+      }
+    }
+    else
+    {
+      If ( GetNext tmpSumms = tsOk )
+      {
+        ContinueDataset;
+        Inc( Counter );
+      }
+    }
+  }
+}
+end; // HandleEvent
+*/
+//------------------------------------------------------------------------------
+HandleEvent DataSet NachislSum_GP
+
+cmOnClick:
+{
+  Var ExprFV: string;
+
+  ExprFV := ExprFieldValue;
+  //lasttime - код источника
+  fr_kod    := comp(subStr(ExprFV, 0, pos('$', ExprFV) - 1));
+  ExprFV := subStr(ExprFV, pos('$', ExprFV) + 1, length(ExprFV));
+
+  //ссылка на лицевой счет
+  fr_rabotn := comp(substr(ExprFV, 0, pos('$$', ExprFV) - 1));
+  ExprFV := subStr(ExprFV, pos('$$', ExprFV) + 2, length(ExprFV));
+
+  //ссылка на доплату cPodr
+  fr_nrec   := comp(subStr(ExprFV, 0, pos('$$$', ExprFV) - 1)) ;
+  ExprFV := subStr(ExprFV, pos('$$$', ExprFV) + 3, length(ExprFV));
+
+  //вид оплаты
+  fr_vid    := comp(subStr(ExprFV, 0, pos('&', ExprFV) - 1)) ;
+  ExprFV := subStr(ExprFV, pos('&', ExprFV) + 1, length(ExprFV));
+
+  //месяц начисления
+  fr_mes    := comp(subStr(ExprFV, 0, pos('&&', ExprFV) - 1)) ;
+  ExprFV := subStr(ExprFV, pos('&&', ExprFV) + 2, length(ExprFV));
+
+  //год начисления
+  fr_yea := comp(subStr(ExprFV, 0, length(ExprFV))) ;
+
+  // = 3 Тип записи: 0 - за отчетный период, 3- за архивный
+  if ((fr_mes = MonthRas) and (fr_yea = YearRas))
+    ChoiceType := 0
+  else
+    ChoiceType := 3;
+
+  SaveMyDsk(true, 'OpenedFromFReport');
+
+  if (GetFirst LSchet where (( fr_rabotn == lschet.Nrec )) = tsOk)
+    if (fr_nrec <> 0)
+      Case fr_kod of
+
+      psPermanentAdditionalPayment:
+      {
+        //  если запись в доплатах существует, то открывает интерфейс доплат
+        if (getfirst Doplata where (( fr_nrec == Doplata.nrec )) = tsOk)
+        {
+          RunInterface('FixedAdditionalPayments', Lschet.nrec , comp(0), word(2));
+        }
+        else
+        // если она уже закрыта, то перейдем в ВО
+        {
+          if (ChoiceType = 0)
+            runinterface('zRezult',Lschet.Nrec, 0, 0);
+          else
+            runinterface('zSumVidOp',Lschet.Nrec,Lschet.TabN,Lschet.Cex,double(0),1,0,integer(fr_yea), integer(fr_mes), longint(fr_vid));
+        }
+      }
+
+      psSickList:
+        RunInterface('BlisNet1', Lschet.nrec, lschet.Cex, fr_nrec, double(0), ChoiceType, word(0) , lschet.TPerson);
+
+      psVacation:
+      {
+        RunInterface('Otpusk1',
+        Lschet.nrec,
+        lschet.Cex, fr_nrec, double(0), ChoiceType);
+      };
+
+      psBasicPayment, psVariance, psWorkingTableHours :
+      {
+        if (ChoiceType = 0)
+          runinterface('zRezult', Lschet.Nrec, 0, 0);
+        else
+          runinterface('zSumVidOp',Lschet.Nrec,Lschet.TabN,Lschet.Cex,double(0),1,0,integer(fr_yea), integer(fr_mes), longint(fr_vid));
+      };
+
+      else
+      {
+        if (ChoiceType = 0)
+          runinterface('zRezult',Lschet.Nrec, 0, 0);
+        else
+          runinterface('zSumVidOp',Lschet.Nrec,Lschet.TabN,Lschet.Cex,double(0),1,0,integer(fr_yea), integer(fr_mes), longint(fr_vid));
+      }
+      end;  //Case
+    else    //Ссылка на доплату cPodr не заполнена, fr_nrec = 0
+      if (ChoiceType = 0)
+        runinterface('zRezult',Lschet.Nrec, 0, 0);
+      else
+        runinterface('zSumVidOp',Lschet.Nrec,Lschet.TabN,Lschet.Cex,double(0),1,0,integer(fr_yea), integer(fr_mes), longint(fr_vid));
+}
+
+cmPreProcess:
+{
+  if PrintCurrent
+  {
+    DataType := 0;
+    Counter := 0;
+    PrintCurrent := false;
+
+    if (RecordsInTable(#tmpSumms) > 0)
+    {
+      PrintCurrent := true;
+      Inc( Counter );
+    }
+  } // if PrintCurrent
+}
+
+cmOnProcess:
+{
+  if PrintCurrent
+  {
+    if ( Counter = 1)
+    {
+      //GP -- надо 189(долг) сделать последним
+      //PushBounds(tbtmpSummsNach);
+      update tmpSumms_GP where (( NachChoice   == tmpSumms_GP.Choice and 189 == tmpSumms_GP.Vid )) set tmpSumms_GP.Vid:=900;
+      PushBounds(tbtmpSummsNach_GP);
+      If ( GetFirst tmpSumms_GP = tsOk )
+      {
+        ContinueDataset;
+        Inc( Counter );
+      }
+    }
+    else
+    {
+      If ( GetNext tmpSumms_GP = tsOk )
+      {
+        ContinueDataset;
+        Inc( Counter );
+      }
+    }
+  }
+}
+
+cmPostProcess:
+{ //GP
+  PopBounds(tbtmpSummsNach_GP);
+}
+end; // HandleEvent
+//------------------------------------------------------------------------------
+
+end;//datastream dsRlist
+
+Procedure PrintDocumentFastPDF;
+var FReport: LongInt;
+    ReportNames: array [0..0] of String;
+#IFDEF _2019_02_13_
+    ExportParam:String;
+#ELSE
+    ExportParam:frxPDFExportParam;
+#ENDIF
+{
+   FReport := FRCreate(dsRlist);
+    FRGetReportNames(FReport, ReportNames);
+
+    if (count(ReportNames)>0)
+    {
+      var ii : word;
+       For(ii:=0;ii<count(ReportNames);ii++)
+        {
+          if ReportNames[ii]='_ЭМ Расчетные листки' // именно ее выгружаем
+           {
+            if (FROpenReport(FReport, ReportNames[0]))
+            {
+#IFDEF _2019_02_13_
+              //'Pages=1-5;Picture=False;DeleteEmptyRows=True;OpenAfterExport=True'
+              ExportParam:='ShowDialog=False;OpenAfterExport=False;EmbeddedFonts=True';
+#ELSE
+              ClearAdvRecord(ExportParam);
+              FRGetDefaultParameters(frExportPDF, ExportParam);
+              ExportParam.Pages:='';
+              ExportParam.ShowDialog := False;
+              ExportParam.OpenAfterExport := false;
+#ENDIF
+              var HREF_F_Path : string =sGetTune('NPOEM_OWN.HREF_F_Path');//Хранилище файлов для доступа через WEB:Папка для отправки файлов
+              if SubStr(HREF_F_Path,Length(HREF_F_Path),1)<>'\'
+              HREF_F_Path:=HREF_F_Path+'\';
+
+              //Message(prParam.wYearBeg + ' ' +prParam.wMonthBeg);
+              if getfirst FORMARKS = tsOK
+              if getfirst LSCHET where ((FORMARKS.CLSCHET == LSCHET.nrec)) = tsOK
+              {
+                //var _file :string = HREF_F_Path + 'ZARLIST_'+String(prParam.wYearBeg) + '_' +String(prParam.wMonthBeg) + '_'+string(LSCHET.tPerson); //+'_' + datetostr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HH_MM_SS_SSS');
+                var _file :string = HREF_F_Path + 'ZARLIST_'+datetostr(date(01,prParam.wMonthBeg,prParam.wYearBeg),'MM_YYYY') + '_'+string(LSCHET.tPerson); //+'_' + datetostr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HH_MM_SS_SSS');                datetostr(date(01,02,2019),'DD.YYYY')
+                if (FRSetParameters(FReport, frExportPDF, ExportParam))
+                 FRExportReport(FReport, frExportPDF, _file);
+              }
+            } //if (FROpenReport(FReport, ReportNames[0]))
+            Break;
+           }
+       }
+    }
+
+    FRDestroy(FReport);
+   //else if not boPrintToPDF
+} //Function PrintDocumentFast:boolean
+procedure oFR_Rlist.ShowReports;
+{
+//  recordsintable(#tmpformarks);
+  if wgetTune('NPOEM_OWN.ZP.RList_ExportToPDFForPortal') = 1 and recordsintable(tnFORMARKS) = 1 //and prParam.wPrOne <> 1
+   then PrintDocumentFastPDF;
+   else  Inherited::ShowReports;
+//  message('-_-');
+
+}
+function oFR_Rlist.FillReport(oParam: oRListPar): boolean;
+{ Result:=Inherited::FillReport(oParam);
+  timelog_init;
+  NPOEM_OWN_ZP_RList_SortDef:=wGetTune('NPOEM_OWN.ZP.RList_SortDef');
+  NPOEM_OWN_ZP_RList_Vipl_Info:=wGetTune('NPOEM_OWN.ZP.RList_Vipl_Info');
+
+  if not (GroupListBy > 0
+  or prParam.bExtra_GroupByPodr
+  or prParam.bExtra_SortByFIO
+  )
+  { case NPOEM_OWN_ZP_RList_SortDef of
+    1:
+    { update tmpForMarks where (( root == tmpForMarks.Field1 and tmpForMarks.Field1 == KatPodr.nrec ))
+      set tmpForMarks.FilialNoStr:=Pad(KatPodr.Kod,10)+tmpForMarks.Fio;
+    }
+    2:
+    { update tmpForMarks where (( root == tmpForMarks.Field1 and tmpForMarks.Field1 == KatPodr.nrec ))
+      set tmpForMarks.FilialNoStr:=Pad(substr(KatPodr.Kod,1,3),10)+tmpForMarks.Fio;
+    }
+    end;
+  } //if not (GroupListBy > 0
+  else NPOEM_OWN_ZP_RList_SortDef:=0;
+} //function oFR_Rlist.FillReport(oParam: oRListPar): boolean;
+
+Procedure Instmp_KlOtpusk(_Vidopl:word);
+{ if _Vidopl=0 then exit;
+  vSpr.insert into tmp_KlOtpusk set tmp_KlOtpusk.Vidopl:=_Vidopl,tmp_KlOtpusk.IsRabDn:=vspr.KlOTpusk.IsRabDn;
+}
+
+HandleEvent
+cmOnVipLoad:
+{ wPerechFSS:=0;
+  ClearFuncCache;
+  timelog_init;
+  timelog('FR_RLIST->cmOnpLoad');
+  v_wt.wRejim :=coGetTune('UP.ZAR.REJIM5');
+  if getfirst Perech where (( 2 == PERECH.NOMGRAF(noindex) ))=tsok
+    wPerechFSS:=Perech.VidPer;
+  pVA_TYPE_DAY        := ExtAttr_ID(coKlVidopl, 'Выводить в расчетный лист');
+  pVA_Check_Duplicate := ExtAttr_ID(coKlVidopl, 'Включить в расчетном листе "контроль дубликатов начислений"');
+  //---- Заполним дни
+  // заблокировал по #804.39
+  if False
+  { vSpr.delete all tmp_KlOtpusk;
+    vSpr._loop KlOtpusk
+    { Instmp_KlOtpusk(vSpr.KlOtpusk.VidOpl  );
+      Instmp_KlOtpusk(vSpr.KlOtpusk.VidOplb1);
+      Instmp_KlOtpusk(vSpr.KlOtpusk.VidOplb2);
+      Instmp_KlOtpusk(vSpr.KlOtpusk.VidFmp  );
+      Instmp_KlOtpusk(vSpr.KlOtpusk.VidFmpb1);
+      Instmp_KlOtpusk(vSpr.KlOtpusk.VidFmpb2);
+
+      Instmp_KlOtpusk(vSpr.KlOtpusk.VidRK    );
+      Instmp_KlOtpusk(vSpr.KlOtpusk.VidRKb1  );
+      Instmp_KlOtpusk(vSpr.KlOtpusk.VidRKb2  );
+    } //vSpr._loop KlOtpusk
+  }// заблокировал по #804.39
+  //----------------------
+  if  inherited :: handleEvent (cmOnVipLoad)=heAbort then Abort;
+  //----------------------
+
+}
+end;
+end.

@@ -1,0 +1,359 @@
+//******************************************************************************
+//                                                      (c) корпорация Галактика
+// Галактика 7.12 - Логистика
+//
+//******************************************************************************
+
+
+create view p1
+
+from
+  Pick
+
+where
+((
+  word(800) == Pick.wList
+));
+
+Procedure DefaultSpSopr;
+{
+  ClearBuffer(#SpSopr);
+
+  SpSopr.cSopr   := KatSopr.Nrec;
+  SpSopr.dSopr   := KatSopr.dSopr;
+  SpSopr.VidSopr := KatSopr.VidSopr;
+  SpSopr.dOprTTN := KatSopr.dOpr;
+  SpSopr.cVal    := KatSopr.cValut;
+  SpSopr.PrMc    := 1;
+}
+
+
+function NZ_SetDefaultCross(TipMon:word; pDocVal:comp): double;
+{
+ var TMPnRec : comp;
+ if (ReadMyDsk(TMPnRec,'_Insmc0_KatSopr_nRec',false)) AND
+    (TMPnRec = KatSopr.nRec) AND (KatSopr.nRec <> 0)
+   {
+     ReadMyDsk(NZ_SetDefaultCross,'_Insmc0_Curse',false);
+     EXIT;
+   };
+
+  var Cr: double;    cr := 1;
+  KatSopr.cVal := if (TipMon = 3, pDocVal, 0);
+  set KatSopr.cValut := if (pDocVal = 0,coGetTune('BaseCurrency'), pDocVal);
+
+  var tmpwNastr: word;
+  case KatSopr.VidSopr of
+    115, 204, 600..603, 605, 606, 611, 612, 630, 632:
+      tmpwNastr := wGetTune('Sklad.SoprDataKurs');
+    else
+      tmpwNastr := wGetTune('Doc.SoprDataKurs');
+  end;
+
+  case tmpwNastr of
+    0:
+    {
+      if (RunInterface(GetDCurse, ZeroDate, KatSopr.cValut, KatSopr.dPrice) = cmCancel)
+        KatSopr.dPrice := KatSopr.dSopr;
+    }
+    1:
+    {
+      KatSopr.dPrice := KatSopr.dSopr;
+    }
+  end;
+  NZ_SetDefaultCross := GetCursPrice;
+
+  IF (KatSopr.dPrice <> ZeroDate) AND ( NZ_SetDefaultCross <> 0)
+  {
+    SaveMyDsk(KatSopr.nRec,'_Insmc0_KatSopr_nRec');
+    SaveMyDsk(NZ_SetDefaultCross,'_Insmc0_Curse' );
+  }
+}
+
+//-- операции удаления
+//-- удаление налогов по накладной
+procedure deleteKatSoprNalogs;
+{
+//  ResetBounds(#SpSopr);
+  Delete SpDocNal where ((KatSopr.VidSopr == SpDocNal.TipDoc and
+                          KatSopr.NRec    == SpDocNal.cDoc));
+
+  oSDFuns.DeleteSoprOrdB(KatSopr.NRec, 0, 0, 0);
+}
+
+
+// удаление и кор-ка информации в модуле Автотранспорт
+Procedure DoDeleteSoprAuto;
+{
+#IFDEF _GP_
+#ELSE
+  while GetFirst SoprDop where ((KatSopr.NRec == SoprDop.cSopr and
+                              SpSopr.nrec  == SoprDop.cSpSopr )) = tsok
+  do
+    {
+      update Putgsm
+        where ((SoprDop.NRec == PutGsm.cSoprDop))
+          set Putgsm.cSoprDop :=0;
+
+      if (delete current SoprDop <> tsOK)
+        break;
+    };
+#ENDIF
+}
+
+
+
+function prepareInsSpSopr(Curse:double;TipMon:word;isUpDateSp:boolean):boolean;
+var isNakl : boolean;
+    ret : word;
+{ #__UNUSED__(Curse,TipMon,isUpDateSp)
+  Result := false;
+  isNakl := true;
+
+  if (GetFirst SpSopr where ((KatSopr.NRec == SpSopr.cSopr)) = tsOk)
+    {
+      if (not isUpDateSp)
+        if (Message(''#3'Заменить спецификацию ' + oKatSoprFunc.GetTipNameDoc(KatSopr.VidSopr, 1, False) + ' на '+
+          'спецификацию выбранного документа?', Confirmation + YesNo) = cmNo)
+          {
+            isNakl := false;
+            exit;
+          }
+
+      deleteKatSoprNalogs;
+
+      for (ret:=GetFirst SpSopr where ((KatSopr.NRec == SpSopr.cSopr));
+           ret = tsok;
+           ret:=GetFirst SpSopr where ((KatSopr.NRec == SpSopr.cSopr)))
+        {
+          DoDeleteSoprAuto;//--корректировка автотранспорта
+
+          #ifdef _SOPRDOC_VIP
+            oStatObj.SetPrevStatObj(SpSopr.cMCUsl);
+          #end
+          #ifdef _SOPRDOCB_VIP
+            oStatObj.SetPrevStatObj(SpSopr.cMCUsl);
+          #end
+          #ifdef SOPINMOV_VIP
+            oStatObj.SetPrevStatObj(SpSopr.cMCUsl);
+          #end
+          #ifdef _AKT110_
+            oStatObj.SetPrevStatObj(SpSopr.cMCUsl);
+          #end
+          ret := oSDfuns.SpSopr_Delete (SpSopr.nRec);
+        }
+    }
+
+  if (not isNakl)
+    Exit;
+
+  Result := isNakl;
+}
+
+function SkidPerc(pSum:double;pIsExtra:word;pDiscount:double):double;
+{
+
+  if (pIsExtra = 0)
+    Result := pSum - (pSum * pDiscount / 100)
+  else
+    Result := pSum + (pSum * pDiscount / 100);
+}
+
+function SkidSumma(pSum:double;pIsExtra:word;pDiscount:double;Koef:double):double;
+{
+  if (pIsExtra = 0)
+    Result := pSum - (pDiscount * Koef)
+  else
+    Result := pSum + (pDiscount * Koef);
+}
+
+function MakeSpecSkidka(var AllSpecSumR, AllSpecSumV, AllSpecSumNDSR, AllSpecSumNDSV: double;
+                        TipMon: word; Curse: double): word;
+var ret        : word;
+    myIsExtra,
+    myIsSum    : word;
+    myDiscount : double;
+    AllSumR,
+    AllSumV    : double;
+    AllSumNDS,
+    AllSumVNDS : double;
+    tmpKoef    : double;
+    tmpSum     : double;
+    _cRecDogovor : comp;
+{
+  Result := 1;
+
+  myIsExtra  := 0;
+  myIsSum    := 0;
+  myDiscount := 0;
+
+  PushPos(#Dogovor);
+  ReSetBounds(#Dogovor);
+
+  _cRecDogovor := 0;
+
+  if (KatSopr.cAppDogovor <> 0)
+   _cRecDogovor := KatSopr.cAppDogovor
+  else
+    if (KatSopr.cDogovor <> 0)
+     _cRecDogovor := KatSopr.cDogovor;
+
+  if _cRecDogovor <> 0
+   {
+    if (GetFirst Dogovor where ((_cRecDogovor == Dogovor.NRec)) =tsOK)
+     {
+       myIsExtra  := Dogovor.IsExtra;
+       myIsSum    := Dogovor.IsSum;
+       myDiscount := Dogovor.Discount
+     }
+    else
+      _cRecDogovor := 0;
+   }
+  SetBounds(#Dogovor);
+  PopPos(#Dogovor);
+
+  if (_cRecDogovor = 0)
+    Exit;
+
+  if ((KatSopr.cCalPlan <> 0) and
+      (myIsSum = 1))
+    { //-- ищем скидку(надбавку) если в виде суммы по календарному плану
+      var CalPlan_Summ,CalPlanSp_Sum:double;
+
+      ret := GetFirst CalPlan where ((KatSopr.cCalPlan == CalPlan.NRec));
+
+      CalPlan_Summ := CalPlan.SummaSpec; CalPlanSp_Sum := 0;
+
+      _LOOP SpDocs where ((nZakaz.cCalPlan  == SpDocs.cDoc and
+                           word(403)        == SpDocs.TiDk))
+          CalPlanSp_Sum := CalPlanSp_Sum + SpDocs.Summa;
+      if (CalPlanSp_Sum > CalPlan_Summ)
+        {
+          myIsExtra  := 0;
+          myDiscount := CalPlanSp_Sum - CalPlan_Summ;
+        }
+      else
+        {
+          myIsExtra  := 1;
+          myDiscount := CalPlan_Summ - CalPlanSp_Sum;
+        }
+    }
+
+  Result := 0;
+
+  if (myDiscount = 0.0)
+    Exit;
+
+  AllSumR   := AllSumV    := 0;
+  AllSumNDS := AllSumVNDS := 0;
+
+  _LOOP SpSopr where ((KatSopr.NRec==SpSopr.cSopr))
+    {
+      case (myIsSum) of
+        0: // процент
+          {
+            case (TipMon) of
+               1:
+                 {
+                   SpSopr.Price := SkidPerc(SpSopr.Price,myIsExtra,myDiscount);
+
+                   if (Curse <> 0)
+                     set SpSopr.VPrice := SpSopr.Price / Curse
+                   else
+                     set SpSopr.Vprice := 0;
+                 }
+               2:
+                 {
+                   SpSopr.VPrice := SkidPerc(SpSopr.VPrice,myIsExtra,myDiscount);
+                   SpSopr.Price  := SpSopr.VPrice * Curse;
+                 }
+               3:
+                 {
+                   SpSopr.VPrice := SkidPerc(SpSopr.VPrice,myIsExtra,myDiscount);
+                   SpSopr.Price  := SpSopr.VPrice * Curse;
+                 }
+               else
+                 {
+                   SpSopr.Price := SkidPerc(SpSopr.Price,myIsExtra,myDiscount);
+
+                   if (Curse <> 0)
+                     set SpSopr.VPrice := SpSopr.Price / Curse
+                   else
+                     set SpSopr.Vprice := 0;
+                 }
+
+            end;
+          }
+        1: // сумма
+          {
+            case (TipMon) of
+               1:
+                 {
+                   tmpKoef := SpSopr.Price * SpSopr.KolOpl / AllSpecSumR;
+                   tmpSum  := SpSopr.Price * SpSopr.KolOpl;
+
+                   SpSopr.Price := SkidSumma(tmpSum,myIsExtra,myDiscount,tmpKoef)/SpSopr.KolOpl;
+
+                   if (Curse <> 0)
+                     set SpSopr.VPrice := SpSopr.Price / Curse
+                   else
+                     set SpSopr.Vprice := 0;
+                 }
+               2:
+                 {
+                   tmpKoef := SpSopr.VPrice * SpSopr.KolOpl / AllSpecSumV;
+                   tmpSum  := SpSopr.VPrice * SpSopr.KolOpl;
+
+                   SpSopr.VPrice := SkidSumma(tmpSum,myIsExtra,myDiscount,tmpKoef)/SpSopr.KolOpl;
+                   SpSopr.Price  := SpSopr.VPrice * Curse;
+                 }
+               3:
+                 {
+                   tmpKoef := SpSopr.VPrice * SpSopr.KolOpl / AllSpecSumV;
+                   tmpSum  := SpSopr.VPrice * SpSopr.KolOpl;
+
+                   SpSopr.VPrice := SkidSumma(tmpSum,myIsExtra,myDiscount,tmpKoef)/SpSopr.KolOpl;
+                   SpSopr.Price  := SpSopr.VPrice * Curse;
+                 }
+               else
+                 {
+                   tmpKoef := SpSopr.Price * SpSopr.KolOpl / AllSpecSumR;
+                   tmpSum  := SpSopr.Price * SpSopr.KolOpl;
+
+                   SpSopr.Price := SkidSumma(tmpSum,myIsExtra,myDiscount,tmpKoef)/SpSopr.KolOpl;
+                   if (Curse <> 0)
+                     set SpSopr.VPrice := SpSopr.Price / Curse
+                   else
+                     set SpSopr.Vprice := 0;
+                 }
+            end;
+          }
+      end;
+
+      if (SpDocs.PrMC = 1)
+        {
+          if (GetFirst KatMC where((SpSopr.cMCUsl==KatMC.NRec))=tsOk)
+            RecalcNalogs(KatMC.cGrNal,SpSopr.cGrNal);
+        }
+      else
+        {
+          if (GetFirst KatUsl where((SpSopr.cMCUsl==KatUsl.NRec))=tsOk)
+            RecalcNalogs(KatUsl.cGrNal,SpSopr.cGrNal);
+        }
+
+      AllSumR    += SpSopr.Price  * SpSopr.KolOpl;
+      AllSumV    += SpSopr.VPrice * SpSopr.KolOpl;
+      AllSumNDS  += SpSopr.SumNDS;
+      AllSumVNDS += SpSopr.SumVNDS;
+
+      SpSopr.rVPrice := SpSopr.VPrice;
+      SpSopr.rPrice  := SpSopr.Price;
+
+      ret := update current SpSopr;
+    }
+
+  AllSpecSumR    := AllSumR;
+  AllSpecSumV    := AllSumV;
+  AllSpecSumNDSR := AllSumNDS;
+  AllSpecSumNDSV := AllSumVNDS;
+}

@@ -1,0 +1,181 @@
+type arrCodeTypes = array [1..1] of word;
+
+const
+  // это дубликат константы из support.ini ибо он неподключается в галактике
+  // и надо будет отслеживать если там поменяется то и мне менять надо
+  sotTable      = 3;
+end;
+
+var
+    // контейнеры с филиальными фильтрами
+    m_lCurBranches, m_lOldBranches, m_lFilialMarkerTmp : longint;
+    m_cCurrentFilial : comp;
+    m_arCodeTables  : arrCodeTypes;
+
+
+// wCodeMainTable - массив с кодами таблиц, по которым будет делатся основная обработка
+// вызываемой функции , при условии что CanMayBeUseThisFunction вернет true
+//  например для пересчета остатков Calc_NewSaldo за месяц по счетам это таблица SaldMoun
+//                                                за день по счетам это таблица SaldDay
+// cTekFilial - текущий филиал
+#ifdef _ObedShchet
+function CanMayBeUseThisFunction(arCodeTables : arrCodeTypes; cTekFilial : comp) : boolean;
+var
+  i : integer;
+  // есть у филиала права на записи из указанных таблиц из других филиалов
+  // если нет прав значит запускать можно
+  bEnableRigths : boolean;
+  bExistRigth : boolean;
+{
+  bEnableRigths := false;// прав нет
+
+  if (Count (arCodeTables) >= 1)
+    for (i := 1; i <= Count (arCodeTables); i := i + 1)
+    {
+      // таблица филиальная
+      if (getFirst fastfirstrow FilialObjects
+                   where ((    cTekFilial      == FilialObjects.cFilial
+                           and sotTable        == FilialObjects.ObjType
+                           and arCodeTables[i] == FilialObjects.wObject (noindex))) <> tsOk) continue;
+
+      // проверяем есть право у этого филиала на действия из других филиалов
+      // (если есть хоть одна запись) значит доступ есть на несколько и потому операции не делаем
+      bExistRigth := false;
+      _Loop FilialRights where ((FilialObjects.Atl_NRec == FilialRights.cFilObj))
+      {
+        // проверяем есть право у этого филиала на действия из других филиалов
+        if (GetFirst LinkFilials where ((FilialRights.cFilial == LinkFilials.Atl_NRec)) <> tsOk) continue;
+
+        bExistRigth := true;
+        break;
+      }
+
+      if (not bExistRigth) continue;
+
+      bEnableRigths := true;// есть права и выполнять автоматическую функции нельзя
+      break;
+    }
+
+  CanMayBeUseThisFunction := not bEnableRigths;
+}
+#end
+
+procedure SetFilialBdToStandart;
+{
+  // проверка - является ли бд филиальной
+  if (ExistFilial)
+  {
+     m_lFilialMarkerTmp := SortedContainer_Init('', 8, 100, 100, False);
+
+     // сохранить текущие филиальные фильтры
+     m_lCurBranches := GetCurrentBranches;
+     m_lOldBranches := SortedContainer_Init('', 8, SortedContainer_GetCount(m_lCurBranches), 10, false);
+     SortedContainer_Copy(m_lOldBranches, m_lCurBranches);
+     SetBranches(0, 0);// обычный режим
+  }
+}
+
+procedure SetStandartBdToFilial;
+{
+  if (ExistFilial)
+  {
+    SetBranches(m_lOldBranches, 0);  //филиальный режим
+    SortedContainer_Done(m_lOldBranches, '');
+    SortedContainer_Done(m_lFilialMarkerTmp, '');
+  }
+}
+// проверка возможности запуска функции проверок
+function CanMayRunCheckInFilialDb(sNameOperation : string) : boolean;
+{
+  CanMayRunCheckInFilialDb := true;
+  m_cCurrentFilial := 0;
+
+  if (ExistFilial)
+  {
+    if (SortedContainer_GetCount(GetCurrentBranches) >= 2)
+    {
+       Message('Функция "' + sNameOperation + '" не может быть запущена'
+               +  chr(13) + 'в режиме выбора нескольких филиалов.', Information + OkButton);
+       CanMayRunCheckInFilialDb := false;
+    }
+    m_cCurrentFilial := SortedContainer_AtC(GetCurrentBranches, 0);
+  }
+}
+
+#ifdef _ObedAll_
+// проверка возможности запуска функции объединения
+function CanMayRunObedInFilialDb : boolean;
+{
+  CanMayRunObedInFilialDb := true;
+  m_cCurrentFilial := 0;
+
+  if (ExistFilial)
+  {
+    if (SortedContainer_GetCount(GetCurrentBranches) >= 2)
+    {
+       Message('Функция объединения не может быть запущена'
+               +  chr(13) + 'в режиме выбора нескольких филиалов.', Information + OkButton);
+       CanMayRunObedInFilialDb := false;
+    }
+    m_cCurrentFilial := SortedContainer_AtC(GetCurrentBranches, 0);
+  }
+#ifndef _ObedShchet
+  else
+  {
+    ClearFieldState(#strFilial, sfVisible);
+    ClearFieldState(#strFilial1, sfVisible);
+  }
+#end
+}
+
+// установка филиальности в таблицах Joihead, SpSoj.
+// вызов обязательно после вставки в эти таблицы.
+procedure SetFilialInNastrObed(nTable : word; sName : tName; cAtl_Branch : comp);
+{
+  if (ExistFilial)
+  {
+    case nTable of
+    coJoiHead :
+    {
+      JoiHead.rStr := sName;
+      JoiHead.Atl_Branch := cAtl_Branch;
+      update current setBranch JoiHead;
+    }
+    coSpJoi :
+    {
+      SpJoi.rStr := sName;
+      SpJoi.Atl_Branch := cAtl_Branch;
+      update current setBranch SpJoi;
+    }
+    end;
+  }
+}
+
+function IsNotExistNastroikiFromOtherFilials(nTypeObed : word; wTable :word) : boolean;
+var
+  cBranch : comp;
+  bExist : boolean;
+{
+  IsNotExistNastroikiFromOtherFilials := false;
+  if (ExistFilial)
+  {
+    bExist := false;
+    _Loop tmpJoiHead where ((    nTypeObed  == tmpJoiHead.TypeEvent
+                             and UserName() == tmpJoiHead.UserName))
+    {
+      cBranch := tmpJoiHead.Atl_Branch;
+      _Loop tmpSpJoi where ((tmpJoiHead.nRec == tmpSpJoi.cJoiHead))
+        if (cBranch <> tmpSpJoi.Atl_Branch and GetTableFilialState(wTable)<> tsFilialTableIsCommon ) then
+        {
+          Message('Обнаружено объединение, содержащее записи из разных филиалов.'
+                  +  chr(13) + 'Объединение будет прервано', Ok + Error);
+          bExist := true;
+          break;
+        }
+      if (bExist) break;
+    }
+    if (not bExist) IsNotExistNastroikiFromOtherFilials := true;
+  }
+  else IsNotExistNastroikiFromOtherFilials := true;
+}
+#end

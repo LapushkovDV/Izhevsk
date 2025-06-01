@@ -1,0 +1,315 @@
+/*************************************************************************************************\
+* Наименование: Разработка процедуры импорта сведений о сотрудниках,                              *
+*               принявших участие в мероприятиях                                                  *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#241          |26/09/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include CatFunc.vih           // Функции работы с Catalogs
+#include PickCat.vih
+
+Interface GP_RPD113_Import 'Импорт сведений о сотрудниках, принявших участие в мероприятиях' Gray;
+show(20,5,75,14);
+
+var cPartDoc: comp;
+    iCatFunc:CatalogsFunctions;
+    cRaiseType:comp;
+
+//Таблица в памяти для импортируемых данных
+Table Struct tmpImport (
+    cPerson   : comp,
+    SumUsl    : double
+);
+
+Create view
+var FileXLS,RaiseType:string;
+    Dat1,Dat2:date;
+from
+  tmpImport,
+  Persons, Appointments,
+  TitleDoc, PartDoc, ContDoc,
+  Raise, RaiseHist, GP_RaiseHistExt113;
+
+Parameters cPartDoc;
+
+function ReadAndCheckFile:boolean; //true - отсутствие ошибок
+var CurRow:longint;
+    err,val,FIO,Str:string;
+    BornDate:date;
+{
+  result:=true;
+
+  xlSetActiveSheet(1);
+  val:=FIO:=Str:='';
+
+  CurRow := 3;
+  do {
+    if (not NextVisual) break;
+
+    xlGetCellValue(CurRow, 1, val);val:=Trim(val);
+    xlGetCellValue(CurRow, 2, FIO);FIO:=Trim(FIO);
+
+    if (FIO <> '') {
+      err:='';
+      xlGetCellValue(CurRow, 3, Str);Str:=Trim(Str);
+      BornDate:=StrToDate(Str,'DD.MM.YYYY');
+
+      if (BornDate=ZeroDate)
+        err:='Ошибка! Не указана дата рождения!'
+      else {
+        //Найдем сотрудника и спопоб пополнения
+        if (getfirst fastfirstrow Persons
+            where(('С' == Persons.IsEmployee and FIO == Persons.FIO and BornDate == Persons.BornDate (noindex) )) <> tsOk) {
+          //Проверим, есть ли Persons без С
+          if (getfirst Persons where ((FIO == Persons.FIO (noindex) and BornDate == Persons.BornDate (noindex) )) = tsOk)
+            err:='Ошибка! '+FIO+' не является сотрудником предприятия!';
+          else
+            err:='Ошибка! Не найден сотрудник c ФИО "'+FIO+'" и датой рождения '+DateToStr(BornDate,'DD.MM.YYYY')+'!';
+        }
+      }
+
+      xlSetCellStringValue(err, CurRow, 7, CurRow, 7);
+      if (err <> '')
+        result := false;
+
+      if (result) {
+        //Добавим строку в служебную таблицу
+        ClearBuffer(#tmpImport);
+        tmpImport.cPerson := Persons.NRec;
+        xlGetCellValue(CurRow, 5, tmpImport.SumUsl);
+        insert current tmpImport;
+      }
+    }
+    CurRow++;
+  } while (val <> '');
+
+  if (not result)
+    xlSetColumnWidth(50, CurRow, 7, CurRow, 7);
+}
+
+function LoadData:boolean; //Создание строк приказа по данным в таблице в памяти
+var npp:word;
+{
+  result:=false;
+
+  if (getfirst fastfirstrow PartDoc where((cPartDoc == PartDoc.nrec)) <> tsOk) {
+    message('Не найден раздел приказа с NRec='+string(cPartDoc,0,0),error);
+    exit;
+  }
+  if (getfirst fastfirstrow TitleDoc where((PartDoc.cDoc == TitleDoc.nrec)) <> tsOk) {
+    message('Не найден приказ с NRec='+string(PartDoc.cDoc,0,0),error);
+    exit;
+  }
+
+  if (GetLast ContDoc where((PartDoc.nRec == ContDoc.cPart and
+                             PartDoc.TypeOper == ContDoc.TypeOper and
+                             1 == ContDoc.SeqNmb)) = tsOk)
+    npp:=ContDoc.wRec
+  else
+    npp:=0;
+
+  _loop tmpImport {
+    if (not NextVisual) break;
+
+    ClearBuffer(tnContDoc);
+    ContDoc.ObjType := 1;
+    ContDoc.SeqNmb := 1;
+    ContDoc.cPart := cPartDoc;
+    ContDoc.TypeOper := PartDoc.TypeOper;
+    ContDoc.NumPart := PartDoc.NRazd;
+    ContDoc.wRec := ++npp;
+    ContDoc.Person := tmpImport.cPerson;
+    //Найдем назначение, действующее на дату приказа
+    if (getlast Appointments where((ContDoc.Person == Appointments.Person and 0 == Appointments.LPrizn and TitleDoc.DocDate >>= Appointments.AppointDate)) = tsOk)
+    {
+      ContDoc.cStr := Appointments.NRec;
+      ContDoc.cDopRef := Appointments.Department;
+    }
+
+    if (insert current ContDoc <> tsok) {
+      message('Ошибка вставки записи в таблицу ContDoc.',error);
+      exit;
+    }
+
+    ClearBuffer(tnRaise);
+    Raise.Person := tmpImport.cPerson;
+    Raise.crDop := ContDoc.NRec;
+    Raise.FromDate := Dat1;
+    Raise.ToDate := Dat2;
+    Raise.RaiseType := cRaiseType;
+    if (insert current Raise <> tsok) {
+      message('Ошибка вставки записи в таблицу Raise.',error);
+      exit;
+    }
+
+    ClearBuffer(tnRaiseHist);
+    RaiseHist.cPsn := Raise.Person;
+    RaiseHist.cRaise := Raise.NRec;
+    RaiseHist.wTypeOper := ContDoc.TypeOper;
+    RaiseHist.RHSum := Raise.Sum;
+    RaiseHist.cContDoc := ContDoc.NRec;
+    RaiseHist.DRec := Raise.FromDate;
+    RaiseHist.DDat2:= Raise.ToDate;
+    RaiseHist.cRaiseType := cRaiseType;
+    if (insert current RaiseHist <> tsok) {
+      message('Ошибка вставки записи в таблицу RaiseHist.',error);
+      exit;
+    }
+
+    ClearBuffer(tnGP_RaiseHistExt113);
+    GP_RaiseHistExt113.cRaiseH := RaiseHist.NRec;
+    GP_RaiseHistExt113.Summa:= tmpImport.SumUsl;
+    if (insert current GP_RaiseHistExt113 <> tsok) {
+      message('Ошибка вставки записи в таблицу GP_RaiseHistExt113.',error);
+      exit;
+    }
+  }//_loop tmpImport
+
+  result:=true;
+}
+
+screen scParam (,,sci13Esc);
+fields
+  FileXLS ('Путь к файлу c данными',,):noprotect,pickbutton,
+    {font={backcolor=if(FileXLS='',ColorNeed,0)}};
+  RaiseType ('Вид поощрения',,):protect,pickbutton,
+    {font={backcolor=if(cRaiseType=0,ColorNeed,0)}};
+  Dat1 ('Отчетный период с',,):noprotect,
+    {font={backcolor=if(Dat1=ZeroDate,ColorNeed,0)}};
+  Dat2 ('Отчетный период по',,):noprotect,
+    {font={backcolor=if(Dat2=ZeroDate,ColorNeed,0)}};
+buttons
+  cmOK,,,'Импорт данных в Систему',,sci1Esc;
+  cmCancel,,,'Выход',,sci1Esc;
+<<
+ `Путь к файлу c данными`
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Вид поощрения`
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  Отчетный период
+ `с`.@@@@@@@@@@  `по`.@@@@@@@@@@
+
+ <.   Импорт   .>                     <.   Отмена   .>
+>>
+end;
+
+function CheckInPutVars:boolean;
+{
+  CheckInPutVars:=false;
+
+  if (FileXLS='') {
+    message('Пожалуйста, укажите Путь к файлу c данными!');
+    SelectField(fnFileXLS);
+    PutCommand(cmPick);
+    exit;
+  }
+  if (not ExistFile(FileXLS)) {
+    message('Файла "'+FileXLS+'" не существует!');
+    exit;
+  }
+
+  if (cRaiseType=0) {
+    message('Пожалуйста, укажите Вид поощрения!');
+    SelectField(fnRaiseType);
+    PutCommand(cmPick);
+    exit;
+  }
+
+  if (Dat1=ZeroDate) {
+    message('Пожалуйста, укажите дату начала отчетного периода!');
+    SelectField(fnDat1);
+    PutCommand(cmPick);
+    exit;
+  }
+  if (Dat2=ZeroDate) {
+    message('Пожалуйста, укажите дату окончания отчетного периода!');
+    SelectField(fnDat2);
+    PutCommand(cmPick);
+    exit;
+  }
+
+  CheckInPutVars:=true;
+}
+
+HandleEvent
+cmInit:{
+  if (cPartDoc=0) {
+    abort;
+    exit;
+  }
+
+  ReadMyDSK(FileXLS,#__InterfaceName__+'FileXLS',false);
+  ReadMyDSK(cRaiseType,#__InterfaceName__+'cRaiseType',false);
+  RaiseType:=iCatFunc.GetCatalogsName(cRaiseType);
+  ReadMyDSK(Dat1,#__InterfaceName__+'Dat1',false);
+  ReadMyDSK(Dat2,#__InterfaceName__+'Dat2',false);
+}
+cmDone:{
+  SaveMyDSK(FileXLS,#__InterfaceName__+'FileXLS');
+  SaveMyDSK(cRaiseType,#__InterfaceName__+'cRaiseType');
+  SaveMyDSK(Dat1,#__InterfaceName__+'Dat1');
+  SaveMyDSK(Dat2,#__InterfaceName__+'Dat2');
+}
+cmOK:{
+  //Проверка параметров
+  if (not CheckInPutVars) exit;
+
+  StartNewVisual(vtRotateVisual, vfTimer+vfBreak+vfConfirm,'Импорт сведений о сотрудниках, принявших участие в мероприятиях...', 0);
+
+  //Откроем и проверим файл
+  xlOpenNewExcel(false);
+  xlDisplayAlerts(false);
+  if (xlOpenWorkBook(FileXLS)) {
+    if (ReadAndCheckFile) {
+      xlCloseWorkBookByName(FileXLS);
+      //Загрузим данные файла в приказ
+      if (LoadData)
+        message('Импорт завершен успешно!');
+    } else {
+      message('При проверке файла обнаружены ошибки! См. файл, колонка 7.');
+      xlSetAppVisibleMode(true);
+      xlCloseWorkBook(1);
+    }
+  }
+  else
+    message('Ошибка при открытии файла "'+FileXLS+'"',error);
+
+  xlKillExcel;
+  delete all tmpImport;
+
+  StopVisual;
+
+  CloseInterface(cmDefault);
+}
+cmPick:{
+  case CurField of
+    fnFileXLS:{
+      var FName:string;
+
+      //Запросим имя файла Excel для импорта
+      FName := GetFileName('*.xls;*.xlsx','Выберите файл Excel для импорта...');
+      if (FName<>'')
+        set FileXLS:=FName;
+    }
+    fnRaiseType:{
+      var cRec:comp;
+      cRec:=coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD113');//113. Нематериальное поощрение
+      if (cRec=0) {
+        message('Не задана настройка "'+GetTuneName('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD113')+'"');
+        exit;
+      }
+
+      SaveMyDsk(cRaiseType, 'PickCatalog2_DopTblCurPos');
+      if (RunInterface(PickCatalog2, integer(-17), cRec, 7) = cmDefault) {
+        cRaiseType:=cRec;
+        set RaiseType:=iCatFunc.GetCatalogsName(cRaiseType);
+      }
+    }
+  end;
+}
+end;
+end.

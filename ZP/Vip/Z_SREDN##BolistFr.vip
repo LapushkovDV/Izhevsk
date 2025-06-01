@@ -1,0 +1,306 @@
+/*************************************************************************************************\
+* Наименование: БЛ правой кн. мыши -> Справки о расчете в формате FastReport->                    *
+*               справка о расчете в графу "Осн. заработок, руб"                                   *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание: выводить сумму по месяцам с учетом вознаграждений.                                  *                                                  *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2421         |09/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include CONTEXTS.VIH
+#include PSNFUNCS.VIH
+#include StrFunc.vih
+#include TotalOrganizationAttributes.vih  // объявление и инициализация TOA
+
+#component "Z_SREDN"
+#include Bolnich_funcs.vih
+#include BlControl.vih // Контроль дат больничных
+
+#doc
+в БЛ правой кн. мыши -> Справки о расчете в формате FastReport->
+справка о расчете в графу "Осн. заработок, руб" выводить сумму по месяцам с учетом вознаграждений.
+В настоящее время вознаграждения входят в сумму Итоговую, а по месяцам не включаются.
+#end
+
+Alter Interface bolistfr;
+Overload
+datastream BolList;
+//----------------------------------------------------------------------------
+//Процедура формирования зарплаты
+//----------------------------------------------------------------------------
+procedure InsertData;
+
+end;
+Create view vboln
+Bounds byRep     /*BLNet.srcBlank*/ Blisnet.srcBlank    == BLANKBLN.Nrec
+;
+
+
+//datastream BolList
+//----------------------------------------------------------------------------
+//Процедура формирования зарплаты
+//----------------------------------------------------------------------------
+procedure InsertData;
+{
+  delete all ZarPl;
+  delete all SortTabn;
+  delete all ArBol;
+  _loop Formarks
+  {
+    Dn_All      := 0;
+    PrDayPr     := 0;
+    PrDayFss    := 0;
+    PrDayPrevPr := 0;
+    PrDayPrevFss:= 0;
+    Bw_Dnz_DN   := 0; //Разница дней между началом заболевания и началом листка
+    AllDn1      := 0;
+    AllDn2      := 0; //к-во дней второго  процента
+    AllDn3      := 0; //к-во дней третьего процента
+
+    var iBlKontrl: BlControl;    // Переменная типа интерфейс BlControl
+    LogCross := iBlKontrl.LogCrossBlOtp(BLNet.NRec);
+    OrganNameStr := '';
+    OrganName := '';
+    if (MySetDefParam = ccRus)
+    {
+      TOA.Bind(0);         // связываем TOA с собственной организацией
+      OrganNameStr := 'Наименование организации:';
+      OrganName := Trim(TOA.GetJuridicalInfo.GetName);
+    }
+
+    kolday   := to_days(BlNet.DatOk)-to_days(BlNet.DataN)+1;
+
+    Datnz := D_N_Z(BlNet.DataN, integer(round(BlNet.ChasGr)),
+                   BlNet.Mes,
+                   BlNet.TypeViol);  //дата начала больничного
+
+    if (Datnz < BlNet.DataN)
+    {
+      Bw_Dnz_DN := SetKolDnP(Datnz,
+                             Sub_day(BlNet.DataN, 1),
+                             GetStrTabn(BlNet.TabN,BlNet.StrTabN),
+                             Ls.Nrec,
+                             BlNet.VIDPOS,
+                             false,
+                             0, // ограничивать продолжительность
+                             0  //остаток по ограничению
+                             );
+    }
+    var ScheduleType: integer; // тип графика "маска ручной корректировки табеля"
+    ScheduleType := integer(wGetTune('UP.SickListDurationCalcSchedule'));
+    if (Blnet.PDCh = 1) then  //Расчет по часам 102.139389
+    {
+       var dateRab : date;
+       var monNumb : byte;
+       var yearNumb: integer;
+       dateRab := Add_Day(Datnz, KVPos.VidOplD);
+       monNumb  := AD_Month(Datnz);
+       yearNumb := AD_Year(Datnz);
+       ResetWorkingTable;
+       if LoadWorkingTable(Ls.Nrec,monNumb,YearNumb) = 0
+       {
+          AllDn1dn := WT_GetHoursBwDates(hkWholeWorking, 0, 0, ScheduleType, Datnz, dateRab);
+          if Blnet.SUMOSN <> 0  //к-во дней первого процента задано вручную в интерфейсе больничных
+               AllDn1dn := Blnet.SUMOSN;
+       }
+    }
+    else
+    //продолжительность первого проц в рабочих днях/часах для выбора процента
+    //кол-во дней(часов) для оплаты по первому проценту,
+    //включая дни нарушения режима
+    AllDn1dn  :=  dni_i_1_shift(
+                         HospitalDays,
+                         Datnz,
+                         Datnz,
+                         Blnet.PDCh,
+                         KVPos.VidOplD,
+                         BlNet.KolDn + Bw_Dnz_DN,
+                         GetStrTabn(BlNet.TabN,BlNet.StrTabN),
+                         Ls.Nrec,
+                         BLNET.VIDPOS,
+                         BlNet.KolDn + Bw_Dnz_DN,
+                         0,
+                         BlNet.SumOsn);
+
+    AllDn2dn := dni_i_2 (Add_Day(Datnz, KVPos.VidOplD-1),    // продолжительность  второго проц
+                        blNet.PDCh,
+                        KVPos.KOLD3,
+                        BlNet.Koldn,
+                        GetStrTabn(BlNet.TabN,BlNet.StrTabN),
+                        Ls.Nrec,
+                        BlNet.VIDPOS);
+    //кол-во дней(часов) для оплаты по первому проценту,
+    //включая дни нарушения режима
+    if  KVPos.VidOplD = 0 //к-во дней первого процента не задано
+    {
+      AllDn_WN1 := kolday;
+    }
+    else
+    {
+      var DatRab:  Date;   //
+      DatRab := Add_Day(Datnz, KVPos.VidOplD - 1);
+      if DatRab > BlNet.Datok
+        DatRab := BlNet.Datok;
+
+      AllDn_WN1  := to_days(DatRab)-to_days(Datnz) + 1;
+      AllDn_WN1  := AllDn_WN1 - Bw_Dnz_DN;
+    }
+
+    AllDn1   :=  //количество дней первого процента
+      dni_i_ch_shift(
+                     HospitalDays,
+                     BlNet.Datan,
+                     Datnz,
+                     blnet.PDCh,
+                     KVPos.VidOplD,
+                     BlNet.KolDn,
+                     GetStrTabn(BlNet.TabN,BlNet.StrTabN),
+                     Ls.Nrec,
+                     BLNET.VIDPOS,
+                     BlNet.KolDn, 0,
+                     BlNet.SumOsn);
+
+    AllDn1 := AllDn1dn; //106.9817
+
+    if KVPos.KOLD3 > 0  //к-во дней второго процента задано явно в классификаторе
+      AllDn2  := kolday - AllDn_WN1 - Bw_Dnz_DN;
+    else
+      AllDn2  := kolday - AllDn_WN1;  //остаток второго процента
+
+    if (KVPos.VidOplD <> 0) and
+       (KVPos.KOLD3 > 0)
+         if AllDn2 > KVPos.KOLD3
+            AllDn2 := KVPos.KOLD3; //больничный с дыркой
+         AllDn3  := kolday - AllDn1 - AllDn2; //к-во дней второго процента
+
+    KolDayPred  := 0; //количество дней за счет предприятия
+    KolDayFss   := 0; //количество дней за счет ФСС
+    KolDayBol   := BLNet.KolDn;  //Кол-во дней болезни
+
+    KlPsZp_SA:= 0; //процент из классификатора с учетом стажа службы в армии
+    if (MySetDefParam = ccRus) then
+      KlPsZp_SA:= Proc_Stag_SA //процент из классификатора с учетом стажа службы в армии
+                  (BLNet.Pszp
+                  ,DatNZ   //дата начала заболевания
+                  ,Ls.DatNps
+                  ,GetStrTabn(BlNet.TabN,BlNet.StrTabN)
+                  ,Ls.Summa19
+                  ,Ls.TPERSON); // Установка кода непрерывного стажа
+
+    for(i:=1; i<= 7;Inc(i))
+    {
+       KolDayPred  := KolDayPred + ArBl.SrZFmpM[i];
+    }
+    KolDayFss   := BLNet.KolDn - KolDayPred;
+
+    var AllY    : word;  //количество записей в таблице SumsCalcPeriod
+
+    AllY := 0;  //количество записей в таблице SumsCalcPeriod
+
+    for(i:=1; i<= 7; Inc(i))
+    {
+      InsertArbl(i);
+    }
+    //-------------------------------------
+    ClearBuffer(#SortTabn);
+    SortTabn.NRecList := BlNet.nrec;
+    SortTabn.TabN     := BlNet.TabN;
+    SortTabn.StrTabN  := BlNet.StrTabN;
+    SortTabn.FIO      := PERSONs.FIO;
+    if (GetFirst Catalogs where ((LSCHET.cAppoint == Catalogs.NRec)) = tsOk)
+      SortTabn.Dolj := Catalogs.Name;
+
+#IFDEF _GP_
+    // Должно быть в стандарте!!!!
+    if (GetFirst Catalogs where ((LS.cAppoint == Catalogs.NRec)) = tsOk)
+      SortTabn.Dolj     := Catalogs.Name;
+#ENDIF
+    if (GetFirst BlankBln where ((BlNet.SrcBlank == BlankBln.NRec)) = tsOk)
+    {
+      SortTabN.NumList := BlankBln.NumList;
+      SortTabN.DatNZ   := BlankBln.DNz;
+    }
+    if (IsInvalid = true)
+      if (GetFirst Catalogs where ((comp(PasspINV.GivenPodr) == Catalogs.NRec)) = tsOk)
+        SortTabn.Inv := Catalogs.CatData;
+    insert current SortTabn;
+    AllY := 0;  //количество записей в таблице SumsCalcPeriod
+    _loop SCP
+    {
+      AllY := AllY + 1;  //количество записей в таблице SumsCalcPeriod
+    }
+    if AllY > 2
+    {
+      message('Для работника с табельным номером ' +
+      GetStrTabn(BlNet.TabN, BlNet.StrTabN) +''#13
+      +' расчетный период содержит более двух лет.'#13
+      +' Формат справки не предусмотрен для данного варианта!');
+     continue;
+    }
+    //-------------------------------------
+    for(i:= 1; i <= 12; Inc(i))
+    {
+      ClearBuffer(#ZarPl);
+
+      ZarPl.NumList := BLNet.nrec;
+
+      if (Blisnet.DopPr = 7) or (Blisnet.DopPr = 4) then
+      {
+        Fyear               := to_date(1,1,SumsPeriod_2.YEAR_ARME[i]);
+        ZarPl.FirstYear     := SumsPeriod_2.YEAR_ARME[i];
+        ZarPl.FirstMonth    := SumsPeriod_2.ARME[i];
+        ZarPl.FirstDays     := SumsPeriod_2.RABD[i];
+        if  (SumsPeriod_2.Field1 = 1) //102.114701, расчет из МРОТ, если  у  сотрудника  не было  дохода
+        and (i = 12)
+          ZarPl.FirstZarp     := 0
+        else
+#IFDEF _GP_
+          ZarPl.FirstZarp     := SumsPeriod_2.FZP[i]+SumsPeriod_2.FMP[i];
+#ELSE
+          ZarPl.FirstZarp     := SumsPeriod_2.FZP[i];
+#ENDIF
+        Lyear               := to_date(31,12,SumsCalcPeriod.YEAR_ARME[i]);
+        ZarPl.LastYear      := SumsCalcPeriod.YEAR_ARME[i];
+        ZarPl.LastMonth     := SumsCalcPeriod.ARME[i];
+        ZarPl.LastDays      := SumsCalcPeriod.RABD[i];
+        if  (SumsCalcPeriod.Field1 = 1) //102.114701, расчет из МРОТ, если  у  сотрудника  не было  дохода
+        and (i = 12)
+          ZarPl.FirstZarp     := 0
+        else
+#IFDEF _GP_
+          ZarPl.LastZarp      := SumsCalcPeriod.FZP[i]+SumsCalcPeriod.FMP[i];
+#ELSE
+          ZarPl.LastZarp      := SumsCalcPeriod.FZP[i];
+#ENDIF
+      }
+      else
+      {
+        ZarPl.FirstYear      := SumsCalcPeriod.YEAR_ARME[i];
+        ZarPl.FirstMonth     := SumsCalcPeriod.ARME[i];
+        ZarPl.FirstDays      := SumsCalcPeriod.RABD[i];
+#IFDEF _GP_
+        ZarPl.FirstZarp      := SumsCalcPeriod.FZP[i]+SumsCalcPeriod.FMP[i];
+#ELSE
+        ZarPl.FirstZarp      := SumsCalcPeriod.FZP[i];
+#ENDIF
+      }
+      insert current Zarpl;
+    }
+  }
+#IFDEF _GP_ //#2421.#8
+  PushBounds(tbbyRep);
+#ENDIF
+} //procedure InsertData;
+
+//**********************************
+datastream BolList
+(
+  table Inherited::SortTabn
+  ( [Katpodr_Kod] KatPodr.kod;
+  );
+) //
+end;//datastream BolList
+
+
+
+end.

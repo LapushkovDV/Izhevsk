@@ -1,0 +1,434 @@
+/*************************************************************************************************\
+* Наименование:  Ведение заказов/проектов - Распределение ФОТ работников по заказам               *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    проверка данных после расчета зарплаты                                           *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#798          |10/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+//TEST Разбиения по заказам
+//228066228
+
+#DEFINE ZAR_AFTERRAS_DEBUG
+#DEFINE _PODR_NOCHANGE_
+
+#include MacroSch.vpp
+#include Contexts.vih  // Контексты
+#include Protector.vih
+
+#include CLSFUNCS.VIH
+#include GetKAU.vih
+#include Contexts.vih // работа с прикладными контекстами
+#doc
+ Меняем аналитику в начислениях и архивах налогов на фот
+#end
+
+//=========================================================
+Interface GP_ZP_AfterRas ;
+//=========================================================
+var iGetKau : GetKau;
+var CLSF                     : CurLSFunctions;
+var CS:                 IContextSession;
+var wkod_plan:string[10];
+#declare sch_struct
+  ,cschetd:string[20]
+  ,csubsch:string[20]
+  ,param  :string[20]
+  ,tbld: array [1..6] of word
+  ,ckaud: array [1..6] of comp
+#end
+table struct tmp_Rasp
+(  cpodr :comp
+  ,cpost :comp
+  ,clschet:comp
+  ,Sum    :double
+  ,cschetd:string[20]
+  ,csubsch:string[20]
+  ,param  :string[20]
+  ,tbld: array [1..6] of word
+  ,ckaud: array [1..6] of comp
+  ,cPrVidopl:comp
+  ,Datan :date
+  ,Datok :date
+)
+with index
+( tmp_Rasp01 = clschet+cpodr+cpost+Sum
+ ,tmp_Rasp02 = Sum
+ ,tmp_Rasp03 = clschet+DATAN
+);
+table struct tmp_vidopl
+(  vidopl  :word
+  ,vidoplp :word
+  ,VHVOE_36:word
+  ,lev_st :word
+  ,RaspZakaz:word
+  ,cschetd:string[20]
+  ,csubsch:string[20]
+  ,param  :string[20]
+  ,tbld: array [1..6] of word
+  ,ckaud: array [1..6] of comp
+)
+with index
+( tmp_vo01 = vidopl
+);
+table struct tmp_schet
+(  cschet :string[20]
+  ,csubsch:string[20]
+  ,tbl :array [1..6] of word
+)
+with index
+( tmp_schet01 = cschet+csubsch
+);
+
+// изменять параметр выбора 1 нет
+var Fill_Param :word;
+//--
+VAR ATTR_RASP_ZAKAZ:comp;
+
+create view
+var
+ NEEDREP :word;
+ kl_need :boolean;
+ wkod :word;
+ k,i :word;
+ wyear ,wmesn :word;
+ wyear1,wmesn1:word;
+ wkodplans :string[2];
+ w_VidOpl:word;
+ myPlansNo:comp ; // PlansSch.nrec - план счетов
+ wc_lsch:comp;
+ PeriodBeginning:date;
+ w_dtb:date;
+as select
+  lschet.tabn
+from 
+ formarks(FORMARKS12)
+ ,lschet
+ ,lschet lschet_m
+ ,nachisl
+ ,PlansSch
+ ,appointments
+ ,tmp_Rasp
+ ,Perexod
+where ((
+ 0 == formarks.choice
+and formarks.CLSCHET == lschet_m.nrec
+and 0 == APPLDOCS.WTABLE
+AND formarks.CLSCHET == APPLDOCS.crec
+and wc_lsch == lschet.nrec
+//===============
+and lschet.nrec == nachisl.clsch
+and wc_lsch == PRNARYAD.cLsch
+and (  PRNARYAD.CHOICE=0
+    )
+//======================
+and myPlansNo == PlansSch.nrec
+//======================
+and w_vidopl == klvidopl.vidopl
+and w_vidopl == tmp_vidopl.vidopl
+
+and pcCostSharing   == PRVIDOPL.CHOICE
+and wc_lsch         == PRVIDOPL.CLSCH
+and PeriodBeginning == PRVIDOPL.DATAN (noindex)
+//
+and wc_lsch == Perexod.CLSCH
+and PeriodBeginning <<= Perexod.DatIzm
+and w_dtb >>=Perexod.DatIzm
+and   ( Perexod.DATOK=ZeroDate
+        or Perexod.DATOK>=w_dtb//GP_SCUD_Events.EnterDate
+       )
+
+//======================
+and lschet.tperson == appointments.person
+and w_dtb >>= appointments.APPOINTDATE
+and lschet.nrec == appointments.caddnrec2(noindex)
+
+
+
+
+))
+
+
+;
+parameters NeedRep,wyear,wmesn;
+//==================
+create view vSchet
+as select tmp_schet.cschet
+from buhschet, tmp_schet
+;
+
+//******************************************************************************
+// Функции
+//******************************************************************************
+
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+procedure SetPeriod(Beginning: date);
+{
+  PeriodBeginning := Beginning;
+  ReReadRecord(#PRVIDOPL);
+}
+
+//================================
+Procedure GetSchet(ww_sch:string[20];ww_sub:string);
+{ if vschet.getfirst fastfirstrow tmp_schet where (( ww_sch == tmp_schet.cschet and ww_sub == tmp_schet.csubsch ))=0 then exit;
+  if vschet.getfirst fastfirstrow buhschet where (( wkod_plan+ww_sch ==buhschet.schet and ww_sub==buhschet.subsch ))=0
+  { vschet.tmp_schet.cschet :=vschet.buhschet.schet;
+    vschet.tmp_schet.csubsch:=vschet.buhschet.subsch;
+    for(k:=1;k<=6;k:=k+1)
+      vschet.tmp_schet.tbl[k]:=vschet.buhschet.kodtable[k] ;
+    vschet.insert current tmp_schet;  
+  }
+}
+//================================
+Procedure Find_Vo(const ww_vidopl:word);
+{ w_vidopl:=ww_vidopl;
+  if getfirst fastfirstrow tmp_vidopl=0 exit;
+  if getfirst fastfirstrow klvidopl=0 {}
+  tmp_vidopl.lev_st:=0;
+  tmp_vidopl.vidopl:=ww_vidopl;
+  tmp_vidopl.vidoplp:=klvidopl.vidoplp;
+  tmp_vidopl.cschetd:=klvidopl.cschetd;
+  tmp_vidopl.csubsch:=klvidopl.CSUBSCHD;
+  tmp_vidopl.VHVOE_36:=if(klvidopl.VHVOE[36]='2',2,if(klvidopl.VHVOE[36]='1',1,0));
+  tmp_vidopl.param   :=klvidopl.param;
+  tmp_vidopl.RaspZakaz:=word(doGetAttrID(coKlVidopl,Klvidopl.Nrec,ATTR_RASP_ZAKAZ));
+  for(k:=1;k<=6;k:=k+1)
+  { tmp_vidopl.tbld[k]:=klvidopl.tbld[k];
+    tmp_vidopl.ckaud[k]:=klvidopl.ckaud[k];
+  } //for(k:=1;k<=6;k:=k+1)
+  insert current tmp_vidopl;  
+    
+}
+
+//===============================================
+//Сотрудники на прямых расходах (сдельная оплата)
+//===============================================
+Function CheckDirectZatrar: boolean;
+{ Result:=false;
+//Система оплаты - сдельная оплата;
+  if Lschet.SisOpl>=30 then exit;
+//На вкладке <Отнесение затрат> не заполнена привязка к заказу;
+
+  for(k:=1;k<=6;k:=k+1)
+  { if Lschet.Tbld[k]=cgKau_Zakaz
+    { if Lschet.cKaud[k]>0
+        Exit;
+
+    }
+
+  }
+//Для расчета заработной платы используются наряды
+  if getfirst PRNARYAD<>tsok    then exit;
+//В табеле учета рабочего времени нет распределения по заказам;
+//Лишнее условие. Нужен признак в лицевом счете if getfirst PrVidopl=tsok then Exit;
+  Result:=true;
+}//Function CheckDirectZatrar: boolean;
+
+
+//===============================================
+//Сотрудники на прямых расходах (сдельная оплата)
+//===============================================
+Function MakeRaspZatrat:boolean;
+var _DTB, _DTE :date;
+{ Result:=false;
+  if NeedRep<>0
+  { Exit;
+
+  }
+  var _itSu  :double=0;
+  var _Su    :double=0;
+  var _pZakaz:comp=0;
+  delete all tmp_rasp;
+  _Loop PRNARYAD
+  { _Su:=PRNARYAD.CHASF;
+    _pZakaz:=0;
+    for(k:=1;k<=6;k:=k+1)
+    { if PRNARYAD.Tbld[k]=cgKau_Zakaz
+      { if PRNARYAD.cKaud[k]>0
+        { _pZakaz:=PRNARYAD.cKaud[k];
+          break;
+
+        }
+      }
+    }
+    w_dtb:=PRNARYAD.DATAN;
+    _DTB:=PeriodBeginning;
+    _DTE:=date(Last_day(_DTB),month(_DTB),year(_DTB));
+    if GetLast Perexod=tsok
+    if Perexod.DatIzm>=PeriodBeginning
+    { _DTB:=Perexod.DatIzm;
+      _DTE:=PRNARYAD.DATOK;
+    }
+    if _pZakaz=0 then continue;
+    if Getfirst tmp_rasp where (( _pZakaz == tmp_rasp.cLschet and _DTB== tmp_rasp.Datan ))<>tsok
+    { Insert into tmp_rasp set
+               tmp_rasp.Sum    :=_Su
+              ,tmp_rasp.cLschet:=_pZakaz
+              ,tmp_rasp.Datan  :=_DTB
+              ,tmp_rasp.Datok  :=_DTE
+
+              ;
+    } else
+    { update current tmp_rasp set tmp_rasp.Sum:=tmp_rasp.Sum+_Su
+         ,tmp_rasp.Datok:=if(tmp_rasp.Datok<_DTE,_DTE,tmp_rasp.Datok);
+
+    }
+
+    _itSu:=_itSu+_Su
+  }//_Loop PRNARYAD
+  _Loop PrVidopl
+  { delete current PrVidopl;
+  }
+  // найдем последний заказ по сумме
+  _pZakaz:=0;
+  if Getlast tmp_rasp ordered by index tmp_Rasp02<>tsok
+  { exit;
+  }
+  _pZakaz:= tmp_rasp .cLschet;
+  LoadWorkingTable(Lschet.Nrec, mesn, yearn);
+
+  var ActualHours: double;
+  // Здесь нужен пример
+  ActualHours := WT_GetHours(hkWorking, stActual);
+  _Su:=0;
+  _Loop tmp_rasp ordered by index tmp_Rasp02
+  {   ClearBuffer(#PRVIDOPL);
+      PRVIDOPL.TABN := LSCHET.TABN;
+      PRVIDOPL.StrTABN := LSCHET.StrTABN;
+      PRVIDOPL.cLsch := LSCHET.Nrec;
+      PRVIDOPL.TPERSON := LSCHET.TPERSON;
+      PRVIDOPL.CEX := LSCHET.CEX;
+      PRVIDOPL.CEXOZ := LSCHET.CEX;
+      PRVIDOPL.CHOICE:=pcCostSharing;
+      PRVIDOPL.DATAN:=PeriodBeginning ;
+      PRVIDOPL.DATAF:=tmp_rasp.Datan ;
+      PRVIDOPL.DATOK:=tmp_rasp.Datok ;
+      // ШПЗ из лицевого счета по умолчанию
+      #CopyInfo_(PRVIDOPL,LSCHET)
+      //---------------
+      PRVIDOPL.CHASF := Round(Tmp_Rasp.Sum*ActualHours/_itSu,2);
+      _Su:=_Su+PRVIDOPL.CHASF;
+      GetSchet(PRVIDOPL.cSchetD,PRVIDOPL.cSubSchD);
+      for(k:=1;k<=6;k:=k+1)
+      { if vschet.tmp_schet.tbl[k]=cgKau_Zakaz
+        { PRVIDOPL.Tbld[k]:=vschet.tmp_schet.tbl[k];
+          PRVIDOPL.cKauD[k]:=tmp_rasp.clschet;
+
+        }
+      } //for(k:=1;k<=6;k:=k+1)
+      // последняя запись - запишем хвост
+      if _PZakaz=tmp_rasp.clschet
+      {
+        if Abs(_Su-_itSu)>0.001
+        { PRVIDOPL.CHASF:=PRVIDOPL.CHASF+_itSu-_Su;
+        }
+      }
+      Insert current PrVidopl;
+  }//_Loop tmp_rasp
+  Result:=true
+} //Function MakeRaspZatrat:boolean;
+
+HandleEvent
+cmInit :
+{  
+  // InitUser(1); // Инициализация Zar_User
+      if Day(dGetTune('UP.DATOTCH')) <> 0
+        SetPeriod(AD_FirstDate(dGetTune('UP.DATOTCH')));
+      else
+        SetPeriod(AD_FirstDate(Cur_Date));
+
+   ATTR_RASP_ZAKAZ:=ExtAttr_Create(coKlVidopl,'Признак распределения по заказам',cgAttrType_Dbl);
+   StartNewVisual (vtIndicatorVisual,vfTimer,'Проверка начислений',recordsintable(#Formarks));
+   InitWorkingTable;
+   GetPlansSchNrec(myPlansNo);
+   if NeedRep=0
+   { if getfirst fastfirstrow planssch=0
+     {  wkod_plan:=planssch.kod;
+        //displ('Используется план счетов по настройке "Настройки Галактики \ Бухгалтерский контур \ Текущий план счетов"');
+        //displ('Код плана счетов = '+string(wkod_plan)+', тип запуска '+string(NeedRep));
+     }
+     else
+     { displ('Не нашли план счетов по настройке "Настройки Галактики \ Бухгалтерский контур \ Текущий план счетов"');
+     }
+   }  
+#IFDEF GP_ZP_AFTERRAS_DEBUG
+   displ('---- ZP_AFTERRAS 01 ')
+#ENDIF
+
+   //====================
+   wyear1:=year(XAR_DATAN) ; 
+   wmesn1:=month(XAR_DATAN) ; 
+   if wyear=0
+   { wyear:=year(XAR_DATAN) ; 
+     wmesn:=month(XAR_DATAN) ; 
+   }  
+#IFDEF GP_ZP_AFTERRAS_DEBUG
+   displ('---- ZP_AFTERRAS 02 ')
+#ENDIF
+
+
+   resetbounds(#tmp_vidopl);
+   delete all tmp_vidopl;
+   setbounds(#tmp_vidopl);
+   resetbounds(#tmp_Rasp);
+   delete all tmp_Rasp;
+   setbounds(#tmp_Rasp);
+
+
+#IFDEF ZAR_AFTERRAS_DEBUG   
+   displ('Начало корректировки');
+#ENDIF   
+  
+
+
+  _loop fullcache Formarks
+  { 
+    if getfirst fastfirstrow lschet_m=0 {}
+    set wc_lsch:=formarks.CLSCHET;
+    if getfirst fastfirstrow lschet=0 {}
+#IFDEF GP_ZP_AFTERRAS_DEBUG
+   displ('Табельный номер='+string(lschet.tabn)+'/'+lschet.strtabn)
+#ENDIF
+    if wyear=wyear1 and wmesn=wmesn1
+    { if CheckDirectZatrar
+      {  MakeRaspZatrat;
+      }
+    }
+    else
+    { //Kau_Replace_Arh;
+    }
+    _loop fullcache appldocs
+    { set wc_lsch:=APPLDOCS.cTIPDOC;
+      if getfirst fastfirstrow lschet=0 {}
+#IFDEF GP_ZP_AFTERRAS_DEBUG
+   displ('Табельный номер совместителя='+string(lschet.tabn)+'/'+lschet.strtabn)
+#ENDIF   
+      if wyear=wyear1 and wmesn=wmesn1
+      {  if  CheckDirectZatrar
+         {
+           MakeRaspZatrat;
+         }
+      }
+      else
+      { //Kau_Replace_Arh;
+      }
+    }//_loop fullcache appldocs
+  } //_loop Formarks
+  
+  StopVisual('',0);
+  /*
+  if NeedRep=1
+  { ShowErrors
+  }
+  */
+#IFDEF GP_ZP_AFTERRAS_DEBUG
+   displ('---- ZP_AFTERRAS finish ')
+#ENDIF
+
+  DoneWorkingTable ;
+  Closeinterface(cmDone);
+  abort ; exit ;
+}
+end ;
+end.

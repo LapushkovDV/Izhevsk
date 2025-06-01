@@ -1,0 +1,1230 @@
+/*************************************************************************************************\
+* Наименование:  Доработка ведения заказов/проектов                                               *
+*                РПД № 20 Интерфейс приказа "Назначение единовременных выплат"                    *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:    Интерфейс приказа "Назначение единовременных выплат"                             *
+*                для быстрого поиска доработан F_GetAn##GtKodGroup.Vip                            *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#000          |07/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#775          |12/09/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+* Разработка  |#1442         |14/12/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include Query.vih
+#include GetKau.vih
+#include RPD.Vih
+#include Marker.Vih
+#component "Z_STAFFORDERS"
+#doc
+  Интерфейс приказа "Назначение единовременных выплат"
+  Доработки системы для учета по заказам.pptx
+#end
+
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+const
+ coListName = 'Список для премии';
+end;
+//******************************************************************************
+Alter Interface RPD_20 ('');
+
+//******************************************************************************
+OverLoad
+  procedure IRPD_Base.EnableDisable;
+  procedure IRPD_BASE.SetRelation(Value: comp);
+  procedure prFillMenu(_menuID: longint);
+end;
+type rowRecord = record
+  def: string;
+  column: byte;
+  value: string;
+end;
+
+var   _recArray: array [1..1] of rowRecord;
+
+table struct tmpPersYearFortune
+(
+    cPersons       : comp
+  , StrTabn        : String
+  , Fio            : String
+  , cAppoint       : comp
+  , cLschet        : comp
+  , Department     : comp
+  , ProcentFortune : double
+  , SumTime        : double
+  , summa          : double
+  , possiblePersPrem : word
+)
+with index
+(
+ ind0 = cPersons
+)
+;
+//******************************************************************************
+// Forward описания функций
+//******************************************************************************
+Function CalcSumma(_Nrec:comp) :double;forward;
+
+//******************************************************************************
+#include ShowKau.Vpp
+#include GetKau.var
+//******************************************************************************
+var
+  //---------------------------
+  // Объекты
+  //---------------------------
+  pMarker       : IMarker(Marker) new; // функция пометки
+  //---------------------------
+  _year    : word;
+  _mes     : byte;
+  _SummaRaspred : double = 0;
+  KAU_PROJECT:word=0; // КАУ Проект
+  //---------------------------
+  ATTR_ZAKAZ_P:comp;//ВА Заказ к части приказа
+  ATTR_ZAKAZ_C:comp;//ВА Заказ к содержимому приказа
+  ATTR_PROJECT_P:comp;//ВА Проект к части приказа
+  ATTR_PROJECT_C:comp;//ВА Проект к содержимому приказа
+  //---------------------------
+  pTmp          :comp;// временный указатель на справочник
+  MarkerTmp     :Longint;
+  isOpenSearch  :boolean=false;
+  isCalcFortune : boolean = false;
+  _typeSelectPersons : Word = 0;
+  _FileWithPersons   : String = '';
+    _logGlobal
+  , _PersExclude : string = '';
+create view
+as select
+ //---------------------------
+  coGetAttrID(coPartDoc,PartDoc.Nrec,ATTR_ZAKAZ_P   ) (FieldName=pZAKAZ_P   ,FieldTitle='Заказ приказа') //
+ ,coGetAttrID(coContDoc,ContDoc.Nrec,ATTR_ZAKAZ_C   ) (FieldName=pZAKAZ_C   ,FieldTitle='Заказ') //
+ ,coGetAttrID(coPartDoc,PartDoc.Nrec,ATTR_PROJECT_P ) (FieldName=pPROJECT_P ,FieldTitle='Проект приказа') //
+ ,coGetAttrID(coContDoc,ContDoc.Nrec,ATTR_PROJECT_C ) (FieldName=pPROJECT_C ,FieldTitle='Проект') //
+ //---------------------------
+ , CalcSumma(PartDoc.Nrec) (FieldName=dSumma ,FieldTitle='Итого') //
+from
+ MNPLAN, MNPLAN MNPLAN_C
+,SPKAU , SPKAU SPKAU_C
+// для суммирования
+, ContDoc ContDoc_Scan
+, Fortune Fortune_Scan
+, Catalogs FortRaiseCat_P // для групповой привязки
+, tmpPersYearFortune
+, UOWRKTABEL
+, Lschet Lschet_YearPrem
+where
+((
+      pZAKAZ_P   ==  MNPLAN.Nrec // Заказ приказа
+  and pZAKAZ_C   ==  MNPLAN_C.Nrec  // Заказ
+  and pPROJECT_P ==  SpKau.Nrec  // Проект приказа
+  and pPROJECT_C ==  SpKau_C.Nrec  // Проект
+  // для суммирования
+  and PartDoc.Nrec == ContDoc_Scan.cPart
+  and 0 << ContDoc_Scan.Seqnmb //
+  //and ContDoc.cStr == Appointments.Nrec
+  //and Appointments.Post == Catalogs.Nrec
+  and ContDoc_Scan.Nrec  == Fortune_Scan.cFCont
+  and PartDoc.CREF1      == FortRaiseCat_P.Nrec
+
+))
+; // create view
+//******************************************************************************
+
+create view vSpr
+as select
+   katkau.nrec
+from
+  katkau
+where ((
+       1        == KATKAU.SYSNUM
+  and  0        == KATKAU.ISACTIVE
+  and  'Проект' == katkau.name
+
+)) ;
+//******************************************************************************
+// Визуальная часть
+//******************************************************************************
+overloadformats BRPSN;
+overloadformats scrDet20;
+//******************************************************************************
+// Люди по данному РПД
+//******************************************************************************
+screen scrPart (, hcStaffWinPr, sci1378Esc);
+show at (,,,2) fixed_y;
+Table PartDoc;
+Fields
+  MNPLAN.NUMBER ('Код заказа',hcStaffWinPr,sci1378Esc) :Protect,  PickButton,QuickChoice;
+//  MNPLAN.NAME   ('Наименование заказа',hcStaffWinPr,sci1378Esc) :Protect, NoDel, PickButton,QuickChoice;
+  SPKAU.Code    ('Код проекта',hcStaffWinPr,sci1378Esc) :Protect,  PickButton,QuickChoice;
+  SpKau.NAME    ('Наименование проекта',hcStaffWinPr,sci1378Esc) :Protect,  PickButton,QuickChoice;
+  dSumma        ('Итого по приказу',,sci1Esc) : [10.2] , Protect, Nodel, NoPickButton;
+  FortRaiseCat_P.Name ('Премия для приказа')  : Protect,PickButton;
+  PartDoc.WINF2 : NoProtect,NoDel;//#1442
+  PartDoc.DDAT1 ('Дата назначений') : NoProtect,NoDel;
+<<
+  `Заказ`  .@@@@@@@@@@@@@@@@@@@  `Проект`.@@@@@@@.@@@@@@@@@@@@@@@@@@@@@@@@@@ Итого .@@@@@@@@@@@@
+  `Наименование выплаты` .@@@@@@@@@@@@@@@@@@@@@@@@@ [.] Выплата в межпериод` Дата  .@@@@@@@@@@@@
+>>
+end;
+browse brPsn  (, hcStaffWinPr, sci1378Esc);
+show at (,3,,7) fixed_y;
+table ContDoc;
+  RecMarker = pMarker { ContDoc.nRec };
+  fields
+    ContDoc.wAttrDoc2 'Назначение'('Основное назначение или совмещение',, sci178Esc):
+      [list 'основное назначение', 'совмещение', 'отсутствует'], [15], noautosize, protect;
+    fullNamePodr 'Подразделение' ('Подразделение', hcStaffWinPr, ): [25], protect;
+    [Podr_Kod] iCatFunc.GetCatalogsCode(ContDoc.cDopRef) 'Код' ('Код Подразделения', hcStaffWinPr, ): [6], protect,NoDel;
+    Persons.FIO    'ФИО' ('Фамилия имя отчество', hcStaffWinPr, ): [28], protect;
+    fTabNmb        'Табельный №' ('Табельный номер'): [12], skip;
+    Catalogs.Name  'Должность'('Должность (из основного назначения или совмещения - для увольнения совместителей)' , hcStaffWinPr) :[15], skip;
+    FORTUNE.DOCSUM 'Сумма' ('Основное назначение или совмещение',, sci178Esc) :[10.2,'\2p[|-]366`666`666`666`666.88'],NoProtect,NoPickButton; //[10,2],
+    CurrNameFort   'Тип'  ('Валюта или проценты.',, sci1378Esc) :[10] ,Protect;
+//--------------
+    MNPLAN_C.NUMBER   'Заказ, код'           ('Код заказа'          ,hcStaffWinPr,sci1378Esc) :[10],Protect,  PickButton,QuickChoice;
+//    MNPLAN_C.NAME   'Заказ, наименование'  ('Наименование заказа' ,hcStaffWinPr,sci1378Esc) :[20],Protect, NoDel, PickButton,QuickChoice;
+//    SPKAU_C.Code    'Проект, код'          ('Код проекта'         ,hcStaffWinPr,sci1378Esc) :[10],Protect, NoDel, PickButton,QuickChoice;
+//    SpKau_C.NAME    'Проект, наименование' ('Наименование проекта',hcStaffWinPr,sci1378Esc) :[20],Protect, NoDel, PickButton,QuickChoice;
+//--------------
+    PersOrderState 'Исполнение'  ('Исполнение', hcStaffWinPr): [12], skip,
+    {font = {color = if ( isValid(#ContDoc) and (TitleDoc.wStatus <> 1) and (ContDoc.wYearPr = 0 or ContDoc.wYearPr = 3) and isValid(#AllMemo), ColorSysRed, 0)}};
+end;
+
+//******************************************************************************
+// Окно содержимого приказа на Назначение единовременных выплат
+//******************************************************************************
+screen scrDet20 (,hcStaffWinPr, sci178Esc);  //Награждение/поощрение, премирование
+//show at (, 5,,);
+show at (, 8,,);
+table Fortune;
+  fields
+    FortRaiseCat.Name ('Вид выплаты',,
+                        sci1378Esc),  protect;
+    FortForRaiseCat.Name ('Основание для выплаты',, sci1378Esc),  protect;
+    Fortune.DocSum ('Сумма/процент', ) : ['\2p[|-]366`666`666`666`666.88'], noprotect;//[11,2]
+    CurrNameFort ('Валюта или проценты.',, sci1378Esc) ,Protect;
+    Fortune.Dat1 ('Дата выплаты',, sci1378Esc):
+                  [10,'DD/MM/YYYY'], noprotect;
+    Fortune.FilialNo ('Выплатить в модуле "ЗП" в межпериод', ), noprotect;
+    Fortune.SNote ('Примечание ', ), noprotect;
+    ContDoc.SBottom ('Основание', ), noprotect;
+    WorkDay: skip;
+    WorkHour: skip;
+    FortuneDocName.Name: skip;
+  buttons
+    cmValue45, [singleline],,, 'Оклад на дату';
+    cmViewAdvance1,,, 'Просмотр примечания к приказу', hcStaffWinPr;
+    cmValue21,,, 'Дополнительные условия по приказу';
+
+<<
+ Наименование         .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Основание для выплаты.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Сумма(процент)       .@@@@@@@@@@@@ .@@@@@@@@@@@@@
+ Дата                 .@@@@@@@@@@@@ [.] Выплата в межпериод`<.Оклад на дату.>
+ Примечание
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Основание
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ .@@@ .@@@ .@@@
+              <. Примечание .>            <. Доп. условия .>
+>>
+end; // screen scrDet35
+
+
+//******************************************************************************\
+// Подсчет сумм
+//******************************************************************************
+Function CalcSumma(_Nrec:comp) :double;
+{ Result:=if(Fortune.wAttr1=0,FORTUNE.DOCSUM,0);
+  if _Nrec=0 then Exit;
+  _Loop fullcache ContDoc_Scan
+  {  if ContDoc.Nrec = ContDoc_Scan.Nrec then continue;
+     Result:=Result + if(Fortune_Scan.wAttr1=0,FORTUNE_Scan.DOCSUM,0);
+  } //_Loop fullcach ContDoc_Scan
+} //Function CalcSumma(_Nrec:comp) :double;\
+
+
+//******************************************************************************\
+// Установить значения полей
+//******************************************************************************
+Procedure SetMFiledValueMark(_field:longint );
+var fTmp :double=0;
+    dTmp:date=date(0,0,0);
+    wTmp:word=0;
+{ if pMarker.Count=0 exit;
+  case _Field of
+   #MNPLAN_C.NUMBER  //'Код заказа'
+  ,#MNPLAN_C.NAME   ://'Заказ, наименование'
+  { pTmp:=pZAKAZ_C;
+  }
+   #SPKAU_C.Code    //'Проект, код'
+  ,#SpKau_C.NAME   ://'Проект, наименование'
+   {
+     pTmp:=pZAKAZ_C;
+   }
+   #FORTRAISECAT.NAME:
+   { pTmp:=Fortune.cFType;
+   }
+   #FortForRaiseCat.Name:
+   { pTmp:=Fortune.cRef1;
+   }
+   #FortuneDocName.Name:
+   { pTmp:=Fortune.cRef2;
+   }
+   #FORTUNE.DOCSUM:
+   { fTmp:=FORTUNE.DOCSUM;
+    wTmp:=Fortune.wAttr1;
+   }
+   #FORTUNE.DAT1:
+   { dTmp:=FORTUNE.DAT1;
+   }
+   #FORTUNE.FILIALNO:
+   { wTmp:=FORTUNE.FILIALNO
+   }
+   else exit;
+   end;
+   //--------------------
+   if message('Скопировать выбранные значения'
+     +chr(13)+'отобранным сотрудникам?', YesNo) <> cmYes
+   { Exit;
+   }
+   //--------------------
+
+   StartNewVisual(vtIndicatorVisual, vfTimer+vfBreak+vfScreenBottom, 'Установка значений..', pMarker.Count);
+
+   _Loop ContDoc_Scan
+   { if ContDoc_Scan.Nrec=ContDoc.Nrec then continue;
+     if ( getfirst pMarker where ((ContDoc_Scan.Nrec == pMarker.pNRec)) <> tsOK )
+               continue;
+     if not NextVisual break;
+     if getfirst Fortune_Scan<>tsok
+     { clearbuffer(#Fortune_Scan);
+       Fortune_Scan.cFCont  := ContDoc_Scan.nRec;
+       Fortune_Scan.DocDate := TitleDoc.DocDate;
+       Fortune_Scan.DocNmb  := TitleDoc.DocNmb;
+       Fortune_Scan.wChoice := 20;
+       insert current Fortune_Scan;
+
+     }
+     case _Field of
+     #MNPLAN_C.NUMBER  //'Код заказа'
+     ,#MNPLAN_C.NAME   ://'Заказ, наименование'
+     { //pTmp:=pZAKAZ_C
+       coSetAttrID(coContDoc,ContDoc_Scan.Nrec,ATTR_ZAKAZ_C,pTmp, #ShowKau(cgKau_Zakaz, pTmp)   )
+     }
+     #SPKAU_C.Code    //'Проект, код'
+     ,#SpKau_C.NAME   ://'Проект, наименование'
+     {
+       coSetAttrID(coContDoc,ContDoc_Scan.Nrec,ATTR_PROJECT_C,pTmp, #ShowKau(KAU_PROJECT, pTmp)   )
+     }
+     #FORTRAISECAT.NAME:
+     { Update current Fortune_Scan Set Fortune_Scan.cFType:=pTmp;
+     }
+     #FortForRaiseCat.Name:
+     { Update current Fortune_Scan Set Fortune_Scan.cRef1:=pTmp;
+     }
+     #FortuneDocName.Name:
+     { Update current Fortune_Scan Set Fortune_Scan.cRef2:=pTmp;
+     }
+     #FORTUNE.DOCSUM:
+     { Update current Fortune_Scan Set Fortune_Scan.DOCSUM:=fTmp, Fortune_Scan.wAttr1:=wTmp;
+     }
+     #FORTUNE.DAT1:
+     { Update current Fortune_Scan Set Fortune_Scan.DAT1:=dTmp;
+     }
+     #FORTUNE.FILIALNO:
+     { Update current Fortune_Scan Set Fortune_Scan.FILIALNO:=wTmp;
+     }
+     end;
+
+   } //_Loop ContDoc_Scan
+   StopVisual('',0);
+   ReScanPanel(#ContDoc)
+} //Procedure SetMFiledValueMark;
+
+Procedure MakeValidFortune;
+var ww_nrec:comp;
+{  ww_nrec:=0;
+   ww_nrec:=Fortune.Nrec;
+   if ww_nrec=0
+   { //ClearBuffer(tnFortune);
+     Fortune.cFCont  := ContDoc.nRec;
+     Fortune.DocDate := TitleDoc.DocDate;
+     Fortune.DocNmb  := TitleDoc.DocNmb;
+     Fortune.cFType  := PartDoc.cRef1;
+     Fortune.wAttr1  := CheckTypeRaise(PartDoc.cRef1);
+     Fortune.Dat1    := PartDoc.DDat1;
+     Fortune.FilialNo:= PartDoc.WINF2;//#1442
+     Fortune.wChoice := 20;
+     insert current Fortune;
+   }
+   else
+   { update current ForTune;
+   }
+} //Procedure MakeValidFortune;
+
+
+
+//******************************************************************************\
+// Выбор полей
+//******************************************************************************
+Function MyPick(_field:longint ) :boolean;
+{   Result:=false;
+    if TitleDoc.wStatus=1
+    {  Message('Приказ утвержден!');
+       exit;
+    }
+
+    ClearMarker(MarkerTmp);
+    var _cgi:word;
+    _cgi := if (not isOpenSearch, cgiPick + cgiNotClear, cgiPick);
+    var IsNeedCopy:boolean=false;
+    //Message(QuickChoiceName)
+
+    case _Field of
+    // #MNPLAN_C.NUMBER  //'Код заказа'
+    //,#MNPLAN.NUMBER  //'Код заказа'
+     #SPKAU.Name    //'Проект, код'
+    ,#SPKAU_C.Name    //'Проект, код'
+    :
+    { //Доработка  KBU\F_GetAn_GtKodGroup.Vip
+
+      if (QuickChoiceName <> '')  QuickChoiceName := 'qcKau_Needed_Name';
+    }
+    else
+    {
+      if (QuickChoiceName <> '')  QuickChoiceName := 'qcKau_Needed';//qcByName';
+    }
+    end;
+    case _Field of
+    #MNPLAN_C.NUMBER  //'Код заказа'
+   ,#MNPLAN_C.NAME   ://'Заказ, наименование'
+    { pTmp:=pZAKAZ_C;
+      if iGetKau.GetCodeKau(cgiPick, cgKau_Zakaz, pTmp)<>0 //cmCancel
+      { coSetAttrID(coContDoc,ContDoc.Nrec,ATTR_ZAKAZ_C,pTmp, #ShowKau(cgKau_Zakaz, pTmp)   );
+        IsNeedCopy:=true
+      }
+      ReScanPanel(#ContDoc)
+    }
+    #MNPLAN.NUMBER  //'Код заказа'
+   ,#MNPLAN.NAME   ://'Заказ, наименование'
+    { pTmp:=pZAKAZ_P;
+      if iGetKau.GetCodeKau(cgiPick, cgKau_Zakaz, pTmp)<>0 //cmCancel
+      { coSetAttrID(coPartDoc,PartDoc.Nrec,ATTR_ZAKAZ_P,pTmp, #ShowKau(cgKau_Zakaz, pTmp)   );
+        if getfirst MnPlan=tsok {}
+      }
+      ReScanPanel(#PartDoc)
+    }
+    #SPKAU_C.Code    //'Проект, код'
+   ,#SpKau_C.NAME   ://'Проект, наименование'
+    {
+      pTmp:=pZAKAZ_C;
+      //InsertMarker(MarkerTmp,pTmp)
+      //if iGetKau.GetCodeKau(cgiPick, KAU_PROJECT, pTmp)<>0 //cmCancel
+      if RunInterface(F_GetAn::GtKodGroup,cgiPick,KAU_PROJECT, pTmp,MarkerTmp,KAU_PROJECT)<>cmCancel
+      { coSetAttrID(coContDoc,ContDoc.Nrec,ATTR_PROJECT_C,pTmp, #ShowKau(KAU_PROJECT, pTmp)   );
+        IsNeedCopy:=true
+
+      }
+      ReScanPanel(#ContDoc)
+    }
+    #SPKAU.Code    //'Проект, код'
+   ,#SpKau.NAME   ://'Проект, наименование'
+    {
+      pTmp:=pZAKAZ_P;
+      if iGetKau.GetCodeKau(cgiPick, KAU_PROJECT, pTmp)<>0 //cmCancel
+      { coSetAttrID(coPartDoc,PartDoc.Nrec,ATTR_PROJECT_P,pTmp, #ShowKau(KAU_PROJECT, pTmp)   );
+        ReScanPanel(#PartDoc) ;
+        if getfirst SpKau=tsok {};
+      }
+    }
+    #CurrNameFort:// ('Валюта или проценты.',, sci1378Esc) ,Protect;
+    { Set Fortune.DocSum:=Fortune.DocSum;
+      MakeValidFortune;
+      update current Fortune;
+      ReScanPanel(#PartDoc); // пересчитать сумму
+      ReScanPanel(#Fortune);
+    }
+    #FortRaiseCat_P.Name:
+    {
+      ParentSav := PartDoc.cRef1;
+      if (RunInterface(PickCatalog2, iFortRaiseSysCode, ParentSav, 0) = cmDefault)
+      { //PreviousType := Fortune.cFType; // взвести флаг того, что поменяли наименование
+        set PartDoc.cRef1 := ParentSav;
+        //set Fortune.wAttr1 := CheckTypeRaise(ParentSav);
+        if message('Заменить вид доплаты во всем приказе?',YesNo)=cmYes
+        { StartNewVisual(vtIndicatorVisual, vfTimer+vfBreak+vfScreenBottom, 'Установка значений..', pMarker.Count);
+          _Loop ContDoc_Scan
+          {
+            if not NextVisual break;
+            if getfirst Fortune_Scan<>tsok
+            { clearbuffer(#Fortune_Scan);
+              Fortune_Scan.cFCont  := ContDoc_Scan.nRec;
+              Fortune_Scan.DocDate := TitleDoc.DocDate;
+              Fortune_Scan.DocNmb  := TitleDoc.DocNmb;
+              Fortune_Scan.cFType  := PartDoc.cRef1;
+              Fortune_Scan.wAttr1  := CheckTypeRaise(PartDoc.cRef1);
+              Fortune_Scan.Dat1    :=PartDoc.DDat1;
+              Fortune_Scan.FilialNo:= PartDoc.WINF2;
+              Fortune_Scan.wChoice := 20;
+              insert current Fortune_Scan;
+            }
+            else
+            { Fortune_Scan.cFType  := PartDoc.cRef1;
+              Fortune_Scan.wAttr1  := CheckTypeRaise(PartDoc.cRef1);
+              Fortune_Scan.FilialNo:= PartDoc.WINF2;
+              Fortune_Scan.wChoice := 20;
+              update current Fortune_Scan;
+
+            }
+          } //   _Loop ContDoc_Scan
+          ReReadRecord(#ContDoc);
+          ReReadRecord(#Fortune);
+          StopVisual('',0);
+        } //if message('Заменить вид доплаты во всем приказе?',YesNo)=cmYes
+      } //if (RunInterface(PickCatalog2, iFortRaiseSysCode, ParentSav, 0) = cmDefault)
+    } //#FortRaiseCat_P.Name:
+
+    end;
+    Result:=true;
+    SetMFiledValueMark(_field)
+} //Function MyPick(_field:longint ) :boolean;
+
+//******************************************************************************\
+// Выбор полей
+//******************************************************************************
+Function MyDelOnProtect(_field:longint ) :boolean;
+{   Result:=false;
+    if TitleDoc.wStatus=1
+    {  Message('Приказ утвержден!');
+       exit;
+    }
+
+    ClearMarker(MarkerTmp);
+    var IsNeedCopy:boolean=false;
+    case _Field of
+    #MNPLAN_C.NUMBER  //'Код заказа'
+   ,#MNPLAN_C.NAME   ://'Заказ, наименование'
+    { pTmp:=0;
+      coSetAttrID(coContDoc,ContDoc.Nrec,ATTR_ZAKAZ_C,pTmp, #ShowKau(cgKau_Zakaz, pTmp)   );
+      IsNeedCopy:=true;
+      ReScanPanel(#ContDoc)
+    }
+    #MNPLAN.NUMBER  //'Код заказа'
+   ,#MNPLAN.NAME   ://'Заказ, наименование'
+    { pTmp:=0;
+      coSetAttrID(coPartDoc,PartDoc.Nrec,ATTR_ZAKAZ_P,pTmp, #ShowKau(cgKau_Zakaz, pTmp)   );
+      ReScanPanel(#PartDoc)
+    }
+    #SPKAU_C.Code    //'Проект, код'
+   ,#SpKau_C.NAME   ://'Проект, наименование'
+    {
+      pTmp:=0;
+      coSetAttrID(coContDoc,ContDoc.Nrec,ATTR_PROJECT_C,pTmp, #ShowKau(KAU_PROJECT, pTmp)   );
+      IsNeedCopy:=true;
+      ReScanPanel(#ContDoc)
+    }
+    #SPKAU.Code    //'Проект, код'
+   ,#SpKau.NAME   ://'Проект, наименование'
+    {
+      pTmp:=0;
+      coSetAttrID(coPartDoc,PartDoc.Nrec,ATTR_PROJECT_P,pTmp, #ShowKau(KAU_PROJECT, pTmp)   );
+      if getfirst SpKau=tsok {};
+      ReScanPanel(#PartDoc) ;
+    }
+    end;
+    Result:=true;
+    SetMFiledValueMark(_field)
+} //Function MyDelOnProtect(_field:longint ) :boolean;
+
+
+
+//******************************************************************************
+// Процедура открытия\закрытия полей для редактирования
+//******************************************************************************
+procedure EnableDisable_Dop;
+{
+  if fnFieldsOpen
+  {
+    SetFieldOption(#SPKAU.Code     , ofSelectable);
+    SetFieldOption(#SPKAU.Name     , ofSelectable);
+    SetFieldOption(#SPKAU_C.Code   , ofSelectable);
+    SetFieldOption(#SPKAU_c.Name   , ofSelectable);
+    SetFieldOption(#MNPLAN.NUMBER  , ofSelectable);
+    SetFieldOption(#MNPLAN.Name    , ofSelectable);
+    SetFieldOption(#MNPLAN_C.NUMBER, ofSelectable);
+    SetFieldOption(#MNPLAN_c.Name  , ofSelectable);
+  }
+  else
+  { ClearFieldOption(#SPKAU.Code     , ofSelectable);
+    ClearFieldOption(#SPKAU.Name     , ofSelectable);
+    ClearFieldOption(#SPKAU_C.Code   , ofSelectable);
+    ClearFieldOption(#SPKAU_c.Name   , ofSelectable);
+    ClearFieldOption(#MNPLAN.NUMBER  , ofSelectable);
+    ClearFieldOption(#MNPLAN.Name    , ofSelectable);
+    ClearFieldOption(#MNPLAN_C.NUMBER, ofSelectable);
+    ClearFieldOption(#MNPLAN_c.Name  , ofSelectable);
+
+  }
+}//procedure EnableDisable_Dop;
+
+//******************************************************************************
+procedure IRPD_Base.EnableDisable;
+{ Inherited::EnableDisable;
+   EnableDisable_Dop;
+
+} //  procedure IRPD.SetRelation(Value: comp);
+
+procedure IRPD.SetRelation(Value: comp);
+{  Inherited::SetRelation(Value);
+   pMarker.UnselectAll;
+
+} //  procedure IRPD.SetRelation(Value: comp);
+
+
+//******************************************************************************
+
+procedure prFillMenu(_menuID: longint);
+{
+  inherited::prFillMenu(_menuID);
+  // Если в пользовательской настройке Управление персоналом\Управление и учет кадров\Приказы\
+  // Приказы по персоналу\Общие настройки\Разрешать утверждение приказов установлено "Запрещать"
+  if wGetTune('UP.STAFF.COMMONRULES.APPROVE_ORDERS') = 1 then
+  {
+    DisableCommand(cmLegend);
+    DisableCommand(cmIerarchy);
+  } else
+  {
+    EnableCommand(cmLegend);
+    EnableCommand(cmIerarchy);
+  };
+
+  if PartDoc.TYPEOPER = 20
+   {
+    AddMenuItem(_menuID, 'separator', 1);
+    AddMenuItem(_menuID, 'Сформировать годовую премию по положению', cmValue59);
+    if not boGettune('NPOEM_OWN.Raise.CALCYEARFORTUNERPD20')
+      then DisableCommand(cmValue59)
+      else EnableCommand(cmValue59);
+   }
+};
+
+
+Procedure InsFortune_Scan;
+{          clearbuffer(#Fortune_Scan);
+           Fortune_Scan.cFCont  := ContDoc_Scan.nRec;
+           Fortune_Scan.DocDate := TitleDoc.DocDate;
+           Fortune_Scan.DocNmb  := TitleDoc.DocNmb;
+           Fortune_Scan.cFType  := PartDoc.cRef1;
+           Fortune_Scan.wAttr1  := CheckTypeRaise(PartDoc.cRef1);
+           Fortune_Scan.Dat1:=PartDoc.DDat1;
+           Fortune_Scan.FilialNo:= PartDoc.WINF2;
+           Fortune_Scan.wChoice := 20;
+           insert current Fortune_Scan;
+
+} //Procedure InsFortune_Scan;
+Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
+{
+   Result:=sqlAddStr(query_handle, add_query_str);
+     LogStrToFile(_logGlobal,add_query_str);
+} //Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
+
+
+procedure FillFromDataBaseWithConditions;
+{
+
+   StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Выборка данных', 0);
+    var _begYear : date = date(01,01,_year);
+    var _endYear : date = date(31,12,_year);
+    var _workFrom : date = date(01,10,_year); // по положению П-12-2018  работать начали до октября
+    var _disdate : date = Titledoc.DOCdate;   // по положению П-12-2018  работающие на дату приказа
+//    var _fio : string= 'Лапушков Дмитрий Владимирович';
+    var _PunishZamechanie : comp = 000A00000003B80Dh; //Замечание
+    var _PunishVigovor    : comp = 000A00000003B76Ch;  //Выговор
+    delete all tmpPersYearFortune;
+
+      var hstr : longint = 0;
+
+    MysqlAddStr(hstr, '  select  Pers.nrec      as cPersons ');
+    MysqlAddStr(hstr, '        , Pers.StrTabn   as StrTabn      ');
+    MysqlAddStr(hstr, '        , Pers.Fio       as Fio          ');
+    MysqlAddStr(hstr, '        , App.Nrec       as cAppoint     ');
+    MysqlAddStr(hstr, '        , App.CADDNREC2  as cLschet      ');
+    MysqlAddStr(hstr, '        , App.Department as Department   ');
+    MysqlAddStr(hstr, '        , coalesce((select top 1 0.5 from PUNISHMENTS                                 ');
+    MysqlAddStr(hstr, '                         where PUNISHMENTS.CPSN = pers.nrec                           ');
+    MysqlAddStr(hstr, '                         and PUNISHMENTS.LASTDATE between #date('+datetostr(_begYear,'DD,MM,YYYY')+') and #date('+datetostr(_endYear,'DD,MM,YYYY')+') ');
+    MysqlAddStr(hstr, '                         and PUNISHMENTS.CPTYPE = #comp('+_PunishZamechanie+')                ');
+    MysqlAddStr(hstr, '          ),1) as ProcentFortune                                                      ');
+    MysqlAddStr(hstr, '        , 0 as SumTime                                                                ');
+    MysqlAddStr(hstr, '        , 0 as Summa                                                                  ');
+    MysqlAddStr(hstr, '        , (select top 1 1 from GP_KPI_PERS_RAISE where CPERSONS = Pers.nrec) as possiblePersPrem ');
+    MysqlAddStr(hstr, '  from Persons Pers                                                                   ');
+    MysqlAddStr(hstr, '  join Appointments App on App.nrec = case when Pers.AppointCur = #date(0,0,0) then Pers.AppointLast  else Pers.AppointCur end  ');
+    MysqlAddStr(hstr, '  join catalogs Dep on dep.nrec = App.Department                                      ');
+    MysqlAddStr(hstr, '  join catalogs Dolj on Dolj.nrec = App.post                                             ');
+    MysqlAddStr(hstr, '   join ( select App.PERSON from Appointments App                                        ');
+    MysqlAddStr(hstr, '            where  (App.DISMISSDATE = #date(0,0,0) or App.DISMISSDATE >= #date('+datetostr(_disdate,'DD,MM,YYYY')+')) and App.lPrizn in (100,0)');
+    MysqlAddStr(hstr, '           group by App.PERSON                                                           ');
+    MysqlAddStr(hstr, '        ) appCurYearUvolen on appCurYearUvolen.person = Pers.nrec                        ');
+    MysqlAddStr(hstr, '   join ( select App.PERSON from Appointments App                                        ');
+    MysqlAddStr(hstr, '            where  App.AppointDate <= #date('+datetostr(_workFrom,'DD,MM,YYYY')+') and App.lPrizn in (100,0)   ');
+    MysqlAddStr(hstr, '           group by App.PERSON                                                           ');
+    MysqlAddStr(hstr, '        ) appCurYearPriem on appCurYearPriem.person = Pers.nrec                          ');
+    MysqlAddStr(hstr, '   join (Select pers.nrec as cPers from Lstab LS                                         ');
+    MysqlAddStr(hstr, '            join Lschet on Lschet.Nrec = LS.cLschet                                      ');
+    MysqlAddStr(hstr, '            join persons pers on pers.nrec = lschet.tPerson                              ');
+    MysqlAddStr(hstr, '         where LS.YearN = '+string(_year)+' and LS.MesN >= 1 and LS.Mesn < 10                         ');
+    MysqlAddStr(hstr, '         group by pers.nrec                                                              ');
+    MysqlAddStr(hstr, '         ) tabel on tabel.cPers = pers.nrec                                              ');
+    MysqlAddStr(hstr, '  where  Pers.nrec not in (select PUNISHMENTS.CPSN from PUNISHMENTS                       ');
+    MysqlAddStr(hstr, '                         where PUNISHMENTS.LASTDATE between #date('+datetostr(_begYear,'DD,MM,YYYY')+') and #date('+datetostr(_endYear,'DD,MM,YYYY')+') ');
+    MysqlAddStr(hstr, '                        and PUNISHMENTS.CPTYPE = #comp('+_PunishVigovor+')');
+    MysqlAddStr(hstr, '                       )    ');
+    MysqlAddStr(hstr, ' and pers.isemployee = ''С'' ');
+    MysqlAddStr(hstr, ' and substring(dep.code, 1, 3) not in (''972'')  ');
+/*
+    MysqlAddStr(hstr, '  and PERS.APPDATE <= #date('+datetostr(_workFrom,'DD,MM,YYYY')+')                                                  ');
+    MysqlAddStr(hstr, '  and (App.DISMISSDATE = 0 or App.DISMISSDATE >= #date('+datetostr(_disdate,'DD,MM,YYYY')+') )                        ');
+*/
+/* испытательный срок убираем, отбираем всех
+    MysqlAddStr(hstr, 'and pers.nrec not in (select                                ');
+    MysqlAddStr(hstr, '   pers.nrec                                                ');
+    MysqlAddStr(hstr, 'from Persons Pers                                           ');
+    MysqlAddStr(hstr, 'join ContDoc CD on CD.PERSON = pers.nrec                    ');
+    MysqlAddStr(hstr, 'join PartDoc PD on Pd.Nrec = CD.cPart                       ');
+    MysqlAddStr(hstr, 'where PD.TYPEOPER = 1                                       ');
+    MysqlAddStr(hstr, 'and CD.dat1 >= #date('+datetostr(_disdate,'DD,MM,YYYY')+')  ');
+    MysqlAddStr(hstr, 'and pers.isemployee = ''С''   )                             ');
+*/
+  var _tmpName :string = iGetKau.GetMarkerName(cgKau_Persons);
+  var Marker_Tmp  : longint =InitMarker(_tmpName, 8, 50, 10, True);
+  if getmarkercount(Marker_Tmp) > 0
+    MysqlAddStr(hstr, 'and pers.nrec not in (Select cRec from t'+SubStr(_tmpName,1,19) +' )    ');
+ DoneMarker(Marker_Tmp,_tmpName);
+    var objQuery: iQuery;
+      objQuery := queryManager.createQuery(hstr);
+
+    if objQuery.execute.errorCode != tsOk
+     then {
+        logstrtofile(_logGlobal,'Ошибка выполнения запроса '+ objQuery.errorCode);
+        }
+    else
+    {
+      sqlCopyInto(objQuery, tntmpPersYearFortune, true);
+    }
+   stopvisual;
+
+}
+#include Z_STAFFORDERS##RPD_20_FortuneloadFromExcel.vpp
+Procedure CalcYearFortune;
+{
+var _FileLog : string = '_YearFortuneCalc_'+ DatetoStr(Cur_Date,'YYYYMMDD')+'_'+TimeToStr(Cur_Time,'HHMMSS')+'.csv';
+DeleteFile(_FileLog);
+
+var _isContinue : boolean  = true ;
+   case _typeSelectPersons of
+    0 : FillFromDataBaseWithConditions
+    1 : _isContinue := FillFromExcel
+   end;
+   if not _isContinue  then
+   {
+     message('В процессе работы обнаружены ошибки',error);
+     ProcessText(_logGlobal, vfEscable or vfNewTitle or vfMacroSize, 'Протокол обработки файлов и загрузки данных');
+     exit;
+   }
+   var _npp : longint = 0;
+   var CS: IContextSession; // для захвата прикладного контекста табеля
+    // В код обработчика инициализации интерфейса добавлены строки:
+   var CL: ContextList;
+   var _allTime : double = 0;
+    if (not CL.Add(CS, 'WorkingTable'))
+    {
+      Message('Не удалось загрузить функции по работе с табелем',error);
+      abort;
+      exit;
+    }
+
+   StartNewVisual(vtIndicatorVisual, vfTimer+vfBreak, 'Расчет времени по табелю', recordsInTable(tntmpPersYearFortune));
+    _loop tmpPersYearFortune
+    {
+      If not nextvisual then Break;
+      var Imonth           : byte = 1;
+//      var DaysVacation     : double = 0;
+      var HourVacation     : double = 0;
+      var HourBusinessTrip : double = 0;
+      var HourWorking      : double = 0;
+//      var DaysBusinessTrip : double = 0;
+//      var DaysWorking      : double = 0;
+      setvisualheader('Расчет времени по табелю за  ' + _mes +' месяцев'+
+      +''#13''+ tmpPersYearFortune.Fio);
+      for (Imonth:= 1; Imonth<= _mes; Imonth++)
+       {
+
+        var _date123456789 : date = date(01,Imonth,_year);
+        _date123456789 := date(last_day(_date123456789),Imonth,_year);
+        var isPersPremiyainMonth : byte = 0;
+        var __cPersons :comp = tmpPersYearFortune.cPersons;
+        if tmpPersYearFortune.possiblePersPrem = 1
+        _try
+        {
+          sql
+            select top 1
+             1
+            from GP_KPI_PERS_RAISE PERS_RAISE
+            where PERS_RAISE.CPERSONS = :(__cPersons) and
+             :(_date123456789) between PERS_RAISE.FRomDATE and case when PERS_RAISE.TODATE = 0 then #date(01,01,2100) else PERS_RAISE.TODATE end
+
+            into (isPersPremiyainMonth)
+            ;
+        }
+        _except else {}
+
+        if isPersPremiyainMonth = 1 then continue;
+
+        _loop Lschet_YearPrem Where ((tmpPersYearFortune.cPersons == Lschet_YearPrem.tPerson))and Lschet_YearPrem.sovm = 0
+        if (LoadWorkingTable(Lschet_YearPrem.nrec, Imonth, _year) = 0)
+        {
+//          var Hours: Double;
+          // рабочих часов по факту за месяц
+          // Hours := WT_GetHours(hkWorking, stActual);
+          // кол-во дней, отработанных в особо вредных условиях
+//          DaysWorking := DaysWorking + WT_GetDaysEx(dkWorking, stActual, 0);
+          HourWorking := HourWorking + WT_GetHours(hkWorking, stActual);
+
+          if (WT_LoadMonthlyAbsences = 0)
+          {
+
+//            LogStrTofile('TestTabel.log', 'WT_LoadMonthlyAbsences = 0)')
+
+            var _iAbsence: integer;
+            for (_iAbsence := 0; _iAbsence < WT_GetMonthlyAbsenceCount; Inc(_iAbsence))
+            {
+              var Notation: comp;
+              Notation := 0;
+              if not((not WT_GetMonthlyAbsenceAttribute(_iAbsence, aaNotation, Notation))
+                  or (Notation = 0))
+              {
+                  var Hours: double;
+//                  var Days: byte;
+                  var AbsenceKind: word;
+                  Hours := AbsenceKind := 0 ;//Days := 0;
+                  WT_GetMonthlyAbsenceAttribute(_iAbsence, aaHours, Hours);
+                //  WT_GetMonthlyAbsenceAttribute(_iAbsence, aaDays, Days);
+                  WT_GetMonthlyAbsenceAttribute(_iAbsence, aaKind, AbsenceKind);
+                   // WT_GetMonthlyAbsenceAttribute(I, aaHours, Hours);
+                  case AbsenceKind of
+                   akVacation    :
+                          {
+                            if(getfirst UOWRKTABEL where ((Notation == UOWRKTABEL.NREC))
+                                                    and (UOWRKTABEL.NUM = 'ОТ'
+                                                      or UOWRKTABEL.NUM = 'ОД'
+                                                        )
+                              )= tsOK
+                             {
+                             //  DaysVacation := DaysVacation + Days;
+                                 HourVacation := HourVacation + Hours;
+                             }
+/*
+//                            WT_GetMonthlyAbsenceAttribute(I, aaCode, VacationCode);
+                            var _Description : string = '';
+                            WT_GetMonthlyAbsenceAttribute(I, aaDescription, _Description);
+                            if Instr('ОСНОВНОЙ',upcase(_Description)) <> 0 or Instr('ДОПОЛНИТ',upcase(_Description)) <> 0
+                             then DaysVacation := DaysVacation + Days;
+*/
+                          }
+//                   akBusinessTrip: DaysBusinessTrip := DaysBusinessTrip + Days;
+                     akBusinessTrip: HourBusinessTrip := HourBusinessTrip + Hours;
+                  end;
+              }
+             }
+          }
+        }
+//        LogStrTofile('TestTabel.log', 'cPerson = '+ string(tmpPersYearFortune.cPersons,0,0)+' ' + string(DaysWorking) + ' ' + string(DaysVacation) + ' ' +string(DaysBusinessTrip))
+       }
+//       var _SumTime : double = (DaysVacation + DaysBusinessTrip + DaysWorking)*tmpPersYearFortune.ProcentFortune;
+         var _SumTime : double = (HourVacation + HourBusinessTrip + HourWorking)*tmpPersYearFortune.ProcentFortune;
+        update current tmpPersYearFortune set tmpPersYearFortune.SumTime := _SumTime;
+        _allTime := _allTime + _SumTime;
+     }
+   stopVisual;
+   StartNewVisual(vtIndicatorVisual, vfTimer+vfBreak, 'Заполнение приказа', recordsInTable(tntmpPersYearFortune));
+    var _SummaRaspredFact : double = 0;
+    LogStrTofile(_FileLog, 'cPersons;StrTabn;Fio;cAppoint;cLschet;Department;ProcentFortune;SumTime;summa;');
+
+    delete tmpPersYearFortune where tmpPersYearFortune.SumTime = 0;
+
+   _loop tmpPersYearFortune
+    {
+     if not NextVisual break;
+      _npp++;
+      var _SummaCur :double = Round(tmpPersYearFortune.SumTime * _SummaRaspred/ _allTime ,0);
+      Insert ContDoc set
+      	  ContDoc.CPART    := PartDoc.nrec
+      	, ContDoc.WREC     := _npp
+      	, ContDoc.NUMPART  := 1
+      	, ContDoc.TYPEOPER := PartDoc.TYPEOPER
+      	, ContDoc.OBJTYPE  := 1
+      	, ContDoc.SEQNMB   := 1
+      	, ContDoc.CDOPREF  := tmpPersYearFortune.Department // Appointments.Department
+      	, ContDoc.PERSON   := tmpPersYearFortune.cPersons   // Persons.nrec
+      	, ContDoc.CSTR     := tmpPersYearFortune.cAppoint   // Appointments.nrec
+      ;
+      insert FORTUNE set
+          FORTUNE.CFTYPE   := PartDoc.CREF1
+        ,	FORTUNE.DOCNMB   := Titledoc.DOCNMB
+        ,	FORTUNE.DOCDATE  := Titledoc.DOCdate
+        ,	FORTUNE.DOCSUM   := _summaCur //tmpPersYearFortune.summa
+        , FORTUNE.CFCONT   := ContDoc.nrec
+        , FORTUNE.WCHOICE  := PartDoc.TYPEOPER
+        , FORTUNE.DAT1     := PartDoc.DDAT1
+        , FORTUNE.FILIALNO := PartDoc.WINF2
+        , FORTUNE.wAttr1   := CheckTypeRaise(PartDoc.cRef1);
+      ;
+     _SummaRaspredFact := _SummaRaspredFact + _SummaCur;
+     LogStrTofile(_FileLog, tmpPersYearFortune.cPersons +';'+tmpPersYearFortune.StrTabn+';'+tmpPersYearFortune.Fio+';'+tmpPersYearFortune.cAppoint+';'+tmpPersYearFortune.cLschet
+      +';'+tmpPersYearFortune.Department+';'+tmpPersYearFortune.ProcentFortune+';'+tmpPersYearFortune.SumTime+';'+tmpPersYearFortune.summa);
+    }
+
+    LogStrTofile(_FileLog, '');
+    LogStrTofile(_FileLog, '');
+
+    LogStrTofile(_FileLog,  ShortStrToWin('К распределению;Распределено;СуммаДней'));
+    LogStrTofile(_FileLog, string(_SummaRaspred)+';'+string(_SummaRaspredFact)+';'+string(_allTime));
+
+  stopvisual;
+}
+function CreatetFilter(_nameMarker: string): boolean;
+{
+      If Upcase(UserName) = 'LAPUSHKOV_DV'
+       {
+         LogStrToFile(_logGlobal,'_nameMarker = ' + _nameMarker);
+       }
+
+  result := false;
+  var strID   : LongInt;  strID   := 0;
+  sqlFreeStr(strID);
+  strID:=0;
+  var Marker_Tmp  : longint =InitMarker(_nameMarker, 8, 50, 10, True);
+
+  sqlAddStr(strID, 'table t'+SubStr(_nameMarker,1,19));
+  sqlAddStr(strID, '(');
+  sqlAddStr(strID, ' cRec: comp');
+  sqlAddStr(strID, ')');
+  sqlAddStr(strID, 'with index');
+  sqlAddStr(strID, '(');
+  sqlAddStr(strID, ' i0 = cRec');
+  sqlAddStr(strID, ');');
+  sqlDropTmpTable('t'+SubStr(_nameMarker,1,19));
+
+  if sqlCreateTmpTable(strID, ctmNormal) = tsOk
+  {
+    var _i : longint = 0;
+    var _cRec : comp = 0h;
+    While(GetMarker(Marker_Tmp,_i,_cRec)=true) DO
+    {
+      var _directQuery : string = 'INSERT INTO t'+SubStr(_nameMarker,1,19)+' (cRec) VALUES (#comp('+String(_cRec,0,0)+'))';
+      var _Err: longint = sqlExecDirect(_directQuery);
+
+      If Upcase(UserName) = 'LAPUSHKOV_DV'
+       {
+         LogStrToFile(_logGlobal,_directQuery);
+         LogStrToFile(_logGlobal,'_Err = ' + string(_Err));
+       }
+     _i++;
+    }
+    var _directQuery : string = 'INSERT INTO t'+SubStr(_nameMarker,1,19)+' (cRec) VALUES (#comp(0))';
+    result := true;
+  }
+  DoneMarker(Marker_Tmp,_nameMarker);
+}
+Window winSetYearFortune 'Параметры расчета годовой премии', doaccept;
+show at (,,55,8) ;
+ Screen scrYearFortune;
+  Fields
+   _year         : NoProtect;
+   _mes         : NoProtect;
+   _SummaRaspred : ['\2p[|-]366`666`666`666`666.88'], NoProtect;
+   _typeSelectPersons : NoProtect;
+   _FileWithPersons : protect, PickButton;
+   _PersExclude : Protect, pickbutton;
+  Buttons
+  cmOk, Default,, 'Сформировать годовую премия с распределением',, scGalDial;
+  cmCancel,,, 'Закрыть окно без формирования премии',, scGalDial;
+
+ <<'Параметры формирования годовой премии'
+                      `Год`.@@@@@
+         `Учет времени по` .@@ месяц включительно
+    `Сумма для распределения`.@@@@@@@@@@@@@@@@@@@
+ (.) -производить отбор по условиям положения о премировании`
+ (.) -использовать файл со списком  `
+`Файл с сотрудниками`.@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Исключить сотрудников из премии`.@@@@@@@@@@@@@@@
+    <.Продолжить.>                 <.Отмена.>
+ >>
+end;
+Handleevent
+CmInit:
+{
+   _logGlobal := '_YearFortuneCalc_QUERY_'+ DatetoStr(Cur_Date,'YYYYMMDD')+'_'+TimeToStr(Cur_Time,'HHMMSS')+'.log';
+  var _tmpName :string= iGetKau.GetMarkerName(cgKau_Persons);
+  var Marker_Tmp  : longint =InitMarker(_tmpName, 8, 50, 10, True);
+  clearmarker(Marker_Tmp);
+ DoneMarker(Marker_Tmp,_tmpName);
+      cfssetprop('L_SCRYEARFORTUNE_Файл_с_сотрудниками', 'Visible',_typeSelectPersons = 1);
+      cfssetprop('i_SCRYEARFORTUNE_FileWithPersons'    , 'Visible',_typeSelectPersons = 1);
+      cfssetprop('L_SCRYEARFORTUNE_Исключить_сотрудников_из_премии', 'Visible',_typeSelectPersons = 0);
+      cfssetprop('i_SCRYEARFORTUNE_PersExclude'                    , 'Visible',_typeSelectPersons = 0);
+
+ _mes := 12;
+}
+cmOk:
+ {
+  if _SummaRaspred <=0
+   {
+    Message('Сумма для распределения должна быть больше 0',error);
+    Exit;
+   }
+
+   if _FileWithPersons = ''  and _typeSelectPersons = 1
+   {
+    Message('для режима загрузки из файла надо выбрать файл',error);
+    Exit;
+
+   }
+
+    if _mes < 1 or _mes > 12
+    then {
+      message('Введите месяц между 1 и 12',error)
+     }
+    else {
+      CalcYearFortune;
+      Closewindow(winSetYearFortune);
+     }
+ }
+ cmdelonprotect:
+ {
+   case curfield of
+    #_PersExclude:{
+         var _tmpName :string= iGetKau.GetMarkerName(cgKau_Persons);
+         var Marker_Tmp  : longint =InitMarker(_tmpName, 8, 50, 10, True);
+         clearmarker(Marker_Tmp);
+          set _PersExclude := '';
+         DoneMarker(Marker_Tmp,_tmpName);
+     }
+   end;
+  rereadrecord;
+ }
+ cmPick:
+ {
+   case curfield of
+    #_PersExclude:{
+       if iGetKau.GetCodeKau(cgiMulti,cgKau_Persons,0h)<>cmCancel
+       {
+         var _tmpName :string= iGetKau.GetMarkerName(cgKau_Persons);
+         var Marker_Tmp  : longint =InitMarker(_tmpName, 8, 50, 10, True);
+          set _PersExclude := 'Выбрано ' + getmarkercount(Marker_Tmp);
+         DoneMarker(Marker_Tmp,_tmpName);
+        CreatetFilter(_tmpName);
+       }
+     }
+     #_FileWithPersons:{
+        _FileWithPersons := GetFileName('*.xls*','Выбор файла со списком сотрудников');
+      }
+   end;
+  rereadrecord;
+ }
+end;
+
+end;
+
+
+Procedure CreateYearFortune;
+{
+
+  // годовое премирование по положению П-012-2019
+  if PartDoc.TYPEOPER <> 20
+   {
+    Message('Годовую премию можно формировать только по РПД20',error);
+    Exit;
+   }
+  if getfirst contdoc = tsOK
+   {
+    Message('В приказе уже есть сотрудники',error);
+    Exit;
+   }
+   _year := year(Titledoc.DOCdate);
+   isCalcFortune := false;
+    RunWindowModal(winSetYearFortune)
+
+}
+//******************************************************************************
+// HandleEvent таблиц
+//******************************************************************************
+TableEvent table PartDoc;
+cmUpdateRecord:
+{ if  inherited :: handleEvent (cmUpdateRecord)=heAbort then Abort;
+  Update current PartDoc;
+}
+cmCheckField:
+{ if  inherited :: handleEvent (cmCheckField)=heAbort then Abort;
+  case CurField of
+  #PartDoc.DDat1:
+  { if IsValidAll(#ContDoc)
+    if message('Обновить дату назначения выплаты во всем приказе?',YesNo)=cmYes
+    {  StartNewVisual(vtIndicatorVisual, vfTimer+vfBreak+vfScreenBottom, 'Установка значений..', pMarker.Count);
+       _Loop ContDoc_Scan
+       { if not NextVisual break;
+         if getfirst Fortune_Scan<>tsok
+         { InsFortune_Scan;
+         }
+         else
+         { Fortune_Scan.Dat1:=PartDoc.dDat1;
+           update current Fortune_Scan;
+         }
+       } //   _Loop ContDoc_Scan
+       StopVisual('',0);
+       ReReadRecord(#ContDoc);
+       ReReadRecord(#Fortune);
+    }
+  }
+  #PartDoc.WINF2: //#1442
+  { if IsValidAll(#ContDoc)
+    if message('Обновить признак выплаты во всем приказе?',YesNo)=cmYes
+    {  StartNewVisual(vtIndicatorVisual, vfTimer+vfBreak+vfScreenBottom, 'Установка значений..', pMarker.Count);
+       _Loop ContDoc_Scan
+       { if not NextVisual break;
+         if getfirst Fortune_Scan<>tsok
+         { InsFortune_Scan;
+         }
+         else
+         { Fortune_Scan.FilialNo:= PartDoc.WINF2;
+           update current Fortune_Scan;
+         }
+       } //   _Loop ContDoc_Scan
+       StopVisual('',0);
+       ReReadRecord(#ContDoc);
+       ReReadRecord(#Fortune);
+    }
+  }
+  end;
+}
+end;//TableEvent table PartDoc
+
+TableEvent table ContDoc;
+cmDeleteRecord:
+{ if  inherited :: handleEvent (cmDeleteRecord)=heAbort then Abort;
+  ReScanPanel(#PartDoc); // пересчитать сумму
+}
+cmSetDefault:
+{ if  inherited :: handleEvent (cmSetDefault)=heAbort then Abort;
+  ClearBuffer(tnFortune);
+
+}
+cmInsertRecord:
+{ if  inherited :: handleEvent (cmInsertRecord)=heAbort then Abort;
+  MakeValidForTune;
+  ReScanPanel(#Fortune);
+}
+cmCheckField:
+{
+  if  inherited :: handleEvent (cmCheckField)=heAbort then Abort;
+  MakeValidFortune;
+  case CurField of
+  #FORTUNE.DOCSUM:
+  { MakeValidFortune;
+    update current Fortune;
+    ReScanPanel(#PartDoc); // пересчитать сумму
+    ReScanPanel(#Fortune);
+  }
+  end;
+}
+end;//TableEvent table ContDoc
+
+TableEvent table FORTUNE;
+cmCheckField:
+{
+  if  inherited :: handleEvent (cmCheckField)=heAbort then Abort;
+  case CurField of
+  #FORTUNE.DOCSUM:
+  { ReScanPanel(#PartDoc); // пересчитать сумму
+  }
+  end;
+  SetMFiledValueMark(CurField);
+}
+cmSetDefault:
+{ if  inherited :: handleEvent (cmSetDefault)=heAbort then Abort;
+  Fortune.wChoice := 20;
+  Fortune.cFType   := PartDoc.cRef1;
+  Fortune.wAttr1   := CheckTypeRaise(PartDoc.cRef1);
+  set Fortune.FilialNo := PartDoc.WINF2;// #1442
+  set FORTUNE.DAT1 := PartDoc.dDat1;
+}
+end;//TableEvent table FORTUNE
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+  HandleEvent
+    cmValue59:
+    {
+     CreateYearFortune;
+     rereadrecord;
+    }
+    cmOpenSearch :
+    {
+      if TitleDoc.wStatus=1
+         abort;
+      isOpenSearch:= true;
+      ProcessCommand(cmPick);
+      isOpenSearch:= false;
+    }
+  cmCheckField:
+  {
+  if  inherited :: handleEvent (cmCheckField)=heAbort then Abort;
+    case curfield of
+    #_typeSelectPersons:
+     {
+      cfssetprop('L_SCRYEARFORTUNE_Файл_с_сотрудниками', 'Visible',_typeSelectPersons = 1);
+      cfssetprop('i_SCRYEARFORTUNE_FileWithPersons'    , 'Visible',_typeSelectPersons = 1);
+      cfssetprop('L_SCRYEARFORTUNE_Исключить_сотрудников_из_премии', 'Visible',_typeSelectPersons = 0);
+      cfssetprop('i_SCRYEARFORTUNE_PersExclude'                    , 'Visible',_typeSelectPersons = 0);
+     }
+    end;
+
+  }
+    cmPick:
+    {
+
+       if  inherited :: handleEvent (cmPick)=heAbort then Abort;
+       MyPick(CurField);
+    }
+    cmDelOnProtect:
+    {  if  inherited :: handleEvent (cmDelOnProtect)=heAbort then Abort;
+       MyDelOnProtect(CurField);
+    }
+    cmOnVipUnload:
+    { if  inherited :: handleEvent (cmOnVipUnload)=heAbort then Abort;
+      DoneMarker(MarkerTmp,'')
+
+    }
+
+    cmOnVipLoad:
+    {  if  inherited :: handleEvent (cmOnVipLoad)=heAbort then Abort;
+       ATTR_ZAKAZ_P:=ExtAttr_CreateComp(coPartDoc,'Заказ', cgAttrType_Comp, word(0), cgKau_Zakaz );///Производственные заказы
+       ATTR_ZAKAZ_C:=ExtAttr_CreateComp(coContDoc,'Заказ', cgAttrType_Comp, word(0), cgKau_Zakaz );///Производственные заказы
+       MarkerTmp:=InitMarker('', 8, 100, 10 );
+       if (vSpr.getfirst katkau<>tsok)
+       {  message('Не нашли пользовательскую аналитику "Проект"');
+       }
+       else
+       {
+         KAU_PROJECT:=vSpr.katkau.KODGROUP;
+         ATTR_PROJECT_P:=ExtAttr_CreateComp(coPartDoc,'Проект', cgAttrType_Comp, word(0), KAU_PROJECT );
+         ATTR_PROJECT_C:=ExtAttr_CreateComp(coContDoc,'Проект', cgAttrType_Comp, word(0), KAU_PROJECT );
+
+       }
+       pMarker.IsNeedCheckDelete := false;
+
+    }
+  end;
+END.

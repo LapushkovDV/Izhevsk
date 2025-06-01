@@ -1,0 +1,88 @@
+#declare GP_RepLaborContractAlterRPD(Num)
+alter interface RPD_#(Num);
+overload
+  procedure prFillMenu(_menuID: longint);
+  Procedure IRPD_Base.EnableDisable;
+end;
+//******************************************************************************
+// можно вынести в RPD_BASE, но тогда начинают идти 6 предупреждений на base_Payment
+// да и EnableDisable в 8 перехвачена
+//******************************************************************************
+Create view vNotes
+var
+  nRecTable:comp;
+  wChoice  :word;
+From Notes
+where ((
+      wChoice     == Notes.choice
+  and nRecTable   == Notes.Owner
+));
+
+File FMemo;
+
+Function MyCheckNotes(_wChoice:word):boolean;
+{ Result:=false;
+  vNotes.nRecTable:=ContDoc.Nrec;
+  vNotes.wChoice  :=_wChoice;
+  Result:=vNotes.Getfirst Notes=tsok;
+  if not Result exit;
+  if FMemo.OpenMemo(vNotes.Notes.NOTE)
+  { Result:=FMemo.GetSize()<>0;
+    FMemo.Close;
+  }
+} //Function MyCheckNotes(_wChoice:word):boolean;
+//******************************************************************************
+// Установить надписи на кнопках
+//******************************************************************************
+Procedure MySetButtonTitle(_nm_screen:string='');
+{ //'Z_STAFFORDERS::NOTESFORCONTDOC.Memo_NOTES.NOTE'
+  var ww_str:string;
+  if _nm_screen='' _nm_screen:='b_SCRDET#(Num)';
+  //cmViewAdvance1
+  ww_str:=if(MyCheckNotes(3002),'Примечан.+','Примечание');
+  cfsSetProp(_nm_screen+'_Примечание',cfpTitle,ww_str);
+  //--
+  ww_str:=if(MyCheckNotes(3005),'Доп.условия+','Доп. условия');
+  cfsSetProp(_nm_screen+'_Доп._условия',cfpTitle,ww_str);
+  ReScanPanel(#PERSONS);
+} //Procedure MySetButtonTitle;
+
+//******************************************************************************
+// Процедура открытия\закрытия полей для редактирования
+//******************************************************************************
+Procedure IRPD_Base.EnableDisable;
+{ MySetButtonTitle('b_SCRDET#(Num)');
+  Inherited::EnableDisable
+}//Procedure EnableDisable;
+
+
+//включение стандартных пунктов контекстного меню приказа
+procedure prFillMenu(_menuID: longint);
+{
+  inherited::prFillMenu(_menuID);
+
+  if (NOAA.GetFirstAgreementByLink(GetCo4Agreement(), GetNRec4Agreement()) <> 0)
+    AddMenuItem(_menuID, 'Печать доп. соглашения (Word)', cmValue17);
+}
+
+HandleEvent
+cmValue17:{//Печать доп. соглашения (Word)
+  if (not UpDateTable) exit;
+
+  var Rep:GP_RepLaborContract;
+  Rep.Run(ContDoc.TypeOper,0,ContDoc.NRec,ContDoc.Person,0);
+}
+cmViewAdvance1: //просмотр примечания к приказу
+{ if  inherited :: handleEvent (cmViewAdvance1)=heAbort then Abort;
+  MySetButtonTitle;
+}
+cmValue21: //доп. условия
+{ if  inherited :: handleEvent (cmValue21)=heAbort then Abort;
+  MySetButtonTitle;
+  // почему то сразу не обновляется
+  EnableDisable;
+}
+
+end;
+end.
+#end

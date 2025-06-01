@@ -1,0 +1,161 @@
+/*************************************************************************************************\
+* Наименование: Регистрация дополнительных пунктов меню                                           *
+* Контур/Модуль: *                                                                                *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |              |29/03/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Разработка  |#3727         |07/12/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_MenuDynamic.vih
+#include GP_FluentMenuBuilder.vih
+#include AtlProtocol.vih
+#include KKTMakeMenu.vih
+
+interface GP_MenuDynamic 'Регистрация дополнительных пунктов меню' Gray;
+show(20,8,80,15);
+
+var atlLog: IAtlProtocol;
+var IsClearResources, ShowLog:boolean;
+create view
+from
+  X$RESOURCES
+where((
+  3==X$RESOURCES.XR$TYPE
+));
+
+screen ScRepParam(,,sci1Esc);
+fields
+  'Программа добавляет новые пункты в меню',skip,{Font={bold=true}};
+  IsClearResources ('Принудительно удаляет записи с меню из X$RESOURCES',,):NoProtect, noframe;
+  ShowLog('Отображает протокол выполнения даже при отсутствии ошибок'): NoProtect, noframe;
+buttons
+  cmAddMenu,default,,'Добавить',,;
+  cmDelMenu,,,'Удалить',,;
+  cmCancel,,,'Выход',,;
+<<
+
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    [:] Удалить все меню из системной таблицы`
+    [:] Отображать протокол`
+
+ <. Добавить .>     <. Удалить .>             <. ~О~тмена  .>
+>>
+end;
+
+exception ExStoreMenuHowDynamics;
+
+procedure ClearResources;
+{
+  if (delete X$RESOURCES <> tsok)
+    message('Ошибка удаления записи в таблице X$RESOURCES!',error);
+}
+
+function AddItemToSubMenu(MenuID: longint; subMenuTitle, newItemTitle: string; newItemCommand: longint): boolean;
+var i, cfgId, newItem: longint;
+    aItems: array[0..0] of longint;
+    aName: string;
+{
+  Result := false;
+  cfgId := cfgGetMenuSelf(MenuID);
+  SetLimit(aItems, 0);
+  if cfsEnumObjects(cfgId, aItems, false) = 0
+    for (i := 0; i < Count(aItems); i++)
+      if cfsGetProp(aItems[i], cfpTitle, aName) = 0
+        if UpCase(aName) = UpCase(subMenuTitle)
+        {
+          timelog('AddItemToSubMenu: SubMenuFound - ' + subMenuTitle);
+          newItem := 0;
+          cfsCreateObject(cfcMenuItem, aItems[i], 'Cmd' + newItemCommand, false, newItem);
+          timelog('AddItemToSubMenu: newItem = ' + newItem);
+          if newItem <> 0
+          {
+            cfsSetProp(newItem, cfpTitle, newItemTitle);
+            cfsSetProp(newItem, cfpCommand, newItemCommand);
+            Result := true;
+          }
+          break;
+        }
+}
+
+HandleEvent
+cmInit:{
+  timelog_init;
+  if (not pr_CurUserAdmin) {
+    message('Программа доступна только пользователям с правами администратора.',error);
+    abort;
+    exit;
+  }
+}
+cmAddMenu:{
+  StartNewVisual(vtRotateVisual, vfTimer+vfBreak+vfConfirm,'Добавление новых пунктов в меню...', 0);
+  LoadVipRef(atlLog, 'AtlProtocol');
+  AtlProtocol(atlLog).Init;
+  atlLog.LogFile := GetStringParameter('Files','LogFilesDirectory',0) + 'DynMenu_' + _DateTimeToStr(_CurDateTime, 'YYMMDD_HHNNSS') + '.log';
+  atlLog.Clear;
+  atlLog.AutoFlush := true;
+  var rootItem: longint = atlLog.LogRoot('Добавление новых пунктов в меню');
+  if (IsClearResources) ClearResources;
+
+  timelog('GP_MenuDynamic->cmAddMenu');
+
+  new(GP_FluentMenuBuilder, Load('C_COMMON::Nastr_Admin', atlLog, 'Меню модуля "Настройка"'))
+    .AddSeparator
+    .AddSubMenu('C_BARCODE::SHK_MENU','МШК')//еще одно меню из C_BarCode в GP_Logistics\Vip\GP_MenuDyn_Sklad.vip
+    .AddSeparator
+    .AddSubMenu('GP_Staff::Catal_MERGE_Menu','Объединение ЭМ')
+    .AddSubMenu('GP_Common::GP_Tools','Утилиты ЭМ')
+    .AddSeparator
+    .AddItem('Регистрация дополнительных пунктов меню', cmRunInterface, 0, '', 'GP_Common::GP_MenuDynamic')
+    .AddItem('Импорт данных', cmRunInterface, 0, '', 'GP_Logistics::GP_Import')
+    .Store;
+
+  GP_MenuDynamic_AddItems;
+  GP_MenuDynamic_AddItemsWithLog(atlLog);
+
+  var iMenu: vKKTMakeMenu;
+  iMenu.CreatHeaderMenu;
+
+  ReinitHeaderMenu;
+
+  Message('Дополнительные пункты меню добавлены');
+
+  atlLog.Refresh;
+  if ShowLog or atlLog.GetRecordStatus(rootItem) <> APE_INFO
+    AtlProtocol(atlLog).ShowLog(true);
+  AtlProtocol(atlLog).Done;
+  StopVisual;
+}
+cmDelMenu:{
+  StartNewVisual(vtRotateVisual, vfTimer+vfBreak+vfConfirm,'Удаление новых пунктов в меню...', 0);
+
+  if (IsClearResources) ClearResources;
+
+  _try {
+    //Меню модуля "Настройка"
+    DeleteMenuHowDynamics('C_Common::Nastr_Admin');
+
+    GP_MenuDynamic_DelItems;
+
+    ReinitHeaderMenu;
+
+    Message('Дополнительные пункты меню удалены')
+  }
+  _except
+    on ExVip:
+      message(ExploreException,error);
+
+  StopVisual;
+}
+end;
+
+end.
+
+GP_Tools Menu
+{ //#3727 такой же пункт есть в УП - НПО Энергомаш - Мотивация - Настройка
+   - 'Создать организацию для сотрудника', cmRunInterface('GP_Staff::GP_CreateOrgForPers'), 'Создать организацию для сотрудника',,,, scMenuCtx,,,;
+
+}

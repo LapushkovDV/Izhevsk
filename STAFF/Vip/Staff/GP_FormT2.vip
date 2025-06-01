@@ -1,0 +1,864 @@
+/*************************************************************************************************\
+* Наименование: Личная карточка по форме T-2                                                      *
+* Контур/Модуль: Управление персоналом                                                            *
+* Пункт меню: Документы / Все приказы по персоналу                                                *
+* Примечание:                                                                                     *
+* Если у работника на дату формирования отчёта было несколько действующих назначений, при запуске *
+* формирования формы Т-2 предлагается выбрать одно из этих назначений.                            *
+* Данные в разделах "III. ПРИЕМ НА РАБОТУ И ПЕРЕВОДЫ НА ДРУГУЮ РАБОТУ" и "VIII. ОТПУСК" выводятся *
+* по выбранному назначению.                                                                       *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1199         |24/11/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_FormT2.vih
+#include CatFunc.vih // Функции работы с каталогом
+#include GP_StrFunc.vih
+#include GP_DepFunc.vih
+#include RunRaise.vih // Интерфейс расчета доплат в кадрах
+#include AppFuncs.vih
+#include ExtAttr.Vih
+//#include GP_Log.vih // Объектный интерфейс для вывода протокола
+
+interface GP_FormT2;
+
+  const
+    DSK_PREFIX = 'FormT2_'; // Префикс для сохранения параметров
+  end;
+
+  // Периоды по одному лицевому счету
+  table struct SAppSel
+  (
+    TabN: tTabN,      // Табельный номер
+    StrTabN: TabnStr, // Строковое значение табельного номера
+    cLSchet: Comp,    // Ссылка на лицевой счет
+    cApp: Comp,       // Ссылка на назначение
+    LPrizn: Integer,  // Доп.признак
+    DBeg: Date,       // Дата с
+    DEnd: Date,       // Дата по
+    DepName: String,  // Название подразделения
+    wAddWord1: Word   // Признак по ШР / вне ШР
+  )
+  with index
+  (
+    SAppSel01 = LPrizn + TabN + StrTabN
+  );
+
+  // Данные по назначениям
+  table Struct SApp
+  (
+    FromDateSort: Date,   // Дата для сортировки
+    NumSort: Word,        // № п/п
+    FromDate: Date,       // Дата назначения
+    cDept: Comp,          // Ссылка на подразделение
+    NameDept: String,     // Подразделение
+    CodeDept: String[20], // Подразделение
+    cPost: Comp,          // Ссылка на должность
+    NamePost: String,     // Должность
+    NameTarif: String,    // Тарифная ставка (оклад)
+    Reason: String        // Основание
+  )
+  with index
+  (
+    SApp01 = FromDateSort + NumSort
+  );
+
+  table struct SOtp
+  (
+    Name: String,       // Вид отпуска
+    WPBeg: Date,        // Период работы: с
+    WPEnd: Date,        // Период работы: по
+    CountDay: Double,   // Кол-во дней
+    OtpBeg: Date,       // Дата начала отпуска
+    OtpEnd: Date,       // Дата окончания отпуска
+    Foundation: String  // Основание
+  )
+  with index
+  (
+    SOtp01 = OtpBeg
+  );
+
+  table struct SAward
+  (
+    Name: String,       // Вид отпуска
+    DocName: String,    // Наименование документа
+    DocNum: String,     // Номер документа
+    DocDate: String     // Дата документа
+  )
+  with index
+  (
+    SAward01 = DocDate
+  );
+
+  create view
+    var
+      pDate: Date;
+    from 
+      Persons,
+      Appointments,
+      LSchet,
+      SAppSel (SAppSel01),
+      SApp (SApp01),
+      SOtp (SOtp01),
+      SAward (SAward01),
+      synonym Persons Persons1,
+      synonym Appointments Appointments1,
+      synonym OtpOtz OtpOtz1,
+      synonym ContDoc ContDocOtp,
+      synonym PartDoc PartDocOtp,
+      synonym TitleDoc TitleDocOtp,
+      synonym WorkPeriod WorkPeriodOst,
+      synonym ContDoc ContDocFortune,
+      AppHist,
+      Raise,
+      Vacations,
+      Catalogs
+    where ((
+          Appointments.cAddNRec2    == LSchet.NRec
+      and Persons.PasspRus          == Passports.NRec
+      and Persons.NRec              == Conscription.Person
+      // Отпуска
+      and Vacations.VacType         == KlOtpusk.NRec
+      and Vacations.cFactOtpusk     == FactOtpusk.NRec
+      and Vacations.NRec            == Otpusk.cVacations
+      and Appointments.cAddNRec2    == Otpusk.cLSch (NoIndex)
+      and ContDocOtp.cPart          == PartDocOtp.NRec
+      and PartDocOtp.cDoc           == TitleDocOtp.NRec
+      and Vacations.cPutVac         == PutVacation.NRec
+      and Vacations.cWorkPeriod     == WorkPeriod.NRec
+      and PutVacation.cWPRemain     == WorkPeriodOst.NRec
+      // Награждения и поощрения
+      and Persons.Nrec              == Fortune.cPers
+      and 0                         == Fortune.wChoice
+      and Fortune.cFCont            == ContDocFortune.Nrec
+    ))
+  ;
+
+  #include GP_StrFunc.var
+  #include GP_DepFunc.var
+  //#include GP_Log.var
+
+  var
+    ICatFunc: CatalogsFunctions;
+    IRaise: RunRaise;
+    IAppFuncs: AppointmentsFunctions;
+    oExtAttr: iExtAttr;
+    CompactMode: Boolean;
+    PrevDept: Comp;
+    PrevPost: Comp;
+
+  // Возвращает название вида работы
+  function GetWorkType(_WorkType: Integer; _AppNRec: Comp): String;
+  begin
+    // Если в поле "Вид работы" карточки работника выбрано "По совместительству"
+    // или тип назначения "Совмещение"
+    if Word(Persons.cSovm) = 1 or _WorkType = 3 then
+      result := 'по совместительству'
+    else
+      if Persons.AppointCur != 0 and Persons.AppointCur = _AppNRec then
+        result := 'основное'
+      else
+        result := '';
+  end;
+  
+  window winSelApp 'Выберите назначение' DoAccept, EscClose, Gray;
+    show at (,, 107, 5);
+
+    browse brSelApp (,, sci18Esc);
+      table SAppSel;
+      fields
+        GetStrTabn(SAppSel.TabN, SAppSel.StrTabn) 'Таб.№' ('Табельный номер'): [10], protect, noAutoSize;
+        GetWorkType(SAppSel.LPrizn, SAppSel.cApp) 'Вид назначения' ('Вид назначения'): [23], protect, noAutoSize;
+        SAppSel.wAddWord1 'По/вне ШР' ('По штатному расписанию/вне штатного расписания'): [9], skip, [list ' ', 'по ШР', 'вне ШР'];
+        DepName 'Подразделение' ('Подразделение'): [50], protect;
+        SAppSel.DBeg 'С' ('Дата начала назначения'): [12], protect, noAutoSize;
+        SAppSel.DEnd 'По' ('Дата окончания назначения'): [12], protect, noAutoSize;
+    end;
+
+    handleEvent
+      cmInit:
+        SetWindowTitle(winSelApp, 'Выберите назначение таб.№ ' + GetStrTabn(Persons.TabNmb, Persons.StrTabn) + ' на ' + To_Char(pDate));
+      cmOk:
+        PutCommand(cmDefault);
+    end;
+  end;
+
+  // Выводит окно выбора назначения
+  public function ChooseApp(_cPerson: Comp; _pDate: Date; _UseFirst: Boolean = false): Comp;
+  begin
+    result := 0;
+    pDate := _pDate;
+    if getFirst Persons where ((_cPerson == Persons.NRec)) != tsOk then
+    begin
+      Message('Не найдена запись в таблице Persons (NRec: ' + To_Char(Persons.NRec, 0, 0) + ')');
+      exit;
+    end;
+    _loop Appointments where ((Persons.NRec == Appointments.Person))
+    begin
+      if Appointments.AppointDate > _pDate then
+        continue;
+      if Appointments.DismissDate != ZeroDate then
+        if Appointments.DismissDate < _pDate then
+          continue;
+      // Учитываем назначения только с закладок "Прием / переводы" и "Внутр.совмест-ва, совмещения"
+      if not (Appointments.lPrizn = 0 or Appointments.lPrizn = 3)
+        continue;
+      ClearBuffer(#SAppSel);
+      if IsValidAll(tnLSchet) then
+      begin
+        SAppSel.TabN := LSchet.TabN;
+        SAppSel.StrTabN := LSchet.StrTabN;
+      end else
+      begin
+        SAppSel.TabN := Persons.TabNmb;
+        SAppSel.StrTabN := Persons.StrTabN;
+      end;
+      SAppSel.cLSchet := Appointments.cAddNRec2;
+      SAppSel.cApp := Appointments.NRec;
+      SAppSel.LPrizn := Appointments.LPrizn;
+      SAppSel.DBeg := Appointments.AppointDate;
+      SAppSel.DEnd := Appointments.DismissDate;
+      SAppSel.DepName := ICatFunc.GetCatalogsName(Appointments.Department);
+      SAppSel.wAddWord1 := Appointments.wAddWord1;
+      if insert current SAppSel != tsOk then
+      begin
+        Message('Не удалось вставить запись в таблицу SAppSel');
+        exit;
+      end;
+      // Если _UseFirst = true используем первое найденное назначение
+      if _UseFirst then
+        break;
+    end;
+    if getFirst SAppSel != tsOk then
+      Message('У работника нет назначений на ' + To_Char(pDate));
+    else
+    begin
+      // Если действующих назначений несколько
+      if RecordsInTable(#SAppSel) > 1 then
+        // Предлагаем выбрать
+        if RunWindowModal(winSelApp) != cmDefault then
+          exit;
+      result := SAppSel.cApp;
+      SaveMyDsk(SAppSel.cApp, DSK_PREFIX + 'cApp');
+    end;
+  end;
+
+  // Возвращает оклад из истории назначения на дату
+  function GetOkladFromAppHist(cApp: Comp; AppDate: Date; AppOkl: Double): Double;
+  begin 
+    if getFirst AppHist where ((
+          cApp    == AppHist.cAppoint
+      and AppDate == AppHist.dRec
+      and (AppHist.CodOper = 1 or AppHist.CodOper = 3 or AppHist.CodOper = 5)
+    )) = tsOk then
+      result := AppHist.TaxRate
+    else
+      result := AppOkl;
+  end;
+
+  // Формальное отображение значения Value в соответствии с заданным форматом
+  // округления RoundFormat, описывающим точность и кратность округления.
+  // Стандартная функция взятая из исходников Галактики (DoubleShow.vpp)
+  function DoubleShow(Value, RoundFormat: Double; const RoundUp: Boolean): String;
+  var
+    Precision: Word; // точность
+    Ratio: Double; // кратность
+  begin
+    if Value = 0 then
+    begin
+      Result := '';
+      exit;
+    end;
+
+    if RoundFormat = 0 then
+    begin
+      Result := String(Value);
+      exit;
+    end;
+
+    Precision := 0;
+    Ratio := Abs(RoundFormat);
+
+    // для округлений до целого
+    if Ratio >= 1 then
+    begin
+      Ratio := Trunc(Ratio);
+      if (RoundFormat > 0) and not RoundUp then
+        Result := String(Round(Value / Ratio) * Ratio, 0, Precision)
+      else
+      begin
+        Result := String(Trunc(Value / Ratio) * Ratio, 0, Precision);
+        if (Value - Trunc(Value / Ratio) * Ratio) != 0 then
+          Result := String(Trunc(Value / Ratio) * Ratio + if(RoundUp, Sign(Value) * Ratio, 0), 0, Precision);
+      end;
+      exit;
+    end;
+
+    // определим точность округления Precision (до какого знака после запятой)
+    while Ratio < 1 do // для дробных
+    begin
+      Inc(Precision);
+      Ratio := 10 * Ratio;
+    end;
+
+    Ratio := Abs(RoundFormat);
+
+    if (RoundFormat > 0) and not RoundUp then
+      Result := String(Trunc(Value) + Round(Round((Value - Trunc(Value)) / Ratio, Precision)) * Ratio, 0, Precision)
+      // двойным округлением компенсируем небольшую неточность, образовавшуюся при делении
+    else
+      Result := String(Trunc(Value) + Trunc((Value - Trunc(Value))/Ratio) * Ratio + 
+       if(RoundUp, Sign(Value) * Ratio, 0), 0, Precision);
+  end;
+
+  // формирование таблицы назначений
+  // Код взят из функции CreateTablApp из PsnRepot2004.vip
+  // Добавлена фильтрация по соответствию выбранному при запуске формы назначению
+  procedure FillSApp(_UseAppFilter: Boolean = false);
+  var
+    _cPersons: Comp;
+    NPP: Word;
+    S: String;
+    RoundingTariff: Double;
+    RoundingOklad: Double;
+    RoundingUp: Boolean;
+  begin
+    // точность округления тарифов и окладов
+    RoundingTariff := doGetTune('UP.ZAR.ZU.RVAL_2');
+    RoundingOklad := doGetTune('UP.ZAR.ZU.RRUB_2');
+    RoundingUp := boGetTune('UP.ZAR.ZU.AGNEED_49');
+
+    delete all from SApp;
+
+    _cPersons := Persons.NRec;
+    NPP := 1;
+
+    LoadVipInterface(iRaise);
+    if NullVipRef(iRaise) then
+      exit;
+
+    while _cPersons != 0 do
+    begin
+      if getFirst FastFirstRow Persons1 where((_cPersons == Persons1.NRec)) != tsOk then
+        exit;
+      _cPersons := Persons1.cPrizn2;
+
+      _loop Appointments1 where ((
+            Persons1.NRec == Appointments1.Person 
+        and (0 = Appointments1.lPrizn or 3 = Appointments1.lPrizn)
+      )) ordered by index APNTBYPERSON
+      begin
+        // Если вид работы по назначению не соответствует виду работы по выбранному назначению
+        if _UseAppFilter then
+        begin
+          if Appointments.LPrizn != Appointments1.lPrizn then
+            continue;
+          // Если вид работы внутреннее совмещение по другому лицевому счёту
+          if Appointments1.lPrizn = 3 and (Appointments.cAddNRec2 != Appointments1.cAddNRec2) then
+            continue;         
+        end;
+        ClearBuffer(#SApp);
+        SApp.FromDate := Appointments1.AppointDate;
+        SApp.FromDateSort := Appointments1.AppointDate;
+        SApp.NumSort := NPP;
+
+        SApp.cDept := Appointments1.Department;
+        SApp.NameDept := oGP_DepFunc.GetFullDepName(Appointments1.Department, DF_ADD_CODE, 1, ' ', Appointments1.AppointDate);
+
+        SApp.cPost := Appointments1.Post;
+        S := ICatFunc.GetCatalogsName(SApp.cPost);
+        // if Appointments1.Category != 0 then
+        //  S := S + ', разряд: ' + Trim(To_Char(Appointments1.Category));
+        SApp.NamePost  := S;
+
+        // оклад при приеме на работу определяем по истории назначения
+        S := DoubleShow(GetOkladFromAppHist(Appointments1.NRec, Appointments1.AppointDate, Appointments1.TaxRate),
+         If(Appointments1.PayModel = 30, RoundingOklad, RoundingTariff), RoundingUp); // Оклад
+        _loop Raise where ((
+              Persons1.NRec             == Raise.Person // Первая доплата
+          and Appointments1.NRec        == Raise.Appoint
+          and Appointments1.AppointDate == Raise.FromDate
+        ))
+        begin
+  if wGetTune('UP.FakelGAL.Fakel') = 0
+  {
+          if Raise.RaiseAttr = 2 then
+            S := S + ' + ' + To_Char(IRaise.GetPercRaiseByDate(Raise.NRec, Appointments1.AppointDate)) + '%';
+          else
+            S := S + ' + ' + To_Char(IRaise.GetSumRaise(Raise.NRec, Appointments1.AppointDate, coAppointments, Appointments1.NRec));
+  }
+  else
+  {
+          if Raise.RaiseAttr = 2 then
+            S := S + ' + ' + iRaise.GetNameRaise(Raise.Nrec) + '-' +  To_Char(IRaise.GetPercRaiseByDate(Raise.NRec, Appointments1.AppointDate)) + '%';
+          else
+            S := S + ' + ' + iRaise.GetNameRaise(Raise.Nrec) + '-' + To_Char(IRaise.GetSumRaise(Raise.NRec, Appointments1.AppointDate, coAppointments, Appointments1.NRec));
+  }
+        end;
+        SApp.NameTarif := S;
+        if Appointments1.OrderNmb != '' or Appointments1.OrderDate != ZeroDate then
+          SApp.Reason := 'приказ № ' + Appointments1.OrderNmb + ' от ' + oGP_SF.DateToStrE(Appointments1.OrderDate)
+        else
+          SApp.Reason := '';
+        if Trim(Appointments1.OrderNmb) != '' then
+        begin
+          SApp.Reason := 'приказ № ' + Appointments1.OrderNmb;
+          if Appointments1.OrderDate != ZeroDate then
+            SApp.Reason := SApp.Reason + ' от ' + DateToStr(Appointments1.OrderDate, 'DD.MM.YYYY');
+        end;
+        insert current SApp;
+
+        NPP++;
+      end;
+    end;
+    FreeVipInterface(iRaise);
+  end;
+
+  function GetStrPrikDateForOtp: String;
+  begin
+    result := '';
+    if getFirst FactOtpusk != tsOk then
+      exit;
+    if FactOtpusk.cWorkPeriod != 0 then
+    begin
+      if getFirst ContDocOtp where ((FactOtpusk.cContDoc == ContDocOtp.NRec )) != tsOk then
+        exit;
+    end else
+      if getFirst ContDocOtp where ((
+        Persons.NRec    == ContDocOtp.Person and
+        6              <<= ContDocOtp.TypeOper and
+        Vacations.NRec  == ContDocOtp.ObjNrec (noIndex)
+      )) != tsOk
+        exit;
+    if getFirst PartDocOtp = tsOk then
+      if getFirst TitleDocOtp = tsOk then
+        result := ' от ' + To_Char(TitleDocOtp.DocDate);
+  end;
+
+  // Заполнение таблицы отпусков
+  // Код взят из функции CreateTablOtp из PsnRepot2004.vip
+  // Добавлена фильтрация по соответствию выбранному при запуске формы назначению
+  procedure FillSOtp;
+  var
+    _cPersons: Comp;
+  begin
+    delete all from SOtp;
+
+    _cPersons := Persons.NRec;
+
+    while _cPersons != 0 do
+    begin
+      if getFirst fastFirstRow Persons1 where((_cPersons == Persons1.NRec)) != tsOk then
+        exit;
+      _cPersons := Persons1.cPrizn2;
+      if getFirst fastFirstRow Appointments1 where ((
+        Persons1.Nrec == Appointments1.Person
+        and (0 = Appointments1.lPrizn or 3 = Appointments1.lPrizn)
+      )) ordered by index APNTBYPERSON = tsOk then
+        if getFirst fastFirstRow OtpOtz1 where ((Appointments1.cAddNrec2 == OtpOtz1.cLSchet)) != tsOk then
+        begin
+          // Нет отзывов из отпуска
+          _loop Vacations where ((
+                Persons1.NRec              == Vacations.Person
+            and Appointments1.AppointDate <<= Vacations.FactYearBeg
+          ))
+          begin
+            // Если отпуск по другому лицевому счёту
+            if not IsValidAll(tnOtpusk) then
+              continue;
+            ClearBuffer(#SOtp);
+            SOtp.Name := KlOtpusk.NOtpus;
+            if Vacations.cWorkPeriod != 0 then
+            begin
+              if PutVacation.wTypeVac = 1 or PutVacation.wTypeVac = 2 then
+              begin
+                SOtp.WPBeg := WorkPeriodOst.dPerBeg;
+                SOtp.WPEnd := WorkPeriodOst.dPerEnd;
+              end else
+              begin
+                SOtp.WPBeg := WorkPeriod.dPerBeg;
+                SOtp.WPEnd := WorkPeriod.dPerEnd;
+              end;
+            end else
+            begin
+              SOtp.WPBeg := Vacations.WorkYearBeg;
+              SOtp.WPEnd := Vacations.WorkYearEnd;
+            end;
+            SOtp.CountDay := Vacations.Duration;
+            SOtp.OtpBeg := Vacations.FactYearBeg;
+            SOtp.OtpEnd := Vacations.FactYearEnd;
+            if Vacations.Foundation != '' then
+              SOtp.Foundation := 'Приказ № ' + Vacations.Foundation + GetStrPrikDateForOtp;
+            insert current SOtp;
+          end;
+        end else
+        begin
+           // Есть отзывы из отпуска
+          _loop Vacations where ((
+                Persons1.NRec              == Vacations.Person
+            and Appointments1.AppointDate <<= Vacations.FactYearBeg
+          ))
+          begin
+            // Если отпуск по другому лицевому счёту
+            if not IsValidAll(tnOtpusk) then
+              continue;
+            // Есть запись в таблице Otpusk
+            if getFirst Otpusk = tsOk then
+            begin
+              _loop Otpusk // Есть запись в таблице Otpusk
+              begin
+                if (Otpusk.FilialNo and vaaCancelled) != 0 then
+                  continue;
+                ClearBuffer(#SOtp);
+                SOtp.Name := KlOtpusk.NOtpus;
+                if Vacations.cWorkPeriod != 0 then
+                begin
+                  if PutVacation.wTypeVac = 1 or PutVacation.wTypeVac = 2 then
+                  begin
+                    SOtp.WPBeg := WorkPeriodOst.dPerBeg;
+                    SOtp.WPEnd := WorkPeriodOst.dPerEnd;
+                  end else
+                  begin
+                    SOtp.WPBeg := WorkPeriod.dPerBeg;
+                    SOtp.WPEnd := WorkPeriod.dPerEnd;
+                  end;
+                end else
+                begin
+                  SOtp.WPBeg := Vacations.WorkYearBeg;
+                  SOtp.WPEnd := Vacations.WorkYearEnd;
+                end;
+                SOtp.CountDay := Vacations.Duration;
+                SOtp.OtpBeg := Otpusk.DATAN;
+                SOtp.OtpEnd := Otpusk.DATOK;
+                if Vacations.Foundation != '' then
+                  SOtp.Foundation := 'Приказ № ' + Vacations.Foundation + GetStrPrikDateForOtp;
+                insert current SOtp;
+              end;
+            end else
+            begin
+              ClearBuffer(#SOtp);
+              SOtp.Name := KlOtpusk.NOtpus;
+              if Vacations.cWorkPeriod != 0 then
+              begin
+                if PutVacation.wTypeVac = 1 or PutVacation.wTypeVac = 2 then
+                begin
+                  SOtp.WPBeg := WorkPeriodOst.dPerBeg;
+                  SOtp.WPEnd := WorkPeriodOst.dPerEnd;
+                end else
+                begin
+                  SOtp.WPBeg := WorkPeriod.dPerBeg;
+                  SOtp.WPEnd := WorkPeriod.dPerEnd;
+                end
+              end else
+              begin
+                SOtp.WPBeg := Vacations.WorkYearBeg;
+                SOtp.WPEnd := Vacations.WorkYearEnd;
+              end;
+              SOtp.CountDay := Vacations.Duration;
+              SOtp.OtpBeg := Vacations.FactYearBeg;
+              SOtp.OtpEnd := Vacations.FactYearEnd;
+              if Vacations.Foundation != '' then
+                SOtp.Foundation := 'Приказ № ' + Vacations.Foundation + GetStrPrikDateForOtp;
+              insert current SOtp;
+            end;
+          end;
+        end;
+    end;
+  end;
+
+  // Заполнение таблицы наград
+  // Если печатается назначение с видом работы "по совместительству", в разделе поощрения и награды
+  // выводим только те награды, которые назначены приказом с РПД 30, в котором в поле "Назначение"
+  // установлено "совмещение"
+  procedure FillSAward;
+  var
+    IsOsn, IsOsnAward: Boolean;
+  begin
+    // Если в поле "Вид работы" карточки работника не выбрано "По совместительству" и тип назначения не "Совмещение"
+    IsOsn := not (Word(Persons.cSovm) = 1 or SAppSel.LPrizn = 3);
+    delete all from SAward;
+    _loop Fortune
+    begin
+      IsOsnAward := true;
+      // Есть приказ по этому поощрению
+      if IsValidAll(tnContDocFortune) then
+        // в поле "Назначение" приказа установлено "совмещение"
+        if ContDocFortune.wAttrDoc2 = 1 then
+          IsOsnAward := false;
+      if IsOsn != IsOsnAward then
+        continue;
+      ClearBuffer(#SAward);
+      SAward.Name := iCatFunc.GetCatalogsName(Fortune.cFType);
+      SAward.DocName := iCatFunc.GetCatalogsName(Fortune.cRef2);
+      SAward.DocNum := Fortune.DocNmb;
+      SAward.DocDate := Fortune.DocDate;
+      insert current SAward;
+    end;
+  end;
+
+  // Инициализирует расчет
+  public function Init(_pDate: Date; _UseAppFilter: Boolean = false): Boolean;
+  var
+    _cApp: tNRec;
+  begin
+    result := false;
+    pDate := _pDate;
+    if not ReadMyDsk(_cApp, DSK_PREFIX + 'cApp', true) then
+    begin
+      Message('Не удалось считать из DSK переменную ' + DSK_PREFIX + 'cApp');
+      exit;
+    end;
+    if getFirst Appointments where ((_cApp == Appointments.NRec)) != tsOk then
+    begin
+      Message('Не найдена запись в таблице Appointments (NRec: ' + To_Char(_cApp, 0, 0) + ')');
+      exit;
+    end;
+    if getFirst Persons where ((Appointments.Person == Persons.NRec)) != tsOk then
+    begin
+      Message('Не найдена запись в таблице Persons (NRec: ' + To_Char(Appointments.Person, 0, 0) + ')');
+      exit;
+    end;
+
+    //oGP_Log.Init('GP_FormT2.log', true, true, true);
+    //oGP_Log.SetVerboseMode(true);
+
+    FillSApp(_UseAppFilter);
+    FillSOtp;
+    FillSAward;
+
+    //oGP_Log.Done(true);
+
+    result := true;
+  end;
+
+  // Возвращает доп.информацию по сотруднкику
+  // Можно было бы сделать отдельный метод на каждый параметр, но так как данных будет немного,
+  // так будет более оптимально
+  public function GetInfo(_Code: String): String;
+  begin
+    result := '';
+    case UpCase(Trim(_Code)) of
+      'PASSPORTDEPCODE': // Код подразделения УВД, выдавшего пасспорт
+        result := Passports.GivenPodr;
+      'WORKTYPE': // Вид работы (Основная / По совместительству)
+        result := GetWorkType(Appointments.LPrizn, Appointments.NRec);
+      'TABNUM': // Табельный номер
+        if IsValidAll(tnLSchet) then
+          result := GetStrTabn(LSchet.TabN, LSchet.StrTabn)
+        else
+          result := GetStrTabn(Persons.TabNmb, Persons.StrTabN);
+      'APPFROMDATE': // Дата назначения
+        result := oGP_SF.DateToStrE(SApp.FromDate); // Дата назначения
+      'APPNAMEDEPT': // Подразделение
+        result := SApp.NameDept;
+      'APPNAMEPOST': // Должность
+        result := SApp.NamePost;
+      'APPCODEPOST': // Код должности
+        result := ICatFunc.GetCatalogsCode(SApp.cPost);
+      'APPNAMETARIF': // Тарифная ставка (оклад)
+        result := SApp.NameTarif;
+      'APPREASON': // Основание
+        result := SApp.Reason;
+      'OTPNAME': // Вид отпуска
+        result := SOtp.Name;
+      'OTPWPBEG': // Период работы: с
+        result := oGP_SF.DateToStrE(SOtp.WPBeg);
+      'OTPWPEND': // Период работы: по
+        result := oGP_SF.DateToStrE(SOtp.WPEnd);
+      'OTPCOUNTDAY': // Кол-во дней
+        result := SOtp.CountDay;
+      'OTPOTPBEG': // Дата начала отпуска
+        result := oGP_SF.DateToStrE(SOtp.OtpBeg);
+      'OTPOTPEND': // Дата окончания отпуска
+        result := oGP_SF.DateToStrE(SOtp.OtpEnd);
+      'OTPFOUNDATION': // Основание
+        result := SOtp.Foundation;
+      'AWARDNAME': // Наименование награды (поощрения), почетного звания
+        result := SAward.Name;
+      'AWARDDOCNAME': // Наименование документа
+        result := SAward.DocName;
+      'AWARDDOCNUM': // Номер документа
+        result := SAward.DocNum;
+      'AWARDDOCDATE': // Дата документа
+        result := SAward.DocDate;
+      'CONTRACTNUM': // Номер трудового договора
+        result := Appointments.ContractNmb;
+      'CONTRACTDATE': // Дата трудового договора
+        result := oGP_SF.DateToStrE(Appointments.ContractDate);
+      'OKPDTR': // Код ОКПДТР для должности из текущего назначения
+        begin
+          if IsValidAll(tnAppointments) then
+            result := ICatFunc.GetCatalogsCode(Appointments.Post);
+        end;
+      'FULLDEPNAME': // Полное наименование подразделения
+        begin
+          if IsValidAll(tnAppointments) then
+            result := oGP_DepFunc.GetFullDepName(Appointments.Department, DF_ADD_CODE, 1, ' ', Appointments.AppointDate);
+        end;
+      'MILCARDNUM': // Номер военного билета
+        if IsValidAll(tnPersons) then
+          if IsValidAll(tnConscription) then
+            result := Conscription.MilCard;
+      'MILCARDDATE': // Дата выдачи военного билета
+        if IsValidAll(tnPersons) then
+          if IsValidAll(tnConscription) then
+            result := if(Conscription.MilCardDate != ZeroDate, DateToStr(Conscription.MilCardDate, 'DD.MM.YYYY'), '');
+      'REGNUM': // Регистрационный номер по журналу учета картотеки
+        if IsValidAll(tnPersons) then
+          if IsValidAll(tnConscription) then
+            // Получаем значение внещнего атрибута "Регистрационный №"
+            result := oExtAttr.sGetAttr(coConscription, Conscription.NRec, 'Регистрационный №');
+      else
+        Message('Не поддерживаемый код в функции GP_FormT2.GetInfo (' + _Code + ')');
+    end;
+  end;
+
+  // Загружает данные по первому назначению
+  // Возвращает true, если операция завершилась успешно
+  public function AppGetFirst(_CompactMode: Boolean = true): boolean;
+  begin
+    CompactMode := _CompactMode;
+    result := (getFirst SApp) = tsOk;
+    if CompactMode and result then
+      PrevDept := SApp.cDept;
+      PrevPost := SApp.cPost;
+  end;
+
+  // Загружает данные по следующему назначению
+  // Возвращает true, если операция завершилась успешно
+  public function AppGetNext: boolean;
+  begin
+    if CompactMode then
+    begin
+      result := (getNext SApp where (PrevDept != SApp.cDept or PrevPost != SApp.cPost)) = tsOk;
+      if result then
+        PrevDept := SApp.cDept;
+        PrevPost := SApp.cPost;
+    end else
+      result := (getNext SApp) = tsOk;
+  end;
+
+  // Загружает данные по первому отпуску
+  // Возвращает true, если операция завершилась успешно
+  public function OtpGetFirst: boolean;
+  begin
+    result := (getFirst SOtp) = tsOk;
+  end;
+
+  // Загружает данные по следующему отпуску
+  // Возвращает true, если операция завершилась успешно
+  public function OtpGetNext: boolean;
+  begin
+    result := (getNext SOtp) = tsOk;
+  end;
+
+  // Загружает данные по первой награде
+  // Возвращает true, если операция завершилась успешно
+  public function AwardGetFirst: boolean;
+  begin
+    result := (getFirst SAward) = tsOk;
+  end;
+
+  // Загружает данные по следующей
+  // Возвращает true, если операция завершилась успешно
+  public function AwardGetNext: boolean;
+  begin
+    result := (getNext SAward) = tsOk;
+  end;
+
+  /*
+  // Ищет в назначениях первую действующую на указанную дату запись
+  function LocateApp(_pDate: Date): Comp;
+  begin
+    result := 0;
+    if not IsValidAll(tnPersons) then
+      exit;
+    _loop Appointments where ((Persons.NRec == Appointments.Person))
+    begin
+      if not IsValidAll(tnLSchet) then
+        continue;
+      if Appointments.AppointDate > _pDate then
+        continue;
+      if Appointments.DismissDate != ZeroDate then
+        if Appointments.DismissDate < _pDate then
+          continue;
+      result := Appointments.NRec;
+      break;
+    end;
+  end;
+
+  // Ищет запись в Persons по таб.№
+  function LocatePerson(_TabN: String; _pDate: Date): Comp;
+  begin
+    result := 0;
+    pDate := _pDate;
+    if wGetTune('FormatClockNumber') = 0 then
+    begin
+      var _TabNNum: LongInt = LongInt(_TabN);
+      if _TabNNum != 0 then
+      begin
+        if (getFirst Persons where (('С' == Persons.IsEmployee and _TabNNum == Persons.TabNmb))) = tsOk then
+          result := Persons.NRec;
+        if result = 0 then
+          if (getFirst Persons where (_TabNNum = Persons.TabNmb)) = tsOk then
+            result := Persons.NRec;
+      end;
+    end else
+      if _TabN != '' then
+      begin
+        if (getFirst Persons where (('С' == Persons.IsEmployee and 0 == Persons.TabNmb and _TabN == Persons.StrTabN))) = tsOk then
+          result := Persons.NRec;
+        if result = 0 then
+          if (getFirst Persons where (_TabN = Persons.StrTabN)) = tsOk then
+            result := Persons.NRec;
+      end;
+    if result != 0 then
+    begin
+      Message(Persons.FIO + ' pDate: ' + To_Char(pDate));
+      if (getFirst Appointments where (Persons.AppointCur = Appointments.NRec)) != tsOk then
+      begin
+        Message('Текущее назначение не найдено');
+      end;
+    end;
+  end;
+  */
+
+  // Возращает информацию о снятии с воинского учета
+  // Работник считается снятым с воинского учета, если у него в разделе 5 картотеки
+  // в поле "Вид учета" выбрано значение, которое входит в группу с названием "Не состоит"
+  function DecommisInfo: String;
+  begin
+    result := '';
+    if not IsValidAll(tnPersons) then
+      exit;
+    if not IsValidAll(tnConscription) then
+      exit;
+    // Значение в поле "Вид учёта"
+    if getFirst Catalogs where ((Conscription.AcntKind == Catalogs.NRec)) != tsOk then
+      exit;
+    // Есть у вида учёта родительская группа?
+    if Catalogs.cParent = 0 then
+      exit;
+    var _VidUch: String = Catalogs.Name;
+    var _cParent: Comp = Catalogs.cParent;
+    if getFirst Catalogs where ((_cParent == Catalogs.NRec)) != tsOk then
+      exit;
+    if LoCase(Catalogs.Name) = 'не состоит' then
+    result := _VidUch;
+  end;
+
+  handleEvent
+    cmOnVipLoad:
+      begin
+        // oGP_Log.Init('GP_FormT2.log', true, true, true);
+        // oGP_Log.SetVerboseMode(true);
+        PrevDept := 0;
+        PrevPost := 0;
+        CompactMode := true;
+      end;
+    //cmOnVipUnLoad:
+    //  oGP_Log.Done(true);
+  end;
+
+end.

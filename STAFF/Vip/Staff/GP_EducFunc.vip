@@ -1,0 +1,168 @@
+/*************************************************************************************************\
+* Наименование: Функции работы с уровнями образования                                             *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:                                                                                     *
+* Скорость работы стандартных функций из EducFunc.vih просто отвратительная - пришлось написать   *
+* свои функции для определения наилучшего образования.                                            *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#335          |12/07/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_EducFunc.vih
+
+interface GP_EducFunc;
+
+  // Список уровней образования, которые учитываются при определении наилучшего образования
+  table struct SLevels
+  (
+    cLevel: tNRec,           // Уровень образования - ссылка на таблицу Catalogs
+    LevelNum: Byte,          // Номер уровня образования (чем больше LevelNum, тем лучше образование)
+    SysCode: Integer         // Системный код уровня образования из таблицы Catalogs
+  )
+  With index
+  (
+    SLevels01 = cLevel,
+    SLevels02 = LevelNum
+  );
+
+  create view
+    from
+      Education,
+      SLevels,
+      Catalogs;
+
+  // Ищет образование с наивысшим уровнем у указанного сотрудника
+  // Если передан параметр _OnDate, ищет наилучшее образование по состоянию на указанную дату
+  // Возвращает ссылку на Education
+  function GetBestEduc(_cPerson: tNRec; _OnDate: Date = ZeroDate): tNRec;
+  var
+    _LevelNum: Byte;
+    _DateFinish: Date;
+  begin
+    result := 0;
+    _LevelNum := 0; // Номер уровня лучшего образования
+    _DateFinish := ZeroDate; // Дата окончания учебного заведения с лучшим уровнем образования
+    // Анализируем все записи об образовании работника, уровень которых есть в таблице SLevels
+    _loop Education where ((
+          _cPerson         == Education.Person
+      and Education.Level /== SLevels.cLevel
+    ))
+    begin
+      // Если передан параметр _OnDate
+      if _OnDate != ZeroDate then
+        // Игнорируем записи с пустой датой окончания и с датой окончания больше, чем _OnDate
+        if Education.ToDate = ZeroDate or Education.ToDate > _OnDate then
+          Continue;
+      // Если номер уровня в текущей записи выше номера уровня найденного лучшего образования
+      if SLevels.LevelNum > _LevelNum then
+      begin
+        // Это образование становится лучшим
+        _LevelNum := SLevels.LevelNum;
+        result := Education.NRec;
+        if Education.ToDate != ZeroDate then
+          _DateFinish := Education.ToDate;
+      end else
+        // Если номер уровня в текущей записи совпадает с номером уровня найденного лучшего образования
+        if SLevels.LevelNum = _LevelNum then
+          // и если это образование завершилось позже найденного лучшего образования
+          if Education.ToDate > _DateFinish then
+          begin
+            // Это образование становится лучшим
+            result := Education.NRec;
+            _DateFinish := Education.ToDate;
+          end;
+    end;
+  end;
+
+  // Ищет образование с указанным системным кодом у указанного сотрудника
+  // Если передан параметр _OnDate, поиск осуществляется по состоянию на указанную дату
+  // Возвращает ссылку на Education
+  function GetEducBySysCode(_cPerson: tNRec; _SysCode: Integer; _OnDate: Date = ZeroDate): tNRec;
+  begin
+    result := 0;
+    // Анализируем все записи об образовании работника, уровень которых есть в таблице SLevels
+    _loop Education where ((
+          _cPerson         == Education.Person
+      and Education.Level /== SLevels.cLevel
+    ))
+    begin
+      // Если передан параметр _OnDate
+      if _OnDate != ZeroDate then
+        // Игнорируем записи с пустой датой окончания и с датой окончания больше, чем _OnDate
+        if Education.ToDate = ZeroDate or Education.ToDate > _OnDate then
+          Continue;
+      if SLevels.SysCode = _SysCode then
+      begin
+        // Это образование становится лучшим
+        result := Education.NRec;
+        exit;
+      end;
+    end;
+  end;
+
+  // Возвращает наивысший уровень образования указанного сотрудника 
+  // Если передан параметр _OnDate, Возвращает наивысший уровень образования по состоянию на указанную дату
+  // Возвращает ссылку на Catalogs
+  function GetBestEducLvl(_cPerson: tNRec; _OnDate: Date = ZeroDate): tNRec;
+  var
+    _cEducation: tNRec;
+  begin
+    result := 0;
+    _cEducation := GetBestEduc(_cPerson, _OnDate);
+    if _cEducation != 0 then
+      if getFirst Education where ((_cEducation == Education.NRec)) = tsOk then
+        result := Education.Level;
+  end;
+
+  // Добавляет запись в таблицу SLevels
+  procedure AddSLevel(_cLevel: tNRec; _LevelNum: Byte; _SysCode: Integer);
+  begin
+    // ClearBuffer(#SLevels); // Вызывать нет нужды - все поля присваиваются
+    SLevels.cLevel := _cLevel;
+    SLevels.LevelNum := _LevelNum;
+    SLevels.SysCode := _SysCode;
+    if insert current SLevels != tsOk then
+      Message('Не удалось добавить запись в таблицу SLevels (Catalogs.NRec = ' + To_Char(_cLevel, 0, 0) + ')');
+  end;
+
+  // Добавляет в таблицу SLevels все записи из таблицы Catalogs, подчинённые указанной
+  procedure AddLvlChildren(_cParent: tNRec; _LevelNum: Byte; _SysCode: Integer);
+  begin
+    PushPos(#Catalogs);
+    _loop Catalogs where ((_cParent == Catalogs.cParent))
+    begin
+      AddSLevel(Catalogs.NRec, _LevelNum, _SysCode);
+      AddLvlChildren(Catalogs.NRec, _LevelNum, _SysCode);
+    end;
+    PopPos(#Catalogs);
+  end;
+
+  // Добавляет в таблицу SLevels запись с указанным системным кодом из таблицы Catalogs, и все записи подчинённые этой записи
+  procedure CacheEducLevels(_SysCode: Integer; _LevelNum: Byte);
+  begin
+    if getFirst Catalogs where ((_SysCode == Catalogs.SysCode)) = tsOk then
+    begin
+      AddSLevel(Catalogs.NRec, _LevelNum, _SysCode);
+      AddLvlChildren(Catalogs.NRec, _LevelNum, _SysCode);
+    end;
+  end;
+
+  handleEvent
+    cmOnVipLoad:
+      begin
+        // Составим список уровней образования, которые учитываются при определении наилучшего образования
+        CacheEducLevels(1461, 1); // Дошкольное
+        CacheEducLevels( -91, 2); // Не имеет начального
+        CacheEducLevels( -92, 3); // Начальное общее
+        CacheEducLevels( -93, 4); // Основное общее
+        CacheEducLevels( -94, 5); // Среднее (полное) общее
+        CacheEducLevels( -96, 6); // Начальное профессиональное
+        CacheEducLevels( -97, 7); // Среднее профессиональное
+        CacheEducLevels(1462, 8); // Неполное высшее
+        CacheEducLevels( -98, 9); // Высшее профессиональное
+      end;
+  end;
+
+end.

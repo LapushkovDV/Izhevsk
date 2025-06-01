@@ -1,0 +1,836 @@
+#include AtlProtocol.vih
+
+interface GP_MassJoinParty 'Обработка партий'
+show (,,65,11);
+
+table struct tFileRows (oidAmm: string, cParty: comp, wMain: word) (i1 = wMain + oidAmm);
+table struct tReplaceParty (cPartyFrom: comp, cPartyTo: comp) (i1 = cPartyFrom);
+table struct tQueries (name: string, sQuery: string, cnt: longint);
+table struct tMCToRecalc (cMC: comp, barkod: string);
+table struct tMoveAttr (cPartyFrom: comp, cPartyTo: comp) (i1 = cPartyFrom);
+table struct tPartyGrpChanges (NRec: comp, Kod: string, Name: string, KodGroup: string, cAttr: comp, doAttr: double, cSoprMnf: comp, cSoprIn: comp, wChangeGroup: word, wChangeAttr: word) (i1 = NRec);
+
+var iAtlProtocol: AtlProtocol;
+
+create view
+var sXls, sXls2: string;
+    wActions: word;
+as select * from
+  AttrNam
+, AttrVal, AttrVal AttrVal2
+, GroupParty
+, KatParty
+, tFileRows, tFileRows tFileRows2
+, tMCToRecalc
+, tMoveAttr
+, tPartyGrpChanges
+, tQueries
+, tReplaceParty;
+
+screen sc1;
+notablenavigation;
+fields
+  sXls: noprotect, pickbutton;
+  wActions: noprotect, noframe;
+  sXls2: noprotect, pickbutton;
+buttons
+  cmRunJoin;
+  cmCancel;
+<<
+
+ `Файл выгрузки` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   Запускаемые действия
+  [.] Заменить ссылки на партию`
+  [.] Заменить пустые атрибуты основной партии`
+  [.] Удалить дублирующие партии`
+  [.] Удалить партии группы "Плановый ЗНП"`
+  [.] Актуализация группы партий`
+  [.] Возврат партий на Ком и Гоз` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ <. Запустить .>                                  <.  Отмена  .>
+>>
+end;
+
+function LoadExcelFile: boolean;
+var i, r1, r2, c1, c2, rFirst, rLast: longInt;
+    oidAmm, sNrec: string;
+    wMain: word;
+    cParty: comp;
+{
+  Result := false;
+  iNextVisual('Загрузка файла');
+  mtClear(tntFileRows, mfNormal);
+  iAtlProtocol.LogMessage(APE_INFO, 'Загрузка Excel-файла: ' + sXls);
+  _try
+  {
+    if not ExistFile(sXls)
+    {
+      iAtlProtocol.LogLine(APE_ERROR, 'Не найден файл: ' + sXls);
+      exit;
+    }
+    if not xlOpenExcel(false)
+    {
+      iAtlProtocol.LogLine(APE_ERROR, 'Ошибка инициализации Excel');
+      exit;
+    }
+    if not xlOpenWorkBook(sXls)
+    {
+      iAtlProtocol.LogLine(APE_ERROR, 'Не удалось открыть файл: ' + sXls);
+      exit;
+    }
+    r1 := r2 := c1 := c2 := 0;
+    xlGetUsedRange(r1, c1, r2, c2);    
+    iAtlProtocol.LogLine(APE_INFO, 'Таблица: ' + r1 +',' +  c1 +',' +  r2 +',' +  c2);
+    rFirst := 2;
+    rLast := 10000;
+    rLast := if(r2 < rLast, r2, rLast);
+    while (rFirst <= r2)
+    {
+      NextVisual;
+      if not xlReadMatrixFromExcel(rFirst, 1, rLast, c2)
+      {
+        iAtlProtocol.LogLine(APE_ERROR, 'Ошибка чтения данных из Excel!');
+        exit;
+      }
+      for (i := 1; i <= rLast - rFirst + 1; i++)
+      {
+        if not NextVisual exit;
+        xlReadFromMatrix(i, 1, oidAmm);
+        xlReadFromMatrix(i, 3, sNrec);
+        cParty := 0;
+        cParty := comp(sNrec);
+        xlReadFromMatrix(i, 7, wMain);
+        if OidAmm = ''
+          break;
+
+        if cParty = 0
+        {
+          iAtlProtocol.LogLine(APE_ERROR, 'Неправильный NREC! ' + i + ': ' + sNrec);
+          continue;
+        }
+        insert tFileRows set tFileRows.oidAmm := oidAmm, tFileRows.cParty := cParty, tFileRows.wMain := wMain;
+      }
+      xlFreeMatrix;
+      if OidAmm = ''
+        break;
+
+      rFirst := rLast + 1;
+      rLast += 10000;
+      rLast := if(r2 < rLast, r2, rLast);
+    }
+  }
+  _except else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, ExploreException);
+  }
+  _finally
+  {
+    xlKillExcel;
+    iAtlProtocol.LogLine(APE_INFO, 'Загружено строк: ' + RecordsInTable(tntFileRows));
+  }
+  
+  mtClear(tntReplaceParty, mfNormal);
+  _loop tFileRows where ((0 == tFileRows.wMain))
+  {
+    if getfirst tFileRows2 where ((1 == tFileRows2.wMain and tFileRows.oidAmm == tFileRows2.oidAmm)) = tsOK
+      insert tReplaceParty set tReplaceParty.cPartyFrom := tFileRows.cParty, tReplaceParty.cPartyTo := tFileRows2.cParty;
+    else
+      iAtlProtocol.LogLine(APE_ERROR, 'Не найдена основная запись для партии с nrec = ' + cParty);
+  }
+  iAtlProtocol.LogLine(APE_INFO, 'Партий к замене: ' + RecordsInTable(tntReplaceParty));
+
+  // _loop tReplaceParty where ((root == tReplaceParty.cPartyFrom and tReplaceParty.cPartyFrom == KatParty.NRec and tReplaceParty.cPartyTo == KatParty2.NRec))
+  //   iAtlProtocol.LogLine(APE_INFO, KatParty.Kod + ' -> ' + KatParty2.Kod);    
+  // iAtlProtocol.LogLine(APE_INFO, RecordsInTable(tntReplaceParty));
+  iAtlProtocol.LogCommit;
+
+  //PutTableToDBF(tntReplaceParty, 'repParty.dbf', ptfFullTable);
+  Result := message('Считано строк: ' + RecordsInTable(tntFileRows) + ''#13 
+                  + 'Партий к замене: ' + RecordsInTable(tntReplaceParty) + ''#13 
+                  + 'Продолжить?', YesNo + Confirmation) = cmYes;
+}
+
+
+function LoadExcelFile2(mParty: TPtr): boolean;
+var i, r1, r2, c1, c2, rFirst, rLast: longInt;
+    sNrec: string;
+    cParty: comp;
+{
+  Result := false;
+  iNextVisual('Загрузка файла');
+  mtClear(tntFileRows, mfNormal);
+  iAtlProtocol.LogMessage(APE_INFO, 'Загрузка Excel-файла: ' + sXls2);
+  _try
+  {
+    if not ExistFile(sXls2)
+    {
+      iAtlProtocol.LogLine(APE_ERROR, 'Не найден файл: ' + sXls2);
+      exit;
+    }
+    if not xlOpenExcel(false)
+    {
+      iAtlProtocol.LogLine(APE_ERROR, 'Ошибка инициализации Excel');
+      exit;
+    }
+    if not xlOpenWorkBook(sXls2)
+    {
+      iAtlProtocol.LogLine(APE_ERROR, 'Не удалось открыть файл: ' + sXls);
+      exit;
+    }
+    r1 := r2 := c1 := c2 := 0;
+    xlGetUsedRange(r1, c1, r2, c2);    
+    iAtlProtocol.LogLine(APE_INFO, 'Таблица: ' + r1 +',' +  c1 +',' +  r2 +',' +  c2);
+    rFirst := 2;
+    rLast := 10000;
+    rLast := if(r2 < rLast, r2, rLast);
+    while (rFirst <= r2)
+    {
+      NextVisual;
+      if not xlReadMatrixFromExcel(rFirst, 1, rLast, 1)
+      {
+        iAtlProtocol.LogLine(APE_ERROR, 'Ошибка чтения данных из Excel!');
+        exit;
+      }
+      for (i := 1; i <= rLast - rFirst + 1; i++)
+      {
+        if not NextVisual exit;
+        xlReadFromMatrix(i, 1, sNrec);
+        if sNrec = '' 
+          break;
+
+        cParty := 0;
+        cParty := comp(sNrec);
+        if cParty = 0
+        {
+          iAtlProtocol.LogLine(APE_ERROR, 'Неправильный NREC! ' + i + ': ' + sNrec);
+          continue;
+        }
+        if not FoundMarker(mParty, cParty)
+          InsertMarker(mParty, cParty);
+      }
+      xlFreeMatrix;
+
+      rFirst := rLast + 1;
+      rLast += 10000;
+      rLast := if(r2 < rLast, r2, rLast);
+    }
+  }
+  _except else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, ExploreException);
+  }
+  _finally
+  {
+    xlKillExcel;
+    iAtlProtocol.LogLine(APE_INFO, 'Загружено строк: ' + GetMarkerCount(mParty));
+  }
+  iAtlProtocol.LogCommit;
+
+  Result := message('Партий к изменению группы: ' + GetMarkerCount(mParty) + ''#13 
+                  + 'Продолжить?', YesNo + Confirmation) = cmYes;
+}
+
+function ReplacePartyLinks: boolean;
+{
+  Result := false;
+  iAtlProtocol.LogMessage(APE_INFO, 'Замена ссылок на партии');
+  iNextVisual('Замена ссылок на партии');
+  mtClear(tntQueries, mfNormal);
+  insert tQueries set tQueries.Name := 'DOCSKAU.CPARTY', tQueries.sQuery := 'update DOCSKAU set DOCSKAU.CPARTY = tReplaceParty.cPartyTo from DOCSKAU, tReplaceParty where DOCSKAU.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'SOPRORDB.CPARTY', tQueries.sQuery := 'update SOPRORDB set SOPRORDB.CPARTY = tReplaceParty.cPartyTo from SOPRORDB, tReplaceParty where SOPRORDB.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'SPINVTAB.CPARTY', tQueries.sQuery := 'update SPINVTAB set SPINVTAB.CPARTY = tReplaceParty.cPartyTo from SPINVTAB, tReplaceParty where SPINVTAB.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'CARDSN.CPARTY', tQueries.sQuery := 'update CARDSN set CARDSN.CPARTY = tReplaceParty.cPartyTo from CARDSN, tReplaceParty where CARDSN.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'EM_SPSOPR_EXT.CPARTYON', tQueries.sQuery := 'update EM_SPSOPR_EXT set EM_SPSOPR_EXT.CPARTYON = tReplaceParty.cPartyTo from EM_SPSOPR_EXT, tReplaceParty where EM_SPSOPR_EXT.CPARTYON = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'GP_PARTY_INPUT.CKATPARTY', tQueries.sQuery := 'update GP_PARTY_INPUT set GP_PARTY_INPUT.CKATPARTY = tReplaceParty.cPartyTo from GP_PARTY_INPUT, tReplaceParty where GP_PARTY_INPUT.CKATPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'GP_PARTY_INPUT_SP.CKATPARTY', tQueries.sQuery := 'update GP_PARTY_INPUT_SP set GP_PARTY_INPUT_SP.CKATPARTY = tReplaceParty.cPartyTo from GP_PARTY_INPUT_SP, tReplaceParty where GP_PARTY_INPUT_SP.CKATPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'DSIO.CPARTY', tQueries.sQuery := 'update DSIO set DSIO.CPARTY = tReplaceParty.cPartyTo from DSIO, tReplaceParty where DSIO.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'INBOXP.CPARTY', tQueries.sQuery := 'update INBOXP set INBOXP.CPARTY = tReplaceParty.cPartyTo from INBOXP, tReplaceParty where INBOXP.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'GP_SPSTEP.CPARTY', tQueries.sQuery := 'update GP_SPSTEP set GP_SPSTEP.CPARTY = tReplaceParty.cPartyTo from GP_SPSTEP, tReplaceParty where GP_SPSTEP.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'SPMTRACT.CPARTY', tQueries.sQuery := 'update SPMTRACT set SPMTRACT.CPARTY = tReplaceParty.cPartyTo from SPMTRACT, tReplaceParty where SPMTRACT.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'RPJORN.CPARTY2', tQueries.sQuery := 'update RPJORN set RPJORN.CPARTY2 = tReplaceParty.cPartyTo from RPJORN, tReplaceParty where RPJORN.CPARTY2 = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'INVTAB.CPARTY', tQueries.sQuery := 'update INVTAB set INVTAB.CPARTY = tReplaceParty.cPartyTo from INVTAB, tReplaceParty where INVTAB.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'GP_HISTDMPARTY.CPARTY', tQueries.sQuery := 'update GP_HISTDMPARTY set GP_HISTDMPARTY.CPARTY = tReplaceParty.cPartyTo from GP_HISTDMPARTY, tReplaceParty where GP_HISTDMPARTY.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'RPJORN.CPARTY1', tQueries.sQuery := 'update RPJORN set RPJORN.CPARTY1 = tReplaceParty.cPartyTo from RPJORN, tReplaceParty where RPJORN.CPARTY1 = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'DORES.CPARTY', tQueries.sQuery := 'update DORES set DORES.CPARTY = tReplaceParty.cPartyTo from DORES, tReplaceParty where DORES.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'GP_BASEDOC.CPARTY', tQueries.sQuery := 'update GP_BASEDOC set GP_BASEDOC.CPARTY = tReplaceParty.cPartyTo from GP_BASEDOC, tReplaceParty where GP_BASEDOC.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'SPSOPR.CPARTY', tQueries.sQuery := 'update SPSOPR set SPSOPR.CPARTY = tReplaceParty.cPartyTo from SPSOPR, tReplaceParty where SPSOPR.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'SPORDER.CPARTY', tQueries.sQuery := 'update SPORDER set SPORDER.CPARTY = tReplaceParty.cPartyTo from SPORDER, tReplaceParty where SPORDER.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'SPSCHF.CPARTY', tQueries.sQuery := 'update SPSCHF set SPSCHF.CPARTY = tReplaceParty.cPartyTo from SPSCHF, tReplaceParty where SPSCHF.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'MBPIN.CPARTYF', tQueries.sQuery := 'update MBPIN set MBPIN.CPARTYF = tReplaceParty.cPartyTo from MBPIN, tReplaceParty where MBPIN.CPARTYF = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'MBPINV.CPARTY', tQueries.sQuery := 'update MBPINV set MBPINV.CPARTY = tReplaceParty.cPartyTo from MBPINV, tReplaceParty where MBPINV.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'SPSTEP.CPARTY', tQueries.sQuery := 'update SPSTEP set SPSTEP.CPARTY = tReplaceParty.cPartyTo from SPSTEP, tReplaceParty where SPSTEP.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'PRICES.CPARTY', tQueries.sQuery := 'update PRICES set PRICES.CPARTY = tReplaceParty.cPartyTo from PRICES, tReplaceParty where PRICES.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'BASEDOC.CPARTY', tQueries.sQuery := 'update BASEDOC set BASEDOC.CPARTY = tReplaceParty.cPartyTo from BASEDOC, tReplaceParty where BASEDOC.CPARTY = tReplaceParty.cPartyFrom ';
+  insert tQueries set tQueries.Name := 'oborot.kauos[1]', tQueries.sQuery := 'update oborot set oborot.kauos[1] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauos[1] = tReplaceParty.cPartyFrom and oborot.tblos[1] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauos[2]', tQueries.sQuery := 'update oborot set oborot.kauos[2] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauos[2] = tReplaceParty.cPartyFrom and oborot.tblos[2] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauos[3]', tQueries.sQuery := 'update oborot set oborot.kauos[3] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauos[3] = tReplaceParty.cPartyFrom and oborot.tblos[3] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauos[4]', tQueries.sQuery := 'update oborot set oborot.kauos[4] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauos[4] = tReplaceParty.cPartyFrom and oborot.tblos[4] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauos[5]', tQueries.sQuery := 'update oborot set oborot.kauos[5] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauos[5] = tReplaceParty.cPartyFrom and oborot.tblos[5] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauos[6]', tQueries.sQuery := 'update oborot set oborot.kauos[6] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauos[6] = tReplaceParty.cPartyFrom and oborot.tblos[6] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauks[1]', tQueries.sQuery := 'update oborot set oborot.kauks[1] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauks[1] = tReplaceParty.cPartyFrom and oborot.tblks[1] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauks[2]', tQueries.sQuery := 'update oborot set oborot.kauks[2] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauks[2] = tReplaceParty.cPartyFrom and oborot.tblks[2] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauks[3]', tQueries.sQuery := 'update oborot set oborot.kauks[3] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauks[3] = tReplaceParty.cPartyFrom and oborot.tblks[3] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauks[4]', tQueries.sQuery := 'update oborot set oborot.kauks[4] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauks[4] = tReplaceParty.cPartyFrom and oborot.tblks[4] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauks[5]', tQueries.sQuery := 'update oborot set oborot.kauks[5] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauks[5] = tReplaceParty.cPartyFrom and oborot.tblks[5] = 10';
+  insert tQueries set tQueries.Name := 'oborot.kauks[6]', tQueries.sQuery := 'update oborot set oborot.kauks[6] = tReplaceParty.cPartyTo from oborot, tReplaceParty where oborot.kauks[6] = tReplaceParty.cPartyFrom and oborot.tblks[6] = 10';
+  insert tQueries set tQueries.Name := 'mnplan.canval1', tQueries.sQuery := 'update mnplan set mnplan.canval1 = tReplaceParty.cPartyTo from mnplan, tReplaceParty where mnplan.canval1 = tReplaceParty.cPartyFrom and mnplan.wkodgr1 = 10';
+  insert tQueries set tQueries.Name := 'mnplan.canval2', tQueries.sQuery := 'update mnplan set mnplan.canval2 = tReplaceParty.cPartyTo from mnplan, tReplaceParty where mnplan.canval2 = tReplaceParty.cPartyFrom and mnplan.wkodgr2 = 10';
+  insert tQueries set tQueries.Name := 'mnplan.canval3', tQueries.sQuery := 'update mnplan set mnplan.canval3 = tReplaceParty.cPartyTo from mnplan, tReplaceParty where mnplan.canval3 = tReplaceParty.cPartyFrom and mnplan.wkodgr3 = 10';
+  insert tQueries set tQueries.Name := 'mnplan.canval4', tQueries.sQuery := 'update mnplan set mnplan.canval4 = tReplaceParty.cPartyTo from mnplan, tReplaceParty where mnplan.canval4 = tReplaceParty.cPartyFrom and mnplan.wkodgr4 = 10';
+  insert tQueries set tQueries.Name := 'mnplan.canval5', tQueries.sQuery := 'update mnplan set mnplan.canval5 = tReplaceParty.cPartyTo from mnplan, tReplaceParty where mnplan.canval5 = tReplaceParty.cPartyFrom and mnplan.wkodgr5 = 10';
+  insert tQueries set tQueries.Name := 'spmnplan.canval1', tQueries.sQuery := 'update spmnplan set spmnplan.canval1 = tReplaceParty.cPartyTo from spmnplan, tReplaceParty where spmnplan.canval1 = tReplaceParty.cPartyFrom and spmnplan.wkodgr1 = 10';
+  insert tQueries set tQueries.Name := 'spmnplan.canval2', tQueries.sQuery := 'update spmnplan set spmnplan.canval2 = tReplaceParty.cPartyTo from spmnplan, tReplaceParty where spmnplan.canval2 = tReplaceParty.cPartyFrom and spmnplan.wkodgr2 = 10';
+  insert tQueries set tQueries.Name := 'spmnplan.canval3', tQueries.sQuery := 'update spmnplan set spmnplan.canval3 = tReplaceParty.cPartyTo from spmnplan, tReplaceParty where spmnplan.canval3 = tReplaceParty.cPartyFrom and spmnplan.wkodgr3 = 10';
+  insert tQueries set tQueries.Name := 'spmnplan.canval4', tQueries.sQuery := 'update spmnplan set spmnplan.canval4 = tReplaceParty.cPartyTo from spmnplan, tReplaceParty where spmnplan.canval4 = tReplaceParty.cPartyFrom and spmnplan.wkodgr4 = 10';
+  insert tQueries set tQueries.Name := 'spmnplan.canval5', tQueries.sQuery := 'update spmnplan set spmnplan.canval5 = tReplaceParty.cPartyTo from spmnplan, tReplaceParty where spmnplan.canval5 = tReplaceParty.cPartyFrom and spmnplan.wkodgr5 = 10';
+  insert tQueries set tQueries.Name := 'spmnpl.canval1', tQueries.sQuery := 'update spmnpl set spmnpl.canval1 = tReplaceParty.cPartyTo from spmnpl, tReplaceParty where spmnpl.canval1 = tReplaceParty.cPartyFrom and spmnpl.wkodgr1 = 10';
+  insert tQueries set tQueries.Name := 'spmnpl.canval2', tQueries.sQuery := 'update spmnpl set spmnpl.canval2 = tReplaceParty.cPartyTo from spmnpl, tReplaceParty where spmnpl.canval2 = tReplaceParty.cPartyFrom and spmnpl.wkodgr2 = 10';
+  insert tQueries set tQueries.Name := 'spmnpl.canval3', tQueries.sQuery := 'update spmnpl set spmnpl.canval3 = tReplaceParty.cPartyTo from spmnpl, tReplaceParty where spmnpl.canval3 = tReplaceParty.cPartyFrom and spmnpl.wkodgr3 = 10';
+  insert tQueries set tQueries.Name := 'spmnpl.canval4', tQueries.sQuery := 'update spmnpl set spmnpl.canval4 = tReplaceParty.cPartyTo from spmnpl, tReplaceParty where spmnpl.canval4 = tReplaceParty.cPartyFrom and spmnpl.wkodgr4 = 10';
+  insert tQueries set tQueries.Name := 'spmnpl.canval5', tQueries.sQuery := 'update spmnpl set spmnpl.canval5 = tReplaceParty.cPartyTo from spmnpl, tReplaceParty where spmnpl.canval5 = tReplaceParty.cPartyFrom and spmnpl.wkodgr5 = 10';
+  insert tQueries set tQueries.Name := 'spmnpl.canval6', tQueries.sQuery := 'update spmnpl set spmnpl.canval6 = tReplaceParty.cPartyTo from spmnpl, tReplaceParty where spmnpl.canval6 = tReplaceParty.cPartyFrom and spmnpl.wkodgr6 = 10';
+  insert tQueries set tQueries.Name := 'spmnpl.canval7', tQueries.sQuery := 'update spmnpl set spmnpl.canval7 = tReplaceParty.cPartyTo from spmnpl, tReplaceParty where spmnpl.canval7 = tReplaceParty.cPartyFrom and spmnpl.wkodgr7 = 10';
+  insert tQueries set tQueries.Name := 'spmnpl.canval8', tQueries.sQuery := 'update spmnpl set spmnpl.canval8 = tReplaceParty.cPartyTo from spmnpl, tReplaceParty where spmnpl.canval8 = tReplaceParty.cPartyFrom and spmnpl.wkodgr8 = 10';
+  insert tQueries set tQueries.Name := 'spmnpl.canval9', tQueries.sQuery := 'update spmnpl set spmnpl.canval9 = tReplaceParty.cPartyTo from spmnpl, tReplaceParty where spmnpl.canval9 = tReplaceParty.cPartyFrom and spmnpl.wkodgr9 = 10';
+  insert tQueries set tQueries.Name := 'attrval.vcomp', tQueries.sQuery := 'update attrval set attrval.vcomp = tReplaceParty.cPartyTo from attrval, tReplaceParty where attrval.vcomp = tReplaceParty.cPartyFrom and attrval.cattrnam in (select nrec from attrnam where cotable=1430)';
+  insert tQueries set tQueries.Name := 'specmtr.cobj', tQueries.sQuery := 'update specmtr set specmtr.cobj = tReplaceParty.cPartyTo from specmtr, tReplaceParty where specmtr.cobj = tReplaceParty.cPartyFrom and specmtr.csaldtune = #comp(0A000000000001h)';
+  insert tQueries set tQueries.Name := 'SaldMoun.KauOs[1]', tQueries.sQuery := 'update SaldMoun set SaldMoun.KauOs[1] = tReplaceParty.cPartyTo from SaldMoun, tReplaceParty where SaldMoun.KauOs[1] = tReplaceParty.cPartyFrom and SaldMoun.TblOs[1] = 10';
+  insert tQueries set tQueries.Name := 'SaldMoun.KauOs[2]', tQueries.sQuery := 'update SaldMoun set SaldMoun.KauOs[2] = tReplaceParty.cPartyTo from SaldMoun, tReplaceParty where SaldMoun.KauOs[2] = tReplaceParty.cPartyFrom and SaldMoun.TblOs[2] = 10';
+  insert tQueries set tQueries.Name := 'SaldMoun.KauOs[3]', tQueries.sQuery := 'update SaldMoun set SaldMoun.KauOs[3] = tReplaceParty.cPartyTo from SaldMoun, tReplaceParty where SaldMoun.KauOs[3] = tReplaceParty.cPartyFrom and SaldMoun.TblOs[3] = 10';
+  insert tQueries set tQueries.Name := 'SaldMoun.KauOs[4]', tQueries.sQuery := 'update SaldMoun set SaldMoun.KauOs[4] = tReplaceParty.cPartyTo from SaldMoun, tReplaceParty where SaldMoun.KauOs[4] = tReplaceParty.cPartyFrom and SaldMoun.TblOs[4] = 10';
+  insert tQueries set tQueries.Name := 'SaldMoun.KauOs[5]', tQueries.sQuery := 'update SaldMoun set SaldMoun.KauOs[5] = tReplaceParty.cPartyTo from SaldMoun, tReplaceParty where SaldMoun.KauOs[5] = tReplaceParty.cPartyFrom and SaldMoun.TblOs[5] = 10';
+  insert tQueries set tQueries.Name := 'SaldMoun.KauOs[6]', tQueries.sQuery := 'update SaldMoun set SaldMoun.KauOs[6] = tReplaceParty.cPartyTo from SaldMoun, tReplaceParty where SaldMoun.KauOs[6] = tReplaceParty.cPartyFrom and SaldMoun.TblOs[6] = 10';
+  insert tQueries set tQueries.Name := 'SaldDay.KauOs[1]', tQueries.sQuery := 'update SaldDay set SaldDay.KauOs[1] = tReplaceParty.cPartyTo from SaldDay, tReplaceParty where SaldDay.KauOs[1] = tReplaceParty.cPartyFrom and SaldDay.TblOs[1] = 10';
+  insert tQueries set tQueries.Name := 'SaldDay.KauOs[2]', tQueries.sQuery := 'update SaldDay set SaldDay.KauOs[2] = tReplaceParty.cPartyTo from SaldDay, tReplaceParty where SaldDay.KauOs[2] = tReplaceParty.cPartyFrom and SaldDay.TblOs[2] = 10';
+  insert tQueries set tQueries.Name := 'SaldDay.KauOs[3]', tQueries.sQuery := 'update SaldDay set SaldDay.KauOs[3] = tReplaceParty.cPartyTo from SaldDay, tReplaceParty where SaldDay.KauOs[3] = tReplaceParty.cPartyFrom and SaldDay.TblOs[3] = 10';
+  insert tQueries set tQueries.Name := 'SaldDay.KauOs[4]', tQueries.sQuery := 'update SaldDay set SaldDay.KauOs[4] = tReplaceParty.cPartyTo from SaldDay, tReplaceParty where SaldDay.KauOs[4] = tReplaceParty.cPartyFrom and SaldDay.TblOs[4] = 10';
+  insert tQueries set tQueries.Name := 'SaldDay.KauOs[5]', tQueries.sQuery := 'update SaldDay set SaldDay.KauOs[5] = tReplaceParty.cPartyTo from SaldDay, tReplaceParty where SaldDay.KauOs[5] = tReplaceParty.cPartyFrom and SaldDay.TblOs[5] = 10';
+  insert tQueries set tQueries.Name := 'SaldDay.KauOs[6]', tQueries.sQuery := 'update SaldDay set SaldDay.KauOs[6] = tReplaceParty.cPartyTo from SaldDay, tReplaceParty where SaldDay.KauOs[6] = tReplaceParty.cPartyFrom and SaldDay.TblOs[6] = 10';
+
+  _loop tQueries
+  {
+    iNextVisual('Замена ссылок на партии: ' + tQueries.name);
+    if sqlExecDirect(tQueries.sQuery) = tsOK
+    {
+      tQueries.cnt := sqlRowCount;
+      update current tQueries;
+      iAtlProtocol.LogLine(APE_INFO, tQueries.name + '. Обновлено: ' + tQueries.cnt);
+    }
+    else
+    {
+      iAtlProtocol.LogLine(APE_ERROR, 'Ошибка запуска запроса замены ссылок: ' + tQueries.name);
+      exit;
+    }
+  }
+  iAtlProtocol.LogLine(APE_INFO, 'Замена ссылок завершена');
+  iAtlProtocol.LogCommit;
+  Result := true;
+}
+
+function RecalcSaldo: boolean;
+var logFileName: string;
+{
+  Result := false;
+  iAtlProtocol.LogMessage(APE_INFO, 'Пересчет сальдо');
+  iAtlProtocol.LogLine(APE_WARNING, 'Пересчет сальдо пока не готов');
+
+  mtClear(tntMCToRecalc, mfNormal);
+  if sqlSelectIntoByName('select distinct KatMC.nRec cMC, KatMC.BarKod barkod from tReplaceParty inner join KatParty on tReplaceParty.cPartyTo = KatParty.NRec inner join KatMC on KatParty.cMC = KatMC.Nrec', tntMCToRecalc) <> tsOK
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка выборки МЦ к пересчету');
+    exit;
+  }
+  iAtlProtocol.LogCommit;
+
+  //iAtlProtocol.LogMessage(APE_INFO, 'Баркоды МЦ к пересчету');
+  //_loop tMCToRecalc
+  //  iAtlProtocol.LogLine(APE_INFO, tMCToRecalc.barkod);
+  logFileName := GetStringParameter('Files','OutputFilesDirectory',0)+ '\GP_MassJoinParty.log';
+  DeleteFile(logFileName);
+  LogStrToFile(logFileName, 'Баркоды МЦ к пересчету');
+  _loop tMCToRecalc
+    LogStrToFile(logFileName,tMCToRecalc.barkod);
+  ProcessText(logFileName, vfMacroSize, '');
+  Result := true;
+}
+
+function MergeAttrs: boolean;
+var cnt: longint;
+{
+  Result := false;
+  iAtlProtocol.LogMessage(APE_INFO, 'Замена атрибутов');
+  iNextVisual('Замена атрибутов');
+
+  _loop AttrNam where ((coKatParty == AttrNam.wTable))
+  {
+    iNextVisual('Замена атрибутов ' + AttrNam.Name);
+    cnt := 0;
+
+    mtClear(tntMoveAttr, mfNormal);
+    var objQuery: IQuery = queryManager.createQuery(SqlQuery(.
+      select tReplaceParty.cPartyFrom, tReplaceParty.cPartyTo from tReplaceParty
+      inner join AttrVal avFrom on avFrom.wTable = :(coKatParty) and tReplaceParty.cPartyFrom = avFrom.cRec and avFrom.cAttrNam = :(AttrNam.NRec)
+      left  join AttrVal avTo   on avTo.wTable   = :(coKatParty) and tReplaceParty.cPartyTo   = avTo.cRec   and avTo.cAttrNam   = :(AttrNam.NRec)
+      where avTo.NRec is null or :(AttrNam.AttrType) = :(cgAttrType_Comp) and avTo.vComp = #comp(0) and avFrom.vComp <> #comp(0)
+    .));
+    if (objQuery.execute.errorCode = tsOk)
+      sqlCopyInto(objQuery, tntMoveAttr, true);
+
+    _loop tMoveAttr
+    {
+      if not NextVisual
+        exit;
+      if getfirst AttrVal2 where ((coKatParty == AttrVal2.wTable and tMoveAttr.cPartyFrom == AttrVal2.cRec and AttrNam.NRec == AttrVal2.cAttrNam)) <> tsOK
+        continue;
+
+      if getfirst AttrVal where ((coKatParty == AttrVal.wTable and tMoveAttr.cPartyTo == AttrVal.cRec and AttrNam.NRec == AttrVal.cAttrNam)) <> tsOK
+      {
+        AttrVal2.NRec := 0;
+        AttrVal2.cRec := tMoveAttr.cPartyTo;
+        insert current AttrVal2;
+        cnt++;
+      }
+      else
+      {
+        AttrVal.vComp := AttrVal2.vComp;
+        update current AttrVal;
+        cnt++;
+      }
+    }
+    iAtlProtocol.LogLine(APE_INFO, AttrNam.Name + ': ' + cnt);
+  }
+  iAtlProtocol.LogCommit;
+  Result := true;
+}
+
+function GetZnpPartiesToDel: boolean;
+{
+  Result := false;
+  iNextVisual('Поиск партий');
+  NextVisual;
+  iAtlProtocol.LogMessage(APE_INFO, 'Поиск партий');
+
+  var res: longint = sqlCreateTmpTable('table tReplaceParty (cPartyFrom: comp, cPartyTo: comp) with index (i1 = cPartyFrom);', ctmNormal);
+  if res <> tsOK
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка создания временной таблицы: ' + res);
+    exit;
+  }
+  NextVisual;
+  var objQuery: IQuery = queryManager.createQuery(SqlQuery(.
+    insert into tReplaceParty (cPartyFrom, cPartyTo)
+    select KatParty.NRec, KatParty.NRec
+    from KatParty
+    where KatParty.cGroupParty = #comp(3096224743817223) and (
+      (select count(*) from DOCSKAU where  DOCSKAU.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SOPRORDB where  SOPRORDB.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SPINVTAB where  SPINVTAB.CPARTY  = KatParty.Nrec )
+    + (select count(*) from CARDSN where  CARDSN.CPARTY  = KatParty.Nrec )
+    + (select count(*) from EM_SPSOPR_EXT where  EM_SPSOPR_EXT.CPARTYON  = KatParty.Nrec )
+    + (select count(*) from GP_PARTY_INPUT where  GP_PARTY_INPUT.CKATPARTY  = KatParty.Nrec )
+    + (select count(*) from GP_PARTY_INPUT_SP where  GP_PARTY_INPUT_SP.CKATPARTY  = KatParty.Nrec )
+    + (select count(*) from DSIO where  DSIO.CPARTY  = KatParty.Nrec )
+    + (select count(*) from INBOXP where  INBOXP.CPARTY  = KatParty.Nrec )
+    + (select count(*) from GP_SPSTEP where  GP_SPSTEP.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SPMTRACT where  SPMTRACT.CPARTY  = KatParty.Nrec )
+    + (select count(*) from RPJORN where  RPJORN.CPARTY2  = KatParty.Nrec )
+    + (select count(*) from INVTAB where  INVTAB.CPARTY  = KatParty.Nrec )
+    + (select count(*) from GP_HISTDMPARTY where  GP_HISTDMPARTY.CPARTY  = KatParty.Nrec )
+    + (select count(*) from RPJORN where  RPJORN.CPARTY1  = KatParty.Nrec )
+    + (select count(*) from DORES where  DORES.CPARTY  = KatParty.Nrec )
+    + (select count(*) from GP_BASEDOC where  GP_BASEDOC.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SPSOPR where  SPSOPR.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SPORDER where  SPORDER.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SPSCHF where  SPSCHF.CPARTY  = KatParty.Nrec )
+    + (select count(*) from MBPIN where  MBPIN.CPARTYF  = KatParty.Nrec )
+    + (select count(*) from MBPINV where  MBPINV.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SPSTEP where  SPSTEP.CPARTY  = KatParty.Nrec )
+    + (select count(*) from PRICES where  PRICES.CPARTY  = KatParty.Nrec )
+    + (select count(*) from BASEDOC where  BASEDOC.CPARTY  = KatParty.Nrec )
+    + (select count(*) from oborot where  oborot.kauos[1]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblos[1] = 10)
+    + (select count(*) from oborot where  oborot.kauos[2]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblos[2] = 10)
+    + (select count(*) from oborot where  oborot.kauos[3]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblos[3] = 10)
+    + (select count(*) from oborot where  oborot.kauos[4]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblos[4] = 10)
+    + (select count(*) from oborot where  oborot.kauos[5]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblos[5] = 10)
+    + (select count(*) from oborot where  oborot.kauos[6]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblos[6] = 10)
+    + (select count(*) from oborot where  oborot.kauks[1]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblks[1] = 10)
+    + (select count(*) from oborot where  oborot.kauks[2]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblks[2] = 10)
+    + (select count(*) from oborot where  oborot.kauks[3]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblks[3] = 10)
+    + (select count(*) from oborot where  oborot.kauks[4]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblks[4] = 10)
+    + (select count(*) from oborot where  oborot.kauks[5]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblks[5] = 10)
+    + (select count(*) from oborot where  oborot.kauks[6]  = KatParty.Nrec and oborot.cPlansSch in (#comp(010001h), #comp(010002h)) and oborot.tblks[6] = 10)
+    + (select count(*) from specmtr where  specmtr.cobj  = KatParty.Nrec and specmtr.csaldtune = #comp(0A000000000001h))
+    + (select count(*) from SaldMoun where  SaldMoun.KauOs[1]  = KatParty.Nrec and SaldMoun.cPlansSch in (#comp(010001h), #comp(010002h)) and SaldMoun.TblOs[1] = 10)
+    + (select count(*) from SaldMoun where  SaldMoun.KauOs[2]  = KatParty.Nrec and SaldMoun.cPlansSch in (#comp(010001h), #comp(010002h)) and SaldMoun.TblOs[1] = 10)
+    + (select count(*) from SaldMoun where  SaldMoun.KauOs[3]  = KatParty.Nrec and SaldMoun.cPlansSch in (#comp(010001h), #comp(010002h)) and SaldMoun.TblOs[1] = 10)
+    + (select count(*) from SaldMoun where  SaldMoun.KauOs[4]  = KatParty.Nrec and SaldMoun.cPlansSch in (#comp(010001h), #comp(010002h)) and SaldMoun.TblOs[1] = 10)
+    + (select count(*) from SaldMoun where  SaldMoun.KauOs[5]  = KatParty.Nrec and SaldMoun.cPlansSch in (#comp(010001h), #comp(010002h)) and SaldMoun.TblOs[1] = 10)
+    + (select count(*) from SaldMoun where  SaldMoun.KauOs[6]  = KatParty.Nrec and SaldMoun.cPlansSch in (#comp(010001h), #comp(010002h)) and SaldMoun.TblOs[1] = 10)
+    + (select count(*) from SALDOFND where  SALDOFND.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SALDOMC where  SALDOMC.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SALDORAZ where  SALDORAZ.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SALDOOBJ where  SALDOOBJ.CPARTY  = KatParty.Nrec )
+    + (select count(*) from TEKSALDO where  TEKSALDO.CPARTY  = KatParty.Nrec )
+    + (select count(*) from SALDOBOX where  SALDOBOX.CPARTY  = KatParty.Nrec )
+    ) = 0
+.));
+  if (objQuery.execute.errorCode = tsOk)
+    iAtlProtocol.LogLine(APE_INFO, 'Найдено партий к удалению: ' + objQuery.rowCount);
+  else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка поиска партий к удалению: ' + objQuery.errorCode);
+    exit;
+  }
+  iAtlProtocol.LogCommit;
+  Result := true;
+}
+
+function DelParties: boolean;
+{
+  Result := false;
+  iNextVisual('Удаление партий');
+  iAtlProtocol.LogMessage(APE_INFO, 'Удаление партий');
+  var objQuery: IQuery = queryManager.createQuery(SqlQuery(.
+    delete AttrVal where AttrVal.wTable = :(coKatParty) and AttrVal.cRec in (select tReplaceParty.cPartyFrom from tReplaceParty)
+  .));
+  if (objQuery.execute.errorCode = tsOk)
+    iAtlProtocol.LogLine(APE_INFO, 'Удалено значений атрибутов: ' + objQuery.rowCount);
+  else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка удаления значений атрибутов: ' + objQuery.errorCode);
+    exit;
+  }
+  objQuery := queryManager.createQuery(SqlQuery(.
+    delete ExClassVal where ExClassVal.wTable = :(coKatParty) and ExClassVal.cRec in (select tReplaceParty.cPartyFrom from tReplaceParty)
+  .));
+  if (objQuery.execute.errorCode = tsOk)
+    iAtlProtocol.LogLine(APE_INFO, 'Удалено значений классификаторов: ' + objQuery.rowCount);
+  else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка удаления значений классификаторов: ' + objQuery.errorCode);
+    exit;
+  }
+  objQuery := queryManager.createQuery(SqlQuery(.
+    delete KatParty where KatParty.NRec in (select tReplaceParty.cPartyFrom from tReplaceParty)
+  .));
+  if (objQuery.execute.errorCode = tsOk)
+    iAtlProtocol.LogLine(APE_INFO, 'Удалено партий: ' + objQuery.rowCount);
+  else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка удаления партий: ' + objQuery.errorCode);
+    exit;
+  }
+  iAtlProtocol.LogCommit;
+  Result := true;
+}
+
+function GetPartyGroups: boolean;
+var res: longint;
+{
+  Result := false;
+  iNextVisual('Проверка групп партий');
+  iAtlProtocol.LogMessage(APE_INFO, 'Проверка групп партий');
+  res := sqlCreateTmpTableAs('tPartyGrpChanges', tntPartyGrpChanges, ctmNormal);
+  NextVisual;
+  if res <> tsOK
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка создания таблицы: ' + res);
+    exit;
+  }
+  NextVisual;
+  var objQuery: IQuery = queryManager.createQuery(SqlQuery(.
+    insert into tPartyGrpChanges (NRec, Kod, Name, KodGroup, cAttr, doAttr, cSoprMnf, cSoprIn, wChangeGroup, wChangeAttr) select * from
+    (
+      select 
+        KatParty.NRec
+      , KatParty.Kod
+      , KatParty.Name
+      , coalesce(GroupParty.Kod, '') KodGroup
+      , coalesce(AttrVal.NRec, #comp(0)) cAttr
+      , coalesce(AttrVal.vDouble, 0.0) doAttr
+      , coalesce(KatSoprMnf.NRec, #comp(0)) cSoprMnf
+      , coalesce(KatSoprIn.NRec, #comp(0)) cSoprIn
+      , case
+          when coalesce(GroupParty.Kod, '') = 'ПР' and KatSoprMnf.NRec is not null then 1
+          when coalesce(GroupParty.Kod, '') in ('ПВ', 'ПФ', 'ВК') and KatSoprMnf.NRec is null then 2
+          when GroupParty.Kod is null and KatSoprIn.NRec is not null then 3
+          else 0
+        end wChangeGroup: word
+      , case
+          when coalesce(GroupParty.Kod, '') = 'ПР' and KatSoprMnf.NRec is not null and coalesce(AttrVal.vDouble, 0.0) <> 0 then 0
+          when coalesce(GroupParty.Kod, '') = 'ПР' and KatSoprMnf.NRec is null and coalesce(AttrVal.vDouble, 0.0) = 0 then 1
+          when coalesce(GroupParty.Kod, '') in ('ПВ', 'ПФ', 'ВК') and KatSoprMnf.NRec is not null and coalesce(AttrVal.vDouble, 0.0) <> 0 then 0
+          when coalesce(GroupParty.Kod, '') in ('ПВ', 'ПФ', 'ВК') and KatSoprMnf.NRec is null and coalesce(AttrVal.vDouble, 0.0) <> 1 then 1
+          when GroupParty.Kod is null and KatSoprIn.NRec is not null and coalesce(AttrVal.vDouble, 0.0) <> 0 then 0
+          else 99
+        end wChangeAttr: word
+      from KatParty
+      left join GroupParty on KatParty.cGroupParty = GroupParty.NRec
+      left join AttrNam on AttrNam.wTable = 1430 and AttrNam.Name = 'Из производства'
+      left join AttrVal on AttrVal.wTable = 1430 and AttrVal.cRec = KatParty.Nrec and AttrVal.cAttrNam = AttrNam.NRec
+      outer apply
+      (
+        select top 1 KatSopr.NRec
+        from KatSopr
+        inner join SpSopr on SpSopr.cSopr = KatSopr.NRec
+        left join SoprHoz on SoprHoz.TiDkGal = KatSopr.VidSopr and SoprHoz.cSoprDoc = KatSopr.NRec
+        left join Oborot on Oborot.cSoprHoz = SoprHoz.NRec
+        left join PlansSch on Oborot.cPlansSch = PlansSch.NRec
+        where KatSopr.VidSopr = 502 and SpSopr.cParty = KatParty.NRec and (PlansSch.Kod = '0' and SoprHoz.cHozOper <> #comp(0) or KatSopr.dSopr >= #date(03, 12, 2020))
+      ) KatSoprMnf
+      outer apply
+      (
+        select top 1 KatSopr.NRec
+        from KatSopr
+        inner join SpSopr on SpSopr.cSopr = KatSopr.NRec
+        where KatSopr.VidSopr = 101 and SpSopr.cParty = KatParty.NRec
+      ) KatSoprIn
+      where 
+      GroupParty.Kod is null or GroupParty.Kod in ('ПР', 'ПВ', 'ВК', 'ПФ')
+    ) tParties
+    where tParties.wChangeGroup <> 0 or tParties.wChangeAttr <> 99
+  .));
+  NextVisual;
+  if (objQuery.execute.errorCode = tsOk)
+    iAtlProtocol.LogLine(APE_INFO, 'Найдено партий к изменению: ' + objQuery.rowCount);
+  else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка выборки партий к изменению: ' + objQuery.errorCode);
+    exit;
+  }
+  NextVisual;
+
+  //res := ReinitTableAsTmp(tntPartyGrpChanges, 'tPartyGrpChanges');
+  //Было бы красиво, но Runtime при попытке _loop
+  res := sqlSelectIntoByName('select * from tPartyGrpChanges', tntPartyGrpChanges);
+  if res <> tsOK
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка получения временной таблицы: ' + res);
+    exit;
+  }
+
+  iAtlProtocol.LogCommit;
+  Result := true;
+}
+
+function PrintGrpPartyChanges: boolean;
+var i, j, rows, cols: longint;
+{
+  Result := false;
+  iNextVisual('Формирование протокола');
+  iAtlProtocol.LogMessage(APE_INFO, 'Формирование протокола');
+  rows := RecordsInTable(tntPartyGrpChanges) + 1;
+  cols := 6;
+  XLCREATEEXCEL('', true);
+  XLSETNUMBERFORMAT('@', 1, 1, rows, cols);
+  XLCREATEMATRIX(rows, cols);
+  i := 1;
+  j := 0;
+  XLSTWRITETOMATRIX(i, ++j, 'Код');
+  XLSTWRITETOMATRIX(i, ++j, 'Наименование');
+  XLSTWRITETOMATRIX(i, ++j, 'Группа текущая');
+  XLSTWRITETOMATRIX(i, ++j, 'Атрибут текущий');
+  XLSTWRITETOMATRIX(i, ++j, 'Группа новая');
+  XLSTWRITETOMATRIX(i, ++j, 'Атрибут новый');
+  XLSETFONTSTYLE(xlBold, 1, 1, 1, cols);
+  _loop tPartyGrpChanges
+  {
+    ++i;
+    j := 0;
+    XLSTWRITETOMATRIX(i, ++j, tPartyGrpChanges.Kod);
+    XLSTWRITETOMATRIX(i, ++j, tPartyGrpChanges.Name);
+    XLSTWRITETOMATRIX(i, ++j, tPartyGrpChanges.KodGroup);
+    XLDOWRITETOMATRIX(i, ++j, tPartyGrpChanges.doAttr);
+    XLSTWRITETOMATRIX(i, ++j, icase(tPartyGrpChanges.wChangeGroup; tPartyGrpChanges.KodGroup, 'ПВ', 'ПР', 'Ком'));
+    XLSTWRITETOMATRIX(i, ++j, if(tPartyGrpChanges.wChangeAttr = 99, string(tPartyGrpChanges.doAttr, 0, 0), tPartyGrpChanges.wChangeAttr));
+  }
+  XLWRITEMATRIXTOEXCEL(1, 1);
+  XLFREEMATRIX;
+  XLKILLEXCEL;
+  iAtlProtocol.LogCommit;
+  Result := message(RecordsInTable(tntPartyGrpChanges) + ' партий к изменению. Продолжить?', Confirmation + YesNo) = cmYes;
+}
+
+function ChangePartyGroups: boolean;
+var cPV, cPR, cKom, cANam: comp;
+{
+  Result := false;
+  iNextVisual('Актуализация групп партий');
+  iAtlProtocol.LogMessage(APE_INFO, 'Актуализация групп партий');
+  if getfirst GroupParty where (('ПВ' == GroupParty.Kod)) <> tsOK
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Не найдена группа партий ПВ');
+    exit;
+  }
+  cPV := GroupParty.NRec;
+  if getfirst GroupParty where (('ПР' == GroupParty.Kod)) <> tsOK
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Не найдена группа партий ПР');
+    exit;
+  }
+  cPR := GroupParty.NRec;
+  if getfirst GroupParty where (('Ком' == GroupParty.Kod)) <> tsOK
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Не найдена группа партий Ком');
+    exit;
+  }
+  cKom := GroupParty.NRec;
+  cANam := ExtAttr_ID(coKatParty, 'Из производства');
+
+  var objQuery: IQuery = queryManager.createQuery(SqlQuery(.
+    update KatParty set KatParty.cGroupParty = case tPartyGrpChanges.wChangeGroup 
+      when 1 then :(cPV)
+      when 2 then :(cPR)
+      when 3 then :(cKom)
+    end
+    from KatParty, tPartyGrpChanges where KatParty.NRec = tPartyGrpChanges.NRec and tPartyGrpChanges.wChangeGroup <> 0
+  .));
+  NextVisual;
+  if (objQuery.execute.errorCode = tsOk)
+    iAtlProtocol.LogLine(APE_INFO, 'Изменено групп партий: ' + objQuery.rowCount);
+  else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка изменения групп партий: ' + objQuery.errorCode);
+    exit;
+  }
+
+  objQuery := queryManager.createQuery(SqlQuery(.
+    update AttrVal set AttrVal.vDouble = tPartyGrpChanges.wChangeAttr
+    from AttrVal, tPartyGrpChanges where AttrVal.NRec = tPartyGrpChanges.cAttr and tPartyGrpChanges.wChangeAttr <> 99
+  .));
+  NextVisual;
+  if (objQuery.execute.errorCode = tsOk)
+    iAtlProtocol.LogLine(APE_INFO, 'Изменено атрибутов: ' + objQuery.rowCount);
+  else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка изменения атрибутов: ' + objQuery.errorCode);
+    exit;
+  }  
+
+  objQuery := queryManager.createQuery(SqlQuery(.
+    insert AttrVal (wTable, cRec, cAttrNam, vDouble)
+    select 1430, tPartyGrpChanges.NRec, :(cANam), tPartyGrpChanges.wChangeAttr from tPartyGrpChanges where tPartyGrpChanges.cAttr = #comp(0) and tPartyGrpChanges.wChangeAttr <> 99
+  .));
+  NextVisual;
+  if (objQuery.execute.errorCode = tsOk)
+    iAtlProtocol.LogLine(APE_INFO, 'Добавлено атрибутов: ' + objQuery.rowCount);
+  else
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Ошибка добавления атрибутов: ' + objQuery.errorCode);
+    exit;
+  }  
+
+  iAtlProtocol.LogCommit;
+  Result := true;
+}
+
+function ChangeGroupKomGoz(mParty: TPtr): boolean;
+var cKom, cGoz, cRec, cAttrPartyIGK: comp;
+    i, cnt: longint;
+{
+  Result := false;
+  iNextVisual('Возврат партий на Ком. и Гоз.');
+  iAtlProtocol.LogMessage(APE_INFO, 'Возврат партий на Ком. и Гоз.');
+
+  cAttrPartyIGK := ExtAttr_ID(coKatParty, VA_KatParty_IGK);
+  if getfirst GroupParty where (('Ком' == GroupParty.Kod)) <> tsOK
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Не найдена группа партий Ком');
+    exit;
+  }
+  cKom := GroupParty.NRec;
+  if getfirst GroupParty where (('ГОЗ' == GroupParty.Kod)) <> tsOK
+  {
+    iAtlProtocol.LogLine(APE_ERROR, 'Не найдена группа партий ГОЗ');
+    exit;
+  }
+  cGoz := GroupParty.NRec;
+
+  cnt := 0;
+  for (i := 0; i < GetMarkerCount(mParty); i++)
+  {
+    GetMarker(mParty, i, cRec);
+    if getfirst fastfirstrow KatParty where ((cRec == KatParty.NRec)) <> tsOk
+    {
+      iAtlProtocol.LogLine(APE_ERROR, 'Не найдена партия с NRec = ' + cRec);
+      continue;
+    }
+    if sGetAttrID(coKatParty, cRec, cAttrPartyIGK) <> ''
+      KatParty.cGroupParty := cGoz;
+    else
+      KatParty.cGroupParty := cKom;
+    update current KatParty;
+    cnt++;
+  }
+  iAtlProtocol.LogLine(APE_INFO, 'Изменено партий: ' + cnt);
+
+  iAtlProtocol.LogCommit;
+  Result := true;
+}
+
+handleEvent
+  cmPick:
+  {
+    case curField of
+      #sXls: set sXls := GetFileName('*.xlsx', 'Файл выгрузки из ESB');
+      #sXls2: set sXls2 := GetFileName('*.xlsx', 'Файл c NREC для замены группы на Ком и Гоз');
+    end;
+  }
+  cmRunJoin:
+  {
+    if wActions = 0
+    {
+      message('Выберитие действие!', Warning);
+      exit;
+    }
+    iAtlProtocol.Clear;
+    iAtlProtocol.Visible := true;
+    StartNewVisual(vtRotateVisual, vfTimer, 'Обработка партий', 0);
+    if (wActions and 0111b) <> 0
+      if LoadExcelFile
+      {
+        if sqlFlushIntoTmp(tntReplaceParty, 'tReplaceParty', FIT_Create) <> tsOK
+        {
+          iAtlProtocol.LogLine(APE_ERROR, 'Ошибка выгрузки таблицы tReplaceParty');
+          exit;
+        }
+        var f: boolean = true;
+        if (wActions and 001b) <> 0
+        {
+          if f 
+            f := ReplacePartyLinks;
+          if f 
+            f := RecalcSaldo;
+        }
+        if (wActions and 010b) <> 0
+          if f 
+            f := MergeAttrs;
+        if (wActions and 100b) <> 0
+          if f 
+            f := DelParties;
+        sqlDropTmpTable('tReplaceParty');
+      }
+    if (wActions and 01000b) <> 0
+    {
+      if GetZnpPartiesToDel
+        DelParties;
+    }
+    if (wActions and 10000b) <> 0
+    {
+      if GetPartyGroups
+        if PrintGrpPartyChanges
+          ChangePartyGroups;
+    }
+    if (wActions and 100000b) <> 0
+    {
+      var mParty: TPtr = InitMarker('', 8, 1, 1);
+      if LoadExcelFile2(mParty)
+        ChangeGroupKomGoz(mParty);
+      DoneMarker(mParty, '');
+    }
+    StopVisual;
+    CloseInterface(cmDefault);
+  }
+end;
+
+end.

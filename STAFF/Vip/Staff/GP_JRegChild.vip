@@ -1,0 +1,589 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                "Журнал учета детей и внуков работников (ЭМ)"                                    *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#230          |21/12/17|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include UserReport.vih
+#include ComFiltr.vih
+#include CatFunc.vih
+#include ExtAttr.Vih
+#include StrFunc.vih
+#include GP_AppChange.vih
+#include GP_XlOutExt.vih
+#include GP_ChRPD.vih
+#include APPFUNCS.VIH
+#include AdrFunc.vih
+
+#define GPInt GP_JRegChild // #(GPInt)
+#define GPNam Журнал учета детей и внуков работников // #(GPNam)
+
+Interface #(GPInt) '#(GPNam) (ЭМ)' EscClose, Gray;
+  show (,,86,16);
+
+const
+#include Excel.inc;
+end;
+#include ExtAttr.var
+
+table struct ttPerFlt // для фильтра по персоналу
+(
+  cRecPers : comp
+)
+with index
+(
+  ttPerFlt01  = cRecPers
+);
+
+table struct ttChildFlt // для фильтра по детям/внукам ttChildFlt.cRecChild
+(
+  cRecChild : comp
+, sNamChild : string
+)
+with index
+(
+  ttChildFlt01  = cRecChild
+);
+
+table struct ttResStr
+(
+  nRec      : comp
+, cRecPers  : comp        
+, cRecLink  : comp        
+, sTbNmb    : string
+, sFIO      : string
+, dBornPSN  : date  
+, sDept     : string
+, sStepRodst: string
+, sFIOChild : string
+, dBornChild: date  
+, sAgeChild : string
+, sSvidRozh : string
+, sPolisOMS : string
+, sAddrTemp : string
+, sAddrBase : string
+, sAddrSch  : string
+, sIsCh     : string
+)
+with index
+(
+  ttResStr00 = nRec(Surrogate)
+, ttResStr01 = cRecPers + cRecLink
+, ttResStr02 = sFIO + dBornChild
+, ttResStr03 = sStepRodst + sFIOChild + dBornChild
+);
+
+var
+  dEnd          : date;
+  dBPer,dEPer   : date;
+  VCommonFiltr  : CommonFiltr; // Для встраивания фильтра по подразделениям / сотрудникам
+  MadeReport    : boolean;
+  iModeRep      : integer;
+  cPersNRec     : comp;
+  PersMarker    : TPtr;
+  iCatFunc      : CatalogsFunctions;
+  ExtAttr       : iExtAttr;
+  iAppFuncs     : AppointmentsFunctions;
+  iStrFunc      : StringFunctions;  //отключено
+  iAppCh        : GP_AppChange;
+  iOut          : GP_XlOutExt;
+  iChRPD        : GP_ChRPD;
+  iAdrFunc      : AddressFunc;
+
+  cPolisOMS
+, cAddrTemp
+, cAddrBase
+, cAddrSch      
+, cBornSvid     
+, cCatChild     : comp;
+  sFullName     : string;
+  lRB, lRE,
+  lCB, lCE,
+  lSB, lSE,
+  lDB, lDE,
+  lRow          : longint;
+  sRodstUni
+ ,sFIOUni       : string;
+  dBornUni      : date;
+  cAppoint      : comp;
+
+create view
+from
+  persons
+, appointments
+, contdoc
+, psnlinks
+, SYS_UDER //тут свидетельство о рождении и паспорт ребенка.
+//, AddressN
+//, STerr
+, ttPerFlt
+, ttResStr
+, ttResStr ttResStrOne
+, ttChildFlt
+, catalogs catchild
+, ContDoc CDoc8
+, Appointments App8
+, ContDoc CDoc1
+, Appointments App1
+where
+((
+     ttPerFlt.cRecPers == persons.nrec
+and           cAppoint == appointments.nrec
+and  appointments.nrec == contdoc.CSTR
+and       persons.nrec == psnlinks.FROMPERSON
+and      psnlinks.nRec == SYS_UDER.CEX
+and                '2' == SYS_UDER.NMNEM and (SYS_UDER.CHOZOPER = cBornSvid)
+//and      psnlinks.nRec == AddressN.cPerson
+//and                  6 == AddressN.ObjType
+//and    AddressN.cSTerr == STerr.nRec
+and  psnlinks.LinkType == ttChildFlt.cRecChild
+and  sRodstUni         == ttResStrOne.sStepRodst
+and  sFIOUni           == ttResStrOne.sFIOChild 
+and  dBornUni          == ttResStrOne.dBornChild
+//appoints and dismiss
+and ttPerFlt.cRecPers == CDoc8.Person
+and integer(8) == CDoc8.TypeOper
+and CDoc8.cStr == App8.nRec and (App8.DismissDate >= dBPer and App8.DismissDate <= dEPer)
+and ttPerFlt.cRecPers == CDoc1.Person
+and integer(1) == CDoc1.TypeOper
+and CDoc1.cStr == App1.nRec and (App1.AppointDate >= dBPer and App1.AppointDate <= dEPer and App1.lPrizn = 0)
+
+))
+;
+
+procedure initChildren;
+{
+  //Полис ОМС ребенка (члена семьи)
+  cPolisOMS := ExtAttr.AttrId(coPsnLinks,'Полис ОМС ребенка (члена семьи)');
+  if cPolisOMS = 0
+    if message('Атрибут Полис ОМС ребенка (члена семьи) не существует.'+chr(13)+'Создать?',yesNo) = cmYes
+      cPolisOMS := ExtAttr.CreateAttr(coPsnLinks,'Полис ОМС ребенка (члена семьи)', cgAttrType_Str);
+
+  //Адрес временного места пребывания ребенка (члена семьи)
+  cAddrTemp := ExtAttr.AttrId(coPsnLinks,'Адрес временного места пребывания ребенка (члена семьи)');
+  if cAddrTemp = 0
+    if message('Атрибут Адрес временного места пребывания ребенка (члена семьи) не существует.'+chr(13)+'Создать?',yesNo) = cmYes
+      cAddrTemp := ExtAttr.CreateAttr(coPsnLinks,'Адрес временного места пребывания ребенка (члена семьи)', cgAttrType_Str);
+
+  //Постоянное место проживания родственника 
+  cAddrBase := ExtAttr.AttrId(coPsnLinks,'Постоянное место проживания родственника');
+  if cAddrBase = 0
+    if message('Атрибут Постоянное место проживания родственника не существует.'+chr(13)+'Создать?',yesNo) = cmYes
+      cAddrBase := ExtAttr.CreateAttr(coPsnLinks,'Постоянное место проживания родственника', cgAttrType_Str);
+
+
+  //Адрес школы (дет.сад) ребенка
+  cAddrSch := ExtAttr.AttrId(coPsnLinks,'Адрес школы (дет.сад) ребенка');
+  if cAddrSch = 0
+    if message('Атрибут Адрес школы (дет.сад) ребенка не существует.'+chr(13)+'Создать?',yesNo) = cmYes
+      cAddrSch := ExtAttr.CreateAttr(coPsnLinks,'Адрес школы (дет.сад) ребенка', cgAttrType_Str);
+
+  //Документ свидетельство о рождении
+  cBornSvid := iCatFunc.GetCatalogsNRec(-3);
+  if getfirst CatChild where((0 == CatChild.lpr and cBornSvid == CatChild.MainLink and '03' == CatChild.Code)) = tsOk 
+    cBornSvid := catchild.nRec;
+  
+  //Группа ДЕТИ
+  cCatChild := iCatFunc.GetCatalogsNRec(-16);
+  if getfirst CatChild where((0 == CatChild.lpr and cCatChild == CatChild.MainLink and 'Дети' == CatChild.Name)) = tsOk 
+    cCatChild := CatChild.nrec;
+  _loop CatChild where((0 == CatChild.lpr and cCatChild == CatChild.cParent))
+  {
+    clearbuffer(#ttChildFlt);
+    ttChildFlt.cRecChild := CatChild.nRec;
+    ttChildFlt.sNamChild := CatChild.Name;
+    insert current ttChildFlt;
+  }
+}
+
+function isChildrenOnDate(dBorn, dCompare : date) : boolean;
+{
+  dBorn := add_Months(dBorn,216);
+  if dBorn > dCompare {isChildrenOnDate:=true;} else {isChildrenOnDate:=false;}
+}
+
+function sFPF : string; {sFPF := DateToStr(Cur_Date(),'_YYMMDD')+TimeToStr(Cur_Time(),'_HHMMSS');}
+
+function isNotCorrect : boolean;
+{
+  result := true;
+  if iModeRep = 0
+    result := false;
+  if iModeRep = 1
+  {
+    if isvalid(#CDoc8)
+      _loop CDoc8
+        if isvalid(#App8)
+          if iChRPD.isConfirmed(CDoc8.nRec)
+            result := false;
+    if result and (Persons.DisDate<>0)
+      if iStrFunc.isHitPeriod(dBPer,dEPer,Persons.DisDate)
+        result := false;
+  }
+  if iModeRep = 2
+  {
+    if isvalid(#CDoc1)
+      _loop CDoc1
+        if isvalid(#App1)
+          if iChRPD.isConfirmed(CDoc1.nRec)
+            result := false;
+    if result and (Persons.AppDate<>0)
+      if iStrFunc.isHitPeriod(dBPer,dEPer,Persons.AppDate)
+        result := false;
+  }
+}
+
+procedure Run;
+{
+  var kol, i    : integer;
+  var cPersNRec : comp;
+  var sAgeT     : string;
+  var dAge      : date;
+  var wDays, wMonths, wYears : word;
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+
+  if (VCommonFiltr.GetPsnCount = 0)
+    VCommonFiltr.SelectAllPsn;
+
+  PersMarker := InitMarker('#(GPInt)_PSN_'+UserName(),8,200,100);
+  PersMarker := VCommonFiltr.GetPersonsMarker;
+
+  RestartVisual('Заполняю таблицу фильтров',1);
+  kol:=  GetMarkerCount(PersMarker);
+  i := 0;
+  while i < kol
+  {
+    GetMarker(PersMarker, i, cPersNRec);
+    insert ttPerFlt set ttPerFlt.cRecPers := cPersNRec;
+    i++;
+    if (not NextVisual) break;
+  }
+  
+  RestartVisual('Обрабатываю данные',1);
+  if isvalid(#ttPerFlt)
+  _loop ttPerFlt
+  {
+    if isvalid(#persons)
+    {
+      if isNotCorrect continue;
+      if (not NextVisual) break;
+      if isvalid(#PsnLinks)
+      _loop PsnLinks
+      {
+        set sRodstUni := iCatFunc.GetCatalogsName(psnlinks.LINKTYPE);
+        set sFIOUni   := psnlinks.RFIO ;                             
+        set dBornUni  := psnlinks.RBORNDATE ;                        
+        if not isvalid(#ttResStrOne)
+        if isvalid(#ttChildFlt) and isChildrenOnDate(PsnLinks.RBORNDATE,dEnd)
+        {
+          clearbuffer(#ttResStr);
+          ttResStr.cRecPers   := persons.nrec;
+          ttResStr.cRecLink   := PsnLinks.nrec;
+          ttResStr.sTbNmb     := if(persons.STRTABN='',persons.TABNMB,persons.STRTABN);
+          ttResStr.sFIO       := persons.FIO;
+          ttResStr.dBornPSN   := persons.BORNDATE;
+          set cAppoint := iAppFuncs.GetAppNrec_OnDate(ttPerFlt.cRecPers, dEnd);
+          if isvalid(#appointments)
+            ttResStr.sDept    := iCatFunc.GetCatalogsCode(appointments.DEPARTMENT);
+          ttResStr.sStepRodst := sRodstUni;
+          ttResStr.sFIOChild  := sFIOUni  ;
+          ttResStr.dBornChild := dBornUni ;
+          //--------------------------
+          wMonths := Months_Between(dEnd, psnlinks.RBORNDATE);
+          dAge    := add_months(psnlinks.RBORNDATE, wMonths);
+          if (dAge > dEnd)
+          {
+            wMonths--;
+            dAge  := sub_months(dAge, 1);
+          }
+          wYears  := DivI(wMonths, 12);
+          wMonths := wMonths mod 12;
+          wDays   := To_Days(Sub_Date(dEnd, dAge));
+          sAgeT   := wYears;
+//отключено
+//                     if(wYears  <> 0, string(wYears )+' '+iStrFunc.DeclYMD(wYears,  ymdYears) +' ', '')
+//                    +if(wMonths <> 0, string(wMonths)+' '+iStrFunc.DeclYMD(wMonths, ymdMonths)+' ', '')   
+//                    +if(wDays   <> 0, string(wDays  )+' '+iStrFunc.DeclYMD(wDays,   ymdDays)      , '') ;
+          //-------------------------
+          ttResStr.sAgeChild  := sAgeT;
+          if isvalid(#Sys_Uder)
+            ttResStr.sSvidRozh:= Sys_Uder.LastUser;
+          if ExtAttr.ValueExistsId(coPsnLinks,PsnLinks.nrec,cPolisOMS) = true
+            ttResStr.sPolisOMS:= ExtAttr.sGetAttrId(coPsnLinks,PsnLinks.nrec,cPolisOMS);
+          if ExtAttr.ValueExistsId(coPsnLinks,PsnLinks.nrec,cAddrTemp)
+            ttResStr.sAddrTemp:= ExtAttr.sGetAttrId(coPsnLinks,PsnLinks.nrec,cAddrTemp);
+          if ExtAttr.ValueExistsId(coPsnLinks,PsnLinks.nrec,cAddrSch)
+            ttResStr.sAddrSch := ExtAttr.sGetAttrId(coPsnLinks,PsnLinks.nrec,cAddrSch);
+
+          if ExtAttr.ValueExistsId(coPsnLinks,PsnLinks.nrec,cAddrBase)
+          {
+            ttResStr.sAddrBase:= ExtAttr.sGetAttrId(coPsnLinks,PsnLinks.nrec,cAddrBase);
+          }
+          if trim(ttResStr.sAddrBase)=''
+            if PsnLinks.RPassAddr<>0
+              ttResStr.sAddrBase:=iAdrFunc.GetFullAddressInd(PsnLinks.RPassAddr);
+/*
+          else
+          {
+            if isvalid(#AddressN)
+              ttResStr.sAddrBase:= AddressN.sAddress1;
+            if isvalid(#STerr)
+              ttResStr.sAddrBase:= STerr.sName +', '+ ttResStr.sAddrBase;
+          }
+*/
+          if isvalid(#contdoc)
+            ttResStr.sIsCh    := iAppCh.State(persons.nrec,contdoc.cSTR,dEnd,12);
+          insert current ttResStr;
+        }
+      }
+    }
+  }
+  if isvalid(#ttResStr)
+  {
+    RestartVisual('Выгружаю данные',1);
+    sFullName := GetDefaultUserPath + '#(GPNam)'+sFPF+'.xls';
+    xlCreateExcel(sFullName, TRUE);
+    lRB  := 4;
+    lRow := 1;
+    lDB  := lDE := lRB + 2;
+    lCB  := 1;
+    lCE  := 1;
+
+    #define repT 2,3,2,3
+    iOut.StringValL('#(GPNam) на ' + datetostr(dEnd,'DD.MM.YYYY'),#repT);
+    xlSetFontSize(14,#repT); xlSetFontStyle(xlBold,#repT);
+
+
+    #define FrmHd  lRB,  lCE,  lRB,  lCE
+    #define FrmH1  lRB+1,lCE,  lRB+1,lCE
+    #define LBR    '+chr(10)+' 
+/*01*/iOut.Header2Row('№ п/п',                      #FrmHd); lCE++;
+/*02*/iOut.Header2Row('Таб. Ном.',                  #FrmHd); lCE++;
+/*03*/iOut.Header2Row('ФИО',                        #FrmHd); lCE++;
+/*04*/iOut.Header2Row('Дата рождения работника',    #FrmHd); lCE++;
+/*05*/iOut.Header2Row('№ цеха / отдел',             #FrmHd); lCE++;
+      iOut.HeaderIns ('Сведения о ребенке',         #FrmHd, 9);
+/*06*/iOut.Header1Row('Степень родства',            #FrmH1); lCE++;
+/*07*/iOut.Header1Row('ФИО',                        #FrmH1); lCE++;
+/*08*/iOut.Header1Row('Дата рождения',              #FrmH1); lCE++;
+/*08*/iOut.Header1Row('Возраст ребенка (полных лет)',#FrmH1); lCE++;
+/*09*/iOut.Header1Row('Свид-во о рожд.',            #FrmH1); lCE++;
+/*10*/iOut.Header1Row('Полис ОМС',                  #FrmH1); lCE++;
+/*11*/iOut.Header1Row('Адрес временного пребывания',#FrmH1); lCE++;
+/*12*/iOut.Header1Row('Постоянное место проживания',#FrmH1); lCE++;
+/*13*/iOut.Header1Row('Школа, дет.сад (адрес орг.)',#FrmH1); lCE++;
+/*14*/iOut.Header2Row('Изменение условий',          #FrmHd); lCE++;
+
+    #define FrmCl lDE,lSE,lDE,lSE
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+
+      lSB := lSE := 1;
+/*01*/iOut.IntegerVal(lRow,               #FrmCl); lSE++;
+/*02*/iOut.CodeVal   (ttResStr.sTbNmb,    #FrmCl); lSE++;
+/*03*/iOut.StringValL(ttResStr.sFio,      #FrmCl); lSE++;
+/*04*//*iOut.DateVal*/if ttResStr.dBornPSN<>0 xlSetCellDateValue(ttResStr.dBornPSN,  #FrmCl); lSE++;
+/*05*/iOut.CodeVal   (ttResStr.sDept,     #FrmCl); lSE++;
+/*06*/iOut.StringValC(ttResStr.sStepRodst,#FrmCl); lSE++;
+/*07*/iOut.StringValL(ttResStr.sFIOChild, #FrmCl); lSE++;
+/*08*//*iOut.DateVal*/if ttResStr.dBornChild<>0 xlSetCellDateValue(ttResStr.dBornChild,#FrmCl); lSE++;
+      iOut.CodeVal   (ttResStr.sAgeChild ,#FrmCl); lSE++;
+/*09*/iOut.StringValL(ttResStr.sSvidRozh, #FrmCl); lSE++;
+/*10*/iOut.StringValL(ttResStr.sPolisOMS, #FrmCl); lSE++;
+/*11*/iOut.StringValL(ttResStr.sAddrTemp, #FrmCl); lSE++;
+/*12*/iOut.StringValL(ttResStr.sAddrBase, #FrmCl); lSE++;
+/*13*/iOut.StringValL(ttResStr.sAddrSch,  #FrmCl); lSE++;
+/*14*/iOut.StringValC(ttResStr.sIsCh,     #FrmCl); lSE++;
+
+      lDE++;
+      lRow++;
+    }
+
+    lSE := 1;
+    #define FrmBl lDB,lSE,lDE,lSE
+/*01*/xlSetColumnWidth( 5,#FrmBl); lSE++;
+/*02*/xlSetColumnWidth( 6,#FrmBl); lSE++;
+/*03*/xlSetColumnWidth(30,#FrmBl); lSE++;
+/*04*/xlSetColumnWidth(12,#FrmBl); xlSetNumberFormat('m/d/yyyy',#FrmBl); lSE++;
+/*05*/xlSetColumnWidth(10,#FrmBl); lSE++;
+/*06*/xlSetColumnWidth(10,#FrmBl); lSE++;
+/*07*/xlSetColumnWidth(30,#FrmBl); lSE++;
+/*08*/xlSetColumnWidth(12,#FrmBl); xlSetNumberFormat('m/d/yyyy',#FrmBl); lSE++;
+      xlSetColumnWidth(13,#FrmBl); lSE++;
+/*09*/xlSetColumnWidth(16,#FrmBl); lSE++;
+/*10*/xlSetColumnWidth(16,#FrmBl); lSE++;
+/*11*/xlSetColumnWidth(16,#FrmBl); lSE++;
+/*12*/xlSetColumnWidth(16,#FrmBl); lSE++;
+/*13*/xlSetColumnWidth(16,#FrmBl); lSE++;
+/*14*/xlSetColumnWidth(14,#FrmBl); lSE++;
+  
+    xlSetFontStyle(xlBold,lRB,lCB,lRB+1,lCE);
+    
+    #define AllTab lRB,lCB,lDE-1,lCE-1
+    xlSetFontSize(11,#AllTab); 
+    xlWrapText(#AllTab);
+    xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0,#AllTab);
+    #define ResPer lDE+2,3,lDE+2,3
+    iOut.StringValL('Ответственный исполнитель: '+sGetTune('User.FIO'),#ResPer);
+    xlSetFontSize(11,#ResPer); xlSetFontStyle(xlBold,#ResPer);
+    iOut.xlTitleEachPageO(lRB,lDB-1);
+    iOut.xlPageScaleLandscape(1);
+    xlFreeze(lDB,1);
+    StopVisual;
+    xlKillExcel;
+  }
+  else
+  {
+    StopVisual;
+    message('Нет данных для формирования отчета!');
+  }
+
+}
+
+Screen s1(,,sci1Esc);
+  show at (,,85,6);
+  fields
+    dEnd ('Отчетная дата',,):{Font = {BackColor = if(dEnd = 0, ColorNeed, 0)}}, noprotect;
+    iModeRep ('Признак, кого включать в отчет (Все, Уволенные за период, Принятые за период)',,): noprotect;
+    dBPer ('Начало периода для отчета',,):{Font = {BackColor = if(dBPer = 0, ColorNeed, 0)}}, noprotect;
+    dEPer ('Конец периода для отчета',,):{Font = {BackColor = if(dEPer = 0, ColorNeed, 0)}}, noprotect;
+  << 'Параметры отчета'
+
+    Отчетная дата .@@@@@@@@@@
+    Режим формирования
+    (.) Все сотрудники      `        Период 
+    (.) Уволенные за период `        с  .@@@@@@@@@@
+    (.) Принятые за период  `        по .@@@@@@@@@@
+  >>
+end;  
+embedded ComFiltrEmbedded 'Фильтры' interface VCommonFiltr;
+  show (,7,85,13);
+end
+Screen s2(,,sci1Esc);
+  show (,14,85,15);
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+  <<
+     <. ~С~формировать .>                         <. ~З~акрыть .>
+  >>
+end;
+
+procedure SetModeRep;
+{
+  if iModeRep = 0
+  {
+    ClearFieldOption(#dBPer, ofSelectable);
+    ClearFieldOption(#dEPer, ofSelectable);
+  }
+  else
+  {
+    SetFieldOption(#dBPer, ofSelectable);
+    SetFieldOption(#dEPer, ofSelectable);
+  }
+}
+
+handleevent
+  cmInit:
+  {
+    delete all from ttPerFlt;
+    delete all from ttResStr;
+    if (not (ReadMyDsk(dEnd, '#(GPInt)_dEnd' , false)))
+      set dEnd := date(31,12,year(Cur_Date));
+    if (not (ReadMyDsk(iModeRep, '#(GPInt)_iModeRep' , false)))
+      set iModeRep := 0;
+    SetModeRep;
+    if (not (ReadMyDsk(dEPer,'#(GPInt)_dEPer', false)))
+      set dEPer := dEnd;
+    if (not (ReadMyDsk(dBPer,'#(GPInt)_dBPer', false)))
+      set dBPer := date(1,1,year(dEPer));
+    MadeReport:= false;
+    initChildren;
+  }
+  cmOk:
+  {
+    if dEnd = 0 
+    or (iModeRep>0 and (dBPer=0 or dEPer=0 or dBPer>dEPer))
+    {
+      message('Задан некорректный период!');
+    }
+    else
+    {
+      Run;
+      SaveMyDsk(dEnd, '#(GPInt)_dEnd' );
+      SaveMyDsk(dBPer,'#(GPInt)_dBPer');
+      SaveMyDsk(dEPer,'#(GPInt)_dEPer');
+      SaveMyDsk(iModeRep,'#(GPInt)_iModeRep');
+      MadeReport:= true;
+      VCommonFiltr.IntClose(MadeReport);
+      VCommonFiltr.StoreAllParams;
+      Notify(cmEvaluateAndModify, 0);
+      DoneMarker(PersMarker, '#(GPInt)_PSN_' + UserName());
+    
+      closeinterface(cmDefault);
+    
+    }
+  }
+  cmCancel:
+  {
+    VCommonFiltr.IntClose(MadeReport);
+    DoneMarker(PersMarker, '#(GPInt)_PSN_' + UserName());
+    SaveMyDsk(dEnd, '#(GPInt)_dEnd' );
+    SaveMyDsk(dBPer,'#(GPInt)_dBPer');
+    SaveMyDsk(dEPer,'#(GPInt)_dEPer');
+    SaveMyDsk(iModeRep,'#(GPInt)_iModeRep');
+  }
+  cmCheckField:
+  {
+    case CurField of
+      #iModeRep: SetModeRep;
+    end;
+  }
+end;
+end.
+
+
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+
+Procedure Run;
+Begin
+  runinterface(#(GPInt));
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := '#(GPNam) (ЭМ)';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Компенсации и льготы';
+    2 : GetGroupName := 'Журналы регистрации и учета';
+  End;
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+end;
+
+End.

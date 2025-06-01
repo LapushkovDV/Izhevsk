@@ -1,0 +1,280 @@
+/*************************************************************************************************\
+* Наименование: Редактирование прав доступа к полям документа                                     *
+* Контур/Модуль: *                                                                                *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1024         |10/05/18|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include Marker.vih
+
+#include GP_UserFilterRoles.vih
+#include GP_UserFilterNotes.vih
+#include GP_UserFilterStoreDSK.vih
+#include GP_UserFilterList.vih
+
+#include GP_DocFieldsStateMatrixEditor.vih
+//*******************************************
+Interface GP_DocFieldsStateMatrixEditor 'Редактирование прав доступа к полям документа' Gray;
+//*******************************************
+show(20,5,110,30);
+
+//*******************************************
+//\/\/\/\ Объекты и переменные /\/\/\/\/\
+//*******************************************
+var pMarker:IMarker(Marker) new;
+    CurDocField:comp;
+    CurVidDoc:word;
+    oFilterStore:GP_IUserFilterStore NoAuto;
+    oUserFilterList:GP_ObjUserFilterList;
+
+//*******************************************
+//\/\/\/\    Временные таблицы     /\/\/\/\/\
+//*******************************************
+table struct local RoleStatus(
+   NRec      :comp   "ID"
+  ,cRole     :comp   "ссылка на роль"
+  ,RoleName  :string "наименование роли"
+  ,cStatus   :comp   "ссылка на статус"
+  ,StatusName:string "наименование статуса"
+)
+with index (
+   i1=NRec(Unique, Surrogate, Journal)
+  ,i2=RoleName+StatusName
+);
+table struct local tmp_KatNotes = KatNotes;
+
+create view
+as select
+   if(IsValidAll(tnGP_FieldsStateMatrix),GP_FieldsStateMatrix.State,0) (FieldName=RecState)
+  ,if((RecState and  1b)= 0,'BMCHECKONBROWSE','BMCHECKOFFBROWSE') (FieldName=VisibleImg )
+  ,if((RecState and 10b)<>0,'BMCHECKONBROWSE','BMCHECKOFFBROWSE') (FieldName=EditableImg)
+  ,R_Role.Nrec
+from
+    RoleStatus(i2)
+  , GP_FieldsStateMatrix
+  , R_Role
+  , tmp_KatNotes
+where((
+     CurDocField        == GP_FieldsStateMatrix.cDocField
+and  RoleStatus.cRole   == GP_FieldsStateMatrix.cRole
+and  RoleStatus.cStatus == GP_FieldsStateMatrix.cStatus
+));
+
+screen scFilter(,,sci13Esc);
+show(,,,3) Fixed_Y;
+table RoleStatus;
+fields
+  [FilterRole] oUserFilterList.FilterStr(1) ('Фильтр по ролям',):Protect,PickButton;
+  [FilterStatus] oUserFilterList.FilterStr(2) ('Фильтр по статусам',):Protect,PickButton;
+<<
+  Фильтр по:
+ `ролям`.@@@@@@@@@@@@@@@@@@@@@@@@  `статусам`.@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end;
+
+browse brRoleStatus (,,sci1EscIns);
+show(,4,,);
+table RoleStatus;
+recMarker=pMarker;
+fields
+  RoleStatus.RoleName 'Наименование роли':[40],Protect;
+  RoleStatus.StatusName 'Статус':[30],Protect;
+  VisibleImg 'Видимость' ('Определяет будет ли поле отображаться',,):
+    [10],Centered,NoAutoSize,image;
+  EditableImg 'Редакт-е' ('Определяет возможность редактировать поле',,):
+    [10],Centered,NoAutoSize,image;
+end;
+
+constructor Init;
+{
+  oFilterStore:=GP_IUserFilterStore(new(GP_UserFilterStoreDSK,InitDSK(#__InterfaceName__)));
+
+  result:=true;
+}
+
+procedure LoadRoleStatus;
+var mRoles,mNotes:longint;
+    IsRolesFilterSet,IsNotesFilterSet:boolean;
+{
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Загрузка списка ролей и статусов...', RecordsInTable(tnR_Role));
+
+  pMarker.UnselectAll;
+  //--------------------
+  MTRetrieve(#tmp_KatNotes,mfFilters + mfClear);
+  MTRetrieve(#RoleStatus,mfFilters + mfClear);
+  //---- так страховка
+  delete all tmp_KatNotes where (( root == tmp_KatNotes.viddoc ));
+  delete all RoleStatus;
+
+  mRoles:=oFilterStore.LoadMarker('mFilterRole');
+  IsRolesFilterSet:=GetMarkerCount(mRoles)>0;
+  mNotes:=oFilterStore.LoadMarker('mFilterStatus'+string(CurVidDoc));
+  IsNotesFilterSet:=GetMarkerCount(mNotes)>0;
+
+  //------------- наполним времянку по статусам
+  var _CurVidDoc:longint=CurVidDoc;
+  insert into tmp_KatNotes
+  select KAtNotes.*
+  From KAtNotes
+  where ((
+     _CurVidDoc == KAtNotes.VidDoc
+  ));
+  if IsNotesFilterSet
+  { delete tmp_KatNotes where (not FoundMarker(mNotes,tmp_KatNotes.NRec) );
+  }
+  //------------- наполним матрицу - роли статусы
+
+  _loop R_Role {
+    NextVisual;
+    if (IsRolesFilterSet)
+      if (not FoundMarker(mRoles,R_Role.NRec)) continue;
+
+    _loop tmp_KatNotes
+    { RoleStatus.NRec:=0;
+      RoleStatus.cRole     :=R_Role.NRec;
+      RoleStatus.RoleName  :=R_Role.Name;
+      RoleStatus.cStatus   :=tmp_KatNotes.NRec;
+      RoleStatus.StatusName:=tmp_KatNotes.Name;
+      insert current RoleStatus;
+    }//_loop KatNotes
+  }//_loop R_Roles
+
+  DoneMarker(mRoles,'');
+  DoneMarker(mNotes,'');
+
+  StopVisual;
+}
+
+procedure InitFilterList;
+{
+  oUserFilterList:=GP_ObjUserFilterList(New(GP_UserFilterList,UserFilterList(oFilterStore)));
+  oUserFilterList.Add(GP_IUserFilter(New(GP_UserFilterRoles,UserFilter(fnFilterRole,'mFilterRole'))));
+  oUserFilterList.Add(GP_IUserFilter(New(GP_UserFilterNotes,UserFilterNotes(fnFilterStatus,'mFilterStatus'+string(CurVidDoc),CurVidDoc))));
+
+  oUserFilterList.Load;
+}
+
+procedure SetCurPos(cDocField:comp;VidDoc:longint);
+{
+  if (CurVidDoc<>VidDoc) {
+    CurVidDoc:=VidDoc;
+    InitFilterList;
+    LoadRoleStatus;
+  }
+
+  CurDocField:=cDocField;
+
+  ReReadRecord(tnRoleStatus);
+}
+
+function InvertStateToMatrix(BitState:word):boolean;
+var IsRecExist:boolean;
+{
+  result:=false;
+
+  IsRecExist:=IsValidAll(tnGP_FieldsStateMatrix);
+
+  if (not IsRecExist) {
+    ClearBuffer(tnGP_FieldsStateMatrix);
+    GP_FieldsStateMatrix.cDocField:=CurDocField;
+    GP_FieldsStateMatrix.cRole:=RoleStatus.cRole;
+    GP_FieldsStateMatrix.cStatus:=RoleStatus.cStatus;
+  }
+
+  GP_FieldsStateMatrix.State:=GP_FieldsStateMatrix.State xor BitState;
+
+  if ((GP_FieldsStateMatrix.State and 11b)=11b)
+    GP_FieldsStateMatrix.State:=BitState;
+
+  if (not IsRecExist)
+    result:=insert current GP_FieldsStateMatrix = tsok
+  else
+    result:=update current GP_FieldsStateMatrix = tsok;
+
+  set GP_FieldsStateMatrix.State;
+
+  if (not result)
+    message('Ошибка модификации записи в таблице GP_FieldsStateMatrix!',error);
+}
+
+procedure CopyStateToMarkeredRec;
+var CurState:word;
+    CurRoleStatus:comp;
+    IsRecExist:boolean;
+{
+  CurRoleStatus:=RoleStatus.NRec;
+  CurState:=GP_FieldsStateMatrix.State;
+
+  SubBounds(tbRMRoleStatus1);
+  AddBounds(tbRMRoleStatus2);
+
+  PushPos(tnRoleStatus);
+  _loop pMarker {
+    if (CurRoleStatus=RoleStatus.NRec) continue;
+
+    IsRecExist:=IsValidAll(tnGP_FieldsStateMatrix);
+
+    if (not IsRecExist) {
+      ClearBuffer(tnGP_FieldsStateMatrix);
+      GP_FieldsStateMatrix.cDocField:=CurDocField;
+      GP_FieldsStateMatrix.cRole:=RoleStatus.cRole;
+      GP_FieldsStateMatrix.cStatus:=RoleStatus.cStatus;
+    }
+
+    GP_FieldsStateMatrix.State:=CurState;
+
+    if (not IsRecExist) {
+      if (insert current GP_FieldsStateMatrix <> tsok) break;
+    } else {
+      if (update current GP_FieldsStateMatrix <> tsok) break;
+    }
+  }//_loop pMarker
+  PopPos(tnRoleStatus);
+
+  SubBounds(tbRMRoleStatus2);
+  AddBounds(tbRMRoleStatus1);
+
+  ReReadRecord(tnRoleStatus);
+}
+
+HandleEvent
+cmImgClick:{
+  var BitState:word=0;
+  case CurImgField of
+    -1073741809,
+    fnVisibleImg:
+      BitState:=1b;
+    -1073741808,
+    fnEditableImg:
+      BitState:=10b;
+  end;
+
+  if (InvertStateToMatrix(BitState))
+    if (pMarker.Count>1 and IsValidAll(tnpMarker))
+      if (message('Установить значение из текущей записи во все помеченные?',YesNo+Confirmation)=cmYes)
+        CopyStateToMarkeredRec;
+  rescanpanel(#RoleStatus);
+}
+cmPick:{
+  if (oUserFilterList.Pick(CurField)) {
+    oUserFilterList.Save;
+    RedrawPanel(CurTable);
+
+    LoadRoleStatus;
+    ReReadRecord(tnRoleStatus);
+  }
+}
+cmDelOnProtect:{
+  if (oUserFilterList.Del(CurField)) {
+    oUserFilterList.Save;
+    RedrawPanel(CurTable);
+
+    LoadRoleStatus;
+    ReReadRecord(tnRoleStatus);
+  }
+}
+end;
+end.

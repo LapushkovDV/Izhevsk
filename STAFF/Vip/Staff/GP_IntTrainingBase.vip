@@ -1,0 +1,687 @@
+/**************************************************************************************************\
+* Наименование: Форма "База регистрации внутреннего обучения"                                     *
+* Контур/Модуль: Управление персоналом                                                            *
+* Пункт меню: Отчеты / Отчеты пользователя / Обучение и развитие персонала / База регистрации     *
+*             внутреннего обучения                                                                *
+* Примечание:                                                                                     *
+* Форма выводит список работников, обучение которых закончилось в указанном отчётном периоде.     *
+* В форму выводятся только те записи из сведений об образовании, которые были созданы на основа-  *
+* нии приказа с распорядительными действием 35 или 235. По РПД 35 выводятся только те записи,     *
+* у которых тема обучения входит в группу с кодома 201.                                           *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#335          |11/05/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+// Если определён параметр UseDSQL используется DirectSQL для выборки данных
+#define UseDSQL
+
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include GP_EducFunc.vih // Функции работы с уровнями образования
+#include CatFunc.vih // Функции работы с каталогом
+#ifdef UseDSQL
+#include Query.vih // Объектный интерфейс  QueryManager
+#end
+
+interface GP_IntTrainingBase 'База регистрации внутреннего обучения' EscClose;
+
+  const
+    REP_NAME = 'GP_IntTrainingBase'; // Название отчёта
+    REP_TITLE = 'База регистрации внутреннего обучения'; // Заголовок отчёта
+    TAB_CNT = 1; // Количество закладок в отчёте
+    TAB_TITLE_1 = 'Отчёт'; // Название закладки 2
+    // Константы ошибок при работе с Excel
+    XE_BAD_OP           =  0; // не удалось выполнить операцию с Excel-файлом
+    XE_CREATE_FILE      =  1; // не удалось создать файл
+    XE_OPEN_FILE        =  2; // не удалось открыть файл
+    XE_INIT_FILE        =  3; // не удалось инициализировать Excel
+    XE_CREATE_MATRIX    =  4; // не удалось создать матрицу
+    XE_FREE_MATRIX      =  5; // не удалось освободить матрицу
+    XE_OUT_MATRIX       =  6; // не удалось вывести матрицу в отчёт
+    XE_WRITE_TO_MATRIX  =  7; // не удалось записать значение в матрицу
+    XE_FORMAT_CELL      =  8; // не удалось отформатировать ячейку
+    XE_SET_CELL_VALUE   =  9; // не удалось записать значение в ячейку
+    XE_SET_CELL_FORMULA = 10; // не удалось записать формулу
+    XE_RUN_MACRO        = 11; // не удалось запустить макрос
+    XE_ADD_SHEET        = 12; // не удалось добавить вкладку
+    XE_DEL_SHEET        = 13; // не удалось удалить вкладку
+    XE_RENAME_SHEET     = 14; // не удалось переименовать вкладку
+    XE_WRONG_TEMPLATE   = 15; // в xlt шаблоне не найден лист с именем
+  end;
+
+  // Чтобы иметь возможность отсортировать список сначала по виду обучения, затем по профессии
+  // используем дополнительную таблицу с индексом
+  table struct SData
+  (
+    cEducation: tNRec,       // Ссылка на таблицу Education
+    OrderNum: String[20],    // Номер приказа
+    Kind: String[50],        // Вид обучения
+    Profession: String[100], // Профессия/вид аттестации
+    cDep: tNRec,             // Ссылка на подразделение
+    cAppointment: tNRec,     // Ссылка на Appointment
+    RPDCode: Integer         // РПД
+  )
+  With index
+  (
+    SData01 = Kind + Profession
+  );
+
+  create view
+    var
+      pDBeg, pDEnd: Date; // Отчётный период
+    from
+      SData (SData01),
+      #ifndef UseDSQL
+      Education,
+      ContDoc,
+      TitleDoc,
+      #end
+      Persons,
+      KlKatego,
+      synonym Education EducationR,
+      synonym Persons LeadPersons
+    where ((
+          SData.cEducation         == EducationR.NRec
+      and EducationR.Person        == Persons.NRec
+      and EducationR.cInf2         == LeadPersons.NRec
+      and SData.cAppointment       == Appointments.NRec
+      and Appointments.EmpCategory == KlKatego.NRec
+      #ifndef UseDSQL
+      and Education.cContDoc      /== ContDoc.NRec
+      and ContDoc.cPart            == PartDoc.NRec
+      and PartDoc.cDoc            /== TitleDoc.NRec
+      #end
+    ))
+    #ifndef UseDSQL
+    and (ContDoc.TypeOper = 35 or ContDoc.TypeOper = 235)
+    and TitleDoc.wStatus = 1
+    #end
+  ;
+  create view vSpr
+  var
+    pCatalogs:comp;
+  as select Catalogs.nrec
+  from Catalogs
+  where (( pCatalogs == Catalogs.nrec ))
+  ;
+
+  var
+    IsAborted: Boolean;
+    ICatFunc: CatalogsFunctions;
+    // Переменные для работы с Excel
+    RecCnt: LongInt; // Количество строк в отчёте
+    FirstCol: LongInt; // Номер первой колонки отчёта
+    LastCol: LongInt; // Номер последней колонки отчёта
+    FirstHeadRow: LongInt; // Номер первой строки отчёта
+    FirstBodyRow: LongInt; // Номер первой строки тела отчёта
+    LastBodyRow: LongInt; // Номер последней строки отчёта
+
+  #include GP_Log.var
+  #include GP_EducFunc.var
+
+  window winParam 'База регистрации внутреннего обучения' DoAccept, EscClose, Gray;
+    show at (,, 39, 5);
+
+    screen scrParam ('',, sci1EnEsc);
+    fields
+      pDBeg ('Дата начала отчетного периода'): noProtect;
+      pDEnd ('Дата окончания отчетного периода'): noProtect;
+    buttons
+      cmOk,,, 'Ввод - принять выбор',,sci1Esc;
+      cmCancel,,, 'Отмена',,sci1Esc;
+    <<
+
+`Период с`.@@@@@@@@@@`по`.@@@@@@@@@@@
+
+     <.  ~O~K  .> <.О~т~мена.>
+    >>
+    end;
+
+    handleEvent
+      cmOk:
+        PutCommand(cmDefault);
+      cmDefault:
+        if pDBeg > pDEnd then
+        begin
+          Message('Дата начала периода должна быть'#13'меньше даты окончания периода');
+          abort;
+        end;
+    end;
+  end;
+
+  // инициализация параметров отчета
+  function InitParam: Boolean;
+  begin
+    if not ReadMyDsk(pDBeg, REP_NAME + 'pDBeg', false) then
+    begin
+      pDBeg := Cur_Date;
+      pDBeg := To_Date(1, Month(pDBeg), Year(pDBeg));
+    end;
+    if not ReadMyDsk(pDEnd, REP_NAME + 'pDEnd', false) then
+    begin
+      pDEnd := Cur_Date;
+      pDEnd := To_Date(Last_Day(pDEnd), Month(pDEnd), Year(pDEnd));
+    end;
+    result := true;
+  end;
+
+  // сохранение параметров отчета
+  procedure SaveParam;
+  begin
+    SaveMyDsk(pDBeg, REP_NAME + 'pDBeg');
+    SaveMyDsk(pDEnd, REP_NAME + 'pDEnd');
+  end;
+
+  // установка параметров отчета
+  function AskParam: Boolean;
+  begin
+    result := false;
+    if not InitParam then
+      Exit;
+    if RunWindowModal(winParam) = cmDefault then
+    begin
+      SaveParam;
+      result := true;
+    end;
+  end;
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  // Исключение для генерации ошибок, связанных с выводом в Excel файл
+  exception ExOnExecelError;
+
+  // Генерирует ошибку, связанную с выводом в Excel файл
+  procedure ExcelError(ErrCode: Word; AddInfo: String);
+  var
+    ErrText: String;
+  begin
+    case ErrCode of
+      XE_BAD_OP:
+        ErrText := 'не удалось выполнить операцию с Excel-файлом';
+      XE_CREATE_FILE:
+        ErrText := 'не удалось создать файл';
+      XE_OPEN_FILE:
+        ErrText := 'не удалось открыть файл';
+      XE_INIT_FILE:
+        ErrText := 'не удалось инициализировать Excel';
+      XE_CREATE_MATRIX:
+        ErrText := 'не удалось создать матрицу';
+      XE_OUT_MATRIX:
+        ErrText := 'не удалось вывести матрицу в отчёт';
+      XE_WRITE_TO_MATRIX:
+        ErrText := 'не удалось записать значение в матрицу';
+      XE_WRONG_TEMPLATE:
+        ErrText := 'в xlt шаблоне не найден лист с именем';
+      XE_FORMAT_CELL:
+        ErrText := 'не удалось отформатировать ячейку';
+      XE_SET_CELL_VALUE:
+        ErrText := 'не удалось записать значение в ячейку';
+      XE_RUN_MACRO:
+        ErrText := 'не удалось запустить макрос';
+      XE_ADD_SHEET:
+        ErrText := 'не удалось добавить вкладку';
+      XE_DEL_SHEET:
+        ErrText := 'не удалось удалить вкладку';
+      XE_RENAME_SHEET:
+        ErrText := 'не удалось переименовать вкладку';
+      XE_FREE_MATRIX:
+        ErrText := 'не удалось освободить матрицу';
+      XE_SET_CELL_FORMULA:
+        ErrText := 'не удалось записать формулу';
+    else
+      ErrText := '';
+    end;
+    oGP_Log.Error(ErrText + ' ' + AddInfo);
+    _raise ExOnExecelError;
+  end;
+
+  // Эта Функция делает более удобной проверку результата операции с Excel
+  // Первым параметром передаем функцию, которая работает с Excel, а вторым и третьим - информацию об ошибке,
+  // которая будет выведена, если эта функция вернёт false (т.е. выполнится с ошибкой)
+  procedure xlOp(IsCorrect: Boolean; ErrCode: Word; AddInfo: String);
+  begin
+    if not IsCorrect then
+      ExcelError(ErrCode, AddInfo);
+  end;
+
+  // Создаёт Excel файл и создаёт в нём вкладки для вывода отчёта
+  procedure PrepareExcelFile(OutFileName: String);
+  var
+    TabCnt: Word;
+  begin
+    if ExistFile(OutFileName) then
+      DeleteFile(OutFileName);
+    SetVisualHeader('Создание Excel-файла...');
+    // Создаем файл Excel
+    xlOp(xlCreateExcel(OutFileName, True), XE_CREATE_FILE, OutFileName);
+    xlOp(xlIsExcelValid, XE_INIT_FILE, '');
+    // Переименуем вкладки
+    // Если в отчете меньше вкладок, чем нам нужно добавим недостающие
+    TabCnt := 0;
+    xlOp(xlGetSheetsCount(TabCnt), XE_ADD_SHEET, '');
+    while TabCnt < TAB_CNT do
+    begin
+      xlOp(xlAddSheet, 11, '');
+      TabCnt++;
+    end;
+    // Если в больше вкладок, чем нам нужно, удалим лишние
+    while TabCnt > TAB_CNT do
+    begin
+      xlOp(xlDeleteSheet(1), XE_DEL_SHEET, '');
+      TabCnt--;
+    end;
+    // Переименуем вкладки
+    xlOp(xlSetSheetName(1, TAB_TITLE_1), XE_RENAME_SHEET, '');
+  end;
+
+  procedure OutTitle(var R: LongInt);
+  begin
+    // Выводим заголовок
+    xlOp(xlSetCellStringValue(REP_TITLE + ' за период с ' + DateToStr(pDBeg, 'DD.MM.YYYY') + ' по ' + DatetoStr(pDEnd, 'DD.MM.YYYY'), R, 1, R, 1), XE_SET_CELL_VALUE, '');
+    // сделаем его жирным
+    xlOp(xlSetFontStyle(xlBold, R, 1, R, 1), XE_FORMAT_CELL, '');
+    // и крупным
+    xlOp(xlSetFontSize(14, R, 1, R, 1), XE_FORMAT_CELL, '');
+    R++;
+  end;
+
+  // Вывод шапки отчёта
+  procedure OutHeader(var R: LongInt);
+  var
+    C: Word;
+  begin
+    SetVisualHeader('Форматирование Excel-файла...');
+    FirstCol := 1;
+
+    C := FirstCol - 1;
+    // №
+    xlOp(xlSetCellStringValue('№', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(6, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, C, LastBodyRow, C), XE_FORMAT_CELL, '');
+    // Вид обучения
+    xlOp(xlSetCellStringValue('Вид обучения', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(45, R, C, R, C), XE_FORMAT_CELL, '');
+    // № протокола
+    xlOp(xlSetCellStringValue('№ протокола', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, C, LastBodyRow, C), XE_FORMAT_CELL, '');
+    // Дата
+    xlOp(xlSetCellStringValue('Дата', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, C, LastBodyRow, C), XE_FORMAT_CELL, '');
+    // Профессия/вид аттестации
+    xlOp(xlSetCellStringValue('Профессия/вид аттестации', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(70, R, C, R, C), XE_FORMAT_CELL, '');
+    // Количество человек
+    xlOp(xlSetCellStringValue('Количество человек', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, C, LastBodyRow, C), XE_FORMAT_CELL, '');
+    // Кол-во часов
+    xlOp(xlSetCellStringValue('Кол-во часов', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(8, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, C, LastBodyRow, C), XE_FORMAT_CELL, '');
+    // ФИО
+    xlOp(xlSetCellStringValue('ФИО', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(32, R, C, R, C), XE_FORMAT_CELL, '');
+    // Должность
+    xlOp(xlSetCellStringValue('Должность', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(50, R, C, R, C), XE_FORMAT_CELL, '');
+    // Год рождения
+    xlOp(xlSetCellStringValue('Год рождения', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, C, LastBodyRow, C), XE_FORMAT_CELL, '');
+    // Образование
+    xlOp(xlSetCellStringValue('Образование', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(30, R, C, R, C), XE_FORMAT_CELL, '');
+    // № подразделения
+    xlOp(xlSetCellStringValue('№ подразделения', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(15, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, C, LastBodyRow, C), XE_FORMAT_CELL, '');
+    // ФИО наставника
+    xlOp(xlSetCellStringValue('ФИО наставника', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(30, R, C, R, C), XE_FORMAT_CELL, '');
+    // № удостоверения / свидетельства
+    xlOp(xlSetCellStringValue('№ удостоверения / свидетельства', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(30, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, C, LastBodyRow, C), XE_FORMAT_CELL, '');
+    // Категория работников
+    xlOp(xlSetCellStringValue('Категория работников', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, C, LastBodyRow, C), XE_FORMAT_CELL, '');
+
+    LastCol := C;
+
+    // Выравниваем содержимое ячеек шапки по верхнему краю и по центру
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Для всех ячеек в шапке включаем перенос слов
+    xlOp(xlWrapText(R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Устанавливаем текстовый формат для всех ячеек шапки
+    xlOp(xlSetNumberFormat('@', R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+
+    // Делаем шрифт шапки жирным
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');;
+    // Увеличиваем высоту шапки
+    xlOp(xlSetRowHeight(45, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+
+    // Рисуем границы ячеек для всей формы
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0, R, FirstCol, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+    // Выравниваем все ячейки тела формы по верхнему краю и центру по горизонтали
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, FirstCol, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+
+    // Выравниваем некоторые ячейки тела формы по верхнему и по левому краю
+    // Вид обучения
+    xlOp(xlAlignCellsEx(xlLeft, xlTop, FirstBodyRow, 2, LastBodyRow, 2), XE_FORMAT_CELL, '');
+    // Профессия/вид аттестации
+    xlOp(xlAlignCellsEx(xlLeft, xlTop, FirstBodyRow, 5, LastBodyRow, 5), XE_FORMAT_CELL, '');
+    // ФИО, Должность
+    xlOp(xlAlignCellsEx(xlLeft, xlTop, FirstBodyRow, 8, LastBodyRow, 9), XE_FORMAT_CELL, '');
+    // Образование
+    xlOp(xlAlignCellsEx(xlLeft, xlTop, FirstBodyRow, 11, LastBodyRow, 11), XE_FORMAT_CELL, '');
+    // ФИО наставника
+    xlOp(xlAlignCellsEx(xlLeft, xlTop, FirstBodyRow, 13, LastBodyRow, 13), XE_FORMAT_CELL, '');
+    // Для всех ячеек тела формы включаем перенос слов
+    xlOp(xlWrapText(FirstBodyRow, FirstCol, LastBodyRow, LastCol), XE_FORMAT_CELL, '');
+    R += 1;
+  end;
+
+  // Возвращает серию, номер и дату выдачи диплома
+  function EdSvidNum: String;
+  begin
+    result := '';
+    if EducationR.Series != '' then
+      result += EducationR.Series + ' ';
+    result += EducationR.DiplomNmb;
+    if EducationR.Diplomdate != ZeroDate then
+      result += ' от ' + DateToStr(EducationR.Diplomdate, 'DD.MM.YYYY');
+  end;
+
+  // Вывод тела отчёта
+  procedure OutBody(var R: LongInt);
+  var
+    C: Word;
+    N: LongInt;
+  begin
+    SetVisualHeader('Вывод данных в отчет...');
+    N := 0;
+    _loop SData
+    begin
+      if IsAborted then
+        break;
+      NextVisual;
+      C := FirstCol - 1;
+      // №
+      xlOp(xlSetCellNumberValue(++N, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Вид обучения
+      if SData.RPDCode = 235 then
+        xlOp(xlSetCellStringValue('Наставничество', R, ++C, R, C), XE_SET_CELL_VALUE, '')
+      else
+        xlOp(xlSetCellStringValue(SData.Kind, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // № протокола
+      xlOp(xlSetCellStringValue(SData.OrderNum, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Дата
+      xlOp(xlSetCellDateValue(EducationR.ToDate, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Профессия/вид аттестации
+      xlOp(xlSetCellStringValue(SData.Profession, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Количество человек
+      xlOp(xlSetCellNumberValue(1, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Кол-во часов
+      xlOp(xlSetCellNumberValue(EducationR.Nmb2, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // ФИО
+      xlOp(xlSetCellStringValue(Persons.FIO, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Должность
+      xlOp(xlSetCellStringValue(ICatFunc.GetCatalogsName(Appointments.Post), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Год рождения
+      xlOp(xlSetCellStringValue(if(Persons.BornDate != ZeroDate, Year(Persons.BornDate), ''), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Образование
+      xlOp(xlSetCellStringValue(ICatFunc.GetCatalogsName(oGP_EducFunc.GetBestEducLvl(Persons.NRec)), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // № подразделения
+      xlOp(xlSetCellStringValue(ICatFunc.GetCatalogsCode(SData.cDep), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // ФИО наставника
+      xlOp(xlSetCellStringValue(LeadPersons.FIO, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // № удостоверения / свидетельства
+      xlOp(xlSetCellStringValue(EdSvidNum, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Категория работников
+      xlOp(xlSetCellStringValue(KlKatego.Kod, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      R++;
+    end;
+  end;
+
+  // На основании темы обучения определяет, нужно ли включать эту запись в отчет
+  function ChkSubject: Boolean;
+  var
+    cSubject: tNRec;
+  begin
+    result := false;
+    //cSubject := EducationR.cAddInf1;
+    vSpr.pCatalogs:=EducationR.cAddInf1;
+    while vSpr.pCatalogs != 0 do
+    begin
+      //if getFirst Catalogs where ((cSubject == Catalogs.NRec)) = tsOk then
+      if vSpr.getfirst Catalogs=tsok
+      begin
+        if Trim(vSpr.Catalogs.Code) = '201' then
+        begin
+          result := true;
+          break;
+        end else
+        { cSubject := vSpr.Catalogs.cParent;
+          vSpr.pCatalogs:=cSubject;
+        }
+      end else
+        break;
+    end;
+  end;
+
+  // Подготовка данных для отчёта
+  procedure PrepareData;
+  begin
+    if IsAborted then
+      exit;
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Анализ данных...', 1);
+    #ifdef UseDSQL
+    SQLCopyInto(
+      QueryManager.CreateQuery(
+        SQLQuery(
+          select
+            Education.NRec as cEducation,
+            TitleDoc.DocNmb as OrderNum,
+            EduLevelCat.Name as Kind,
+            COALESCE(COALESCE(EduSpecCat.Name, EduSubjectCat.Name), '') as Profession,
+            ContDoc.cDopRef as cDep,
+            ContDoc.cStr as cAppointment,
+            ContDoc.TypeOper as RPDCode
+          from
+            Education
+            inner join ContDoc on Education.cContDoc = ContDoc.NRec
+            inner join PartDoc on ContDoc.cPart = PartDoc.NRec
+            inner join TitleDoc on PartDoc.cDoc = TitleDoc.NRec
+            left join Catalogs as EduLevelCat on Education.Level = EduLevelCat.NRec
+            left join Catalogs as EduSpecCat on Education.Speciality = EduSpecCat.NRec
+            left join Catalogs as EduSubjectCat on Education.cAddInf1 = EduSubjectCat.NRec
+          where
+            (ContDoc.TypeOper = 35 or ContDoc.TypeOper = 235) and TitleDoc.wStatus = 1 and Education.ToDate >= :DBeg and Education.ToDate <= :DEnd
+        )
+      ).SetParam('DBeg', pDBeg).SetParam('DEnd', pDEnd)
+    , #SData, true);
+    #else
+    _try
+      begin
+        // К сожалению, индекса по полю Education.ToDate нет, придётся использовать фильтр
+        _loop Education where (Education.ToDate >= pDBeg and Education.ToDate <= pDEnd)
+        begin
+          if IsAborted then
+            break;
+          NextVisual;
+          ClearBuffer(#SData);
+          SData.cEducation := Education.NRec;
+          SData.OrderNum := TitleDoc.DocNmb; // № приказа
+          SData.Kind := ICatFunc.GetCatalogsName(Education.Level); // Вид обучения
+          SData.cDep := ContDoc.cDopRef; // Подразделение
+          SData.cAppointment := ContDoc.cStr; // Ссылка на Appointment
+          SData.RPDCode := ContDoc.TypeOper; // РПД 
+          SData.Profession := ICatFunc.GetCatalogsName(Education.Speciality); // Профессия/вид аттестации - Специальность
+          if SData.Profession = '' then
+            SData.Profession := ICatFunc.GetCatalogsName(Education.cAddInf1); // Профессия/вид аттестации - Тема
+          if insert current SData != tsOk then
+          begin
+            oGP_Log.Error('Не удалось добавить запись в таблицу SData (Education.NRec = ' + To_Char(Education.NRec, 0, 0) + ')');
+            continue;
+          end;
+        end;
+      end
+    _except
+      on ExUserBreak:
+        begin
+          IsAborted := true;
+        end;
+    #end
+    // После того, как форма была уже сделана и соптимизирована для работы через DirectSQL
+    // добавили еще одно условие - необходимость для RPD 35 выводить только записи, у которых
+    // тема входит в группу с кодом 201 (при чем уровней вложенности может быть несколько)
+    // Просто повторным проходом удалим записи по RPD 35, которые не удовлетворяют этому услови.
+    SetVisualHeader('Анализ тем обучения...');
+    _loop backward SData where (SData.RPDCode = 35)
+    begin
+      if IsAborted then
+        break;
+      NextVisual;
+      if not ChkSubject then
+        if delete current SData != tsOk then
+          oGP_Log.Error('Не удалось удлить запись из таблицы SData');
+    end;
+    StopVisual('', 0);
+  end;
+
+  file MacroFile;
+
+  function CreateMacro(MacroFileName: string): Boolean;
+  begin
+    result := false;
+    if MacroFile.OpenFile(MacroFileName, stCreate) then
+    begin
+      MacroFile.Writeln('Sub FormatReport');
+      MacroFile.Writeln('  Selection.AutoFilter');
+      MacroFile.Writeln('End Sub');
+      MacroFile.Close;
+      result := true;
+    end else
+      oGP_Log.Error('Не удалось создать файл "' + MacroFileName + '"');
+  end;
+
+  procedure RunMacro;
+  var
+    MacroFileName: String;
+  begin
+    if IsAborted then
+      exit;
+    MacroFileName := GetDefaultUserPath + REP_NAME + '.bas';
+    if not CreateMacro(MacroFileName) then
+      exit;
+    xlImportModule(MacroFileName);
+    xlRunMacro('FormatReport');
+    DeleteFile(MacroFileName);
+  end;
+
+  // Формирует отчёт
+  procedure CreateReport;
+  var
+    OutFileName: String;
+    R: LongInt;
+  begin
+    IsAborted := false;
+    PrepareData;
+    if IsAborted then
+      exit;
+
+    RecCnt := RecordsInTable(#SData);
+    if RecCnt = 0 then
+    begin
+      Message('Нет данных для формирования отчёта');
+      exit;
+    end;
+
+    OutFileName := GetDefaultUserPath + REP_TITLE + ' с ' + DatetoStr(pDBeg, 'DD.MM.YYYY') + ' по ' + DatetoStr(pDEnd, 'DD.MM.YYYY') + '.xlsx';
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', RecCnt);
+    _try
+    begin
+      PrepareExcelFile(OutFileName);
+      R := 1;
+      // Выводим заголовок отчёта
+      OutTitle(R);
+      FirstHeadRow := R;
+      FirstBodyRow := FirstHeadRow + 1; // Высота шапки - 1 строка
+      LastBodyRow := FirstBodyRow + RecCnt - 1;
+      // Выводим шапку отчёта
+      OutHeader(R);
+      // Выводим тело отчёта
+      OutBody(R);
+      // Запускаем макрос
+      RunMacro;
+    end
+    _except on ExOnExecelError, ExUserBreak:
+    begin
+      IsAborted := true;
+    end;
+    StopVisual('',0);
+    xlKillExcel;
+  end;
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  HandleEvent
+    cmInit:
+      begin
+        if AskParam then
+        begin
+          oGP_Log.Init(REP_NAME + '.log', true, true, true);
+          oGP_Log.SetVerboseMode(true);
+          CreateReport;
+          oGP_Log.Done(true);
+        end;
+        abort;
+      end;
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_GP_IntTrainingBase implements IUserReport;
+
+interface UserReport_GP_IntTrainingBase;
+
+  procedure Run;
+  begin
+    RunInterface('GP_IntTrainingBase');
+  end;
+
+  function GetReportName: String;
+  begin
+    result := 'База регистрации внутреннего обучения';
+  end;
+
+  function GetGroupName(Level: Word): String;
+  begin
+    result := '';
+    case Level of
+      1: result := 'Обучение и развитие персонала';
+    end;
+  end;
+
+  function GetPriority: Integer;
+  begin
+    result := 0;
+  end;
+
+  function VisibleInModule(Ind: Byte): String;
+  begin
+    result := '';
+    case Ind of
+      1: result := 'STAFFMAINMENU';
+    end;
+  end;
+
+end.

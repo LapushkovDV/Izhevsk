@@ -1,0 +1,1486 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*            "Журнал регистрации и учета компенсации стоимости услуг ведомственной гостиницы (ЭМ)"*
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#221          |10/09/18|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include UserReport.vih
+#include ComFiltr.vih
+#include CatFunc.vih
+#include RunStaj.vih
+#include AppFuncs.vih
+#include FeeSigners.vih
+#include DeptIer.vih         // Функции работы с подразделениями
+#include StrFunc.vih         // Функции работы со строками
+
+#include GP_3GD.vih
+#include GP_AppChange.vih
+#include GP_XlOutExt.vih
+
+#define GPInt GP_JRegVedGost // #(GPInt)
+#define GPNam Журнал регистрации и учета компенсации стоимости услуг ведомственной гостиницы // #(GPNam)
+
+Interface #(GPInt) '#(GPNam) (ЭМ)' EscClose, Gray;
+  show (,,86,19);
+
+const
+#include Excel.inc;
+end;
+
+table struct ttPerFlt // для фильтра по персоналу
+(
+  cRecPers : comp
+)
+with index
+(
+  ttPerFlt01  = cRecPers
+);
+
+table struct ttTypOp
+(
+  wCodeOper : word
+, sNameOper : string
+)
+with index
+(
+  ttTypOp01 = wCodeOper
+);
+
+table struct ttResStr // статический набор данных
+(
+  nRec      : comp
+, cRecPers  : comp        
+, dDocDate  : date
+, wDocMonth : word
+, wDocYear  : word   
+, sTbNmb    : string      //02
+, sFIO      : string      //03
+, sDept     : string      //04
+, sDepP     : string      //05
+, sPost     : string      //06
+, sKomp     : string      //07
+, sKomC     : string
+, cKomp     : comp
+, sStaj     : string      //08
+
+, sDogG     : string      //09 ? номер и дата договора с гостиницей (н)
+, dDogB     : date        //   дата начала действия договора
+, dDogG     : date        //10 ? срок действия этого договора       (н)
+, iKatN     : integer     //11 ? категория номера                   (н)
+, iKolM     : integer     //12 ? количество мест                    (н)
+, dNach     : date        //13 ? предварительно - дата назначения компенсации - окончательно из заплаты последний день месяца
+, dNachR    : date        // дата начисления компенсации
+, sSpoO     : string      //14 ? способ оплаты                      (н) видимо из каталогс-а но к чему вязать?
+, dbPayM    : double      //15 ? плата за месяц                     (н)
+, dbDedM    : double      //16 ? сумма за месяц к удержанию         (н)
+, dbSumZ    : double
+, dbSumU    : double
+, lVidOpl   : longint
+
+, dbSumK    : double      //17
+, sPrik     : string      //18
+, iISupr    : integer     //19
+, iIChil    : integer     //20
+, sIChil    : string  // ?
+, sIsCh     : string      //21
+, sIsSup    : string
+, sChild1   : string
+, sChild2   : string
+)
+with index
+(
+  ttResStr00 = nRec(Surrogate)
+, ttResStr01 = cRecPers + sKomC + dNach
+, ttResStr02 = sFIO + dNach + sKomC
+, ttResStr03 = cRecPers + lVidOpl
+, ttResStr04 = cRecPers + cKomp + wDocYear + wDocMonth
+// 2018.02.28 Обновление. Склеиваем ВСЕ в одну строку за месяц
+, ttResStr05 = cRecPers + wDocYear + wDocMonth
+);
+
+table struct ttPers
+(
+  cRecPsn : comp,
+  sFIO    : string
+)
+with index
+(
+  ttPers00 = cRecPsn
+, ttPers01 = sFIO
+);
+
+table struct ttVidOpl
+(
+  sVOpl   : string
+, lVOpl   : longint
+, cKomp   : comp
+)
+with index
+(
+  ttVidOpl01 = lVOpl
+);
+
+table struct ttZGD
+(
+  cRecDept : comp
+, sCodeZGD : string
+, sNameZGD : string
+)
+with index
+(
+  ttZGD01 = cRecDept
+);
+
+table struct mtReport
+(
+  sPodr   : string
+, sTbNmb  : string
+, sFIO    : string
+, sPost   : string
+, sDogN   : string
+, dbKomp  : double
+, dbUder  : double
+, sSpoOp  : string
+, wSpoOp  : word
+, sPeriod : string
+)
+with index
+(
+  mtReport01 = sFIO
+);
+
+table struct mtSigners
+(
+  wIdx:  word
+, sPost: string
+, sFIO:  string
+)
+with index
+(
+  mtSigners01 = wIdx
+);
+
+table struct mtDelRaise
+(
+  dPric   : date
+, dFrom   : date
+, dTo     : date
+, dAbort  : date
+, sDogN   : string
+, sTbNmb  : string
+, sFIO    : string
+, cPsn    : comp
+, sPodr   : string
+, sPost   : string
+, cNRRa   : comp
+, cParRa  : comp
+, dbKomp  : double
+)
+with index
+(
+  mtDelRaise01 = sFIO
+)
+;
+
+#include FeeSigners.var
+
+var
+  dBeg, dEnd    : date;
+  VCommonFiltr  : CommonFiltr; // Для встраивания фильтра по подразделениям / сотрудникам
+  MadeReport    : boolean;
+  wModeRep      : word;
+  cPersNRec     : comp;
+  PersMarker    : TPtr;
+  RPDMarker     : TPtr;
+  mKomp         : TPtr;
+  iCatFunc      : CatalogsFunctions;
+  iRunStaj      : Runstaj;
+  iAppFunc      : AppointmentsFunctions;
+  i3GD          : GP_3GD;
+  iAppCh        : GP_AppChange;
+  iOut          : GP_XlOutExt;
+  IDepartIer    : DepartIer;           // Переменная типа интерфейс DepartIer
+  iStrFunc      : StringFunctions;     // Переменная типа интерфейс StringFunctions
+  sFullName     : string;
+  sRPD          : string;
+  wRPD          : word;
+  sKomp         : string;
+  wKomp         : word;
+  lRB, lHS,
+  lCB, lCE,
+  lSB, lSE,
+  lDB, lDE,
+  lRow   : longint;
+  dSumE  : date;
+  lVOplT : longint; 
+  cVidUd : comp;
+  wVidUd : word;
+  sVidUd : string;
+  sSigner: string;
+  cDopl107: comp;
+
+create view
+var
+  cApp4SumVidOp : comp;
+  cApp4SumVidUd : comp;
+  cMainLinkDept : comp;
+from
+  persons
+, appointments
+, appointments App4SumVidOp
+, appointments App4SumVidUd
+, SumVidOp
+, SumVidUd
+, raisehist
+, GP_RaiseHistExt107
+, raise
+, TYPEPR
+, ttPerFlt
+, ttResStr
+, ttTypOp
+, ttPers
+, ttVidOpl
+, contdoc
+, TitleDoc
+, PartDoc
+, Catalogs CatSposobOplaty
+, mtReport (mtReport01)
+, mtSigners (mtSigners01)
+, KlVidOpl
+, LSchet
+//, Catalogs CatUd //UP.STAFF.PRIKAZ_PERS.RPD_107.VIDUD
+, KlVidUd
+, Catalogs ZGDDept
+, ttZGD
+, ttZGD ttZGDD
+, ttZGD ttZGDV
+, ttZGD ttZGDU
+, PsnLinks 
+, PsnLinks PsnLinks2
+, mtDelRaise
+
+where
+((
+     ttPerFlt.cRecPers == persons.nrec
+and  ttPerFlt.cRecPers == raisehist.CPSN and (raisehist.DOCDATE >= dBeg and raisehist.DOCDATE <= dEnd)
+and   raisehist.cRaise == raise.nrec
+and raisehist.cContDoc == contdoc.nrec
+and      ContDoc.cPart == PartDoc.Nrec
+and       PartDoc.cDoc == TitleDoc.Nrec
+and     RaiseHist.nrec == GP_RaiseHistExt107.cRaiseH
+and GP_RaiseHistExt107.cSposOpl == CatSposobOplaty.nRec
+and       contdoc.cStr == appointments.nrec
+and   contdoc.TypeOper == ttTypOp.wCodeOper
+and  appointments.DEPARTMENT == ttZGDD.cRecDept
+// -----
+and    ContDoc.cAddInf == PsnLinks.nRec
+and    ContDoc.CNEW4   == PsnLinks2.nRec
+
+and ttPerFlt.cRecPers  == LSchet.tPerson
+//Oplaty
+and LSchet.nRec        == SumVidOp.cLSch
+and year(dBeg)        <<= SumVidOp.YearN and (year(dEnd) >= SumVidOp.YearN)
+and    SumVidOp.VIDOPL == ttVidOpl.lVOpl
+and      cApp4SumVidOp == App4SumVidOp.nRec
+and  App4SumVidOp.DEPARTMENT == ttZGDV.cRecDept
+//Uderzhaniya
+and LSchet.nRec        == SumVidUd.cLSch
+//and year(dBeg)        <<= SumVidUd.YearV and (year(dEnd) >= SumVidUd.YearV and SumVidUd.VidUd = wVidUd)
+and year(dBeg)        <<= SumVidUd.YearN and (year(dEnd) >= SumVidUd.YearN and SumVidUd.VidUd = wVidUd)
+and      cApp4SumVidUd == App4SumVidUd.nRec
+and  App4SumVidUd.DEPARTMENT == ttZGDU.cRecDept
+
+
+and integer(0)    == ZGDDept.LPr
+and cMainLinkDept == ZGDDept.MainLink
+and ZGDDept.nRec  == ttZGD.cRecDept
+))
+;
+
+//Подписанты----------------------
+
+Window winSign 'Выбор подписантов';
+Show At (,, 70, 7);
+  Screen sSig(,,sci1Esc);
+    fields
+      sSigner('Подписанты',,sci13Esc): {Font = {BackColor = if(sSigner = '', ColorNeed, 0)}}, protect;
+    buttons
+      cmOk,,,'Запуск',,;
+      cmCancel,,,'Выход',,;
+    << 'Параметры отчета'
+
+     `Подписанты`
+      .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+     <. ~С~формировать .>                         <. ~З~акрыть .>
+    >>
+  end;
+handleevent
+  cmPick:
+  {
+    Case CurField of
+      #sSigner:
+        if iFeeSigners.RunMainWindow(1)
+          set sSigner := iFeeSigners.GetFeeSignersName;
+
+    end;
+  }
+  cmDelOnProtect:
+  {
+    case CurField of
+      #sSigner:
+        set sSigner := '';
+    end;
+  }
+  cmOk:
+  {
+    if trim(sSigner) <> '' 
+      CloseWindowEx(winSign, cmDefault)
+    else
+      message('Не заданы подписанты!', Error);
+  }
+  cmCancel:
+  {
+    CloseWindowEx(winSign, cmCancel);
+  }
+end;
+end;
+
+procedure InsertFeeSignersList(_wIdx: word; _sPost: string; _sFIO: string);
+{
+  ClearBuffer(#mtSigners);
+  mtSigners.wIdx  := _wIdx;
+  mtSigners.sPost := _sPost;
+  mtSigners.sFIO  := _sFIO;
+  if (insert current mtSigners <> tsOk) {}
+}
+
+procedure MakeFeeSignersList;
+var
+  sPostCur, sFIOCur: string = '';
+{
+  iFeeSigners.FindFeeSignersByName(cgReport_KASSFRO, sSigner);
+  if iFeeSigners.FeeSignersIsValid
+  {
+    if iFeeSigners.RestrictFeeByRole(1, cgRole_UtvLico)
+      if iFeeSigners.GetSignerFirst
+      {
+        sPostCur := iFeeSigners.GetSignerPosition(1);
+        sFIOCur  := iFeeSigners.GetSignerFIO(cgCommisFIOManual1);
+        InsertFeeSignersList(1, sPostCur, sFIOCur);
+      }
+    iFeeSigners.ClearRestriction;
+    if iFeeSigners.RestrictFeeByRole(1, 1002)
+      if iFeeSigners.GetSignerFirst
+      {
+        sPostCur := iFeeSigners.GetSignerPosition(1);
+        sFIOCur  := iFeeSigners.GetSignerFIO(cgCommisFIOManual1);
+        InsertFeeSignersList(2, sPostCur, sFIOCur);
+      }
+    iFeeSigners.ClearRestriction;
+    if iFeeSigners.RestrictFeeByRole(1, cgRole_Otvetstv)
+      if iFeeSigners.GetSignerFirst
+      {
+        sPostCur := iFeeSigners.GetSignerPosition(1);
+        sFIOCur  := iFeeSigners.GetSignerFIO(cgCommisFIOManual1);
+        InsertFeeSignersList(3, sPostCur, sFIOCur);
+      }
+    iFeeSigners.ClearRestriction;
+  }
+}
+//----------------------
+
+function sFPF : string; {sFPF := DateToStr(Cur_Date(),'_YYMMDD')+TimeToStr(Cur_Time(),'_HHMMSS');}
+
+procedure FillZGD;
+{
+  set cMainLinkDept := iCatFunc.GetCatalogsNRec(-11);
+  RestartVisual('Заполняю описатель иерархии ЗГД',1);
+  i3GD.Init3GD;
+  if isvalid(#ZGDDept)
+  _loop ZGDDept
+  {
+    if (not NextVisual) break;
+    if not isvalid(#ttZGD)
+    {
+      ClearBuffer(#ttZGD);
+      ttZGD.cRecDept := ZGDDept.nRec;
+      ttZGD.sCodeZGD := i3GD.sCode3GD(ZGDDept.nRec);
+      insert current ttZGD;
+    }
+  }
+}
+
+#declare CommonFields
+//--------------------------------------------------------------------------------------
+ttResStr.sDept    := substr(iCatFunc.GetCatalogsCode(appointments.DEPARTMENT),1,3);
+ttResStr.sPost    := iCatFunc.GetCatalogsName(appointments.POST);
+if isvalid(#ttZGDD)
+  ttResStr.sDepP    := ttZGDD.sCodeZGD;
+ttResStr.dNachR   := RaiseHist.dRec;
+ttResStr.dDogB    := RaiseHist.dDat2; 
+if isvalid(#GP_RaiseHistExt107)
+{
+  ttResStr.sDogG  := GP_RaiseHistExt107.NumDog;
+  ttResStr.dDogG  := GP_RaiseHistExt107.SrokDog; 
+  ttResStr.iKatN  := GP_RaiseHistExt107.Kateg; 
+  ttResStr.iKolM  := GP_RaiseHistExt107.KolMest;
+  ttResStr.sSpoO  := iCatFunc.GetCatalogsName(GP_RaiseHistExt107.cSposOpl); 
+  ttResStr.iISupr := GP_RaiseHistExt107.FMembers;
+  ttResStr.iIChil := GP_RaiseHistExt107.FMembCh;
+}
+//--------------------------------------------------------------------------------------
+#end
+/*
+  [RepOnDate]    DateToStr(TitleDoc.DocDate,'month') + ' ' +DateToStr(TitleDoc.DocDate,'YYYY') + ' года.';
+  [NoPric]       TitleDoc.DocNmb;
+  [DtPric]       if(TitleDoc.DocDate<>0,DateToStr(TitleDoc.DocDate,'DD.MM.YYYY'),'');
+  [sSignPost]    iAppFunc.GetAppPost(iAppFunc.GetAppNrec_OnDate(coGetTune('UP.STAFF.SIGNATORYAUTHORITY'),cur_date));
+  [sSignFIO]     iStrFunc.GetFIO(sGetTune('UP.STAFF.SIGNATORYAUTHORITY'));
+  [Exec]         sGetTune('User.FIO');
+
+  table ttReport
+  (
+    [CodePodr]  ttReport.sPodr; 
+    [TabNmb]    ttReport.sTbNmb;
+    [FIO]       ttReport.sFIO;
+    [Post]      ttReport.sPost;
+    [NoDogGost] ttReport.sDogN;
+    [SumKomp]   ttReport.dbKomp;
+    [SumUder]   ttReport.dbUder;
+    [SposOplat] ttReport.sSpoOp;
+    [TypeOpl]   ttReport.wSpoOp;
+    [Period]    ttReport.sPeriod;
+  );
+
+  table mtSigners
+  (
+    [sPostSign]  mtSigners.sPost; 
+    [sFIOSign]   iStrFunc.GetFIO(mtSigners.sFIO);
+  );
+*/
+procedure PrintReestr;
+{
+  #define FrmClR lRER, ++lCER
+
+  var lRecTable: longint = recordsintable(#mtReport);
+  var lRBR, lRER, lCBR, lCER : longint = 1;
+  var lLineR : longint;
+  
+  xlSetSheetName(2,'Реестр на выплату компенсаций'); 
+  xlSetActiveSheet(2);
+  xlMergeCells(lRBR, lCBR, lRBR, 8);
+  xlSetCellStringValue('Реестр работников на выплату компенсаций', lRBR, lCBR, lRBR, lCBR);
+  xlSetFontSize(14,  lRBR, lCBR, lRBR, lCBR); xlSetFontStyle(xlBold,  lRBR, lCBR, lRBR, lCBR); lRBR++;
+  xlMergeCells(lRBR, lCBR, lRBR, 8);
+  xlSetCellStringValue('стоимости услуг ведомственной гостиницы', lRBR, lCBR, lRBR, lCBR);   lRBR++;
+  xlMergeCells(lRBR, lCBR, lRBR, 8);
+  xlSetCellStringValue('с ' + DateToStr(dBeg, 'DD.MM.YYYY') + ' по ' + DateToStr(dEnd, 'DD.MM.YYYY'), lRBR, lCBR, lRBR, lCBR); lRBR += 2;
+
+  lCER := 0;
+  lCER++; xlSetCellStringValue('№'+chr(10)+'п/п',                    lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('№'+chr(10)+'подр',                   lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('Таб.'+chr(10)+'ном.',                lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('ФИО работника',                      lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('Должность,'+chr(10)+'специальность', lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('Срок'+chr(10)+'договора',            lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('№ Договора',                         lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('Сумма'+chr(10)+'начисления',         lRBR, lCER, lRBR, lCER);
+  xlSetFontStyle(xlBold, lRBR, lCBR, lRBR, lCER);
+
+  if (not xlCreateMatrix(lRecTable, lCER))
+  {
+    message('Ошибка функции xlCreateMatrix.',error);
+    xlKillExcel;
+    StopVisual;
+    exit;
+  }
+
+  lLineR := 0;
+  _loop mtReport
+  {
+    if ( mtReport.dbKomp = 0 ) continue;
+    if (not NextVisual) break;
+    lCER := 0;
+    xlStWriteToMatrix(#FrmClR, ++lLineR);
+    xlStWriteToMatrix(#FrmClR, mtReport.sPodr  );
+    xlStWriteToMatrix(#FrmClR, mtReport.sTbNmb );
+    xlStWriteToMatrix(#FrmClR, mtReport.sFIO   );
+    xlStWriteToMatrix(#FrmClR, mtReport.sPost  );
+    xlStWriteToMatrix(#FrmClR, mtReport.sPeriod);
+    xlStWriteToMatrix(#FrmClR, mtReport.sDogN  );
+    xlDoWriteToMatrix(#FrmClR, mtReport.dbKomp );
+    lRER++;
+  }
+  xlSetNumberFormat('@', lRBR+1, 1, lRBR+lRER, 7);
+  xlSetNumberFormat('# ##0,00;-# ##0,00;', lRBR+1, 8, lRBR+lRER, 8);
+  if (not xlWriteMatrixToExcel(lRBR+1, 1))
+    message('Ошибка функции xlWriteMatrixToExcel.',error);
+  xlFreeMatrix;
+  xlSetCellStringValue('Итого:', (lRBR+lRER), 4, (lRBR+lRER), 4);
+  iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;H'+(lRBR+1)+':H'+(lRBR+lRER-1)+')', (lRBR+lRER), 8, (lRBR+lRER), 8);
+  xlSetFontStyle(xlBold, (lRBR+lRER), lCBR, (lRBR+lRER), lCER);
+  
+  xlSetColumnWidth( 4, lRBR, 1, lRBR, 1);
+  xlSetColumnWidth( 6, lRBR, 2, lRBR, 2);
+  xlSetColumnWidth( 6, lRBR, 3, lRBR, 3);
+  xlSetColumnWidth(30, lRBR, 4, lRBR, 4);
+  xlSetColumnWidth(30, lRBR, 5, lRBR, 5);
+  xlSetColumnWidth(12, lRBR, 6, lRBR, 6);
+  xlSetColumnWidth(12, lRBR, 7, lRBR, 7);
+  xlSetColumnWidth(12, lRBR, 8, lRBR, 8);
+  
+  xlAlignCellsEx(xlCenter, xlCenter, 1, lCBR, (lRBR+lRER), lCER);
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, lRBR, lCBR, lRBR+lRER, lCER);
+
+  lRER += 2 + lRBR;
+  _loop mtSigners
+  {
+    xlMergeCells(lRER, 1, lRER, 5);
+    xlSetCellStringValue(mtSigners.sPost, lRER, 1, lRER, 1);
+    xlMergeCells(lRER, 6, lRER, 8);
+    xlAlignCellsEx(xlRight, xlCenter, lRER, 6, lRER, 8);
+    xlSetCellStringValue(iStrFunc.GetFIO(mtSigners.sFIO), lRER, 6, lRER, 6);
+    xlSetFontStyle(xlBold,  lRER, 1, lRER, 6); lRER += 2;
+  }
+  xlWrapText(lRBR, lCBR, (lRBR+lRER), lCER);
+
+  xlSetSheetName(3,'Реестр на удержание из ЗП'); 
+  xlSetActiveSheet(3);
+
+  lRBR := lRER := lCBR := lCER := 1;
+  xlMergeCells(lRBR, lCBR, lRBR, 8);
+  xlSetCellStringValue('Реестр работников на удержание', lRBR, lCBR, lRBR, lCBR);
+  xlSetFontSize(14,  lRBR, lCBR, lRBR, lCBR); xlSetFontStyle(xlBold,  lRBR, lCBR, lRBR, lCBR); lRBR++;
+  xlMergeCells(lRBR, lCBR, lRBR, 8);
+  xlSetCellStringValue('стоимости услуг ведомственной гостиницы', lRBR, lCBR, lRBR, lCBR);   lRBR++;
+  xlMergeCells(lRBR, lCBR, lRBR, 8);
+  xlSetCellStringValue('с ' + DateToStr(dBeg, 'DD.MM.YYYY') + ' по ' + DateToStr(dEnd, 'DD.MM.YYYY'), lRBR, lCBR, lRBR, lCBR); lRBR += 2;
+
+  lCER := 0;
+  lCER++; xlSetCellStringValue('№'+chr(10)+'п/п',                    lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('№'+chr(10)+'подр',                   lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('Таб.'+chr(10)+'ном.',                lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('ФИО работника',                      lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('Должность,'+chr(10)+'специальность', lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('Срок'+chr(10)+'договора',            lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('№ Договора',                         lRBR, lCER, lRBR, lCER);
+  lCER++; xlSetCellStringValue('Сумма'+chr(10)+'удержания',          lRBR, lCER, lRBR, lCER);
+  xlSetFontStyle(xlBold, lRBR, lCBR, lRBR, lCER);
+
+  if (not xlCreateMatrix(lRecTable, lCER))
+  {
+    message('Ошибка функции xlCreateMatrix.',error);
+    xlKillExcel;
+    StopVisual;
+    exit;
+  }
+
+  lLineR := 0;
+  _loop mtReport
+  {
+    if ( mtReport.wSpoOp = 0 ) continue;
+    if ( mtReport.dbUder = 0 ) continue;
+    if ( not NextVisual ) break;
+    lCER := 0;
+    xlStWriteToMatrix(#FrmClR, ++lLineR);
+    xlStWriteToMatrix(#FrmClR, mtReport.sPodr  );
+    xlStWriteToMatrix(#FrmClR, mtReport.sTbNmb );
+    xlStWriteToMatrix(#FrmClR, mtReport.sFIO   );
+    xlStWriteToMatrix(#FrmClR, mtReport.sPost  );
+    xlStWriteToMatrix(#FrmClR, mtReport.sPeriod);
+    xlStWriteToMatrix(#FrmClR, mtReport.sDogN  );
+    xlDoWriteToMatrix(#FrmClR, mtReport.dbUder );
+    lRER++;
+  }
+  xlSetNumberFormat('@', lRBR+1, 1, lRBR+lRER, 7);
+  xlSetNumberFormat('# ##0,00;-# ##0,00;', lRBR+1, 8, lRBR+lRER, 8);
+  if (not xlWriteMatrixToExcel(lRBR+1, 1))
+    message('Ошибка функции xlWriteMatrixToExcel.',error);
+  xlFreeMatrix;
+  xlSetCellStringValue('Итого:', (lRBR+lRER), 4, (lRBR+lRER), 4);
+  iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;H'+(lRBR+1)+':H'+(lRBR+lRER-1)+')', (lRBR+lRER), 8, (lRBR+lRER), 8);
+  xlSetFontStyle(xlBold, (lRBR+lRER), lCBR, (lRBR+lRER), lCER);
+  
+  xlSetColumnWidth( 4, lRBR, 1, lRBR, 1);
+  xlSetColumnWidth( 6, lRBR, 2, lRBR, 2);
+  xlSetColumnWidth( 6, lRBR, 3, lRBR, 3);
+  xlSetColumnWidth(30, lRBR, 4, lRBR, 4);
+  xlSetColumnWidth(30, lRBR, 5, lRBR, 5);
+  xlSetColumnWidth(12, lRBR, 6, lRBR, 6);
+  xlSetColumnWidth(12, lRBR, 7, lRBR, 7);
+  xlSetColumnWidth(12, lRBR, 8, lRBR, 8);
+  
+  xlAlignCellsEx(xlCenter, xlCenter, 1, lCBR, (lRBR+lRER), lCER);
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, lRBR, lCBR, lRBR+lRER, lCER);
+
+  lRER += 2 + lRBR;
+  _loop mtSigners
+  {
+    xlMergeCells(lRER, 1, lRER, 5);
+    xlSetCellStringValue(mtSigners.sPost, lRER, 1, lRER, 1);
+    xlMergeCells(lRER, 6, lRER, 8);
+    xlAlignCellsEx(xlRight, xlCenter, lRER, 6, lRER, 8);
+    xlSetCellStringValue(iStrFunc.GetFIO(mtSigners.sFIO), lRER, 6, lRER, 6);
+    xlSetFontStyle(xlBold,  lRER, 1, lRER, 6); lRER += 2;
+  }
+  xlWrapText(lRBR, lCBR, (lRBR+lRER), lCER);
+
+//------------------------------
+  lRecTable := recordsintable(#mtDelRaise);
+  if ( lRecTable <> 0 )
+  {
+    lRBR := lRER := lCBR := lCER := 1;
+    
+    xlSetSheetName(4,'Реестр на отмену компенсаций'); 
+    xlSetActiveSheet(4);
+    xlMergeCells(lRBR, lCBR, lRBR, 8);
+    xlSetCellStringValue('Реестр работников на отмену компенсаций', lRBR, lCBR, lRBR, lCBR);
+    xlSetFontSize(14,  lRBR, lCBR, lRBR, lCBR); xlSetFontStyle(xlBold,  lRBR, lCBR, lRBR, lCBR); lRBR++;
+    xlMergeCells(lRBR, lCBR, lRBR, 8);
+    xlSetCellStringValue('стоимости услуг ведомственной гостиницы', lRBR, lCBR, lRBR, lCBR);   lRBR++;
+    xlMergeCells(lRBR, lCBR, lRBR, 8);
+    xlSetCellStringValue('с ' + DateToStr(dBeg, 'DD.MM.YYYY') + ' по ' + DateToStr(dEnd, 'DD.MM.YYYY'), lRBR, lCBR, lRBR, lCBR); lRBR += 2;
+
+    lCER := 0;
+    lCER++; xlSetCellStringValue('№'+chr(10)+'п/п',                    lRBR, lCER, lRBR, lCER);
+    lCER++; xlSetCellStringValue('№'+chr(10)+'подр',                   lRBR, lCER, lRBR, lCER);
+    lCER++; xlSetCellStringValue('Таб.'+chr(10)+'ном.',                lRBR, lCER, lRBR, lCER);
+    lCER++; xlSetCellStringValue('ФИО работника',                      lRBR, lCER, lRBR, lCER);
+    lCER++; xlSetCellStringValue('Должность,'+chr(10)+'специальность', lRBR, lCER, lRBR, lCER);
+    lCER++; xlSetCellStringValue('Срок'+chr(10)+'договора',            lRBR, lCER, lRBR, lCER);
+    lCER++; xlSetCellStringValue('№ Договора',                         lRBR, lCER, lRBR, lCER);
+    lCER++; xlSetCellStringValue('Сумма'+chr(10)+'начисления',         lRBR, lCER, lRBR, lCER);
+    lCER++; xlSetCellStringValue('Отменяется'+chr(10)+'с даты',        lRBR, lCER, lRBR, lCER);
+    xlSetFontStyle(xlBold, lRBR, lCBR, lRBR, lCER);
+
+    if (not xlCreateMatrix(lRecTable, lCER))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+
+    lLineR := 0;
+    _loop mtDelRaise
+    {
+      if ( not FoundMarker(PersMarker, mtDelRaise.cPsn) ) continue;
+      if ( not NextVisual ) break;
+      lCER := 0;
+      xlStWriteToMatrix(#FrmClR, ++lLineR);
+      xlStWriteToMatrix(#FrmClR, mtDelRaise.sPodr  );
+      xlStWriteToMatrix(#FrmClR, mtDelRaise.sTbNmb );
+      xlStWriteToMatrix(#FrmClR, mtDelRaise.sFIO   );
+      xlStWriteToMatrix(#FrmClR, mtDelRaise.sPost  );
+      xlStWriteToMatrix(#FrmClR, if(mtDelRaise.dFrom<>0,'с '  +datetostr(mtDelRaise.dFrom,'DD.MM.YYYY'),'')
+                                +if(mtDelRaise.dTo<>0,  ' по '+datetostr(mtDelRaise.dTo,  'DD.MM.YYYY'),''));
+      xlStWriteToMatrix(#FrmClR, mtDelRaise.sDogN  );
+      xlDoWriteToMatrix(#FrmClR, mtDelRaise.dbKomp );
+      xlDtWriteToMatrix(#FrmClR, mtDelRaise.dAbort );
+      lRER++;
+    }
+    xlSetNumberFormat('@', lRBR+1, 1, lRBR+lRER, 7);
+    xlSetNumberFormat('# ##0,00;-# ##0,00;', lRBR+1, 8, lRBR+lRER, 8);
+    if (not xlWriteMatrixToExcel(lRBR+1, 1))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+    xlFreeMatrix;
+    xlSetCellStringValue('Итого:', (lRBR+lRER), 4, (lRBR+lRER), 4);
+    iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;H'+(lRBR+1)+':H'+(lRBR+lRER-1)+')', (lRBR+lRER), 8, (lRBR+lRER), 8);
+    xlSetFontStyle(xlBold, (lRBR+lRER), lCBR, (lRBR+lRER), lCER);
+    
+    xlSetColumnWidth( 4, lRBR, 1, lRBR, 1);
+    xlSetColumnWidth( 6, lRBR, 2, lRBR, 2);
+    xlSetColumnWidth( 6, lRBR, 3, lRBR, 3);
+    xlSetColumnWidth(30, lRBR, 4, lRBR, 4);
+    xlSetColumnWidth(30, lRBR, 5, lRBR, 5);
+    xlSetColumnWidth(12, lRBR, 6, lRBR, 6);
+    xlSetColumnWidth(12, lRBR, 7, lRBR, 7);
+    xlSetColumnWidth(12, lRBR, 8, lRBR, 8);
+    xlSetColumnWidth(12, lRBR, 9, lRBR, 9);
+    
+    xlAlignCellsEx(xlCenter, xlCenter, 1, lCBR, (lRBR+lRER), lCER);
+    xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, lRBR, lCBR, lRBR+lRER, lCER);
+
+    lRER += 2 + lRBR;
+    _loop mtSigners
+    {
+      xlMergeCells(lRER, 1, lRER, 5);
+      xlSetCellStringValue(mtSigners.sPost, lRER, 1, lRER, 1);
+      xlMergeCells(lRER, 6, lRER, 8);
+      xlAlignCellsEx(xlRight, xlCenter, lRER, 6, lRER, 8);
+      xlSetCellStringValue(iStrFunc.GetFIO(mtSigners.sFIO), lRER, 6, lRER, 6);
+      xlSetFontStyle(xlBold,  lRER, 1, lRER, 6); lRER += 2;
+    }
+    xlWrapText(lRBR, lCBR, (lRBR+lRER), lCER);
+  }
+//------------------------------  
+  xlSetActiveSheet(1);
+}
+
+procedure MakeReestrOneRecord;
+{
+  ClearBuffer(#mtReport);
+
+  mtReport.sTbNmb:= if (Appointments.lPrizn = 0, GetStrTabn(Persons.TabNmb,Persons.StrTabn), 
+                                                 GetStrTabN(Appointments.AppTabNmb, Appointments.StrTabN));
+  mtReport.sFIO  := Persons.FIO;    
+
+  mtReport.sPodr := SubStr(iCatFunc.GetCatalogsCode(Appointments.Department),1,3);
+  mtReport.sPost := if ( boGetTune('UP.STAFF.USE_LONGNAME_ANK'),trim(iCatFunc.GetCatalogsLongName(Appointments.Post)),
+                                                                trim(iCatFunc.GetCatalogsName(Appointments.Post)));
+  mtReport.dbKomp  := RaiseHist.RHSUM;
+  mtReport.sPeriod := if(RaiseHist.dRec<>0 ,  'с '+datetostr(RaiseHist.dRec ,'DD.MM.YYYY'),'')
+                     +if(RaiseHist.dDat2<>0,' по '+datetostr(RaiseHist.dDat2,'DD.MM.YYYY'),'');
+  if isvalid(#GP_RaiseHistExt107)
+  {
+    mtReport.sDogN := GP_RaiseHistExt107.NumDog;
+    mtReport.dbUder:= GP_RaiseHistExt107.SummaMes;  
+    mtReport.sSpoOp:= iCatFunc.GetCatalogsName(GP_RaiseHistExt107.cSposOpl);
+    mtReport.wSpoOp:= if(pos('из зарплаты',mtReport.sSpoOp)<>0,1,0) ;
+  }
+  insert current mtReport;
+}
+
+procedure Run;
+{
+  var kol, i    : integer;
+  var cPersNRec : comp;
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+
+  
+  if ( wModeRep = 1 )
+  {
+    if (not (ReadMyDsk(sSigner, 'RPD107_sSigner', false)))
+      sSigner := sGetTune('UP.Staff.SignatoryAuthority');
+    iFeeSigners.InitFeeSigners(cgReport_KASSFRO);
+    if (not iFeeSigners.FindFeeSignersByName(cgReport_KASSFRO, sSigner))
+      sSigner:='';
+
+    if (RunWindowModal(winSign) = cmDefault)
+    {
+      MakeFeeSignersList;
+    }
+    SaveMyDsk(sSigner, 'RPD107_sSigner');
+  }
+
+  if (VCommonFiltr.GetPsnCount = 0)
+    VCommonFiltr.SelectAllPsn;
+
+  PersMarker := InitMarker('#(GPInt)_PSN_'+UserName(),8,200,100);
+  PersMarker := VCommonFiltr.GetPersonsMarker;
+
+  RestartVisual('Заполняю таблицу фильтров',1);
+  kol:=  GetMarkerCount(PersMarker);
+  i := 0;
+  while i < kol
+  {
+    GetMarker(PersMarker, i, cPersNRec);
+    insert ttPerFlt set ttPerFlt.cRecPers := cPersNRec;
+    i++;
+    if (not NextVisual) break;
+  }
+
+  FillZGD;
+
+//  message(coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_107.VIDUD')); // !!!ПОЧЕМУ coGetTune возвращает код (KlVidUd.VidUd) а не nRec???
+  //      vSpr.pCatParentDot:=coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD107');
+  cDopl107 := coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD107');
+  if ( cDopl107 = 0 ) message('Не задана настройка UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD107', Error);
+  
+  set wVidUd := coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_107.VIDUD');
+  if getfirst KlVidUd where((wVidUd == KlVidUd.VidUd)) = tsOk
+  {
+    cVidUd := KlVidUd.nRec;
+    sVidUd := KlVidUd.NVidUd;
+  }
+  else
+  {message('Не задана настройка UP.STAFF.PRIKAZ_PERS.RPD_107.VIDUD', Error)}
+
+  RestartVisual('Идет сбор данных', 1);
+  if isvalid(#ttPerFlt)
+  _loop ttPerFlt
+  {
+    if (not NextVisual) break;
+    if isvalid(#persons) {}
+    if isvalid(#RaiseHist)
+    _loop RaiseHist
+    {
+    
+      if ( not isvalid(#Raise) ) continue;
+      if ( not isvalid(#contdoc) ) continue;
+      if ( not isvalid(#appointments) ) continue;
+      if ( not isvalid(#ttTypOp) ) continue;
+      if raise.OrderDate1 = RaiseHist.DOCDATE and raise.OrderDate2 = 0
+      {
+        //Для реестров
+        if ( wModeRep = 1 )
+          MakeReestrOneRecord;
+        //---
+//        if (not NextVisual) break;
+        if getfirst ttPers where((persons.nrec == ttPers.cRecPsn)) <> tsOk
+        {
+          clearbuffer(#ttPers);
+          ttPers.cRecPsn := persons.nrec;
+          ttPers.sFIO := persons.fio;
+          insert current ttPers;
+        }
+        clearbuffer(#ttResStr);
+        //Добавляем общие данные строку для склейки в разрезе:
+        if getfirst ttResStr where((  persons.nrec             == ttResStr.cRecPers
+// 2018.02.28 Обновление. Склеиваем ВСЕ в одну строку за месяц
+//                                   and RaiseHist.cRaiseType     == ttResStr.cKomp
+                                  and Year (RaiseHist.DOCDATE) == ttResStr.wDocYear
+                                  and Month(RaiseHist.DOCDATE) == ttResStr.wDocMonth
+                                  ))<>tsOk
+        {
+          ttResStr.cRecPers := persons.nrec;
+          ttResStr.cKomp    := RaiseHist.cRaiseType;
+          ttResStr.wDocYear := Year (RaiseHist.DOCDATE);
+          ttResStr.wDocMonth:= Month(RaiseHist.DOCDATE);
+          ttResStr.sTbNmb   := if(persons.STRTABN='',persons.TABNMB,persons.STRTABN);
+          ttResStr.sFIO     := persons.FIO;
+          ttResStr.sKomp    := iCatFunc.GetCatalogsName(RaiseHist.cRaiseType);
+          ttResStr.sKomC    := iCatFunc.GetCatalogsCode(RaiseHist.cRaiseType);
+          ttResStr.sStaj    := iRunStaj.RunStrStaj(persons.nrec,89,dEnd);
+          set lVOplT        := longint(Trim(iCatFunc.GetCatalogsCatData(RaiseHist.cRaiseType)));
+          ttResStr.lVidOpl  := lVOplT;
+          //проверяем - есть ли в таблице для фильтра по видам оплат текущий, добавляем если нет
+          if getfirst ttVidOpl where ((lVOplT == ttVidOpl.lVOpl)) <> tsOk
+          {
+            if getfirst KlVidOpl where ((lVOplT == KlVidOpl.VidOpl)) = tsOk
+              insert ttVidOpl 
+                set 
+                  ttVidOpl.lVOpl := ttResStr.lVidOpl,
+                  ttVidOpl.sVOpl := KlVidOpl.NVidOpl,
+                  ttVidOpl.cKomp := ttResStr.cKomp;
+          }
+          ttResStr.sIsCh    := iAppCh.State(persons.nrec,contdoc.cSTR,dEnd,12);
+          #CommonFields
+          insert current ttResStr;
+        }
+        //тут проверяем дату документа и дату уже существующей записи в ttResStr
+        //если обрабатываем более новый документ - обновляем необходимые поля более свежими данными
+        if ttResStr.dDocDate < RaiseHist.DOCDATE 
+        {
+          #CommonFields
+        }
+        //суммируем остальное
+        if isvalid(#GP_RaiseHistExt107)
+        {
+          ttResStr.dbPayM   += GP_RaiseHistExt107.PlataMes; 
+          ttResStr.dbDedM   += GP_RaiseHistExt107.SummaMes; 
+        }
+        ttResStr.dbSumK   += RaiseHist.RHSUM;
+        ttResStr.sPrik    += ' '+RaiseHist.DOCNMB+' от '+datetostr(RaiseHist.DOCDATE,'DD.MM.YYYY');
+        if ( ContDoc.wAttrDoc3 = 1 ) 
+          ttResStr.sIsSup := 'Да';
+        if isValid(#PsnLinks)
+          ttResStr.sChild1 := PsnLinks.Rfio+', рожд. '+DateToStr(PsnLinks.RBornDate, 'DD.MM.YYYY');
+        if isValid(#PsnLinks2)
+          ttResStr.sChild2 := PsnLinks2.Rfio+', рожд. '+DateToStr(PsnLinks2.RBornDate, 'DD.MM.YYYY');
+        update current ttResStr;
+      }
+    }
+
+    if isvalid(#LSchet)
+    _loop LSchet
+    {
+      //Oplaty
+      if isvalid(#SumVidOp)
+      _loop SumVidOp
+      {
+        dSumE := date(Last_Day(date(1,SumVidOp.MesN,SumVidOp.YearN)),SumVidOp.MesN,SumVidOp.YearN);
+        if isvalid(#ttVidOpl)
+        if  date(1,month(dBeg),year(dBeg)) <= date(1,SumVidOp.MesN,SumVidOp.YearN)
+        and date(Last_Day(dEnd),month(dEnd),year(dEnd)) >= dSumE
+        {
+          clearbuffer(#ttResStr);
+          //вставляем отвязанную запись по выплате если нет приказа за месяц
+          if getfirst ttResStr where((  persons.nrec   == ttResStr.cRecPers
+// 2018.02.28 Обновление. Склеиваем ВСЕ в одну строку за месяц
+//                                     and ttVidOpl.cKomp == ttResStr.cKomp
+                                    and SumVidOp.YearN == ttResStr.wDocYear
+                                    and SumVidOp.MesN  == ttResStr.wDocMonth
+                                    )) <> tsOk
+          {//if getfirst ttResStr
+            ttResStr.cRecPers := persons.nrec;
+            ttResStr.cKomp    := ttVidOpl.cKomp;
+            ttResStr.wDocYear := SumVidOp.YearN;
+            ttResStr.wDocMonth:= SumVidOp.MesN;
+            ttResStr.sTbNmb   := if(persons.STRTABN='',persons.TABNMB,persons.STRTABN);
+            ttResStr.sFIO     := persons.FIO;
+            ttResStr.sKomp    := iCatFunc.GetCatalogsName(ttVidOpl.cKomp);
+            ttResStr.sKomC    := iCatFunc.GetCatalogsCode(ttVidOpl.cKomp);
+            ttResStr.sStaj    := iRunStaj.RunStrStaj(persons.nrec,89,dEnd);
+            ttResStr.lVidOpl  := SumVidOp.VidOpl;
+            //----------------------------------------------------------------
+            set cApp4SumVidOp := iAppFunc.GetAppNrec_OnDate(persons.nrec,dSumE);
+            if isvalid(#App4SumVidOp)
+            {
+              ttResStr.sDept  := substr(iCatFunc.GetCatalogsCode(App4SumVidOp.DEPARTMENT),1,3);
+              ttResStr.sPost  := iCatFunc.GetCatalogsName(App4SumVidOp.POST);
+              if isvalid(#ttZGDV)
+                ttResStr.sDepP:= ttZGDV.sCodeZGD;
+              ttResStr.sIsCh  := iAppCh.State(persons.nrec,App4SumVidOp.nRec,dEnd,12);
+            }
+            insert current ttResStr;
+            if getfirst ttPers where((persons.nrec == ttPers.cRecPsn)) <> tsOk
+            {
+              clearbuffer(#ttPers);
+              ttPers.cRecPsn := persons.nrec;
+              ttPers.sFIO := persons.fio;
+              insert current ttPers;
+            }
+          }//if getfirst ttResStr
+          //апдейтим ttResStr по текущему курсору (новому или существующему)
+          ttResStr.dbSumZ += SumVidOp.Summa;
+          ttResStr.dNach  := dSumE;
+          update current ttResStr;
+        }
+      }
+      //Uderzhaniya
+      if isvalid(#SumVidUd)
+      _loop SumVidUd
+      {
+        dSumE := date(Last_Day(date(1,SumVidUd.MesN,SumVidUd.YearN)),SumVidUd.MesN,SumVidUd.YearN);
+        if  date(1,month(dBeg),year(dBeg)) <= date(1,SumVidUd.MesN,SumVidUd.YearN)
+        and date(Last_Day(dEnd),month(dEnd),year(dEnd)) >= dSumE
+        {
+          clearbuffer(#ttResStr);
+          //вставляем отвязанную запись по выплате если нет приказа за месяц
+          if getfirst ttResStr where((  persons.nrec   == ttResStr.cRecPers
+// 2018.02.28 Обновление. Склеиваем ВСЕ в одну строку за месяц
+//                                     and cVidUd         == ttResStr.cKomp
+                                    and SumVidUd.YearN == ttResStr.wDocYear
+                                    and SumVidUd.MesN  == ttResStr.wDocMonth
+                                    )) <> tsOk
+          {//if getfirst ttResStr
+            ttResStr.cRecPers := persons.nrec;
+            ttResStr.cKomp    := cVidUd;
+            ttResStr.wDocYear := SumVidUd.YearN;
+            ttResStr.wDocMonth:= SumVidUd.MesN;
+            ttResStr.sTbNmb   := if(persons.STRTABN='',persons.TABNMB,persons.STRTABN);
+            ttResStr.sFIO     := persons.FIO;
+            ttResStr.sKomp    := sVidUd;
+//            ttResStr.sKomC    := iCatFunc.GetCatalogsCode(ttVidOpl.cKomp);
+            ttResStr.sStaj    := iRunStaj.RunStrStaj(persons.nrec,89,dEnd);
+            ttResStr.lVidOpl  := wVidUd;
+            //----------------------------------------------------------------
+            set cApp4SumVidUd := iAppFunc.GetAppNrec_OnDate(persons.nrec,dSumE);
+            if isvalid(#App4SumVidUd)
+            {
+              ttResStr.sDept  := substr(iCatFunc.GetCatalogsCode(App4SumVidUd.DEPARTMENT),1,3);
+              ttResStr.sPost  := iCatFunc.GetCatalogsName(App4SumVidUd.POST);
+              if isvalid(#ttZGDU)
+                ttResStr.sDepP:= ttZGDU.sCodeZGD;
+              ttResStr.sIsCh  := iAppCh.State(persons.nrec,App4SumVidUd.nRec,dEnd,12);
+            }
+            insert current ttResStr;
+            if getfirst ttPers where((persons.nrec == ttPers.cRecPsn)) <> tsOk
+            {
+              clearbuffer(#ttPers);
+              ttPers.cRecPsn := persons.nrec;
+              ttPers.sFIO := persons.fio;
+              insert current ttPers;
+            }
+          }//if getfirst ttResStr
+          //апдейтим ttResStr по текущему курсору (новому или существующему)
+          ttResStr.dbSumU += SumVidUd.SumUd;
+          ttResStr.dNach  := dSumE;
+          update current ttResStr;
+        }
+      }
+    }
+  }
+
+  //это реестр по отмене доплат 
+  //делается по РПД10 так что выбираем отдельно
+  if ( wModeRep = 1 )
+  {
+    sql select
+      TitleDoc.DOCDATE,
+      DelRaise.DFROMDATE,
+      DelRaise.dToDate,
+      DelRaise.dRaiseAbort,
+      GP_RaiseHistExt107.NumDog,
+      Persons.STRTABN,
+      Persons.FIO,
+      Persons.NRec,
+      CatDept.Code,
+      CatPost.Name,
+      RaiseCat.NRec,
+      RaiseCat.cParent,
+      DelRaise.dSum1
+    from
+               ContDoc
+    inner join DelRaise on 1 = DelRaise.wTypeInfo and ContDoc.NRec = DelRaise.cOrderCont1
+    left  join Catalogs RaiseCat on DelRaise.cRaiseType = RaiseCat.Nrec
+    left  join Appointments on ContDoc.cStr = Appointments.NRec
+    left  join Catalogs CatPost on Appointments.Post = CatPost.NRec
+    left  join Catalogs CatDept on Appointments.Department = CatDept.NRec
+    left  join Persons on Appointments.Person = Persons.NRec
+    left  join PartDoc on ContDoc.cPart = PartDoc.NRec
+    left  join TitleDoc on PartDoc.cDoc = TitleDoc.NRec
+    left  join Raise on ContDoc.nRec = Raise.cRDopEnd
+    left  join RaiseHist on Raise.Nrec = RaiseHist.cRaise
+    left  join GP_RaiseHistExt107 on RaiseHist.nrec = GP_RaiseHistExt107.cRaiseH
+    where
+        ( contdoc.typeoper = 10 )
+    and ( RaiseCat.NRec = :(cDopl107) or RaiseCat.cParent = :(cDopl107) )
+    and ( TitleDoc.DOCDATE >= :(dBeg) and TitleDoc.DOCDATE <= :(dEnd) )
+    and ( TitleDoc.wStatus = 1 )
+    and ( GP_RaiseHistExt107.NumDog is not null )
+    into mtDelRaise
+    ;
+  }
+  if isvalid(#ttResStr)
+  {
+    RestartVisual('Выгружаю данные',1);
+    sFullName := GetDefaultUserPath + '#(GPNam)'+sFPF+'.xls';
+
+    xlCreateExcel(sFullName, TRUE);
+    if ( wModeRep = 1 )
+    {
+      xlAddSheet; xlAddSheet; xlAddSheet; xlSetActiveSheet(1);
+      xlSetSheetName(1,'Журнал регистрации и учета'); 
+    }
+    lRB  := 3;
+    lHS  := 3;
+    lRow := 1;
+    lDB  := lDE := lRB + lHS;
+    lCB  := 1;
+    lCE  := 1;
+
+    #define repT 1,3,1,3
+    iOut.StringValL('#(GPNam) за период с '+datetostr(dBeg,'DD.MM.YYYY')+' по '+datetostr(dEnd,'DD.MM.YYYY'),#repT);
+    xlSetFontSize(14,#repT); xlSetFontStyle(xlBold,#repT);
+
+    #define FrmHd  lRB,  lCE,  lRB,  lCE
+    #define FrmH2  lRB+2,lCE,  lRB+2,lCE
+/*01*/iOut.Header3Row('№ п/п',                               #FrmHd); lCE++;
+/*02*/iOut.Header3Row('Таб. Ном.',                           #FrmHd); lCE++;
+/*03*/iOut.Header3Row('ФИО',                                 #FrmHd); lCE++;
+/*04*/iOut.Header3Row('№ цеха / отдел',                      #FrmHd); lCE++;
+/*05*/iOut.Header3Row('Код вышест. подразд.',                #FrmHd); lCE++;
+/*06*/iOut.Header3Row('Должность / специальность',           #FrmHd); lCE++;
+/*07*/iOut.Header3Row('Вид компенсации',                     #FrmHd); lCE++;
+/*08*/iOut.Header3Row('Стаж работы на предприятии',          #FrmHd); lCE++;
+/*09*/iOut.Header3Row('№ договора',                          #FrmHd); lCE++;
+/*  */iOut.Header3Row('Дата начала действия договора',       #FrmHd); lCE++;
+/*10*/iOut.Header3Row('Дата окончания действия договора',    #FrmHd); lCE++;
+/*11*/iOut.Header3Row('Кате-гория номера',                   #FrmHd); lCE++;
+/*12*/iOut.Header3Row('Кол-во мест',                         #FrmHd); lCE++;
+/*13*/iOut.Header3Row('Дата начисления',                     #FrmHd); lCE++;
+/*14*/iOut.Header3Row('Способ оплаты',                       #FrmHd); lCE++;
+/*15*/iOut.Header3Row('Плата за месяц',                      #FrmHd); lCE++;
+/*16*/iOut.Header3Row('Сумма за месяц (к удержанию)',        #FrmHd); lCE++;
+/*17*/iOut.Header3Row('Размер компенсации (к начислению)',   #FrmHd); lCE++;
+/*  */iOut.Header3Row('Фактическая сумма дотации',           #FrmHd); lCE++;
+/*  */iOut.Header3Row('Фактически удержано',                 #FrmHd); lCE++;
+/*18*/iOut.Header3Row('Номер и дата списка',                 #FrmHd); lCE++;
+      iOut.HeaderIns2('Количество членов семьи',             #FrmHd, 2);
+/*19*/iOut.Header1Row('супруг (а)',                          #FrmH2); lCE++;
+/*20*/iOut.Header1Row('дети',                                #FrmH2); lCE++;
+      iOut.Header3Row('Супруг является работником завода',   #FrmHd); lCE++;
+      iOut.Header3Row('Ребенок 1',                           #FrmHd); lCE++;
+      iOut.Header3Row('Ребенок 2',                           #FrmHd); lCE++;
+/*21*/iOut.Header3Row('Изменение условий',                   #FrmHd); lCE++;
+
+    #define FrmCl lDE,lSE,lDE,lSE
+    var sTbNmbT, sKompT, sPrikT: string = '';
+    var iRowB  : longint;
+    var dbSum1,dbSum2,dbSum3 : double = 0;
+    var wMonPrik : word = 0;
+    var lRowT,lRowC, lRowB : longint;
+    
+    iRowB:=lDE;
+    _loop ttPers ordered index ttPers01
+    {
+      if (not NextVisual) break;
+      lSB := lSE := 1;
+      iRowB:=lDE;
+      dbSum1:=dbSum2:=dbSum3:=0;
+      lRowT:=0;
+      lRowC:=1;
+      _loop ttResStr where((ttPers.cRecPsn==ttResStr.cRecPers)) lRowT++; 
+      if (not xlCreateMatrix(lRowT,27))
+      {
+        message('Ошибка функции xlCreateMatrix.',error);
+        xlKillExcel;
+        exit;
+      }
+/*01*/xlDoWriteToMatrix(lRowC,lSE,lRow++);//iOut.IntegerVal(lRow,           #FrmCl); lRow++;
+      _loop ttResStr where((ttPers.cRecPsn==ttResStr.cRecPers)) ordered index ttResStr04
+      {
+
+//        lSB := lSE := 1;
+        lSE := 1;
+/*01*/                          lSE++;
+/*02*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sTbNmb);//iOut.CodeVal   (ttResStr.sTbNmb,#FrmCl); lSE++;
+/*03*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sFio  );//iOut.StringValL(ttResStr.sFio  ,#FrmCl); lSE++;
+/*04*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sDept );//iOut.CodeVal   (ttResStr.sDept ,#FrmCl); lSE++;
+/*05*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sDepP );//iOut.CodeVal   (ttResStr.sDepP ,#FrmCl); lSE++;
+/*06*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sPost );//iOut.StringValL(ttResStr.sPost ,#FrmCl); lSE++;
+/*07*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sKomp );//iOut.StringValL(ttResStr.sKomp ,#FrmCl); lSE++;
+/*08*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sStaj );//iOut.StringValR(ttResStr.sStaj ,#FrmCl); lSE++;
+/*09*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sDogG );//iOut.StringValR(ttResStr.sDogG ,#FrmCl); lSE++;
+/*  */  xlDtWriteToMatrix(lRowC,lSE++,ttResStr.dNachR);//iOut.DateVal   (ttResStr.dDogB ,#FrmCl); lSE++;
+/*  *///xlDtWriteToMatrix(lRowC,lSE++,ttResStr.dDogB );//iOut.DateVal   (ttResStr.dDogB ,#FrmCl); lSE++;
+/*10*/  xlDtWriteToMatrix(lRowC,lSE++,ttResStr.dDogG );//iOut.DateVal   (ttResStr.dDogG ,#FrmCl); lSE++;
+/*11*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.iKatN );//iOut.IntegerVal(ttResStr.iKatN ,#FrmCl); lSE++;
+/*12*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.iKolM );//iOut.IntegerVal(ttResStr.iKolM ,#FrmCl); lSE++;
+/*13*/  xlDtWriteToMatrix(lRowC,lSE++,if(ttResStr.dNach<>0,ttResStr.dNach,ttResStr.dNachR));//iOut.DateVal   (if(ttResStr.dNach<>0,ttResStr.dNach,ttResStr.dNachR), #FrmCl); lSE++;
+/*14*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sSpoO );//iOut.StringValL(ttResStr.sSpoO ,#FrmCl); lSE++;
+/*15*/  xlDoWriteToMatrix(lRowC,lSE++,ttResStr.dbPayM);//iOut.DoubleVal (ttResStr.dbPayM,#FrmCl); lSE++;
+/*16*/  xlDoWriteToMatrix(lRowC,lSE++,ttResStr.dbDedM);//iOut.DoubleVal (ttResStr.dbDedM,#FrmCl); lSE++;
+/*17*/  xlDoWriteToMatrix(lRowC,lSE++,ttResStr.dbSumK);//iOut.DoubleVal (ttResStr.dbSumK,#FrmCl); lSE++;
+/*  */  xlDoWriteToMatrix(lRowC,lSE++,ttResStr.dbSumZ);//iOut.DoubleVal (ttResStr.dbSumZ,#FrmCl); lSE++;
+/*  */  xlDoWriteToMatrix(lRowC,lSE++,ttResStr.dbSumU);//iOut.DoubleVal (ttResStr.dbSumZ,#FrmCl); lSE++;
+/*18*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sPrik );//iOut.StringValC(ttResStr.sPrik ,#FrmCl); lSE++;//xlAddCellStringValue(ttResStr.sPrik,lDE, lSE); lSE++;
+/*19*/  xlDoWriteToMatrix(lRowC,lSE++,ttResStr.iISupr);//iOut.IntegerVal(ttResStr.iISupr,#FrmCl); lSE++;
+/*20*/  xlDoWriteToMatrix(lRowC,lSE++,ttResStr.iIChil);//iOut.IntegerVal(ttResStr.iIChil,#FrmCl); lSE++;
+        xlStWriteToMatrix(lRowC,lSE++,ttResStr.sIsSup );//iOut.StringValC(ttResStr.sIsCh ,#FrmCl); lSE++;
+        xlStWriteToMatrix(lRowC,lSE++,ttResStr.sChild1);//iOut.StringValC(ttResStr.sIsCh ,#FrmCl); lSE++;
+        xlStWriteToMatrix(lRowC,lSE++,ttResStr.sChild2);//iOut.StringValC(ttResStr.sIsCh ,#FrmCl); lSE++;
+/*21*/  xlStWriteToMatrix(lRowC,lSE++,ttResStr.sIsCh );//iOut.StringValC(ttResStr.sIsCh ,#FrmCl); lSE++;
+        lDE++;
+        lRowC++;
+      }//_loop ttResStr
+
+      xlSetNumberFormat('@', iRowB, 2, iRowB+lRowC, 2);
+      if (not xlWriteMatrixToExcel(iRowB,1))
+        message('Ошибка функции xlWriteMatrixToExcel.',error);
+      xlFreeMatrix;
+      lSE := 1; 
+      xlSetFontStyle(xlBold,lDE,lCB,lDE,lCE);
+      iOut.HeaderInsL('Итого по '+ttResStr.sFio, #FrmCl, 5);
+      iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;P'+iRowB+':P'+(lDE-1)+')', lDE, 16, lDE, 16);
+      iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;Q'+iRowB+':Q'+(lDE-1)+')', lDE, 17, lDE, 17);
+      iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;R'+iRowB+':R'+(lDE-1)+')', lDE, 18, lDE, 18);
+      iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;S'+iRowB+':S'+(lDE-1)+')', lDE, 19, lDE, 19);
+      iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;T'+iRowB+':T'+(lDE-1)+')', lDE, 20, lDE, 20);
+      lDE++;
+    }//_loop ttPers
+
+    var iItC : integer;
+    #define FrmIt lDE,iItC,lDE,iItC
+    #define Itog  '=СУММ(R'+lDB+'C'+iItC+':R'+(lDE-1)+'C'+iItC+')'
+    iOut.xlR1C1OnOff(true);
+    iItC :=  3; iOut.StringValR('Итого:', #FrmIt);
+    iItC := 13; iOut.FormulaIntegerVal(#Itog, #FrmIt);
+    iItC := 22; iOut.FormulaIntegerVal(#Itog, #FrmIt);
+    iItC := 23; iOut.FormulaIntegerVal(#Itog, #FrmIt);
+    iOut.xlR1C1OnOff(false);
+    iItC := 16; iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;P'+lDB+':P'+(lDE-1)+')', #FrmIt);
+    iItC := 17; iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;Q'+lDB+':Q'+(lDE-1)+')', #FrmIt); 
+    iItC := 18; iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;R'+lDB+':P'+(lDE-1)+')', #FrmIt); 
+    iItC := 19; iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;S'+lDB+':S'+(lDE-1)+')', #FrmIt); 
+    iItC := 20; iOut.FormulaDoubleVal('=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;T'+lDB+':T'+(lDE-1)+')', #FrmIt); 
+
+    lSE := 1;
+    #define FrmBl lDB,lSE,lDE,lSE
+    xlAlignCellsEx(xlGeneral,xlCenter,lDB,lCB,lDE,lCE);
+/*01*/xlSetColumnWidth( 4,#FrmBl); lSE++;
+/*02*/xlSetColumnWidth( 6,#FrmBl); xlAlignCellsEx(xlCenter,xlCenter,#FrmBl); xlSetNumberFormat('@',#FrmBl); lSE++;
+/*03*/xlSetColumnWidth(17,#FrmBl); lSE++;
+/*04*/xlSetColumnWidth( 8,#FrmBl); xlAlignCellsEx(xlCenter,xlCenter,#FrmBl); xlSetNumberFormat('@',#FrmBl); lSE++;
+/*05*/xlSetColumnWidth( 8,#FrmBl); xlAlignCellsEx(xlCenter,xlCenter,#FrmBl); xlSetNumberFormat('@',#FrmBl); lSE++;
+/*06*/xlSetColumnWidth(16,#FrmBl); lSE++;
+/*07*/xlSetColumnWidth(18,#FrmBl); lSE++;
+/*08*/xlSetColumnWidth(12,#FrmBl); xlAlignCellsEx(xlCenter,xlCenter,#FrmBl); lSE++;
+/*09*/xlSetColumnWidth(11,#FrmBl); xlAlignCellsEx(xlCenter,xlCenter,#FrmBl); xlSetNumberFormat('@',#FrmBl); lSE++;
+/*  */xlSetColumnWidth(11,#FrmBl); lSE++;
+/*10*/xlSetColumnWidth(11,#FrmBl); lSE++;
+/*11*/xlSetColumnWidth( 7,#FrmBl); lSE++;
+/*12*/xlSetColumnWidth( 6,#FrmBl); lSE++;
+/*13*/xlSetColumnWidth(11,#FrmBl); lSE++;
+/*14*/xlSetColumnWidth(11,#FrmBl); lSE++;
+/*15*/xlSetColumnWidth(10,#FrmBl); xlSetNumberFormat('### ### ### ##0, 00',#FrmBl); lSE++;
+/*16*/xlSetColumnWidth(10,#FrmBl); xlSetNumberFormat('### ### ### ##0, 00',#FrmBl); lSE++;
+/*17*/xlSetColumnWidth(13,#FrmBl); xlSetNumberFormat('### ### ### ##0, 00',#FrmBl); lSE++;
+/*  */xlSetColumnWidth(13,#FrmBl); xlSetNumberFormat('### ### ### ##0, 00',#FrmBl); lSE++;
+/*  */xlSetColumnWidth(13,#FrmBl); xlSetNumberFormat('### ### ### ##0, 00',#FrmBl); lSE++;
+/*18*/xlSetColumnWidth(12,#FrmBl); xlAlignCellsEx(xlCenter,xlCenter,#FrmBl); lSE++;
+/*19*/xlSetColumnWidth( 6,#FrmBl); xlAlignCellsEx(xlCenter,xlCenter,#FrmBl); lSE++;
+/*20*/xlSetColumnWidth( 6,#FrmBl); xlAlignCellsEx(xlCenter,xlCenter,#FrmBl); lSE++;
+      xlSetColumnWidth(11,#FrmBl); lSE++;
+      xlSetColumnWidth(17,#FrmBl); lSE++;
+      xlSetColumnWidth(17,#FrmBl); lSE++;
+/*21*/xlSetColumnWidth(12,#FrmBl); lSE++;
+  
+    xlSetFontSize( 9,lRB,lCB,lDB-1,lCE); xlSetFontSize(11,lDB,lCB,lDE,lCE);
+    xlSetFontStyle(xlBold,lRB,lCB,lDB-1,lCE); xlSetFontStyle(xlBold,lDE,1,lDE,lCE);
+    xlWrapText(lRB,lCB,lDE,lCE);
+    xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0,lRB,lCB,lDE,lCE-1);
+    iOut.StringValL('Ответственный исполнитель: '+sGetTune('User.FIO'),lDE+2,3,lDE+2,3);
+    xlSetFontSize(11,lDE+2,3,lDE+2,3); xlSetFontStyle(xlBold,lDE+2,3,lDE+2,3);
+    iOut.xlTitleEachPageO(lRB,lDB-1);
+    iOut.xlPageScaleLandscape(1);
+    xlFreeze(lDB,6);
+    if ( wModeRep = 1 )
+      PrintReestr;
+    StopVisual;
+    xlKillExcel;
+  }
+  else
+  {
+    StopVisual;
+    message('Нет данных для формирования отчета!');
+  }
+
+}
+
+Screen s1(,,sci1Esc);
+  show at (,,85,9);
+  fields
+    dBeg ('Начало периода',,):{Font = {BackColor = if(dBeg = 0, ColorNeed, 0)}}, noprotect;
+    dEnd ('конец периода',,): {Font = {BackColor = if(dEnd = 0, ColorNeed, 0)}}, noprotect;
+    sRPD ('Распорядительное действие',, scStaffKatPodrRefsPick):  {Font = {BackColor = if(sRPD = 'не установлено', ColorNeed, 0)}}, protect;
+    sKomp('Выплаты по видам компенсации',, scStaffKatPodrRefsPick):  {Font = {BackColor = if(sKomp = 'не установлены', ColorNeed, 0)}}, protect;
+    wModeRep ('Режим формирования',,): noprotect;
+  << 'Параметры отчета'
+   `Период отчета`
+    С .@@@@@@@@@@ по .@@@@@@@@@@@
+
+    Действие     .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    
+    Виды компенсации 
+    для выплат   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    [.] Включать реестры на дотации/удержание`
+  >>
+end;  
+embedded ComFiltrEmbedded 'Фильтры' interface VCommonFiltr;
+  show (,10,85,16);
+end
+Screen s2(,,sci1Esc);
+  show (,17,85,18);
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+  <<
+     <. ~С~формировать .>                         <. ~З~акрыть .>
+  >>
+end;
+
+function sSetKomp(mSetKomp: TPtr): string;
+{
+  var cTmp: comp;
+  var kol, i    : integer;
+  var lViOp : comp;
+
+  if (getMarkerCount(mSetKomp) = 0)
+  {
+    delete all from ttVidOpl;
+    result := 'не установлены';
+    exit;
+  }
+  else
+  {
+    if (getMarkerCount(mSetKomp) = 1)
+    {
+      GetMarker(mSetKomp, 0, cTmp);
+      result := iCatFunc.GetCatalogsName(cTmp);
+    }
+    else
+      result := 'Множественный выбор (' + string(getMarkerCount(mSetKomp)) + ')';
+    
+    kol:=  GetMarkerCount(mSetKomp);
+    i := 0;
+    while i < kol
+    {
+      GetMarker(mSetKomp, i, cTmp);
+      lViOp := longint(Trim(iCatFunc.GetCatalogsCatData(cTmp)));
+      if getfirst KlVidOpl where ((lViOp == KlVidOpl.VidOpl)) = tsOk
+        insert ttVidOpl 
+          set 
+            ttVidOpl.lVOpl := lViOp,
+            ttVidOpl.sVOpl := KlVidOpl.NVidOpl,
+            ttVidOpl.cKomp := cTmp;
+      i++;
+    }
+  }
+}
+
+procedure FillRPDStr;
+{
+  var i,kol : integer;
+  Set sRPD := 'не установлено';
+
+  kol :=  GetMarkerCount(RPDMarker);
+  if (kol = 1)
+  {
+    if GetMarker(RPDMarker, 0, wRPD)
+      if GetFirst TypePr where ((wRPD == TypePr.CodOper)) = tsOk
+      {
+        set sRPD:= TypePr.NOper;
+        clearbuffer(#ttTypOp);
+        ttTypOp.wCodeOper := TYPEPR.CODOPER;
+        ttTypOp.sNameOper := TYPEPR.NOPER;
+        insert current ttTypOp;
+      }
+  }
+  else
+  {
+    set sRPD := 'Несколько распорядительных действий (' + kol + ')';
+    i := 0;
+    while i < kol
+    {
+      GetMarker(RPDMarker, i, wRPD);
+      if GetFirst TypePr where ((wRPD == TypePr.CodOper)) = tsOk
+      {
+        clearbuffer(#ttTypOp);
+        ttTypOp.wCodeOper := TYPEPR.CODOPER;
+        ttTypOp.sNameOper := TYPEPR.NOPER;
+        insert current ttTypOp;
+      }
+      i++;
+    }
+  }
+}
+
+handleevent
+  cmInit:
+  {
+    delete all from ttPerFlt;
+    delete all from ttResStr;
+    delete all from ttTypOp;
+    if (not (ReadMyDsk(dBeg, '#(GPInt)_dBeg', false)))
+      dBeg := date(1,1,year(Cur_Date));
+    if (not (ReadMyDsk(dEnd, '#(GPInt)_dEnd', false)))
+      dEnd := date(31,12,year(Cur_Date));
+    if (not (ReadMyDsk(wModeRep, '#(GPInt)_wModeRep', false)))
+      wModeRep := 0;
+    MadeReport:= false;
+    wRPD := 0;
+    Set sRPD := 'не установлено';
+    RPDMarker := InitMarker('#(GPInt)_RPD_' + UserName(), 4, 10, 5);// Маркер для RPD
+    if GetMarkerCount(RPDMarker) >0 FillRPDStr;
+    mKomp := InitMarker('#(GPInt)_mKomp_' + UserName(),  8, 1000, 100);// Маркер для mKomp
+    set sKomp := sSetKomp(mKomp);
+//    i3GD.Init3GD;
+  }
+  cmPick:
+  {
+    case CurField of
+    #sRPD:
+    {
+      wRPD := 107;
+      if RunInterface ('PickManyRPD', wRPD, RPDMarker, vfMultipleSelection,0) = cmDefault
+      {
+        delete all from ttTypOp;
+        FillRPDStr;
+      }
+    }
+    #sKomp:
+    {
+      if (RunInterface('PICKCATALOGEX', -17, 0, Comp(100), mKomp) = cmDefault)//-17 -53
+        set sKomp := sSetKomp(mKomp);
+    }
+    end;
+  }
+  cmDelOnProtect:
+  {
+    case CurField of
+    #sRPD:
+    {
+      Set sRPD := 'не установлено';
+      delete all from ttTypOp;
+      ClearMarker(RPDMarker);
+    }
+    #sKomp:
+    {
+      ClearMarker(mKomp);
+      set sKomp := sSetKomp(mKomp);
+    }
+    end;
+  }
+  cmOk:
+  {
+    if (dBeg = 0) or (dEnd = 0) or (dBeg > dEnd)
+    {
+      message('Задан некорректный период!');
+    }
+    else
+    {
+      if GetMarkerCount(RPDMarker) = 0
+      {message('Не задано РПД!');}
+      else
+      if GetMarkerCount(mKomp) = 0
+      {message('Не заданы компенсации для выплат!');}
+      else
+      {
+        Run;
+        SaveMyDsk(dBeg, '#(GPInt)_dBeg');
+        SaveMyDsk(dEnd, '#(GPInt)_dEnd');
+        SaveMyDsk(wModeRep, '#(GPInt)_wModeRep');
+        MadeReport:= true;
+        VCommonFiltr.IntClose(MadeReport);
+        VCommonFiltr.StoreAllParams;
+        Notify(cmEvaluateAndModify, 0);
+        DoneMarker(RPDMarker, '#(GPInt)_RPD_' + UserName());
+        DoneMarker(PersMarker, '#(GPInt)_PSN_' + UserName());
+        DoneMarker(mKomp, '#(GPInt)_mKomp_' + UserName());
+      
+        closeinterface(cmDefault);
+      }
+    }
+  }
+  cmCancel:
+  {
+    VCommonFiltr.IntClose(MadeReport);
+    DoneMarker(RPDMarker, '#(GPInt)_RPD_' + UserName());
+    DoneMarker(PersMarker, '#(GPInt)_PSN_' + UserName());
+    DoneMarker(mKomp, '#(GPInt)_mKomp_' + UserName());
+    SaveMyDsk(dBeg, '#(GPInt)_dBeg');
+    SaveMyDsk(dEnd, '#(GPInt)_dEnd');
+    SaveMyDsk(wModeRep, '#(GPInt)_wModeRep');
+  }
+end;
+end.
+
+
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+
+Procedure Run;
+Begin
+  runinterface(#(GPInt));
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := '#(GPNam) (ЭМ)';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Компенсации и льготы';
+    2 : GetGroupName := 'Журналы регистрации и учета';
+  End;
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+end;
+
+End.

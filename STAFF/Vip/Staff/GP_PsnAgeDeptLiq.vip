@@ -1,0 +1,660 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                "Кадровый состав по возрасту, по подразделениям и процент текучести"             *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#256          |21/08/17|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include UserReport.vih
+#include CatFunc.vih
+#include RunStaj.vih
+#include ExtAttr.Vih
+
+#include GP_3GD.vih
+#include GP_XlOutExt.vih
+
+#define GPInt GP_PsnAgeDeptLiq // #(GPInt)
+#define GPNam Кадровый состав по возрасту, по подразделениям и процент текучести // #(GPNam)
+
+Interface #(GPInt) '#(GPNam) (ЭМ)' EscClose, Gray;
+  show (,,99,11);
+
+const
+#include Excel.inc;
+end;
+#include ExtAttr.var
+
+#include GP_PsnAgeDeptLiq.tbl
+
+var
+  wPeriodMonth
+ ,wPeriodYear   : word;  
+  iCatFunc      : CatalogsFunctions;
+  iRunStaj      : Runstaj;
+  iOut          : GP_XlOutExt;
+  i3GD          : GP_3GD;
+  ExtAttr       : iExtAttr;
+  sPodr         : string;
+  mPodr         : TPtr; //Маркер по подразделениям
+  sClas         : string;
+  mClas         : TPtr; //Маркер по внешнему классификатору
+  cLiq          : comp;
+  iMonth        : integer;
+  sFullName     : string;
+  iFilter       : integer;
+  lRB, lHS,
+  lCB, lCE,
+  lSB, lSE,
+  lBB, lBE,
+  lDB, lDE      : longint;
+
+create view
+var
+  dBeg, dEnd    : date;
+from
+ ttRepPADL
+,ttRepPADL    allpdr
+,ttRepPADL    allwrk
+,ttTypeDiss
+,ttDissByType
+,ttLog
+,persons      dispsn
+,appointments disapp
+,contdoc      disdoc
+,catalogs     disrsn
+,statis
+,ExtCatLinks
+,LSchet       dislsc
+,LSchet       alllsc
+,staffstruct  allsts
+,appointments allapp
+,EXCLASSSEG
+where
+((
+//Уволенные
+                dBeg<<= disapp.dismissdate (noindex) and (dEnd >= disapp.dismissdate)
+and disapp.person    == dispsn.nrec
+and disapp.nrec      == disdoc.cstr and (disdoc.typeoper=8)
+and disapp.caddnrec2 == dislsc.nrec
+//Число сотрудников
+and allpdr.cpodr     == allsts.Department and ((dEnd<=allsts.dClose or allsts.dClose=0) and dEnd>=allsts.dInput)
+and allsts.nRec      == allapp.StaffStr and ((dEnd<=allapp.DismissDate or allapp.DismissDate=0) and dEnd>=allapp.AppointDate)
+and allapp.cAddnRec2 == alllsc.nRec
+))
+;
+
+procedure initLiq;
+{
+  cLiq := ExtAttr.AttrId(coCatalogs,'Учитывается при расчете текучести');
+  if cLiq = 0
+    if message('Атрибут Учитывается при расчете текучести не существует.'+chr(13)+'Создать?',yesNo) = cmYes
+      cLiq := ExtAttr.CreateAttr(coCatalogs,'Учитывается при расчете текучести', cgAttrType_Dbl);
+}
+
+function cECSRec(sCode : string): comp;
+{
+  result := comp(0);
+  if getfirst EXCLASSSEG where ((word(35)==EXCLASSSEG.CLASSCODE and sCode == EXCLASSSEG.VALUE)) = tsOk
+    result := EXCLASSSEG.nRec;
+}
+
+function wWhatAgePeriod(dBorn, dPeriod : date) : word;
+{
+  var wAgePsn : word=0;
+  var wRez    : word=0;
+
+  if dBorn <> 0 
+  {
+    wAgePsn := Year(Sub_Date(dPeriod,dBorn));
+    if wAgePsn < 30
+      wRez := 1
+    else
+    if wAgePsn < 61
+      wRez := 2
+    else
+      wRez := 3;
+  }
+  else
+  {
+    wRez := 0;
+  }
+  wWhatAgePeriod := wRez;
+}
+
+procedure FillTypeDiss;
+var
+  cDissMainLink : comp;
+  iNPP          : integer;
+{
+  iNPP := 0;
+  cDissMainLink := iCatFunc.GetCatalogsNRec(-121);
+  _loop disrsn where ((0 == disrsn.lpr and cDissMainLink == disrsn.mainlink))
+  {
+    iNPP++;
+    clearbuffer(#ttTypeDiss);
+    ttTypeDiss.cTypeDiss := disrsn.nrec;
+    ttTypeDiss.sTypeDiss := iCatFunc.GetCatalogsName(disrsn.nrec);
+    ttTypeDiss.sSort     := iNPP;
+    insert current ttTypeDiss;
+  }
+}
+
+procedure MakeDismiss;
+{
+  var wSovm : word;
+  iNextVisual('Формируем увольнения.');
+  if isvalid(#disapp)
+  _loop disapp
+  {
+    if (not NextVisual) break;
+
+    if iFilter = 0
+    if GetMarkerCount(mPodr) > 0
+    if (not foundmarker(mPodr,disapp.department)) continue;
+
+    if iFilter = 1
+    if GetMarkerCount(mClas) > 0
+    if i3GD.bFindCurZGDPodr(disapp.department)
+    {
+      if (not foundmarker(mClas,cECSRec(i3GD.sCodeCurZGDPodr))) continue;
+    }
+    else continue;
+    
+    if isvalid(#dispsn)
+    if isvalid(#disdoc)
+    {
+      if getfirst ttRepPADL where((disapp.department == ttRepPADL.cPodr)) <> tsOk
+      {
+        wSovm := 99;
+        if isvalid(#dislsc)
+          wSovm := dislsc.sovm;
+        if wSovm >1 continue;
+        clearbuffer(#ttRepPADL);
+        ttRepPADL.cPodr    := disapp.department;
+        ttRepPADL.sPodr    := iCatFunc.GetCatalogsCode(disapp.department);
+        ttRepPADL.sPodrN   := iCatFunc.GetCatalogsName(disapp.department);
+        ttRepPADL.iAllDiss := 1;
+        case wWhatAgePeriod(dispsn.borndate,disapp.dismissdate) of
+        1:{ttRepPADL.iRng1Diss:=1;}
+        2:{ttRepPADL.iRng2Diss:=1;}
+        3:{ttRepPADL.iRng3Diss:=1;}
+        end;
+        ttRepPADL.iStajDiss:=if(iRunStaj.GetStajYears(dispsn.nrec, 89, disapp.dismissdate)<1,1,0);
+        //тут увольнения для расчета коэфф добавить фильтр по виду работы
+        if ExtAttr.ValueExistsId(coCatalogs,disapp.cdisreason,cLiq) = true
+        if ExtAttr.doGetAttrID(coCatalogs,disapp.cdisreason,cLiq) > 0 and wSovm = 0
+        {
+          ttRepPADL.iAllDissL := 1;
+          case wWhatAgePeriod(dispsn.borndate,disapp.dismissdate) of
+          1:{ttRepPADL.iRng1DissL:=1;}
+          2:{ttRepPADL.iRng2DissL:=1;}
+          3:{ttRepPADL.iRng3DissL:=1;}
+          end;
+          ttRepPADL.iStajDissL:=if(iRunStaj.GetStajYears(dispsn.nrec, 89, disapp.dismissdate)<1,1,0);
+        }
+        insert current ttRepPADL;
+      }
+      else
+      {
+        wSovm := 99;
+        if isvalid(#dislsc)
+          wSovm := dislsc.sovm;
+        if wSovm >1 continue;
+        ttRepPADL.iAllDiss++;
+        case wWhatAgePeriod(dispsn.borndate,disapp.dismissdate) of
+        1:{ttRepPADL.iRng1Diss++;}
+        2:{ttRepPADL.iRng2Diss++;}
+        3:{ttRepPADL.iRng3Diss++;}
+        end;
+        if iRunStaj.GetStajYears(dispsn.nrec, 89, disapp.dismissdate)<1 ttRepPADL.iStajDiss++;
+        if ExtAttr.ValueExistsId(coCatalogs,disapp.cdisreason,cLiq) = true
+        if ExtAttr.doGetAttrID(coCatalogs,disapp.cdisreason,cLiq) > 0 and wSovm = 0
+        {
+          ttRepPADL.iAllDissL++;
+          case wWhatAgePeriod(dispsn.borndate,disapp.dismissdate) of
+          1:{ttRepPADL.iRng1DissL++;}
+          2:{ttRepPADL.iRng2DissL++;}
+          3:{ttRepPADL.iRng3DissL++;}
+          end;
+          if iRunStaj.GetStajYears(dispsn.nrec, 89, disapp.dismissdate)<1 ttRepPADL.iStajDissL++;
+        }
+        update current ttRepPADL;
+      }
+      if getfirst ttTypeDiss where((disapp.cdisreason == ttTypeDiss.cTypeDiss)) = tsOk {}
+      if getfirst ttDissByType where((ttRepPADL.nrec==ttDissByType.cRepPADL and ttTypeDiss.nrec==ttDissByType.cTypeDiss)) <> tsOk
+      {
+        clearbuffer(#ttDissByType);
+        ttDissByType.cRepPADL  :=ttRepPADL.nrec;
+        ttDissByType.cTypeDiss :=ttTypeDiss.nrec;
+        ttDissByType.iDiss     :=1;
+        insert current ttDissByType;
+      }
+      else
+      {
+        ttDissByType.iDiss++;
+        update current ttDissByType;
+      }
+    }
+  }
+}
+
+procedure MakeAveragePsn;
+{
+  var dPeriod : date;
+  iNextVisual('Формируем списочную численность за период.');
+
+  if isvalid(#allpdr)
+    _loop allpdr
+    {
+      if getfirst allwrk where((allpdr.cPodr == allwrk.cPodr)) = tsOk
+      {
+        if getfirst ExtCatLinks where((11==ExtCatLinks.ObjType and allpdr.cPodr==ExtCatLinks.StaffCat)) = tsOk
+        {
+          dPeriod:=dBeg; 
+          do
+          {
+            if getfirst Statis where ((  ExtCatLinks.ExtCat==Statis.Cex 
+                                     and Year(dPeriod)     ==Statis.YearN 
+                                     and Month(dPeriod)    ==Statis.MesN 
+                                     and word(0)           ==Statis.Sovm
+            /*if getfirst Statis*/   )) = tsOk 
+            {
+              _loop Statis where
+              ((  ExtCatLinks.ExtCat==Statis.Cex 
+              and Year(dPeriod)     ==Statis.YearN 
+              and Month(dPeriod)    ==Statis.MesN 
+              and word(1)          >>=Statis.Sovm //т.к. KOLRABK все равно есть только для Sovm=0 вычислим в другом месте
+              ))
+              {
+//                allwrk.iAllWork  +=Statis.KOLRABK;
+                allwrk.iAllWorkSP+=Statis.SREDKOL ;//if(Statis.Sovm=0,Statis.SREDKOL ,0);
+                allwrk.iUvolSP   +=Statis.KolRabUv;//if(Statis.Sovm=0,Statis.KolRabUv,0); 
+              }
+              update current allwrk;
+            }
+            else
+            {
+              clearbuffer(#ttLog);
+              ttLog.wMode   := 0;
+              ttLog.sWho    := allpdr.sPodr;
+              ttLog.sReason := 'По подразделению не сформированы статистические данные за '+DateToStr(dPeriod,'month YYYY')+'г.'; 
+              insert current ttLog;
+            }
+            dPeriod := add_months(dPeriod,1);
+          } while to_date(last_day(dPeriod),month(dPeriod),year(dPeriod)) <= to_date(last_day(dEnd),month(dEnd),year(dEnd));
+        }
+        if isvalid(#allsts)
+        _loop allsts
+          if isvalid(#allapp)
+          _loop allapp
+          {
+            if (not NextVisual) break;
+            if isvalid(#alllsc)
+//              if alllsc.Sovm <> 2 and allapp.lPrizn=0 and allapp.Rate<>0
+              if alllsc.Sovm < 2 and allapp.lPrizn=0 and allapp.Rate<>0
+                allwrk.iAllWork+=1;
+          }//_loop allapp
+        update current allwrk;
+      }//if getfirst allwrk where((allpdr.cPodr == allwrk.cPodr)) = tsOk
+    }//_loop allpdr
+}
+
+#define repT       2,    3,    2,    3
+#define FrmHd    lRB,  lCE,  lRB,  lCE
+#define FrmHu    lRB+1,lCE,  lRB+1,lCE
+#define FrmCl    lDE,  lCE,  lDE,  lCE
+#define AllTab   lRB,  lCB,  lDE,  lCE
+#define AllHd    lRB,  lCB,lDB-1,  lCE
+#define AllIt    lDB,  lCB,  lDB,  lCE
+
+procedure PrintReport;
+{
+  var lRUB : longint;
+  var dbSSC: double; 
+
+  iNextVisual('Выгружаю данные в Excel.');
+
+  iMonth := Months_Between(dBeg,dEnd)+1;
+
+  iOut.xlR1C1OnOff(true);
+  lRB  := 4;
+  lHS  := 2;
+  lDB  := lDE := lRB + lHS;
+  lCB  := lCE := 1;
+  
+//  iOut.StringValL('#(GPNam) за '+datetostr(dBeg,'month YYYY')+' года',#repT);
+  iOut.StringValL('#(GPNam) с '+datetostr(dBeg,'DD.MM.YYYY')+' по '+datetostr(dEnd,'DD.MM.YYYY'),#repT);
+  xlSetFontSize(14,#repT); xlSetFontStyle(xlBold,#repT);
+
+  iOut.Header2Row('Наименование СП',            #FrmHd); lCE++;
+  iOut.Header2Row('Код СП',                     #FrmHd); lCE++;
+  iOut.Header2Row('Количество всего работающих за период отчета по Основному месту и Внешние совместители',   #FrmHd); lCE++;
+  iOut.Header1Row('Кол-во уволен-ных',          #FrmHd); 
+  iOut.Header1Row('всего',                      #FrmHu); lCE++;
+  iOut.HeaderIns ('Уволено',                    #FrmHd, 4);
+  iOut.Header1Row('до 30 лет',                  #FrmHu); lCE++;
+  iOut.Header1Row('30-60',                      #FrmHu); lCE++;
+  iOut.Header1Row('60+',                        #FrmHu); lCE++;
+  iOut.Header1Row('Со стажем менее 1 года',     #FrmHu); lCE++;
+  iOut.HeaderIns ('Кол-во причин увольнений для расчета текучести',#FrmHd, 5);
+  iOut.Header1Row('Всего',                      #FrmHu); lCE++;
+  iOut.Header1Row('до 30 лет',                  #FrmHu); lCE++;
+  iOut.Header1Row('30-60',                      #FrmHu); lCE++;
+  iOut.Header1Row('60+',                        #FrmHu); lCE++;
+  iOut.Header1Row('Со стажем менее 1 года',     #FrmHu); lCE++;
+  iOut.Header1Row('Текучесть',                  #FrmHu); lCE++;
+  lCE++;
+  lCE++;
+  lRUB := lCE;
+  _loop ttTypeDiss ordered index ttKlTypeDiss02
+  {
+    iOut.Header1RowT(ttTypeDiss.sTypeDiss,       #FrmHu); lCE++;
+//    iOut.Header1Row(ttTypeDiss.sTypeDiss,       #FrmHu); lCE++;
+  }
+  iOut.HeaderIns ('Кол-во причин увольнений для расчета текучести',lRB,  lRUB,  lRB,  lRUB, lCE-lRUB);
+  _loop ttRepPADL ordered index ttRepPADL02
+  {
+    lCE := 1;
+    iOut.StringValL(ttRepPADL.sPodrN+' ('+ttRepPADL.sPodr/*integer(ttRepPADL.iAllWork)*/+')',#FrmCl); lCE++;
+    iOut.CodeVal   (ttRepPADL.sPodr,     #FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iAllWork,  #FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iAllDiss,  #FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iRng1Diss, #FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iRng2Diss, #FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iRng3Diss, #FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iStajDiss, #FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iAllDissL, #FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iRng1DissL,#FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iRng2DissL,#FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iRng3DissL,#FrmCl); lCE++;
+    iOut.StringValC(ttRepPADL.iStajDissL,#FrmCl); lCE++;
+    iOut.FormulaPctVal('=ЕСЛИ(R'+lDE+'C15<>0;((R'+lDE+'C9/R'+lDE+'C15));0)',#FrmCl); lCE++;
+    /*iOut.StringValC*/xlSetCellNumberValue(ttRepPADL.iAllWorkSP/iMonth,#FrmCl); lCE++;
+    /*iOut.StringValC*/xlSetCellNumberValue(ttRepPADL.iUvolSP,#FrmCl); lCE++;
+    _loop ttTypeDiss ordered index ttKlTypeDiss02
+    {
+      if getfirst ttDissByType where ((ttRepPADL.nrec==ttDissByType.cRepPADL and ttTypeDiss.nrec==ttDissByType.cTypeDiss)) = tsOk
+      {
+        iOut.StringValC(ttDissByType.iDiss,#FrmCl); lCE++;
+      }
+      else
+        lCE++;
+    }
+    lDE++;
+  }
+  lCE--;
+  var iItC : integer;
+  #define FrmIt lDE,iItC,lDE,iItC
+  #define Itog  '=СУММ(R'+lDB+'C'+iItC+':R'+(lDE-1)+'C'+iItC+')'
+  #define PLiq  '=СУММ(R'+lDB+'C'+iItC+':R'+(lDE-1)+'C'+iItC+')'
+  iItC :=  1; iOut.StringValR('Итого:', #FrmIt);
+  for(iItC:=3;iItC <= lCE;iItC++)
+  {
+    if iItC <> 14 and iItC <> 15
+    {
+      iOut.FormulaIntegerValC(#Itog, #FrmIt);
+    }
+    else
+    if iItC = 14
+    {
+      iOut.FormulaPctVal('=ЕСЛИ(R'+lDE+'C15<>0;((R'+lDE+'C9/R'+lDE+'C15));0)',lDE,14,lDE,14);
+    }
+    else
+    {
+      iOut.FormulaDoubleValC(#Itog, #FrmIt);
+    }
+  }
+  
+  iOut.xlR1C1OnOff(false);
+  iOut.xlTitleEachPageO(lRB,lDB-1);
+  xlSetFontSize(11,#AllTab); 
+  xlSetFontStyle(xlBold,lRB,1,lDB-1,lCE);    
+  xlSetFontStyle(xlBold,lRB,1,lDE,1);    
+  xlSetFontStyle(xlBold,lDE,1,lDE,lCE);    
+  xlSetColumnWidth(18,lRB,1,lDE,1);
+  xlSetColumnWidth( 9,lRB,2,lDE,lCE);
+//  iOut.xlRangeVert('P', 5, 1); //Включить если надо выводить причины увльнения вертикально
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0, #AllTab);
+  xlWrapText(#AllTab);
+//  xlFreeze(lDB,1);
+  iOut.xlHideCol('O');
+  iOut.xlHideCol('P');
+  iOut.xlTitleEachPageO(lRB,lDB-1);
+  iOut.xlPageScaleLandscape(1);
+}
+
+procedure printlog;
+{
+  iNextVisual('Выгружаю отчет.');
+  lRB  := 1;
+  lHS  := 1;
+  lDB  := lDE := lRB + lHS;
+  lCB  := lCE := 1;
+    lSE := 1;
+    iOut.StringValC('Причина'      ,#FrmCl); lSE++;
+    iOut.StringValC('Пояснение' ,#FrmCl); lSE++;
+    lDE++;
+  _loop ttLog ordered index ttLog01
+  {
+    if (not NextVisual) break;
+    lCE := 1;
+    iOut.StringValL(ttLog.sWho    ,#FrmCl); lCE++;
+    iOut.StringValL(ttLog.sReason ,#FrmCl); lCE++;
+    lDE++;
+  }
+  lSE := 1;
+  xlSetColumnWidth(10,lRB,1,lDE,1);
+  xlSetColumnWidth(100,lRB,2,lDE,2);
+}
+
+function sFPF : string; {sFPF := DateToStr(Cur_Date(),'_YYMMDD')+TimeToStr(Cur_Time(),'_HHMMSS');}
+
+procedure Run;
+{
+//  dBeg := To_Date(1,wPeriodMonth,wPeriodYear);
+//  dEnd := Sub_Day(Add_Months(dBeg,1),1);
+  
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+  FillTypeDiss;
+  initLiq;
+  MakeDismiss;
+  MakeAveragePsn;
+  if isvalid(#ttRepPADL)
+  {
+    sFullName := GetDefaultUserPath + '#(GPNam)'+sFPF+'.xls';
+
+    xlCreateExcel(sFullName, TRUE);
+    xlAddSheet;
+    xlSetActiveSheet(1);
+    xlSetSheetName(1,'Отчет');
+    PrintReport;
+    if isvalid(#ttLog)
+    {
+      xlSetActiveSheet(2);
+      printlog;
+      xlSetSheetName(2,'Ошибки');
+      xlSetActiveSheet(1);
+    }
+    xlKillExcel;
+  }
+  else
+  {
+    message('Нет увольнений за период.');
+  }
+  StopVisual;
+}
+
+Screen s1(,,sci1Esc);
+  show at (,,98,10);
+  fields
+    dBeg ('Начало периода',,):{Font = {BackColor = if(dBeg = 0, ColorNeed, 0)}}, noprotect;
+    dEnd ('конец периода',,): {Font = {BackColor = if(dEnd = 0, ColorNeed, 0)}}, noprotect;
+    iFilter : noprotect;
+    sPodr('Выбранные подразделения',hcStaffAppDepartment,sci13Esc) :   Protect, PickButton;
+    sClas('Выбранные значения',hcStaffAppDepartment,sci13Esc) :   Protect, PickButton;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+  << 'Параметры отчета'
+    `Период отчета`
+    С .@@@@@@@@@@ по .@@@@@@@@@@@
+
+   `Фильтры по:`
+    (.) Подразделения для отчета:  `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    (.) Вышестоящий руководитель:  `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    <. ~С~формировать .>  <. ~З~акрыть .>
+  >>
+end;
+
+function sSetPodrName(mSetPdr: TPtr): string;
+{
+  if (getMarkerCount(mSetPdr) = 0)
+  {
+    result := 'Выбраны все';
+    exit;
+  }
+  else
+    if (getMarkerCount(mSetPdr) = 1)
+    {
+      var cTmp: comp;
+      GetMarker(mSetPdr, 0, cTmp);
+        result := iCatFunc.GetCatalogsName(cTmp);
+    }
+    else
+      result := 'Несколько подразделений (' + string(getMarkerCount(mSetPdr)) + ')';
+}
+
+function sSetClas(mSetClas: TPtr): string;
+{
+  if getMarkerCount(mSetclas) = 0
+    result := 'Выбраны все'
+  else
+    result := 'Выбрано значений ('+getMarkerCount(mSetclas)+')';
+}
+
+#declare CloseGpInterface
+//++++++++++++++++++++++++++++++++++++++++++++++++
+  SaveMyDsk(dBeg,   '#(GPInt)_dBeg');
+  SaveMyDsk(dEnd,   '#(GPInt)_dEnd');
+  SaveMyDsk(iFilter,'#(GPInt)_iFilter');
+  DoneMarker(mPodr, '#(GPInt)_mPodr_' + UserName());
+  DoneMarker(mClas, '#(GPInt)_mClas_' + UserName());
+  closeinterface(cmDefault);
+//++++++++++++++++++++++++++++++++++++++++++++++++
+#end
+
+handleevent
+  cmInit:
+  {
+    if (not (ReadMyDsk(dBeg,   '#(GPInt)_dBeg',   false)))
+      set dBeg := date(1,1,year(Cur_Date));
+    if (not (ReadMyDsk(dEnd,   '#(GPInt)_dEnd',   false)))
+      set dEnd := date(31,12,year(Cur_Date));
+    if (not (ReadMyDsk(iFilter,'#(GPInt)_iFilter',false)))
+      set iFilter := 0;
+    if iFilter = 0
+    {ToggleFieldVisible(#sPodr,true );ToggleFieldVisible(#sClas,false);}
+    else
+    {ToggleFieldVisible(#sClas,true );ToggleFieldVisible(#sPodr,false);}
+    mPodr := initMarker('#(GPInt)_mPodr_' + UserName(), 8, 1000, 100);
+    set sPodr := sSetPodrName(mPodr);
+    mClas := initMarker('#(GPInt)_mClas_' + UserName(), 8, 1000, 100);
+    set sClas := sSetClas(mClas);
+    i3GD.Init3GD;
+  }
+  cmPick:
+  {
+    case CurField of
+      #sPodr:
+        if (RunInterface('PICKCATALOGEX', -11, 0, Comp(100), mPodr) = cmDefault)
+          set sPodr := sSetPodrName(mPodr);
+      #sClas:
+      {
+        if (RunInterface('GP_GetSomeClass', 35, mClas,1 ) = cmDefault)
+          set sClas := sSetClas(mClas);
+      }
+    end;
+  }
+  cmDelOnprotect:
+  {
+    case CurField of
+      #sPodr: {ClearMarker(mPodr); set sPodr := sSetPodrName(mPodr);}
+      #sClas: {ClearMarker(mClas); set sClas := sSetClas(mClas);}
+    end;
+  }
+  cmCheckField:
+  {
+    case CurField of
+      #iFilter:
+      {
+        if iFilter = 0
+        {ToggleFieldVisible(#sPodr,true );ToggleFieldVisible(#sClas,false);}
+        else
+        {ToggleFieldVisible(#sClas,true );ToggleFieldVisible(#sPodr,false);}
+      }
+    end;
+  }
+  cmOk:
+  {
+    if (dBeg = 0) or (dEnd = 0) or (dBeg > dEnd)
+    {
+      message('Задан некорректный период!');
+    }
+    else
+    {
+      if iFilter = 1 and getMarkerCount(mClas) = 0 {RunInterface('GP_GetSomeClass', 35, mClas,0);}
+      Run;
+      #CloseGpInterface
+    }
+  }
+
+  cmCancel:
+  {
+    #CloseGpInterface
+  }
+end;
+end.
+
+
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+
+Procedure Run;
+Begin
+  runinterface(#(GPInt));
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := '#(GPNam) (ЭМ)';
+End;
+
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Ведение картотеки сотрудников';
+  End;
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+end;
+
+End.

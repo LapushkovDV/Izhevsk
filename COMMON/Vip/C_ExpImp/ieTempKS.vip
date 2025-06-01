@@ -1,0 +1,647 @@
+/*************************************************************************************************\
+* Наименование: Импорт Накладных из Excel в Галактику                                             *
+* Контур/Модуль: Обмен бизнес-документами                                                         *
+* Примечание:                                                                                     *
+*          Запустить импорт можно из Акта об излишках. кнопка импорта под заголовком окна         *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата      |Исполнитель              |Проект                         *
+* ---------------------------------------------------------------------------------------------   *
+* Разработка  |#3105         |16/07/2018|Шунин А.Г.               |НПО Энергомаш                  *
+\*************************************************************************************************/
+
+#doc
+<p>Импорт Накладных из Excel в Галактику
+<p>Замена запятой на точку для всех чисел с плавающей точкой
+<p>Код МЦ добавляется до 10 знаков нулями слева
+#end
+// в ExImLogE.rComp был Nrec из таблицы в памяти, смысл которого ничтожен
+// а nRec реальной записи spSOPR.Nrec из базы не сохранялся. - Исправлено
+
+#include ieCommonImp.vih
+// #include MakeOrder.vih
+
+#component "C_ExpImp"
+alter interface ieTempKS;
+overload
+Function DefineField( sFieldValue : String; HeadOrSpec : Byte; sCode : String ) : Boolean;
+Function ImportField( IsHeader : Boolean; wNumber : Word; Var sFieldValue : String ) : Boolean;
+function ImportDocument( cTempDoc : Comp ) : comp;
+procedure ClearHeaderLinksVar;
+procedure UpdateHeaderLinks;
+procedure UpdateSpecLinks;
+end;
+
+var cLastPodrUp: comp;
+var cLastPodr: comp;
+
+procedure UpdateSpecLinks;
+{
+   inherited::UpdateSpecLinks;
+   // Исправляем партию
+  if getfirst KatParty = tsok // tSpec.cParty      == KatParty.nRec
+  if tSpec.cmcUsl <> KatParty.cmc
+  {
+      Var pKOD: string = KatParty.KOD;
+
+      if getfirst KatParty where (( tSpec.cmcUsl == KatParty.cmc and pKOD == KatParty.KOD (noindex) ))= tsok // tSpec.cParty      == KatParty.nRec
+      {
+        set tSpec.cParty := KatParty.nRec;
+        UpDate current tSpec;
+      }
+  }
+}
+procedure ClearHeaderLinksVar;
+{
+   cLastPodrUp := cLastPodr := comp(0);
+   inherited::ClearHeaderLinksVar;
+}
+
+procedure UpdateHeaderLinks;
+{
+  var pKS:type$KatSopr = type$KatSopr(tHeader.Buffer);
+
+  inherited::UpdateHeaderLinks;
+
+  tHeader.cMolFrom := pKS.cMolFrom ;
+  tHeader.cPodrFrom := pKS.cPodrFrom ;
+  tHeader.cMolTo   := pKS.cMolTo ;
+  tHeader.cPodrTo   := pKS.cPodrTo ;
+}
+Function DefineField( sFieldValue : String; HeadOrSpec : Byte; sCode : String ) : Boolean;
+{
+  var wCode: word = word(sCode);
+  sFieldValue := trim(sFieldValue) ;
+  case (HeadOrSpec) of
+    ieHeader:
+    {
+      case wCode of // Там лежит код поля
+        iehKS + 24,//: tHeader.Summa     := double(sFieldValue); // общая сумма по документу
+        iehKS + 25,//: tHeader.sNalogs   := double(sFieldValue); // Сумма налога
+        iehKS + 31,//: tHeader.SumVal    := double(sFieldValue);  // Сумма в валюте
+        iehKS + 53,//: tTTNDoc.Speed     := double(sFieldValue); // средняя скорость по маршруту
+        iehKS + 65,//: tTTNDoc.dPunpDop  := double(sFieldValue); // количество доп. операций
+        iehKS + 75,//: tTTNDoc.dPunrDop  := double(sFieldValue); // количество доп. операций
+        iehKS + 77,//: tTTNDoc.SumAvt    := double(sFieldValue); // стоимость транспортировки
+        iehKS + 95,//: tHeader.KolKompl  := double(sFieldValue); //Количество комплектов
+        iehKS + 152,//: dPunktPogr        := double(sFieldValue);
+        iehKS + 154:// dPunktRazgr       := double(sFieldValue);
+        {
+          sFieldValue := Replace(sFieldValue,',','.'); // Из Excel читается разделитель - ',' меняем на '.'
+        }
+
+        iehKS + 38, // strMolFrom        := sFieldValue; // МОЛ - отправитель
+        iehKS + 39: // strMolTo          := sFieldValue; // МОЛ - получатель
+        {
+          // begin ПредОбработка для ЭНЕРГОМАШ
+          // Нужен МОЛ в формате КОДПОдразделения_ФИОМОЛ
+          // Нужно сделать из  171 Вашина Елена Александровна 93г.р.
+          //                   171_Вашина Елена Александровна
+
+             var S: string;
+             var cNEW: comp = comp(0);
+             S := ExtractDelimitedWord( sFieldValue, 2, ' ');
+             S := S + ' ' + ExtractDelimitedWord( sFieldValue, 3, ' ');
+             S := S + ' ' + ExtractDelimitedWord( sFieldValue, 4, ' ');
+
+LogStrToFile('#_MOL.TXT', sFieldValue +' > ' + S);
+             sFieldValue := S;
+
+             if ( Getfirst Fastfirstrow KatMOL WHERE (( cLastPodr == KATMOL.cskl )) and sFieldValue = KATMOL.NAME ) =tsOK
+             cNEW := KatMOL.nRec
+             else
+             if ( Getfirst Fastfirstrow KatMOL WHERE (( cLastPodrUP == KATMOL.cskl )) and sFieldValue = KATMOL.NAME ) =tsOK
+             cNEW := KatMOL.nRec;
+
+             if cNEW <> comp(0)
+             if wCode = (iehKS + 38)
+             {
+               strMolFrom    := KatMOL.NAME;
+               strMolFromKod := KatMOL.KOD;
+               tHeader.cMolFrom := KatMOL.nRec ;
+             }
+             else
+             {
+               tHeader.cMolTO := KatMOL.nRec ;
+               strMolTo    := KatMOL.NAME;
+               strMolToKod := KatMOL.KOD;
+             }
+
+             if cNEW <> comp(0)
+LogStrToFile('#_MOL.TXT', sFieldValue +' > МОЛ=' + KatMOL.KOD + ' ' + KatMOL.NAME)
+             Else
+LogStrToFile('#_MOL.TXT', sFieldValue +' > МОЛ не найден MOL not found');
+          //   end ПредОбработка для ЭНЕРГОМАШ
+               DefineField := true;
+               exit;
+        }
+        iehKS + 40,// strPodrFrom       := sFieldValue; // Подразделение - отправитель
+        iehKS + 41:// strPodrTo         := sFieldValue; // Подразделение - получатель
+        {
+             var S: string;
+
+	     if sFieldValue = '968 Родионов Владислав Витальевич' sFieldValue := '968-4 Родионов Владислав Витальевич';// МАП склада
+
+             S := ExtractDelimitedWord( sFieldValue, 1, ' ');
+             if (getFirst KATPODR where ((S == KATPODR.KOD)) ) = tsOk
+             {
+                Var sPodrName,sPodrKOD: string = '';
+                sPodrName := KATPODR.NAME; sPodrKOD := KATPODR.KOD;
+                cLastPodrUp := cLastPodr := KatPodr.nRec;
+
+                // Выбор нижестоящего склада для указанного подразделения по наличию: 1<основной>, 2<МАСК>, 3 прочие склады, 4 не менять.
+                sFieldValue := KATPODR.NAME;
+              if IEHead.SubTipDoc <> 602 // Накладная на передачу мц в спецоснастку. Склад Строго по коду
+              {
+LogStrToFile('#_MOL.TXT', sFieldValue +' > ' + KatPodr.NAME + ' cLastPodrUp= ' + cLastPodrUp + ' sFieldValue='  + sFieldValue  );
+
+                if ( Getfirst Fastfirstrow KatPodr WHERE (( cLastPodrUp == KatPodr.cpodr AND 1==KatPodr.sklad)) and Instr('осн', KatPodr.kod ) > 1) =tsOK
+                {cLastPodr := KATPODR.nRec; sPodrName := KATPODR.NAME; sPodrKOD := KATPODR.KOD}
+                else
+                if ( Getfirst Fastfirstrow KatPodr WHERE (( cLastPodrUp == KatPodr.cpodr AND 1==KatPodr.sklad)) and Instr('МАСК)', KatPodr.kod ) > 1) =tsOK
+                {cLastPodr := KATPODR.nRec; sPodrName := KATPODR.NAME; sPodrKOD := KATPODR.KOD}
+                else
+                if ( Getfirst Fastfirstrow KatPodr WHERE (( cLastPodrUp == KatPodr.cpodr AND 1==KatPodr.sklad)) and Instr('МАСК', KatPodr.kod ) > 1) =tsOK
+                {cLastPodr := KATPODR.nRec; sPodrName := KATPODR.NAME; sPodrKOD := KATPODR.KOD}
+                else
+                if ( Getfirst Fastfirstrow KatPodr WHERE (( cLastPodrUp == KatPodr.cpodr AND 1==KatPodr.sklad)) ) =tsOK
+                {cLastPodr := KATPODR.nRec; sPodrName := KATPODR.NAME; sPodrKOD := KATPODR.KOD}
+              }
+
+                 if wCode = (iehKS + 40)
+                 {
+                   tHeader.cPodrFrom := cLastPodr;
+                   strPodrFrom    := sPodrNAME;
+                   strPodrFromKod := sPodrKOD;
+                 }
+                 else
+                 {
+                   tHeader.cPodrTo := cLastPodr;
+                   strPodrTo    := sPodrNAME;
+                   strPodrToKod := sPodrKOD;
+                 }
+
+LogStrToFile('#_MOL.TXT', sFieldValue +' > ' + sFieldValue + ' PodrKOD NAME= ' + sPodrKOD + ' ' + sPodrNAME  + ' cLastPodr='+ cLastPodr + ' cLastPodrUP=' + cLastPodrUP  );
+               DefineField := true;
+               exit;
+             }
+        }
+        iehKS + 130:
+         sFieldValue := Replace(sFieldValue,',','.'); // Из Excel читается разделитель - ',' меняем на '.
+
+      end;
+    }
+    ieSpec:
+    {
+      case (word(sCode)) of // Там лежит код поля
+        iesKS +  1 :  //  strMCKode        := sFieldValue;
+        {
+          if sFieldValue <> '' sFieldValue :=  LPadCh(sFieldValue,'0',10);
+        }
+        iesKS + 32 :
+        {
+          if sFieldValue <> '' sFieldValue :=  LPadCh(sFieldValue,'0',9);  // Код партии
+        }
+        iesKS +  3,// : tSpec.Kol        := double(sFieldValue);  // количество
+        iesKS +  4,// : tSpec.Price      := double(sFieldValue);  // цена за единицу
+        iesKS +  7,// : tSpec.KolFact    := double(sFieldValue);  // количество фактическое
+        iesKS + 10,// : tSpec.SumAvt     := double(sFieldValue);
+        iesKS + 12,// : tSpec.Netto      := double(sFieldValue);
+        iesKS + 13,// : tSpec.mTara      := double(sFieldValue);
+        iesKS + 17,// : tSpec.SumNDS     := double(sFieldValue);      // Сумма налога в НДЕ
+        iesKS + 18,// : tSpec.SumVNDS    := double(sFieldValue);      // Сумма налога в валюте
+        iesKS + 21,// : tNal.Nalog       := double(sFieldValue);        // Ставка налога
+        iesKS + 25,// : tSpec.vPrice     := double(sFieldValue);        // Цена за единицу в валюте
+        iesKS + 26,// : tSoprOrdB.Price  := double(sFieldValue);        // Цена оприходования
+        iesKS + 29,// : tNal.SumVal      := double(sFieldValue);        // Сумма налога в валюте
+        iesKS + 30,// : tNal.Summa       := double(sFieldValue);       // Сумма налога в НДЕ
+        iesKS + 38,// : tSpec.KolGrm      := double(sFieldValue); // Количество грузовых мест
+        iesKS + 42,// : tSpec.procub := double(sFieldValue);
+        iesKS + 46,// : kolichestvo := double(sFieldValue);
+        iesKS + 65,// : nadbavka   := double(sFieldValue);
+        iesKS + 66:// : prZavod    := double(sFieldValue);
+        {
+          sFieldValue := Replace(sFieldValue,',','.'); // Из Excel читается разделитель - ',' меняем на '.
+        }
+
+        iesKS + 40:// атрибут - ссылка. Из номера Счета берём nRec Счета
+          if (sFieldValue != '')
+          {
+            var bPos: byte;
+            var sAttrValue: string;
+            bPos := Pos('"', SFieldValue);
+            sAttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+            if (GetFirst AttrNam where ((SubStr(SFieldValue,1,bpos-1) == AttrNam.Name and
+                                          word(5)                     == AttrNam.AttrType and
+                                          coSpSopr                    == AttrNam.wTable)) = tsOk)
+            {
+               case AttrNam.rObject of
+    1502,5063: {
+                  var cPlan: comp;
+
+                  if InSTR('НУ',IESFlds.DbfName ) > 0 //  для Налогового Плана счетов
+                    cPlan := coGetTune('NPOEM_OWN.BU.CPLANSSCHNAL')
+                  else
+                  {
+                    cPlan := coGetTune('NPOEM_OWN.BU.CPLANSSCHBUH');
+                    if cPlan = comp(0)  cPlan := coGetTune('KONSOLID.CPLANSSCH');
+
+                  }
+
+                   if (getfirst BuhSchet where ((cPlan == Buhschet.CPLANSSCH and sAttrValue == Buhschet.CODE)) = tsOk)
+                   {
+                     sAttrValue := BuhSchet.Name;
+                     //cAttrValue := Buhschet.Nrec;
+                     sFieldValue := SubStr(SFieldValue,1,bpos-1) +'"'+  string(Buhschet.Nrec);
+                   }
+               }
+           else
+               {
+                 var cc: comp = comp(0);
+                 // если указано не число
+                 if ( comp(0) = comp(trim(Replace(sAttrValue,' ','')) ) ) or ( SubStr(SFieldValue,1,bpos-1) = '.Статья затрат')
+                 {
+                   cc := refImpDef.GetKauID(AttrNam.ROBJECT, sAttrValue, sAttrValue);
+                   if cc <> comp(0)
+                    sFieldValue := Replace(sFieldValue, sAttrValue, string(cc) ); // замена наименования/Кода на nRec
+                 }
+                 logStrToFile('#sFieldValue2.log', sFieldValue + '  АттрName='+ SubStr(SFieldValue,1,bpos-1) );
+               }
+               end;
+            }
+          }
+
+        iesKS + 95: // 'Внешний атрибут число <- Номер записи источника'
+        {
+          if (sFieldValue != '')
+          {
+            Var bPos : word;
+            var AttrValue: string;
+            bPos := Pos('"', SFieldValue);
+            AttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+            iexAttr.doSetAttr(coIESFlds,tSpec.Nrec, SubStr(SFieldValue,1,bpos-1), double(AttrValue));
+          }
+
+        }
+        iesKS + 63:
+        {
+          sFieldValue := Replace(sFieldValue,',','.'); // Из Excel читается разделитель - ',' меняем на '.
+        }
+      end;
+    }
+  end;
+
+  DefineField := inherited::DefineField( sFieldValue, HeadOrSpec, sCode);
+}
+
+Function ImportField( IsHeader : Boolean; wNumber : Word; Var sFieldValue : String ) : Boolean;
+{
+  if not IsHeader
+  {
+  //   logStrToFile('#logNUm.txt','wNUM=' + wNumber + '  IESFlds.CODE = ' + IESFlds.CODE )
+    if IESFlds.CODE = String(iesKS + 95)
+    {
+//     Message('IESFlds.CODE = String(iesKS + 95)');
+      result := true;
+      sFieldValue := string(lCurRow);
+      exit;
+    }
+
+  }
+
+  var sFieldName : string = if (IsHeader, IEHFlds.DbfName, IESFlds.DbfName);
+  if substr(sFieldName,1,1) = '=' // Значение указано в настройках импорта
+  {
+    sFieldValue := substr(sFieldName,2,255);
+    result := true;
+    exit;
+  }
+
+  result := inherited::ImportField(IsHeader, wNumber,sFieldValue);
+}
+
+/*******************************************************************************
+  ImportDocument - переносим запись из временной таблицы в постоянную
+********************************************************************************/
+function ImportDocument( cTempDoc : Comp ) : comp;
+{
+//  var oMakeOrder: MakeOrder;
+  result := 0;
+  if(cTempDoc <> 0)
+  {
+    if(getfirst tHeader where (( cTempDoc == tHeader.nRec )) <> tsOk ) exit;
+  }
+  if(((IEHead.Reestr And mskVerifyDoc) Shr 05h) = 0)
+  // Добавил проверку на значение настройки настройки "Автонумерация документов".
+  // Если номер пустой и настройка не установлена в значение "с помощью специальной таблицы",
+  // то такой документ не даем импортировать в базу.
+  if((tHeader.NSopr = '' and wGetTune('FN.AvtoNum') <> 0) or (tHeader.dSopr = date(0,0,0)) or (tHeader.VidSopr = 0))
+  {
+    fun.UpdateImportLog(tHeader.NRec, 0, ieAbsentFields, ExImLogT.nRec);
+    case(wAbsWarningResult) of
+      cmSkipAll : exit;
+    else
+    {
+      var sTemp  : string[70];
+      var sTemp2 : string[70];
+      var sTemp3 : string[70];
+      var sTmp1  : string;
+      var sTmp2  : string;
+      var cTmp   : comp;
+
+      sTemp  := 'Отсутствуют обязательные поля для импорта накладных';
+      sTemp2 :=  '';
+      if(tHeader.NSopr = '')
+      {
+        sTemp2 := 'Не задан номер накладной ';
+      }
+      if(tHeader.dSopr = date(0,0,0))
+      {
+        sTemp2 := sTemp2 + 'Не задана дата накладной ';
+      }
+      if(tHeader.VidSopr = 0)
+      {
+        sTemp2 := sTemp2 + 'Не задан тип накладной ';
+      }
+      sTemp3 := 'Такой документ не может быть добавлен';
+      wAbsWarningResult := RunDialog('ieAbsentFieldsError', sTemp, sTemp2, sTemp3);
+      case(wAbsWarningResult) of
+        cmSkipThis :
+        {
+          wAbsWarningResult := 0;
+        }
+        cmSkipAll :
+        {
+        }
+        cmCancel :
+        {
+          _raise exUserBreak;
+        }
+      end; // Case
+    }
+    end;
+    exit;
+  }
+
+  ClearBuffer(#KatSopr);
+  KatSopr.Buffer    := type$KatSopr(tHeader.Buffer);
+  KatSopr.nRec      := GetNextNRec(#KatSopr, 0);
+  KatSopr.YearSopr  := Year(KatSopr.dSopr);
+  KatSopr.dPrice    := If( tHeader.dPrice <> date(0,0,0), tHeader.dPrice, tHeader.dSopr );
+  case(KatSopr.VidSopr)of // определяем тип по виду накладной
+     501..506,
+     600,603,
+     606, 624,625,
+     511,512,
+     601,602,605,611,612,
+     521,522,523,
+     621, 622, 604 :
+       KatSopr.TipSopr := 0; // Внутренние перемещения
+     101,102,103,111,105,106 :
+       KatSopr.TipSopr := 1; // Прием товаров и услуг
+     201,202,203,211,205,206,
+     513, 553 :
+       KatSopr.TipSopr := 2; // Отпуск товаров и услуг
+  end; // Case
+
+  if(tHeader.Descr <> '')
+    KatSopr.Descr := tHeader.Descr; // = 'GAL_IMPORT'; // В штатную настройку импорта
+  else
+    KatSopr.Descr := sGetTune('USER.DESCR');
+
+  if(tHeader.DesGr <> '')
+    KatSopr.DesGr := tHeader.DesGr;
+  else
+    KatSopr.DesGr := sGetTune('USER.DESGR');
+
+  if (KatSopr.TaraVoz = 0)
+    KatSopr.TaraVoz := wGetTune('Tara.TaraVoz') + 1;
+  //Если номер не заполнен и настройка Автонумерация документов имеет значение "с помощью специальной таблицы"
+  //то заполняем номер функцией getlastnumd
+  if (tHeader.NSopr = '' )
+    KatSopr.NSopr := getlastnumd(tHeader.VidSopr);
+
+  fun.UpdateImportLog(tHeader.nRec, KatSopr.nRec, ieImported, ExImLogT.nRec);
+  insert current KatSopr;
+  result := KatSopr.nRec;
+  // КОПИРОВАНИЕ ВНЕШНИХ АТРИБУТОВ ДЛЯ ЗАГОЛОВКА
+  iExAttr.CopyAllAttrEx1(coIEHFlds, tHeader.nRec, coKatSopr, KatSopr.nRec, false);
+  ////////////////////////////////
+  oExtClass.CopyAllClassValEx(coIEHFlds, tHeader.nRec, coKatSopr, KatSopr.nRec);
+
+  Var wNpp: word = 0;         //Изменения по сравнению с исходиком- оригиналом
+  _LOOP tSpec
+  {
+    wNpp++;
+    ClearBuffer(#SpSopr);
+    SpSopr.Buffer     := type$SpSopr(tSpec.Buffer);
+    SpSopr.NPP := wNpp;       // Изменения по сравнению с исходиком- оригиналом
+    SpSopr.NRec       := 0;
+    SpSopr.VidSopr    := KatSopr.VidSopr;
+    SpSopr.dSopr      := KatSopr.dSopr;
+    SpSopr.cSopr      := KatSopr.nRec;
+    SpSopr.rPrice     := SpSopr.Price;
+    SpSopr.rVPrice    := SPSopr.VPrice;
+
+    if(ieHead.SubTipDoc = 504) SpSopr.cGpSopr := KatSopr.cKatSopr;//_cGpSopr;
+    SpSopr.KolFact    := if(tSpec.KolFact <> 0, tSpec.KolFact,
+      if((SpSopr.prMC = 1)or(SpSopr.prMC = 2)or(SpSopr.prMC = 3),tSpec.Kol ,1));
+
+    SpSopr.KolOpl     := if(tSpec.KolOpl <>0, tSpec.KolOpl ,
+      If((SpSopr.prMC = 1)or(SpSopr.prMC = 2)or(SpSopr.prMC = 3),tSpec.Kol ,1));
+    SpSopr.cVal       := if(((tSpec.cVal = 0) and ( KatSopr.cVal <> 0 )), tHeader.cVal, tSpec.cVal );
+    SpSopr.nRec       := GetNextNRec(#SpSopr, 0);
+
+    if (SpSopr.PrVoz <> 0)
+      SpSopr.PrVoz := KatSopr.TaraVoz;
+    insert current SpSopr;
+
+// 1 Begin Изменения по сравнению с исходиком- оригиналом
+    _loop ExImLogE where ((ExImLogR.nRec == ExImLogE.cLogR and tSpec.nRec == ExImLogE.rComp (noindex) )) // проставим у тех записей где не заполнен rComp ссылку текущей записи, считаем что ошибки принадлежат этой записи
+    {
+        ExImLogE.rComp := SpSopr.Nrec;
+        update current ExImLogE;
+    }
+// 1 END Изменения по сравнению с исходиком- оригиналом
+
+
+    if (SpSopr.cParty = 0) // Изменения по сравнению с исходиком- оригиналом
+    If GetFirst tKatParty where (( tSpec.cMCUsl == tKatParty.cMC ))= tsOK
+    {
+      ClearBuffer(#KatParty);
+      KatParty.buffer := type$KatParty(tKatParty.Buffer);
+      KatParty.nRec := GetNextNRec(#KatParty, 0);
+      KatParty.Name := KatMC.Name + '_' + string(KatParty.nrec);
+      KatParty.Kod  := string(KatParty.nrec);
+      insert current KatParty;
+      if (SpSopr.cParty = 0)
+        update current SpSopr set cParty = KatParty.nRec;
+      delete current tKatParty;
+    }
+
+    if (ieHead.SubTipDoc = 630) and (SpSopr.cParty <> 0)
+      if (wGetTune('Party.MethodModifydGodn') = 1) or (wGetTune('Party.MethodModifydGodn') = 2)
+        if GetFirst KatParty where ((SpSopr.cParty == KatParty.nRec)) = tsOk
+        {
+          KatParty.dGodn         := KatSopr.DSopr;
+          KatParty.GodenDateTime := _DateTime1(KatParty.dGodn, Time(23,59,0,0));
+          UpDate Current KatParty;
+        }
+
+    if (tdoped.kol<>0)
+    {
+      ClearBuffer(#spdoped);
+      spdoped.Buffer  := type$spdoped(tDopEd.Buffer);
+      spdoped.NRec    := 0;
+      spdoped.wtable  := word(1110);
+      spdoped.crec    := spsopr.nrec;
+      spdoped.wtipkol := word (1);
+      spdoped.cdoped  := deiname.cdoped;
+      spdoped.npp     := 1;
+      spdoped.cmcdoped := deiname.nrec;
+      insert current spdoped;
+      delete current tdoped;
+    }
+
+     if(getfirst tSpecMTR where(( tSpec.nRec == tSpecMTR.cSpec and
+                                    coSpSopr  == tSpecMTR.coTable)) =tsOk)
+    {
+    
+      ClearBuffer(#SpecMTR);
+      SpecMTR.Buffer := type$SpecMTR(tSpecMTR.Buffer);
+LogStrToFile('#_SpecMTR.TXT', '1=SpecMTR.cobj = ' + SpecMTR.cobj + ' SpecMtr.cSaldTune=' + SpecMtr.cSaldTune+ ' CKAU[2]=' + SpecMTR.CKAU[1]  + ' CKAU[2]=' + SpecMTR.CKAU[2]);
+      SpecMTR.NRec   := 0;
+      SpecMTR.cSpec  := SpSopr.NRec;
+      // инициализация в ЦУ аналитики доп.ЦУ. код предоставлен Мирковским по Skype с 9.2
+
+      if (SpSopr.VidSopr = cgDoc_0101
+       or SpSopr.VidSopr = cgDoc_0115
+       or SpSopr.VidSopr = cgDoc_0502
+       or SpSopr.VidSopr = cgDoc_0611)
+      {
+        if (GetFirst SaldTune where ((SpecMtr.cSaldTune == SaldTune.nRec)) = tsOk)
+        {
+//        if (GetFirst SaldTune where ((SpecMtr.cSaldTune == SaldTune.nRec)) != tsOk)
+//          exit;
+
+LogStrToFile('#_SpecMTR.TXT', '2=SpecMTR.cobj = ' + SpecMTR.cobj + ' SpecMtr.cSaldTune=' + SpecMtr.cSaldTune+ ' CKAU[2]=' + SpecMTR.CKAU[1]  + ' CKAU[2]=' + SpecMTR.CKAU[2]);
+        oTune.GetTune(SaldTune.wType);
+        oMTRFun.InsUpdRec(SpecMTR.buffer);
+        delete current tSpecMTR;
+
+// что-то тут не так в Энергомаше. До этого места буфер SpecMtr пригодный для работы
+    /*
+        var vwPl: word = oTune.GetPlaceKau(cgKau_ExtCU);
+
+        if (vwPl < 2)
+          exit;
+
+        var pBufExtCU: type$ExtCU;
+
+        if oExtCUFuncs.Get_ExtCU(0, SpSopr.nRec, pBufExtCU)
+           SpecMtr.cKau[vwPl - 1] := oExtCUFuncs.Ins_ExtCU(pBufExtCU);
+*/
+        }
+      }
+      else
+      {
+        oMTRFun.InsUpdRec(SpecMTR.buffer);
+        delete current tSpecMTR;
+      }
+LogStrToFile('#_SpecMTR.TXT', 'END_SpecMTR.cobj = ' + SpecMTR.cobj + ' SpecMtr.cSaldTune=' + SpecMtr.cSaldTune+ ' CKAU[2]=' + SpecMTR.CKAU[1]  + ' CKAU[2]=' + SpecMTR.CKAU[2]);
+    }
+
+
+    // КОПИРОВАНИЕ ВНЕШНИХ АТРИБУТОВ ДЛЯ СПЕЦИФИКАЦИИ
+    iExAttr.CopyAllAttrEx1(coIESFlds, tSpec.nRec, coSpSopr, SpSopr.nRec, false);
+
+    ////////////////////////////////
+    oExtClass.CopyAllClassValEx(coIESFlds, tSpec.nRec, coSpSopr, SpSopr.nRec);
+
+    if(tSpec.prMC = 1)
+    {
+      if(getfirst tSoprOrdB where((tSpec.NRec == tSoprOrdB.cSpSopr))= tsOk)
+      {
+        ClearBuffer(#SoprOrdB);
+        SoprOrdB.Buffer   := type$SoprOrdB(tSoprOrdB.Buffer);
+        SoprOrdB.NRec     := 0;
+        SoprOrdB.cSoprDoc := KatSopr.nRec;
+        SoprOrdB.cSpSopr  := SpSopr.nRec;
+        SoprOrdB.cMC      := SpSopr.cMCUsl;
+        SoprOrdB.Kol      := SpSopr.KolFact;
+        SoprOrdB.VPrice   := SpSopr.VPrice;
+        SoprOrdB.cVal     := SpSopr.cVal;
+        insert current SoprOrdB;
+        delete current tSoprOrdB;
+      }
+    }
+    if(SpSopr.ManualTax = 1)  // ручные налоги  - через...
+    {
+      if(getfirst tNal where((tSpec.nRec == tNal.cSpDoc))= tsOk)
+      {
+        ClearBuffer(#SpDocNal);
+        SpDocNal.Buffer := type$SpDocNal(tNal.Buffer);
+        SpDocNal.NRec   := 0;
+        SpDocNal.SumNal := if(SpSopr.SumNDS > 0.0000001, SpSopr.SumNDS, SpSopr.SumVNDS);
+        SpDocNal.cSpDoc := SpSopr.nRec;
+        SpDocNal.cDoc   := KatSopr.nRec;
+        SpDocNal.TipDoc := SpSopr.VidSopr;
+        if(tNal.cOrg = comp(0)) SpDocNal.cOrg := KatSopr.cOrgBase;
+        insert current SpDocNal;
+        delete current tNal;
+      }
+    }
+    else
+      if ( KatSopr.VidSopr = 106 or KatSopr.VidSopr = 206)
+      {
+        SpDocNal.NRec   := 0;
+        SpDocNal.cSpDoc := SpSopr.nRec;
+        SpDocNal.cDoc   := KatSopr.nRec;
+        SpDocNal.TipDoc := SpSopr.VidSopr;
+        SpDocNal.cOrg := KatSopr.cOrgBase;
+        insert current SpDocNal;
+      }
+  }
+  // раcсчет средних цен
+// 2 Begin Изменения по сравнению с исходиком- оригиналом
+//  if ((KatSopr.TipSopr = 0) and (IEHead.Reestr And mskRecalcSumma) > 0)
+//    oMakeOrder.CalcSrPriceInNakl(KatSopr.NRec);
+// 2 END Изменения по сравнению с исходиком- оригиналом
+
+  // пересчет суммы
+  var _result: boolean = true;
+  case KatSopr.VidSopr of
+  101..103, 108:
+    RunInterface(L_SOPRDOC::iChkSumB, KatSopr.NRec, 0, 0, FALSE, if (KatSopr.cVal = 0, 10, 20), _result);
+  else
+    RunInterface(L_SOPRDOC::iChkSum , KatSopr.NRec, 0   , FALSE, if (KatSopr.cVal = 0, 10, 20), _result);
+  end;
+
+  if(getfirst tTTNDoc where((coKatSopr    == tTTNDoc.wTable and
+                             tHeader.NRec == tTTNDoc.cDoc)) = tsOk)
+  {
+    ClearBuffer(#TTNDoc);
+    TTNDoc.Buffer   := type$TTNDoc(tTTNDoc.Buffer);
+    TTNDoc.nrec := GetNextNRec(#TTNDoc, 0);
+
+    if(getfirst PutLst where ((TTNDoc.sPList == PutLst.NPL)) = tsOk)
+      TTNDoc.cPList := PutLst.NRec;
+    TTNDoc.wTable   := coKatSopr;
+    TTNDoc.cDoc     := KatSopr.NRec;
+    insert current TTNDoc;
+    iExAttr.CopyAllAttrEx1(coTTNDoc, tTTNDoc.nRec, coTTNDoc, TTNDoc.nRec, false);
+    //атрибуты не копируем, так как они привязываются к вставляемому nRec TTNDoc
+  }
+
+  update  SoprHoz where (( KatSopr.VidSopr  ==  SoprHoz.TipDoc
+                       and KatSopr.Nrec     ==  SoprHoz.cSoprDoc )) set cHozoper := tHeader.cHozOper;
+
+  //копируем атрибуты и удаляем их
+  delete all NoVisual tTTNDoc where((coKatSopr    == tTTNDoc.wTable and
+                                     tHeader.nRec == tTTNDoc.cDoc));
+  delete all NoVisual tSpec Where (( tHeader.nRec == tSpec.cSopr ));
+  delete current tHeader;
+} // Procedure ImportDocument
+
+end.
+// 968 Родионов Владислав Витальевич
+// должны загружаться на склад 968-4 основной, а не в подразделение 968 (вчера на эту тему меня к Чикуровой вызывали, типа надо остатки на склад положить). Как это нужно указать?

@@ -1,0 +1,349 @@
+/*************************************************************************************************\
+* Наименование: УП- Операции - Сервисные функции - Импорт данных по изменению окладов             *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: не анализируется настройка формата табельного номера:                               *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#3627         |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#component "Z_STAFF"
+#doc
+Наименование: УП- Операции - Сервисные функции - Импорт данных по изменению окладов
+Контур/Модуль: Кадры
+<p>#3627
+1. не анализируется настройка формата табельного номера - неправильно выводится протокол.
+2. В окне <Импорт данных> добавить выбор шкалы из классификатора тарифных ставок (шкала от 01.12.2018), либо возможность ввода даты шкалы (01.12.2018)
+3. При импорте данных в РПД_50, добавить заполнение ссылки на новую шкалу тарифных ставок и разряда. Для ее заполнения нужно взять код тарифной ставки из текущего назначения сотрудника, и найти аналогичную по коду в новой шкале от указанной даты (01.12.2018)
+скрины прилагаю
+
+#end
+Alter Interface EXPORTNAD;
+OverLoad
+  procedure CheckData;
+  function AppHistCreate(_cDocNmb, _cDestContDoc, _cPerson, _cApp: comp; _dateDoc : date): boolean;
+  Procedure FillingXls;
+  function PartDocCreate(cDocNmb,cDestTitleDoc: comp; dateDoc : date): boolean;
+end;
+
+Create view ExportData
+var
+  dDATIZM      :date;// Дата изменения
+  pMINRAZR     :comp;// ссылка на шкалу первого разряда
+  pAppointments:comp;// ссылка на назначение
+  pAppHist     :comp;// ссылка на историю
+as select MINRAZR.DATIZM
+From  MINRAZR
+    , TarStav
+    , Appointments
+    , AppHist AppHist1
+    , TarStav TarStav_Old
+where ((
+    dDATIZM == MINRAZR.DATIZM
+and pAppointments == Appointments.Nrec
+and Appointments.Tariff == TarStav_Old.Nrec
+and TarStav_Old.SisOpl ==  TarStav.SisOpl
+and TarStav_Old.CodTar ==  TarStav.CodTar
+and TarStav_Old.Razr   ==  TarStav.Razr
+and dDATIZM            ==  TarStav.DatIzm
+
+and pAppHist == AppHist1.Nrec
+));
+
+//***************************************************
+OverLoadFormats FormPar;
+//***************************************************
+screen FormPar 'Настройка параметров выбора' ;
+
+fields
+   wRegym('Режим работы функции: проверка корректности, формирование приказа',hcStaff_AdminDataImpChangeOklad,) : noprotect;
+   TypeFile ('Тип файла',hcStaff_AdminDataImpChangeOklad, scbut):
+    [List 'Dbf','Excel'], protect;
+   docDate ('Дата приказа',hcStaff_AdminDataImpChangeOklad, ): [10,'DD/MM/YYYY'], noprotect,
+    {font = {backcolor = if(YEAR(docDate) = 0, ColorNeed, 0)}};
+#IFDEF _GP_
+   dDATIZM : noProtect,{font = {backcolor = if(not isvalidall(tnMinRazr), ColorError, 0)}};
+#ENDIF
+   Dbf_Fname  ('Путь для DBF - файла', hcStaff_AdminDataImpChangeOklad, sci13Esc): protect,
+    {font = {backcolor = if(Dbf_FName = '', ColorNeed, 0)}};
+buttons
+   cmOk, default,, 'Ввод', hcStaff_AdminDataImpChangeOklad, sci1Esc;
+   cmCancel,,, 'Отмена', hcStaff_AdminDataImpChangeOklad, sci1Esc;
+<<
+  `Режим работы функции:`
+  (.) Проверка корректности импортируемых данных`
+  (.) Формирование приказа на основе импортируемых данных`
+
+  `Тип файла`             .@@@@@@@@@          `Дата приказа`   .@@@@@@@@@@
+                                         `Дата тарифной сетки` .@@@@@@@@@@
+  `Путь на файл с данными`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    <.~П~родолжить.>                                     <.   Отмена   .>
+>>
+end;
+
+
+//******************************************************************************
+// Перехваченные функции
+//******************************************************************************
+
+//******************************************************************************
+// проверить корректность импортируемых данных
+//******************************************************************************
+procedure CheckData;
+{
+  if (GetLast Persons where (( 'С' == Persons.IsEmployee
+                                  and FieldsFromFile.TabN == Persons.TabNmb
+                                  and FieldsFromFile.strTabn == Persons.StrTabn
+                                  and FieldsFromFile.FIO ==Persons.FIO(noindex)
+                               )) = tsOk)
+  {
+    if(FieldsFromFile.ChangeDate<Persons.AppDate)
+    {
+      log('Дата изменения оклада меньше даты приема на работу для сотрудника '+ FieldsFromFile.FIO, mfError);
+      bError := false;
+      exit;
+    }
+  }
+  else
+    if (GetLast Persons where (( 'Y' == Persons.IsEmployee
+                                  and FieldsFromFile.TabN == Persons.TabNmb
+                                  and FieldsFromFile.strTabn == Persons.StrTabn
+                                  and FieldsFromFile.FIO ==Persons.FIO(noindex)
+                              )) = tsOk)
+    {
+      if(FieldsFromFile.ChangeDate<Persons.AppDate)
+      {
+        log('Дата изменения оклада меньше даты приема на работу для сотрудника '+ FieldsFromFile.FIO, mfError);
+        bError := false;
+        exit;
+      }
+    }
+    else
+    {
+      log('Не найден сотрудник '+ FieldsFromFile.FIO + ' с табельным номером '+GetStrTabn(FieldsFromFile.TabN,FieldsFromFile.StrTabN)+'!', mfError);
+      bError := false;
+      exit;
+    }
+
+} //CheckData
+
+//******************************************************************************
+// создать запись в таблице  AppHist
+//******************************************************************************
+function AppHistCreate(_cDocNmb, _cDestContDoc, _cPerson, _cApp: comp; _dateDoc : date): boolean;
+var
+  cNewAppHist: comp;
+{
+  iChP.ChP_ClearAllParam;
+  iChP.ChP_SetStringParam(3, string(_cDocNmb));        // AppHist.DocNmb
+  iChP.ChP_SetDateParam  (4, _dateDoc);                // AppHist.DocDate
+  iChP.ChP_SetCompParam  (5, _cDestContDoc);           // AppHist.cContDoc
+#IFDEF _GP_
+  NextVisual;
+  var _pTariff:comp=0;
+  var _wRazr:word=0;
+  pAppointments :=_cApp;
+  _Loop Appointments
+  { _wRazr:=Appointments.CATEGORY;
+    _Loop TarStav_Old
+      _Loop TarStav
+        _pTariff:=TarStav.Nrec;
+  } //_Loop Appointments
+  iChP.ChP_SetCompParam  (6, _pTariff);                      // AppHist.Tariff
+  iChP.ChP_SetWordParam  (7, _wRazr);                      // AppHist.Category
+
+#ELSE
+  iChP.ChP_SetCompParam  (6, 0);                      // AppHist.Tariff
+  iChP.ChP_SetWordParam  (7, 0);                      // AppHist.Category
+#ENDIF
+  iChP.ChP_SetDoubleParam(11, FieldsFromFile.Oklad);  // AppHist.TaxRate
+  iChP.ChP_SetStringParam(13, '1');                   // AppHist.LastUser
+
+  cNewAppHist := iAH.AH_InsertRecord(_cApp, 50, FieldsFromFile.ChangeDate);
+
+  if cNewAppHist = 0
+    result := false;
+  else
+  {
+    if NOAA.NeedFormAddAgreementPers(50)
+      NOAA.CreateAgreement(WWC.GetContractOnDate(_cPerson, _dateDoc, _cApp), _dateDoc, coAppHist, cNewAppHist);
+
+    result := true;
+    iCorrKoef.DeleteKK(cNewAppHist, skkAppHist);
+#IFDEF _GP_
+    pAppHist:=cNewAppHist;
+    _Loop AppHist1
+    { update current AppHist1 set AppHist1.wState:=0
+    }
+#ENDIF
+  }
+} //function AppHistCreate(_cDocNmb, _cDestContDoc, _cPerson, _cApp: comp; _dateDoc : date): boolean;
+
+//******************************************************************************
+// заполняет табличку по файлу excel
+// Забираем целиком
+// i - byte !!!
+//******************************************************************************
+Procedure FillingXls;
+{ Delete All FieldsFromFile;
+  var xlMatrix : boolean;
+  MyXLSFile := xlOpenExcel(false);
+
+  if not  MyXLSFile
+  {
+    Message('Ошибка открытия Excel ', Error);
+    Set Dbf_Fname := '';
+    Exit;
+  }
+
+  MyXLSFile := xlOpenWorkBook(Dbf_Fname);
+
+  if not MyXLSFile
+  {
+    Message('Ошибка открытия XLS-файла ' + Dbf_Fname, Error);
+    Set Dbf_Fname := '';
+    Exit;
+  }
+#IFDEF _GP_
+  StartNewVisual(vtNumericVisual, vfTimer + vfConfirm + vfbreak
+                  , 'Чтение данных', 1);
+  var iStart:longint=1;
+  var ii    :longint=0;// вместо i
+  var row_matrix:longint=500;
+  do {
+  xlMatrix:= xlReadMatrixFromExcel (iStart,1,iStart+row_matrix,5);
+#ELSE
+  xlMatrix:= xlReadMatrixFromExcel (1,0,100,4);
+#ENDIF
+
+  if not xlMatrix
+  {
+    Message('Ошибка чтения XLS-файла ' + Dbf_Fname, Error);
+#IFDEF _GP_
+    break;
+#else
+    Exit;
+#ENDIF
+  }
+  else
+  {
+#IFDEF _GP_
+#ELSE
+    StartNewVisual(vtRotateVisual, vfTimer + vfConfirm
+                  , 'Чтение данных', 1);
+#ENDIF
+    ii :=2;
+
+    do
+    {
+#IFDEF _GP_
+      if not NextVisual
+      { FieldsFromFile.FIO:='';
+        break;
+      }
+#ENDIF
+      ClearBuffer(#FieldsFromFile);
+      xlReadFromMatrix(ii,1,FieldsFromFile.Num);
+      xlReadFromMatrix(ii,2,FieldsFromFile.FIO);
+#IFDEF _GP_
+      if FieldsFromFile.FIO='' break;
+#endif
+      if (wGetTune('FormatClockNumber') = 0)
+      {
+        xlReadFromMatrix(ii,3,FieldsFromFile.TabN);
+        FieldsFromFile.strTabn := '';
+      }
+      else
+      {
+        xlReadFromMatrix(ii,3,FieldsFromFile.strTabn);
+        FieldsFromFile.TabN := 0;
+      }
+
+      xlReadFromMatrix(ii,4,FieldsFromFile.Oklad);
+      xlReadFromMatrix(ii,5,ChangeDate);
+      FieldsFromFile.ChangeDate := StrToDate(ChangeDate,'DD.MM.YYYY');
+      Insert current  FieldsFromFile;
+      ii :=ii+1;
+#IFDEF _GP_
+      if ii>row_matrix
+      { // чтобы меньше переписывать начнем с -1 строки(i=2 в начале цикла)
+        iStart:=iStart+ii-2;
+        break;
+      }
+#ENDIF
+      xlReadFromMatrix(ii,2,FieldsFromFile.FIO);
+    }
+    while FieldsFromFile.FIO <> ''; // условие для завершения обхода по файлу
+  }
+#IFDEF _GP_
+  } while FieldsFromFile.FIO <> '' and iStart<10000
+#ENDIF
+
+  MyXLSFile := xlCloseWorkBook(word(Dbf_Fname));
+  MyXLSFile := xlKillExcel;
+  StopVisual('', 0);
+} //FillingXls
+
+//******************************************************************************
+// создать запись в таблице  PartDoc
+//******************************************************************************
+function PartDocCreate(cDocNmb,cDestTitleDoc: comp; dateDoc : date): boolean;
+{ timelog('EXPORTNAD->PartDocCreate:start');
+
+  StartNewVisual(vtIndicatorVisual, vfTimer //+ vfConfirm + vfbreak
+                  , 'Формирование приказа', RecordsInTable(#FieldsFromFile));
+
+  Result:=Inherited::PartDocCreate(cDocNmb,cDestTitleDoc, dateDoc);
+  StopVisual('', 0);
+  timelog('EXPORTNAD->PartDocCreate:finish');
+
+} //function PartDocCreate(cDocNmb,cDestTitleDoc: comp; dateDoc : date): boolean;
+
+//******************************************************************************
+// HandleEvent самого окна
+//******************************************************************************
+HandleEvent
+  cmInit:
+  { timelog_init;
+    timelog('EXPORTNAD->cmInit');
+    if not ReadMyDsk(dDATIZM,'EXPORTNAD_dDATIZM',false)
+    { if getlast MINRAZR where (( ZeroDate << MINRAZR.DATIZM )) /*MINRAZR03*/ =tsok
+      //?     dSetTune('UP.DatIzm', MinRazr.DatIzm);
+        dDATIZM:=MINRAZR.DATIZM;
+
+    }
+    if dDATIZM<dGetTune('UP.DatIzm') dDATIZM:=dGetTune('UP.DatIzm') ;
+    set dDATIZM:=dDATIZM;
+    if  inherited :: handleEvent (cmInit)=heAbort then Abort;
+
+  }
+  cmCheckField:
+  { if  inherited :: handleEvent (cmCheckField)=heAbort then Abort;
+    case CurField of
+    #dDATIZM:
+    { if getfirst MINRAZR<>tsok
+      { message('На дату '+DateToStr(dDATIZM,'DD/MM/YYYY')+ ' нет тарифных сеток!');
+      }
+    }
+    end;
+  }
+  //'Z_STAFF::KLSISOPLTARIFF.KLSISOPLEMBEDDED.Z_ZAR::IKLSISOPL.RRR.KLSISOPL.SISOPL'
+  cmDone:
+  { SaveMyDsk(dDATIZM,'EXPORTNAD_dDATIZM');
+    if  inherited :: handleEvent (cmDone)=heAbort then Abort;
+  }
+  cmOk:
+  { timelog('EXPORTNAD->cmOk:ok');
+
+    if getfirst MINRAZR<>tsok
+    { message('На дату '+DateToStr(dDATIZM,'DD/MM/YYYY')+ ' нет тарифных сеток!');
+      Exit;
+    }
+    else
+    { if  inherited :: handleEvent (cmOk)=heAbort then Abort;
+    }
+    timelog('EXPORTNAD->cmOk:finish');
+  }
+end;
+end.

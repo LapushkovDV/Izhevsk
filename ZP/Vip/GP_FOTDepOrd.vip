@@ -1,0 +1,1069 @@
+/*************************************************************************************************\
+* Наименование: Фактический ФОТ по отделам                                                        *
+* Контур/Модуль: Заработная плата                                                                 *
+* Пункт меню: Отчеты / Отчеты пользователя / Экономическая и статистическая отчетность /          *
+* Фактический ФОТ по отделам                                                                      *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#831          |24/04/18|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include GP_StrFunc.vih
+#include GP_Filter.vih
+#include Query.vih
+#include GP_QueryBuilder.vih
+
+#define GPInt GP_FOTDepOrd // #(GPInt)
+#define GPNam Фактический ФОТ по отделам // #(GPNam)
+
+interface GP_FOTDepOrd '#(GPNam)' EscClose;
+
+  const
+    EXT_ATTR_PROD_TYPE = 'Вид производства'; // Внеший атрибут "Вид производства" к каталогу подразделений
+    // Тип данных (константа DT_XXXX)
+    DT_TOTAL     = 1; // Общий итог
+    DT_PERIOD    = 2; // Итого за месяц
+    DT_PROD_TYPE = 3; // Итого по виду производства
+    DT_DEP       = 4; // Итого по подразделению
+    // Тип суммы
+    ST_FIRST_LINE = 1; // Тип суммы - первая строка
+    ST_SECOND_LINE = 2; // Тип суммы - вторая строка
+    // FLT_KATPODR = 1;
+    REP_TITLE = 'Фактический ФОТ по заказам'; // Заголовок отчёта
+    TAB_CNT = 1; // Количество закладок в отчёте
+    TAB_TITLE_1 = 'Отчёт'; // Название закладки 1
+    XL_TEXT_FORMAT = '@';
+    // Константы ошибок при работе с Excel
+    XE_BAD_OP           =  0; // не удалось выполнить операцию с Excel-файлом
+    XE_CREATE_FILE      =  1; // не удалось создать файл
+    XE_OPEN_FILE        =  2; // не удалось открыть файл
+    XE_INIT_FILE        =  3; // не удалось инициализировать Excel
+    XE_CREATE_MATRIX    =  4; // не удалось создать матрицу
+    XE_FREE_MATRIX      =  5; // не удалось освободить матрицу
+    XE_OUT_MATRIX       =  6; // не удалось вывести матрицу в отчёт
+    XE_WRITE_TO_MATRIX  =  7; // не удалось записать значение в матрицу
+    XE_FORMAT_CELL      =  8; // не удалось отформатировать ячейку
+    XE_SET_CELL_VALUE   =  9; // не удалось записать значение в ячейку
+    XE_SET_CELL_FORMULA = 10; // не удалось записать формулу
+    XE_RUN_MACRO        = 11; // не удалось запустить макрос
+    XE_ADD_SHEET        = 12; // не удалось добавить вкладку
+    XE_DEL_SHEET        = 13; // не удалось удалить вкладку
+    XE_RENAME_SHEET     = 14; // не удалось переименовать вкладку
+    XE_WRONG_TEMPLATE   = 15; // в xlt шаблоне не найден лист с именем
+  end;
+
+  #include GP_StrFunc.var
+
+  // Периоды
+  table struct SGroup
+  (
+    NRec: tNRec, // NRec
+    DataType: byte, // Тип данных (константа DT_XXXX)
+    Month: word, // Месяц
+    Year: word, // Год
+    cParent: tNRec, // Родительская запись
+    Name: string // Наименование
+    // Sum: double // Сумма
+  )
+  with index
+  (
+    SGroup01 = NRec,
+    SGroup02 = DataType + Year + Month,
+    SGroup03 = DataType + cParent + Name
+  );
+
+  // Номера заказов
+  table struct SOrder
+  (
+    cOrder: tNRec, // Ссылка на заказ
+    Code: string[21] // Код заказа
+  )
+  with index
+  (
+    SOrder01 = cOrder,
+    SOrder02 = Code
+  );
+
+  // Суммы по заказам
+  table struct SSum
+  (
+    cSGroup: tNRec, // Группа
+    cOrder: tNRec, // Заказ
+    SumType: byte, // Тип суммы (константа ST_XXXXX)
+    Sum: double // Сумма
+  )
+  with index
+  (
+    SSum01 = cSGroup + cOrder + SumType
+  );
+
+  // Данные по оплатам
+  table struct SOpl
+  (
+    MesN: Word, // Месяц, в котором начислено
+    CexOZ: tNRec, // Ссылка на подразделение (KatPodr.NRec)
+    PodrCode: string[20], // Код подразделения
+    VidOplP: longint, // Код вида оплаты польз.
+    VidOplS: longint, // Код вида оплаты сист.
+    StZatrCode: string[20], // Код статьи затрат доп.аналитики "Статьи расходов/доходов"
+    cOrder: tNRec, // Ссылка на заказ (MnPlan.NRec)
+    OrderNum: string[20], // Номер заказа
+    Sum: tSumma // Сумма
+  )
+  with index
+  (
+    SOpl01 = MesN + PodrCode + OrderNum
+  );
+
+  var
+    oGP_Filter_KatPodr: GP_Filter; // Фильтр по подразделениям
+
+  create view
+    var
+      pYear: word; // Год отчётного периода
+      IsAborted: boolean;
+      SumFormat: string;
+    as select
+      (oGP_Filter_KatPodr.GetState) (fieldName = FltKatPodrSt)
+    from
+      Zar_User,
+      MnPlan,
+      SGroup (SGroup01),
+      SOrder (SOrder02),
+      SSum (SSum01),
+      synonym SSum SSum1 (SSum01),
+      synonym SSum SSum2 (SSum01),
+      SOpl (SOpl01)
+    where ((
+          UserName           == Zar_User.OwnName
+      and SGroup.NRec        == SSum1.cSGroup
+      and SOrder.cOrder      == SSum1.cOrder
+      and ST_FIRST_LINE      == SSum1.SumType
+      and SGroup.NRec        == SSum2.cSGroup
+      and SOrder.cOrder      == SSum2.cOrder
+      and ST_SECOND_LINE     == SSum2.SumType
+      // Подразделение
+      and SOpl.CexOZ         == KatPodr.NRec
+      // Внешний атрибут "Вид производства" к каталогу подразделений
+      and coKatPodr          == AttrNam.WTable
+      and EXT_ATTR_PROD_TYPE == AttrNam.Name
+      and AttrNam.WTable     == AttrVal.WTable
+      and KatPodr.NRec       == AttrVal.cRec
+      and AttrNam.NRec       == AttrVal.cAttrNam
+      and AttrVal.vComp      == SpKau.NRec
+    ));
+
+  #include GP_Log.var
+
+  var
+    pYearRas: integer = 0;
+    pMonthRas: integer = 0;
+    iQBuilder: GP_QueryBuilder new;
+
+  window winParam '#(GPNam)' DoAccept, EscClose, Gray;
+    show at (,, 74, 7);
+
+    screen scrParam ('',, sci1EnEsc);
+    fields
+      pYear ('Год отчетного периода'): noprotect, SpinButton [1, 1, 9999];
+      FltKatPodrSt ('Список подразделений',, sci13Esc): protect;
+    buttons
+      cmOk,,, 'Ввод - принять выбор',,sci1Esc;
+      cmCancel,,, 'Отмена',,sci1Esc;
+    <<
+
+`Отчетный период:`.@@@@@ год
+
+`Подразделение`   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+                        <.  ~O~K  .> <.О~т~мена.>
+    >>
+    end;
+
+    handleEvent
+      cmOk:
+        PutCommand(cmDefault);
+      cmDefault:
+        if (oGP_Filter_KatPodr.SelCount = 0)
+        {
+          Message('В поле "Подразделение" должно быть выбрано хотя бы одно подразделение');
+          abort;
+        }
+    end;
+  end;
+
+  function InitParam: boolean;
+  {
+    InitParam := False;
+    if (not GetUserDate(pYearRas, pMonthRas, 0, ZeroDate, ZeroDate))
+      exit;
+    if (not ReadMyDsk(pYear, '#(GPInt)_pYear', false))
+      pYear := pYearRas;
+    InitParam := True;
+  }
+
+  procedure SaveParam;
+  {
+    SaveMyDsk(pYear, '#(GPInt)_pYear');
+  }
+
+  function AskParam: boolean;
+  {
+    AskParam := False;
+    if (not InitParam)
+      exit;
+    if (RunWindowModal(winParam) = cmDefault)
+    {
+      AskParam := True;
+      SaveParam;
+    }
+  }
+
+  function LocateSOrder(_cOrder: tNRec): tNRec;
+  {
+    result := 0;
+    if (getFirst MnPlan where ((_cOrder == MnPlan.NRec)) = tsOk)
+    {
+      if (getFirst SOrder where ((_cOrder == SOrder.cOrder)) != tsOk)
+      {
+        // ClearBuffer(#SOrder); // Чистить нет нужды - все поля присваиваются
+        SOrder.cOrder := _cOrder;
+        SOrder.Code := MnPlan.Number;
+        if (insert current SOrder != tsOk)
+        {
+          oGP_Log.Error('Не удалось вставить запись в таблицу SOrder');
+          exit;
+        }
+      }
+      result := SOrder.cOrder;
+    }
+    else
+      oGP_Log.Error('Не найдена запись в таблице MnPlan с NRec = ' + To_Char(_cOrder, 0, 0));
+  }
+
+  function LocateSGroup(_DataType: byte; _cParent: tNRec; _Name: string): tNRec;
+  {
+    result := 0;
+    if (getFirst SGroup where ((
+          _DataType == SGroup.DataType
+      and _cParent  == SGroup.cParent
+      and _Name     == SGroup.Name
+    )) != tsOk)
+    {
+      ClearBuffer(#SGroup);
+      SGroup.NRec := RecordsInTable(#SGroup) + 1;
+      SGroup.DataType := _DataType;
+      SGroup.cParent := _cParent;
+      SGroup.Name := _Name;
+      if ((insert current SGroup) != tsOk)
+      {
+        oGP_Log.Error('Не удалось добавить месяц в таблицу SGroup');
+        exit;
+      }
+    }
+    result := SGroup.NRec;
+  }
+
+  procedure AddSSum(_cSGroup: tNRec; _cOrder: tNRec; _SumType: byte; _Sum: Double);
+  {
+     var _DataType: byte = 0;
+     if (getFirst SGroup where ((_cSGroup == SGroup.NRec)) != tsOk) then
+     {
+       oGP_Log.Error('Не найдена запись в таблице SGroup с NRec = ' + To_Char(SGroup.NRec, 0, 0) + 
+        '(SumType: ' + To_Char(_SumType) + ')');
+       exit;
+     }
+     _DataType := SGroup.DataType;
+     if (getFirst SSum where ((
+           _cSGroup == SSum.cSGroup
+       and _cOrder == SSum.cOrder
+       and _SumType == SSum.SumType
+     )) = tsOk) then
+     {
+       SSum.Sum += _Sum;
+       if (update current SSum != tsOk)
+         oGP_Log.Error('Не удалось обновить запись в таблице SSum');
+     }
+     else
+     {
+       ClearBuffer(#SSum);
+       SSum.cSGroup := _cSGroup;
+       SSum.cOrder := _cOrder;
+       SSum.SumType := _SumType;
+       SSum.Sum := _Sum;
+       if (insert current SSum != tsOk)
+         oGP_Log.Error('Не удалось добавить запись в таблицу SSum');
+     }
+     if (SGroup.cParent != 0)
+       AddSSum(SGroup.cParent, _cOrder, _SumType, _Sum);
+  }
+
+  // Создает и заполняет временную таблицу со списком выбранных подразделений
+  procedure FillPeriods;
+  {
+    var i: Byte;
+    for (i := 1; i <= 12; i++)
+    {
+      ClearBuffer(#SGroup);
+      SGroup.NRec := RecordsInTable(#SGroup) + 1;
+      SGroup.DataType := DT_PERIOD;
+      SGroup.Month := i;
+      SGroup.Year := pYear;
+      // SGroup.cParent := 0;
+      // SGroup.Name := '';
+      // SGroup.Sum := 0;
+      if (insert current SGroup != tsOk)
+        oGP_Log.Error('Не удалось добавить месяц в таблицу SGroup');
+    }
+  }
+
+  // Заполняет с помощью DirectSQL запроса данные по оплатам из таблицы SumVidOp
+  procedure FillSOplFromSumVidOp;
+  {
+    if (IsAborted)
+      exit;
+    var Q: IQuery New;
+    Q := QueryManager.createQuery(SQLQuery(
+      SELECT
+        SumVidOp.MesN AS MesN, // Месяц, в котором начислено
+        SumVidOp.CexOz AS CexOZ, // Ссылка на подразделение (KatPodr.NRec)
+        KatPodr.Kod AS PodrCode, // Код подразделения
+        SumVidOp.VidOplP AS VidOplP, // Код вида оплаты польз.
+        SumVidOp.VidOpl AS VidOplS, // Код вида оплаты сист.
+        StZatr.Kod AS StZatrCode, // Код статьи затрат доп.аналитики "Статьи расходов/доходов"
+        MnPlan.NRec AS cOrder, // Ссылка на заказ (MnPlan.NRec)
+        MnPlan.Number AS OrderNum, // Номер заказа
+        Sum(SumVidOp.Summa) AS Sum // Сумма
+      FROM
+        SumVidOp
+        INNER JOIN StZatr ON CASE
+            WHEN SumVidOp.TblExtr[1] = 13 THEN SumVidOp.KauExtr[1]
+            WHEN SumVidOp.TblExtr[2] = 13 THEN SumVidOp.KauExtr[2]
+            WHEN SumVidOp.TblExtr[3] = 13 THEN SumVidOp.KauExtr[3]
+            WHEN SumVidOp.TblExtr[4] = 13 THEN SumVidOp.KauExtr[4]
+            WHEN SumVidOp.TblExtr[5] = 13 THEN SumVidOp.KauExtr[5]
+            WHEN SumVidOp.TblExtr[6] = 13 THEN SumVidOp.KauExtr[6]
+        END = StZatr.NRec
+        INNER JOIN MnPlan ON CASE
+            WHEN SumVidOp.TblD[1] = 7 THEN SumVidOp.cKAUD[1]
+            WHEN SumVidOp.TblD[2] = 7 THEN SumVidOp.cKAUD[2]
+            WHEN SumVidOp.TblD[3] = 7 THEN SumVidOp.cKAUD[3]
+            WHEN SumVidOp.TblD[4] = 7 THEN SumVidOp.cKAUD[4]
+            WHEN SumVidOp.TblD[5] = 7 THEN SumVidOp.cKAUD[5]
+            WHEN SumVidOp.TblD[6] = 7 THEN SumVidOp.cKAUD[6]
+        END = MnPlan.NRec
+        LEFT JOIN KatPodr ON SumVidOp.CexOz = KatPodr.NRec
+      WHERE
+            :(pYear) = SumVidOp.YearN
+        %Filter
+      GROUP BY
+        SumVidOp.MesN,
+        SumVidOp.CexOz,
+        KatPodr.Kod,
+        SumVidOp.VidOplP,
+        SumVidOp.VidOpl,
+        StZatr.Kod,
+        MnPlan.NRec,
+        MnPlan.Number
+    ));
+    // Если установлен фильтр по подразделению
+    var hStrFilter: longint = 0;
+    sqlAddStr(hStrFilter, iQBuilder.MakeCriteriaFromMarker('and SumVidOp.CexOZ ', oGP_Filter_KatPodr.GetSelMarker()));
+    if (hStrFilter <> 0)
+    {
+      Q.setMacro('Filter', hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    if (Q.Execute.ErrorCode != 0)
+    {
+      oGP_Log.Error('Ошибка выполнения DSQL запроса по таблице SumVidOp (' + To_Char(Q.ErrorCode) + ')');
+    }
+    else
+    {
+      if (Q.getResultSet.Count > 0)
+      {
+        var wErr: longint = SqlCopyInto(Q.getResultSet, tnSOpl, true);
+        if (wErr = 30003)
+          oGP_Log.Error('Обнаружена ошибка при отборе данных по таблице SumVidOp' + chr(13) + 'Закройте все окна и повторите запуск');
+      }
+    }
+  }
+
+  // Заполняет с помощью DirectSQL запроса данные по оплатам из таблицы Nachisl
+  procedure FillSOplFromNachisl;
+  {
+    if (IsAborted)
+      exit;
+    var Q: IQuery New;
+    Q := QueryManager.createQuery(SQLQuery(
+      SELECT
+        Nachisl.MesN AS MesN, // Месяц, в котором начислено
+        Nachisl.CexOz AS CexOZ, // Ссылка на подразделение (KatPodr.NRec)
+        KatPodr.Kod AS PodrCode, // Код подразделения
+        Nachisl.VidOpl AS VidOplP, // Код вида оплаты польз.
+        Nachisl.VidOplS AS VidOplS, // Код вида оплаты сист.
+        StZatr.Kod AS StZatrCode, // Код статьи затрат доп.аналитики "Статьи расходов/доходов"
+        MnPlan.NRec AS cOrder, // Ссылка на заказ (MnPlan.NRec)
+        MnPlan.Number AS OrderNum, // Номер заказа
+        Sum(Nachisl.Summa) AS Sum // Сумма
+      FROM
+        Nachisl
+        INNER JOIN StZatr ON CASE
+            WHEN Nachisl.TblExtr[1] = 13 THEN Nachisl.KauExtr[1]
+            WHEN Nachisl.TblExtr[2] = 13 THEN Nachisl.KauExtr[2]
+            WHEN Nachisl.TblExtr[3] = 13 THEN Nachisl.KauExtr[3]
+            WHEN Nachisl.TblExtr[4] = 13 THEN Nachisl.KauExtr[4]
+            WHEN Nachisl.TblExtr[5] = 13 THEN Nachisl.KauExtr[5]
+            WHEN Nachisl.TblExtr[6] = 13 THEN Nachisl.KauExtr[6]
+        END = StZatr.NRec
+        INNER JOIN MnPlan ON CASE
+            WHEN Nachisl.TblD[1] = 7 THEN Nachisl.cKAUD[1]
+            WHEN Nachisl.TblD[2] = 7 THEN Nachisl.cKAUD[2]
+            WHEN Nachisl.TblD[3] = 7 THEN Nachisl.cKAUD[3]
+            WHEN Nachisl.TblD[4] = 7 THEN Nachisl.cKAUD[4]
+            WHEN Nachisl.TblD[5] = 7 THEN Nachisl.cKAUD[5]
+            WHEN Nachisl.TblD[6] = 7 THEN Nachisl.cKAUD[6]
+        END = MnPlan.NRec
+        LEFT JOIN KatPodr ON Nachisl.CexOz = KatPodr.NRec
+      WHERE
+            :(pYear) = Nachisl.YearN
+        %Filter
+      GROUP BY
+        Nachisl.MesN,
+        Nachisl.CexOz,
+        KatPodr.Kod,
+        Nachisl.VidOpl,
+        Nachisl.VidOplS,
+        StZatr.Kod,
+        MnPlan.NRec,
+        MnPlan.Number
+    ));
+    // Если установлен фильтр по подразделению
+    var hStrFilter: longint = 0;
+    sqlAddStr(hStrFilter, iQBuilder.MakeCriteriaFromMarker('and Nachisl.CexOZ ', oGP_Filter_KatPodr.GetSelMarker()));
+    if (hStrFilter <> 0)
+    {
+      Q.setMacro('Filter', hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    if (Q.Execute.ErrorCode != 0)
+    {
+      oGP_Log.Error('Ошибка выполнения DSQL запроса по таблице Nachisl (' + To_Char(Q.ErrorCode) + ')');
+    }
+    else
+    {
+      if (Q.getResultSet.Count > 0)
+      {
+        var wErr: longint = SqlCopyInto(Q.getResultSet, tnSOpl, true);
+        if (wErr = 30003)
+          oGP_Log.Error('Обнаружена ошибка при отборе данных по таблице Nachisl' + chr(13) + 'Закройте все окна и повторите запуск');
+      }
+    }
+  }
+
+  // Заполняет с помощью DirectSQL запроса данные по оплатам из таблицы Nenach
+  procedure FillSOplFromNenach;
+  {
+    if (IsAborted)
+      exit;
+    var Q: IQuery New;
+    Q := QueryManager.createQuery(SQLQuery(
+      SELECT
+        Nenach.MesN AS MesN, // Месяц, в котором начислено
+        Nenach.CexOz AS CexOZ, // Ссылка на подразделение (KatPodr.NRec)
+        KatPodr.Kod AS PodrCode, // Код подразделения
+        Nenach.VidOpl AS VidOplP, // Код вида оплаты польз.
+        Nenach.VidOplS AS VidOplS, // Код вида оплаты сист.
+        StZatr.Kod AS StZatrCode, // Код статьи затрат доп.аналитики "Статьи расходов/доходов"
+        MnPlan.NRec AS cOrder, // Ссылка на заказ (MnPlan.NRec)
+        MnPlan.Number AS OrderNum, // Номер заказа
+        Sum(Nenach.Summa) AS Sum // Сумма
+      FROM
+        Nenach
+        INNER JOIN StZatr ON CASE
+            WHEN Nenach.TblExtr[1] = 13 THEN Nenach.KauExtr[1]
+            WHEN Nenach.TblExtr[2] = 13 THEN Nenach.KauExtr[2]
+            WHEN Nenach.TblExtr[3] = 13 THEN Nenach.KauExtr[3]
+            WHEN Nenach.TblExtr[4] = 13 THEN Nenach.KauExtr[4]
+            WHEN Nenach.TblExtr[5] = 13 THEN Nenach.KauExtr[5]
+            WHEN Nenach.TblExtr[6] = 13 THEN Nenach.KauExtr[6]
+        END = StZatr.NRec
+        INNER JOIN MnPlan ON CASE
+            WHEN Nenach.TblD[1] = 7 THEN Nenach.cKAUD[1]
+            WHEN Nenach.TblD[2] = 7 THEN Nenach.cKAUD[2]
+            WHEN Nenach.TblD[3] = 7 THEN Nenach.cKAUD[3]
+            WHEN Nenach.TblD[4] = 7 THEN Nenach.cKAUD[4]
+            WHEN Nenach.TblD[5] = 7 THEN Nenach.cKAUD[5]
+            WHEN Nenach.TblD[6] = 7 THEN Nenach.cKAUD[6]
+        END = MnPlan.NRec
+        LEFT JOIN KatPodr ON Nenach.CexOz = KatPodr.NRec
+      WHERE
+            :(pYear) = Nenach.YearN
+        %Filter
+      GROUP BY
+        Nenach.MesN,
+        Nenach.CexOz,
+        KatPodr.Kod,
+        Nenach.VidOpl,
+        Nenach.VidOplS,
+        StZatr.Kod,
+        MnPlan.NRec,
+        MnPlan.Number
+    ));
+    // Если установлен фильтр по подразделению
+    var hStrFilter: longint = 0;
+    sqlAddStr(hStrFilter, iQBuilder.MakeCriteriaFromMarker('and Nenach.CexOZ ', oGP_Filter_KatPodr.GetSelMarker()));
+    if (hStrFilter <> 0)
+    {
+      Q.setMacro('Filter', hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    if (Q.Execute.ErrorCode != 0)
+    {
+      oGP_Log.Error('Ошибка выполнения DSQL запроса по таблице Nenach (' + To_Char(Q.ErrorCode) + ')');
+    }
+    else
+    {
+      if (Q.getResultSet.Count > 0)
+      {
+        var wErr: longint = SqlCopyInto(Q.getResultSet, tnSOpl, true);
+        if (wErr = 30003)
+          oGP_Log.Error('Обнаружена ошибка при отборе данных по таблице Nenach' + chr(13) + 'Закройте все окна и повторите запуск');
+      }
+    }
+  }
+
+  // Ищет в таблице SGroup группу, соответствующую указанному периоду
+  function LocateGrPeriod(_Month: byte): tNRec;
+  {
+    if (getFirst SGroup where ((
+          DT_PERIOD == SGroup.DataType
+      and pYear     == SGroup.Year
+      and _Month    == SGroup.Month
+    )) = tsOk)
+    {
+      result := SGroup.NRec;
+    }
+    else
+    {
+      oGP_Log.Error('Не найдена запись в таблице SGroup (Month: ' + To_Char(SOpl.MesN) + ' Year: ' + To_Char(pYear));
+      result := 0;
+    }
+  }
+
+  procedure PrepareData;
+  {
+    IsAborted := false;
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, ''#3'Анализ данных...'#13, 1);
+
+    #ifdef __DEBUG__
+    oGP_Log.Info('Анализ данных:');
+    #end
+
+    if (not IsAborted)
+      FillPeriods;
+    if (not IsAborted)
+      FillSOplFromSumVidOp;
+    if (not IsAborted)
+      FillSOplFromNachisl;
+    if (not IsAborted)
+      FillSOplFromNenach;
+
+    SetVisualHeader('Формирование формы...');
+    var cGrTotal: tNRec = LocateSGroup(DT_TOTAL, 0, 'Всего');
+    var cGrPeriod: tNRec = 0;
+    var cGrProdType: tNRec = 0;
+    var cGrDep: tNRec = 0;
+    var cSOrder: tNRec = 0;
+    var Sum1, Sum2: tSumma;
+    var StZCode: String;
+    _loop SOpl
+    {
+      if (not NextVisual)
+        IsAborted := true;
+      if (IsAborted)
+        break;
+      #ifdef __DEBUG__
+      oGP_Log.Info('');
+      oGP_Log.Info('MesN: ' + To_Char(SOpl.MesN));
+      oGP_Log.Info('SOpl.CexOZ: ' + To_Char(SOpl.CexOZ, 0, 0));
+      oGP_Log.Info('SOpl.PodrCode: ' + To_Char(SOpl.PodrCode));
+      oGP_Log.Info('SOpl.VidOplP: ' + To_Char(SOpl.VidOplP));
+      oGP_Log.Info('SOpl.VidOplS: ' + To_Char(SOpl.VidOplS));
+      oGP_Log.Info('SOpl.StZatrCode: ' + To_Char(SOpl.StZatrCode));
+      oGP_Log.Info('SOpl.cOrder: ' + To_Char(SOpl.cOrder, 0, 0));
+      oGP_Log.Info('SOpl.OrderNum: ' + To_Char(SOpl.OrderNum));
+      oGP_Log.Info('SOpl.Sum: ' + To_Char(SOpl.Sum, 0, 2));
+      #end
+      // Ищем группу, соответствующую месяцу оплаты
+      cGrPeriod := LocateGrPeriod(SOpl.MesN);
+      if (cGrPeriod != 0)
+      {
+        var ProdTypeCode: String = UpCase(SpKau.Code);
+        #ifdef __DEBUG__
+        oGP_Log.Info('---');
+        oGP_Log.Info('SGroup.Year: ' + To_Char(SGroup.Year));
+        oGP_Log.Info('SGroup.Month: ' + To_Char(SGroup.Month));
+        oGP_Log.Info('cGrPeriod: ' + To_Char(cGrPeriod, 0, 0));
+        oGP_Log.Info('KatPodr.Kod: ' + KatPodr.Kod);
+        oGP_Log.Info('ProdTypeCode: ' + To_Char(ProdTypeCode));
+        #end
+        // Ищем группу, соответствующую Виду производства (если не найдено, создаём ее)
+        cGrProdType := LocateSGroup(DT_PROD_TYPE, cGrPeriod, ProdTypeCode);
+        if (cGrProdType != 0)
+        {
+          // Ищем группу, соответствующую коду подразделения (если не найдено, создаём ее)
+          cGrDep := LocateSGroup(DT_DEP, cGrProdType, KatPodr.Kod);
+          if (cGrDep != 0)
+          {
+            // Ищем запись, соответствующую заказу оплаты (если не найдено, создаём ее)
+            cSOrder := LocateSOrder(SOpl.cOrder);
+            if (cSOrder != 0)
+            {
+              /*
+              Возможные коды статей затрат и их наименования
+              Код: 0101  Наименование: 01 Основная з/плата
+              Код: 01011 Наименование: 01.1 Основная  з/плата не уменьшающая налогообл.базу
+              Код: 0102  Наименование: 02 Дополнительная з/плата
+              Код: 01021 Наименование: 02.1 Дополнительная з/плата не уменьшающая налогообл.базу
+              Код: 0104  Наименование: 04 Премии
+              Код: 01041 Наименование: 04.1 Премия не уменьшающая налогообл.базу
+              */
+              Sum1 := 0;
+              Sum2 := 0;
+              // Первые четыре цифры кода статьи затрат
+              StZCode := SubStr(SOpl.StZatrCode, 1, 4);
+              // первая сумма - результаты расчета заработной платы по всем видам с аналитикой
+              // "Статьи расходов/доходов" со значениями 01, 02, 04 (и соответствующие им не уменьшающая налогообл.базу)
+              if (StZCode = '0101' or StZCode = '0102' or StZCode = '0104')
+              {
+                Sum1 := SOpl.Sum;
+                // вторая сумма - результаты расчета заработной платы по всем видам с аналитикой
+                // "Статьи расходов/доходов" со значением 04 (и соответствующие ей не уменьшающая налогообл.базу)
+                if (StZCode = '0104')
+                  Sum2 := SOpl.Sum;
+              }
+              // Строка данных 1
+              if (Sum1 != 0)
+              {
+                // Добавляем суммы в ячейку формы
+                AddSSum(cGrDep, cSOrder, ST_FIRST_LINE, Sum1);
+                // Увеличиваем общий итог
+                AddSSum(cGrTotal, cSOrder, ST_FIRST_LINE, Sum1);
+              }
+              // Строка данных 2
+              if (Sum2 != 0)
+              {
+                // Добавляем суммы в ячейку формы
+                AddSSum(cGrDep, cSOrder, ST_SECOND_LINE, Sum2);
+                // Увеличиваем общий итог
+                AddSSum(cGrTotal, cSOrder, ST_SECOND_LINE, Sum2);
+              }
+            }
+          }
+        }
+      }
+    }
+    StopVisual('', 0);
+  }
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  var
+    // Переменные для работы с Excel
+    FirstCol: longint; // Номер первой колонки отчёта
+    LastCol: longint; // Номер последней колонки отчёта
+    FirstMonthRow: longint; // Номер первой строки текущего месяца
+
+  // Исключение для генерации ошибок, связанных с выводом в Excel файл
+  exception ExOnExecelError;
+
+  // Генерирует ошибку, связанную с выводом в Excel файл
+  procedure ExcelError(ErrCode: word; AddInfo: string);
+  {
+    var ErrText: string;
+    case ErrCode of
+      XE_BAD_OP:
+        ErrText := 'не удалось выполнить операцию с Excel-файлом';
+      XE_CREATE_FILE:
+        ErrText := 'не удалось создать файл';
+      XE_OPEN_FILE:
+        ErrText := 'не удалось открыть файл';
+      XE_INIT_FILE:
+        ErrText := 'не удалось инициализировать Excel';
+      XE_CREATE_MATRIX:
+        ErrText := 'не удалось создать матрицу';
+      XE_OUT_MATRIX:
+        ErrText := 'не удалось вывести матрицу в отчёт';
+      XE_WRITE_TO_MATRIX:
+        ErrText := 'не удалось записать значение в матрицу';
+      XE_WRONG_TEMPLATE:
+        ErrText := 'в xlt шаблоне не найден лист с именем';
+      XE_FORMAT_CELL:
+        ErrText := 'не удалось отформатировать ячейку';
+      XE_SET_CELL_VALUE:
+        ErrText := 'не удалось записать значение в ячейку';
+      XE_RUN_MACRO:
+        ErrText := 'не удалось запустить макрос';
+      XE_ADD_SHEET:
+        ErrText := 'не удалось добавить вкладку';
+      XE_DEL_SHEET:
+        ErrText := 'не удалось удалить вкладку';
+      XE_RENAME_SHEET:
+        ErrText := 'не удалось переименовать вкладку';
+      XE_FREE_MATRIX:
+        ErrText := 'не удалось освободить матрицу';
+      XE_SET_CELL_FORMULA:
+        ErrText := 'не удалось записать формулу';
+    else
+      ErrText := '';
+    end;
+    oGP_Log.Error(ErrText + ' ' + AddInfo);
+    _raise ExOnExecelError;
+  }
+
+  // Эта Функция делает более удобной проверку результата операции с Excel
+  // Первым параметром передаем функцию, которая работает с Excel, а вторым и третьим - информацию об ошибке,
+  // которая будет выведена, если эта функция вернёт false (т.е. выполнится с ошибкой)
+  procedure xlOp(IsCorrect: boolean; ErrCode: word; AddInfo: string);
+  {
+    if (not IsCorrect)
+      ExcelError(ErrCode, AddInfo);
+  }
+
+  // Создаёт Excel файл и создаёт в нём вкладки для вывода отчёта
+  procedure PrepareExcelFile(OutFileName: string);
+  {
+    if (ExistFile(OutFileName))
+      DeleteFile(OutFileName);
+    SetVisualHeader('Создание Excel-файла...');
+    // Создаем файл Excel
+    xlOp(xlCreateExcel(OutFileName, True), XE_CREATE_FILE, OutFileName);
+    xlOp(xlIsExcelValid, XE_INIT_FILE, '');
+    // Переименуем вкладки
+    // Если в отчете меньше вкладок, чем нам нужно добавим недостающие
+    var TabCnt: word = 0;
+    xlOp(xlGetSheetsCount(TabCnt), XE_ADD_SHEET, '');
+    while TabCnt < TAB_CNT do
+    {
+      xlOp(xlAddSheet, 11, '');
+      TabCnt++;
+    }
+    // Если в больше вкладок, чем нам нужно, удалим лишние
+    while TabCnt > TAB_CNT do
+    {
+      xlOp(xlDeleteSheet(1), XE_DEL_SHEET, '');
+      TabCnt--;
+    }
+    // Переименуем вкладки
+    xlOp(xlSetSheetName(1, TAB_TITLE_1), XE_RENAME_SHEET, '');
+  }
+
+  procedure OutTitle(var R: longint);
+  {
+    // Выводим заголовок
+    xlOp(xlSetCellStringValue(REP_TITLE + ' за ' + To_Char(pYear) + ' год (счет 20.01.1, 23.01, заказ 76378)',
+     R, 1, R, 1), XE_SET_CELL_VALUE, '');
+    // сделаем его жирным
+    xlOp(xlSetFontStyle(xlBold, R, 1, R + 1, 1), XE_FORMAT_CELL, '');
+    // и крупным
+    xlOp(xlSetFontSize(12, R, 1, R + 1, 1), XE_FORMAT_CELL, '');
+    R += 1;
+  }
+
+  // Вывод шапки отчёта
+  procedure OutHeader(var R: longint);
+  {
+    SetVisualHeader('Форматирование Excel-файла...');
+    FirstCol := 1;
+
+    var C: word = FirstCol - 1;
+    // Месяц
+    xlOp(xlSetCellStringValue('Месяц', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R + 1, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    // Отдел
+    xlOp(xlSetCellStringValue('Отдел', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R + 1, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(15, R, C, R, C), XE_FORMAT_CELL, '');
+    // ФОТ
+    xlOp(xlSetCellStringValue('ФОТ', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetCellStringValue('В т.ч. О4', R + 1, C, R + 1, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+    var I: word = 0;
+    _loop SOrder
+    {
+      xlOp(xlSetNumberFormat(XL_TEXT_FORMAT, R + 1, C + I + 1, R + 1, C + I + 1), XE_FORMAT_CELL, '');
+      xlOp(xlSetCellStringValue(SOrder.Code, R + 1, C + I + 1, R + 1, C + I + 1), XE_SET_CELL_VALUE, '');
+      xlOp(xlSetColumnWidth(10, R, C + I + 1, R, C + I + 1), XE_FORMAT_CELL, '');
+      I++;
+    }
+    xlOp(xlMergeCells(R, C, R, C + I), XE_FORMAT_CELL, '');
+    C += I;
+    // Всего
+    xlOp(xlSetCellStringValue('Всего', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R + 1, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(10, R, C, R, C), XE_FORMAT_CELL, '');
+
+    LastCol := C;
+
+    // Выравниваем содержимое ячеек шапки по верхнему краю и по центру
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    // Устанавливаем текстовый формат для всех ячеек шапки
+    xlOp(xlSetNumberFormat(XL_TEXT_FORMAT, R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    // Делаем шрифт шапки жирным
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');;
+
+    // Рисуем границы ячеек для шапки
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0, 
+     R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+
+    R += 2;
+  }
+
+  // Вывод одной строки в отчёт
+  procedure OutRec(var R: longint);
+  {
+    var C: word = FirstCol - 1;
+
+    // Устанавливаем формат вывода для сумм
+    xlOp(xlSetNumberFormat(SumFormat, R, FirstCol + 2, R + 1, LastCol), XE_FORMAT_CELL, '');
+
+    // Первая строка
+    // Месяц
+    if (SGroup.DataType = DT_PERIOD)
+      xlOp(xlSetCellStringValue(DateToStr(To_Date(1, SGroup.Month, SGroup.Year), 'month'), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    else
+      C++;
+    // Отдел
+    xlOp(xlSetNumberFormat(XL_TEXT_FORMAT, R, ++C, R, C), XE_FORMAT_CELL, '');
+    case SGroup.DataType of
+      DT_TOTAL, DT_DEP:
+        xlOp(xlSetCellStringValue(SGroup.Name, R, C, R, C), XE_SET_CELL_VALUE, '');
+      DT_PROD_TYPE:
+        xlOp(xlSetCellStringValue('Итого ' + SGroup.Name, R, C, R, C), XE_SET_CELL_VALUE, '');
+      DT_PERIOD:
+        xlOp(xlSetCellStringValue('Всего ' + DateToStr(To_Date(1, SGroup.Month, SGroup.Year), 'month'), R, C, R, C), XE_SET_CELL_VALUE, '');
+    end;
+    // В т.ч. О4
+    C++;
+    // ФОТ
+    var TSum1: Double = 0;
+    _loop SOrder
+    {
+      if (IsValidAll(tnSSum1))
+      {
+        xlOp(xlSetCellNumberValue(SSum1.Sum, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        TSum1 += SSum1.Sum;
+      }
+      else
+        C++;
+    }
+    // Всего
+    xlOp(xlSetCellNumberValue(TSum1, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+
+    // Вторая строка
+    R++;
+    C := FirstCol - 1 + 3;
+    // ФОТ
+    var TSum2: Double = 0;
+    _loop SOrder
+    {
+      if (IsValidAll(tnSSum2))
+      {
+        xlOp(xlSetCellNumberValue(SSum2.Sum, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+        TSum2 += SSum2.Sum;
+      }
+      else
+        C++;
+    }
+    // Всего
+    xlOp(xlSetCellNumberValue(TSum2, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+
+    // Вторую стоку выводим другим цветом
+    xlOp(xlSetFontColor(00A85430h, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+
+    // Итоги выводим жирным шрифтом
+    if (SGroup.DataType = DT_TOTAL or SGroup.DataType = DT_PERIOD or SGroup.DataType = DT_PROD_TYPE)
+      xlOp(xlSetFontStyle(xlBold, R - 1, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+
+    if (SGroup.DataType = DT_TOTAL)
+      // Рисуем границы ячеек
+      xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV, xlThin, 0, 0, 
+       R - 1, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    /*
+    if ((SGroup.DataType = DT_TOTAL or SGroup.DataType = DT_PERIOD) and FirstMonthRow != 0)
+    {
+      // Рисуем границы ячеек
+      xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV, xlThin, 0, 0, 
+       FirstMonthRow, FirstCol, R - 2, LastCol), XE_FORMAT_CELL, '');
+    }
+    if (SGroup.DataType = DT_PERIOD)
+      FirstMonthRow := R - 1;
+    */
+    if (SGroup.DataType = DT_PERIOD)
+    {
+      // Объединяем колонку с названием месяца и выравниваем название месяца в ней по верхему краю
+      xlOp(xlMergeCells(FirstMonthRow, FirstCol, R, FirstCol), XE_FORMAT_CELL, '');
+      xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstMonthRow, FirstCol, R, FirstCol), XE_FORMAT_CELL, '');
+      // Рисуем границы ячеек
+      xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV, xlThin, 0, 0, 
+       FirstMonthRow, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    }
+    R++;
+  }
+
+  // Вывод тела отчёта
+  procedure OutBody(var R: longint);
+  {
+    // SumFormat := '# ##0' + GetDecimalSeparator + '00';
+    SumFormat := '# ##0';
+    SetVisualHeader('Вывод данных в отчет...');
+    #ifdef __DEBUG__
+    oGP_Log.Info('Вывод данных в отчет...');
+    #end
+    FirstMonthRow := 0;
+    _loop SGroup where((DT_PERIOD == SGroup.DataType)) ordered by index SGroup02
+    {
+      FirstMonthRow := R;
+      var _cGroupPeriod: tNRec = SGroup.NRec;
+      PushPos(#SGroup);
+      _loop SGroup where((DT_PROD_TYPE == SGroup.DataType and _cGroupPeriod == SGroup.cParent)) ordered by index SGroup03
+      {
+        var _cGroupProdType: tNRec = SGroup.NRec;
+        PushPos(#SGroup);
+        _loop SGroup where((DT_DEP == SGroup.DataType and _cGroupProdType == SGroup.cParent)) ordered by index SGroup03
+        {
+          OutRec(R);
+        }
+        PopPos(#SGroup);
+        OutRec(R);
+      }
+      PopPos(#SGroup);
+      OutRec(R);
+    }
+    if (getFirst SGroup where((DT_TOTAL == SGroup.DataType)) = tsOk)
+      OutRec(R);
+  }
+
+  // Формирует отчёт
+  procedure CreateReport;
+  {
+    IsAborted := false;
+    PrepareData;
+    if (IsAborted)
+      exit;
+
+    if (RecordsInTable(#SOpl) = 0)
+    {
+      Message('Нет данных для формирования отчёта');
+      exit;
+    }
+
+    var OutFileName: string = GetDefaultUserPath + '#(GPNam) ' + To_Char(pYear) + '.xlsx';
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+    _try
+    {
+      PrepareExcelFile(OutFileName);
+      var R: longint = 1;
+      // Выводим заголовок отчёта
+      OutTitle(R);
+      // Выводим шапку отчёта
+      OutHeader(R);
+      // Выводим тело отчёта
+      OutBody(R);
+    end
+    _except on ExOnExecelError, ExUserBreak:
+    {
+      IsAborted := true;
+    }
+    StopVisual('',0);
+    xlKillExcel;
+  }
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  handleEvent
+    cmInit:
+      {
+        // Фильтр по видам оплат
+        if (LoadVipInterface(oGP_Filter_KatPodr))
+        {
+          oGP_Filter_KatPodr.Init(GP_FLT_KAT_PODR, 'GP_FOTDepOrd_Deps', 'Выбор подразделений', GP_FLT_ST_NIK_OR_KB);
+          if (AskParam)
+          {
+            oGP_Log.Init('#(GPInt).log', true, true, true);
+            CreateReport;
+            oGP_Log.Done(true);
+          }
+          oGP_Filter_KatPodr.Done;
+          FreeVipInterface(oGP_Filter_KatPodr);
+        } else
+          Message(''#10#13' Ошибка! Не удалось инициализировать фильтр по подразделениям', Error);
+        abort;
+      }
+    cmPick:
+      case CurField of
+        #FltKatPodrSt:
+          if (oGP_Filter_KatPodr.Pick)
+          {
+            // pFilters := pFilters or FLT_KATPODR;
+            RescanPanel(CurTable);
+          }
+      end;
+    cmDelOnProtect:
+      case CurField of
+        #FltKatPodrSt:
+          {
+            oGP_Filter_KatPodr.Reset;
+            // pFilters := pFilters and (not FLT_KATPODR);
+            RescanPanel(CurTable);
+          }
+      end;
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_GP_FOTDepOrd implements IUserReport;
+
+interface UserReport_GP_FOTDepOrd;
+
+  procedure Run;
+  {
+    RunInterface('GP_FOTDepOrd');
+  }
+
+  function GetReportName: string;
+  {
+    result := 'Фактический ФОТ по отделам';
+  }
+
+  function GetGroupName(Level: word): string;
+  {
+    result := '';
+    case Level of
+      1: result := 'Экономическая и статистическая отчетность';
+    end;
+  }
+
+  function GetPriority: integer;
+  {
+    result := 0;
+  }
+
+  function VisibleInModule(Ind: Byte): string;
+  {
+    result := '';
+    case Ind of
+      1: result := 'MENUZARP';
+    end;
+  }
+
+end.

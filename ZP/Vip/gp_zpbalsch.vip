@@ -1,0 +1,1035 @@
+/*************************************************************************************************\
+* Наименование:  Ведомость распределения з/п по балансовым счетам (с резервом на отпуска)         *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:                                                                                     *
+* Вид работы  |Номер          |Дата    |Исполнитель              |Проект                          *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#825          |13/02/18 |Ермолов К.Р.             |НПО Энергомаш                   *
+\*************************************************************************************************/
+
+#include UserReport.vih
+#include marker.vih
+
+interface gp_zpbalsch 'Параметры отчета' gray
+Show at (,,55,9);
+
+table struct otchper // Текущий отчетный период
+(
+  data: date
+)
+;
+
+table struct naryad  // В разрезе счетов
+(
+sch: string,         // № счета
+zakaznmb: string,    // № заказа
+otdel: string,       // Код подразделения
+ozp: decimal(31,15), // Основная з\п
+dzp: decimal(31,15), // Дополнительная з\п
+prem: decimal(31,15) // Премия
+)
+with index
+(
+i1 = sch + zakaznmb + otdel (unique)
+)
+;
+
+table struct naryad2  // В разрезе счетов
+(
+sch: string,
+zakaznmb: string,
+otdel: string,
+s1: decimal(31,15), // 69/102
+s2: decimal(31,15),  // 69/000
+s3: decimal(31,15) // ФОТ резерва
+)
+with index
+(
+i1 = sch + zakaznmb + otdel (unique)
+)
+;
+
+table struct podr   // Таблица используется несколько раз для разных разрезов (Код подразделения или № заказа или Вид производства)
+(
+otdzakvid: string,  // Код подразделения или № заказа или Вид производства
+ozp: decimal(31,15),
+dzp: decimal(31,15),
+prem: decimal(31,15)
+)
+with index
+(
+i1 = otdzakvid (unique)
+)
+;
+
+table struct podr2  // Таблица используется несколько раз для разных разрезов (Код подразделения или № заказа или Вид производства)
+(
+otdzakvid: string,
+s1: decimal(31,15),
+s2: decimal(31,15),
+s3: decimal(31,15)
+)
+with index
+(
+i1 = otdzakvid (unique)
+)
+;
+
+table struct complex  // Общая сумма по видам производства
+(
+ozp: decimal(31,15),
+dzp: decimal(31,15),
+prem: decimal(31,15)
+)
+;
+
+table struct complex2 // Общая сумма по видам производства
+(
+s1: decimal(31,15),
+s2: decimal(31,15),
+s3: decimal(31,15)
+)
+;
+
+table struct tSelPodr // Подразделения с внешним атрибутом "Вид производства"
+(
+nrec: comp,
+kod: string,
+name: string
+)
+with index
+(
+i1 = nrec (unique)
+)
+;
+
+table struct tselmnf //Виды производства
+(
+  nrec: comp,
+  name: string
+)
+with index
+(
+  i1 = nrec  (autoInc, unique)
+)
+;
+
+create view zpbalsch
+
+var
+ExcelPath, znum, Filtr_Katpodr, Filtr_mnf, Filtr_cmnf, nik, pUserName: string;
+counter, wErr: longint;
+ozps, dzps, prems, s1s, s2s: double;
+mes: word;
+god: integer;
+pMarkerpodr, pMarkermnf: IMarker(marker) new;
+Filtr_cKatPODR: comp;
+
+as select naryad.*, podr.*, complex.*, naryad2.*, podr2.*, complex2.*, tSelPodr.*
+from naryad, podr, complex, naryad2, podr2, complex2, tSelPodr, tselmnf, otchper;
+
+#include Sql_Func.Vpp
+
+window wnSelMNF 'Вид производства' doAccept, EscClose;
+Show at (5,5,50,25);
+Browse brSelmnf '';
+Table tSelmnf;
+recMarker=pMarkermnf {tSelmnf.nrec};
+Fields
+tSelmnf.NAME 'Вид производства':[100],Protect,NoDel;
+end;
+end;
+
+window wnSelPodr 'Подразделения' doAccept, EscClose;
+Show at (5,5,100,25);
+Browse brSelPodr '' ;
+Table tSelPodr;
+recMarker=pMarkerPodr {tSelPodr.nrec};
+Fields
+tSelPodr.kod  'Код':[10],Protect,NoDel;
+tSelPodr.name 'Наименование подразделения':[100],Protect,NoDel;
+end;
+end;
+
+screen scr ('Параметры отчета',,sci13Esc);
+  fields
+  Filtr_mnf: pickbutton, protect;
+  nik: noprotect, noframe;
+  Filtr_Katpodr: pickbutton, protect;
+  mes : [list
+        1 '1',
+        2 '2',
+        3 '3',
+        4 '4',
+        5 '5',
+        6 '6',
+        7 '7',
+        8 '8',
+        9 '9',
+        10 '10',
+        11 '11',
+        12 '12'], protect;
+  god: noprotect, spinbutton [1, 1917, 2117];
+  buttons
+    cmGo, ,, 'Сформировать' ,,;
+    <<
+
+    Виды производства: .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                        [.] Только НИК`
+    Подразделения:     .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    Месяц:             .@@@@
+    Год:               .@@@@@
+
+    <.Сформировать.>
+
+    >>
+end;
+
+handleevent
+
+cmInit:
+{
+  pUserName:= UserName();
+
+  Filtr_mnf:= 'Не выбрано';
+  Filtr_katpodr:= 'Выберете вид производства';
+
+  sql
+  select dateval
+  from tuneval
+  where strempty = 'UP.DATOTCH' and obj = 10
+  into otchper
+  ;
+
+  mes:= month(otchper.data);
+  god:= year(otchper.data);
+
+  delete all from tSelmnf;
+
+  sql
+  select #comp(0), attrval.vstring
+  from katpodr
+  inner join katpodr katpodr1 on (katpodr1.nrec = katpodr.cpodr and katpodr1.kod = substring(katpodr.kod,1,3)) or (katpodr1.nrec = katpodr.nrec and length(katpodr.kod) = 3)
+  inner join extcatlinks on extcatlinks.extcat = katpodr.nrec
+  inner join catalogs on catalogs.nrec = extcatlinks.staffcat
+  inner join attrval on attrval.crec = catalogs.nrec
+  inner join attrnam on attrnam.nrec = attrval.cattrnam
+  where attrnam.name = 'Вид производства'
+  group by attrval.vstring
+  into tselmnf
+  ;
+}
+
+cmCheckField:
+{
+  if curfield = #nik
+  {
+    if nik = '1'
+    {
+      Filtr_mnf:= 'НИК';
+      Filtr_katpodr:= 'Не выбрано';
+
+      delete all from tSelmnf;
+
+      sql
+      select #comp(0), attrval.vstring
+      from katpodr
+      inner join katpodr katpodr1 on (katpodr1.nrec = katpodr.cpodr and katpodr1.kod = substring(katpodr.kod,1,3)) or (katpodr1.nrec = katpodr.nrec and length(katpodr.kod) = 3)
+      inner join extcatlinks on extcatlinks.extcat = katpodr.nrec
+      inner join catalogs on catalogs.nrec = extcatlinks.staffcat
+      inner join attrval on attrval.crec = catalogs.nrec
+      inner join attrnam on attrnam.nrec = attrval.cattrnam
+      where attrnam.name = 'Вид производства' and attrval.vstring = 'Научно-испытательный комплекc'
+      group by attrval.vstring
+      into tselmnf
+      ;
+
+      pMarkermnf.SelectAll;
+
+      sqlDropTmpTable ('tSelmnfUser');
+      sqlCreateTmpTable('table tSelmnfUser (name: string) with index (i1 = name);', ctmNormal);
+
+      SubBounds(tbRmtSelmnf1);
+      AddBounds(tbRmtSelmnf2);
+
+      _loop pmarkermnf
+      {
+        Filtr_cmnf := tSelmnf.name;
+
+        stmt := sqlAllocStmt;
+        ClearQuery(vliSQLCommand);
+        PrepareSQLQuery('insert into tSelmnfUser (name) values ('''+Filtr_cmnf+''') ');
+        ExecDSQLex(0);
+      }
+
+      SubBounds(tbRmtSelmnf2);
+      AddBounds(tbRmtSelmnf1);
+
+      delete all from tSelPodr;
+
+      ClearQuery(vliSQLCommand);
+      PrepareSQLQuery('select katpodr1.nrec, katpodr1.kod, katpodr1.name');
+      PrepareSQLQuery('from katpodr');
+      PrepareSQLQuery('inner join katpodr katpodr1 on (katpodr1.nrec = katpodr.cpodr and katpodr1.kod = substring(katpodr.kod,1,3)) or (katpodr1.nrec = katpodr.nrec and length(katpodr.kod) = 3)');
+      PrepareSQLQuery('inner join extcatlinks on extcatlinks.extcat = katpodr.nrec');
+      PrepareSQLQuery('inner join catalogs on catalogs.nrec = extcatlinks.staffcat');
+      PrepareSQLQuery('inner join attrval on attrval.crec = catalogs.nrec');
+      PrepareSQLQuery('inner join attrnam on attrnam.nrec = attrval.cattrnam');
+      PrepareSQLQuery('inner join zar_user on (upper(zar_user.ownname) = upper('''+pUserName+'''))');
+      PrepareSQLQuery('where attrnam.name = ''Вид производства'' and (attrval.vstring in (select tSelmnfUser.name from tSelmnfUser)) and (zar_user.podrshare <> ''+'' or (katpodr.nrec in (select userrights.crecds from userrights where zar_user.ownname = userrights.ownname)))');
+      PrepareSQLQuery('group by katpodr1.nrec, katpodr1.kod, katpodr1.name');
+      PrepareSQLQuery('order by katpodr1.kod');
+      stmt:=0;
+      stmt := sqlAllocStmt;
+      wErr:=ExecDSQLex(tntSelPodr);
+
+      pMarkerpodr.UnselectAll;
+    }
+    else
+    {
+      Filtr_mnf:= 'Не выбрано';
+      Filtr_katpodr:= 'Выберете вид производства';
+
+      delete all from tSelPodr;
+      delete all from tSelmnf;
+
+      sql
+      select #comp(0), attrval.vstring
+      from katpodr
+      inner join katpodr katpodr1 on (katpodr1.nrec = katpodr.cpodr and katpodr1.kod = substring(katpodr.kod,1,3)) or (katpodr1.nrec = katpodr.nrec and length(katpodr.kod) = 3)
+      inner join extcatlinks on extcatlinks.extcat = katpodr.nrec
+      inner join catalogs on catalogs.nrec = extcatlinks.staffcat
+      inner join attrval on attrval.crec = catalogs.nrec
+      inner join attrnam on attrnam.nrec = attrval.cattrnam
+      where attrnam.name = 'Вид производства'
+      group by attrval.vstring
+      into tselmnf
+      ;
+
+      pMarkermnf.UnselectAll;
+      pMarkerpodr.UnselectAll;
+    }
+  }
+}
+
+cmPick:
+{
+  if curfield = #Filtr_mnf
+  {
+    runwindow(wnSelmnf);
+  }
+
+  if curfield = #Filtr_Katpodr
+  {
+    runwindow(wnSelPodr);
+  }
+}
+
+cmGo:
+{
+
+if Filtr_katpodr = 'Не выбрано' or  Filtr_katpodr = 'Выберете вид производства'
+{
+  message('Не выбраны подразделения');
+}
+else
+{
+
+ ExcelPath:= TranslatePath('%ClientStartPath%');
+
+    xlCreateExcelWithTemplate(ExcelPath+'XLS_ЭМ\ZP\gp_zpbalsch.xlsx',true);
+    if (xlIsExcelValid) xlSetActiveWorkBookByName('1');
+
+     xlsetcellstringvalue('ВЕДОМОСТЬ РАСПРЕДЕЛЕНИЯ З/П ПО БАЛАНСОВЫМ СЧЕТАМ (С РЕЗЕРВОМ НА ОТПУСКА) ЗА ' + mes + '.' + god, 1, 1, 1, 1);
+
+StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+
+counter:= 6;
+ozps:= 0;
+dzps:= 0;
+prems:= 0;
+s1s:= 0;
+s2s:= 0;
+
+sqlDropTmpTable ('tSelPodrUser');
+sqlCreateTmpTable('table tSelPodrUser (nrec: comp) with index (i1 = nrec);', ctmNormal);
+
+
+delete all from naryad;
+
+SubBounds(tbRmtSelPodr1);
+AddBounds(tbRmtSelPodr2);
+
+_loop pMarkerPodr
+{
+  Filtr_cKatPODR := tSelPodr.nrec;
+
+  stmt := sqlAllocStmt;
+  ClearQuery(vliSQLCommand);
+  PrepareSQLQuery('insert into tSelPodrUser (nrec) values (#comp('+string(Filtr_cKatPODR)+')) ');
+  ExecDSQLex(0);
+
+  sql
+  select buhschet.code, mnplan.number, katpodr1.kod, sum(nachisl1.summa), sum(nachisl2.summa), sum(nachisl3.summa)
+  from mnplan
+  left join buhschet on buhschet.nrec = mnplan.canval2
+  left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7
+  left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+  inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)
+  left join klvidopl on klvidopl.vidopl = nachislzakaz.vidopls
+  left join stzatr on stzatr.nrec = klvidopl.kauextr[1]
+  left join nachislzakaz nachisl1 on nachisl1.nrec = nachislzakaz.nrec and nachisl1.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec
+                                                                                    and (stzatr.name in ('01 Основная з/плата'
+                                                                                                        ,'01.1 Основная  з/плата не уменьшающая налогообл.базу'
+                                                                                                        ,'Основная з/плата, включая Премии'
+                                                                                                        )
+                                                                                        )
+  left join nachislzakaz nachisl2 on nachisl2.nrec = nachislzakaz.nrec and nachisl2.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec
+                                                                                    and (stzatr.name in ('02 Дополнительная з/плата'
+                                                                                                        ,'02.1 Дополнительная з/плата не уменьшающая налогообл.базу'
+                                                                                                        ,'Дополнительная з/плата'
+                                                                                                        )
+                                                                                        )
+  left join nachislzakaz nachisl3 on nachisl3.nrec = nachislzakaz.nrec and nachisl3.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec
+                                                                                    and (stzatr.name  in('04 Премии'
+                                                                                                        ,'04.1 Премия не уменьшающая налогообл.базу'
+                                                                                                        ,'104 Проект "Управление качеством:автоматизированный учет отступлений от КД и ТД '
+                                                                                                        ,'106 Проект "Управление качеством: разработка и внедрение системы учета затрат ка'
+                                                                                                        )
+                                                                                        )
+  where nachislzakaz.mesn = :(mes) and nachislzakaz.yearn = :(god) and katpodr1.nrec = :(Filtr_cKatpodr)
+  group by buhschet.code, mnplan.number, katpodr1.kod
+  into naryad
+  ;
+}
+
+  delete all from naryad2;
+
+_loop pMarkerPodr
+{
+  Filtr_cKatPODR := tSelPodr.nrec;
+
+  sql
+  select buhschet.code, mnplan.number, katpodr1.kod,
+  sum(coalesce(perevodtekzakaz8.sumper,0)),
+  sum(coalesce(perevodtekzakaz2.sumper,0)) + sum(coalesce(perevodtekzakaz3.sumper,0)) + sum(coalesce(perevodtekzakaz5.sumper,0)) + sum(coalesce(perevodtekzakaz11.sumper,0)) +
+  sum(coalesce(perevodtekzakaz12.sumper,0)) + sum(coalesce(perevodtekzakaz14.sumper,0)), sum(coalesce(perevodtekzakaz13.sumper,0))
+  from mnplan
+  left join buhschet on buhschet.nrec = mnplan.canval2
+  left join perevodtekzakaz on perevodtekzakaz.mesn = :(mes)
+      and perevodtekzakaz.yearn = :(god)
+      and perevodtekzakaz.vidper = 8
+      and perevodtekzakaz.ckaud[1] = mnplan.nrec
+      and perevodtekzakaz.tbld[1] = 7
+  left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+  inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)
+      and katpodr1.nrec = :(Filtr_cKatpodr)
+
+  left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.cnach = perevodtekzakaz.cnach and perevodtekzakaz2.mesn = perevodtekzakaz.mesn and perevodtekzakaz2.vidper =2
+  left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.cnach = perevodtekzakaz.cnach and perevodtekzakaz3.mesn = perevodtekzakaz.mesn and perevodtekzakaz3.vidper =3
+  left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.cnach = perevodtekzakaz.cnach and perevodtekzakaz5.mesn = perevodtekzakaz.mesn and perevodtekzakaz5.vidper =5
+  left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.cnach = perevodtekzakaz.cnach and perevodtekzakaz8.mesn = perevodtekzakaz.mesn and perevodtekzakaz8.vidper =8
+  left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.cnach = perevodtekzakaz.cnach and perevodtekzakaz11.mesn = perevodtekzakaz.mesn and perevodtekzakaz11.vidper =11
+  left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.cnach = perevodtekzakaz.cnach and perevodtekzakaz12.mesn = perevodtekzakaz.mesn and perevodtekzakaz12.vidper =12
+  left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.cnach = perevodtekzakaz.cnach and perevodtekzakaz14.mesn = perevodtekzakaz.mesn and perevodtekzakaz14.vidper =14
+  left join perevodtekzakaz perevodtekzakaz13 on perevodtekzakaz13.cnach = perevodtekzakaz.cnach and perevodtekzakaz13.mesn = perevodtekzakaz.mesn and perevodtekzakaz13.vidper = 13
+    group by buhschet.code, mnplan.number, katpodr1.kod
+  into naryad2
+  ;
+}
+
+if getfirst naryad = tsok
+{
+  znum:= naryad.zakaznmb;
+}
+
+    _loop naryad
+      {
+        counter++;
+
+        if znum = naryad.zakaznmb
+        {
+          ozps:= ozps + naryad.ozp;
+          dzps:= dzps + naryad.dzp;
+          prems:= prems + naryad.prem;
+
+          _loop naryad2 where ((naryad.sch == naryad2.sch and naryad.zakaznmb == naryad2.zakaznmb and naryad.otdel == naryad2.otdel))
+          {
+            s1s:= s1s + naryad2.s1;
+            s2s:= s2s + naryad2.s2;
+            dzps:= dzps + naryad2.s3;
+          }
+        }
+        else
+        {
+          xlmergecells(counter,1,counter,5);
+          xlsetcellstringvalue('Итого по заказу:', counter,1,counter,1);
+          xlsetcellnumbervalue(ozps, counter,6,counter,6);
+          xlsetcellnumbervalue(dzps, counter,7,counter,7);
+          xlsetcellnumbervalue(prems, counter,8,counter,8);
+          xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,9,counter,9);
+          xlsetfontstyle(1, counter, 1, counter, 12);
+          xlsetcellnumbervalue(s1s, counter,10,counter,10);
+          xlsetcellnumbervalue(s2s, counter,11,counter,11);
+          xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,12,counter,12);
+
+          ozps:= naryad.ozp;
+          dzps:= naryad.dzp;
+          prems:= naryad.prem;
+          s1s:= 0;
+          s2s:= 0;
+
+          _loop naryad2 where ((naryad.sch == naryad2.sch and naryad.zakaznmb == naryad2.zakaznmb and naryad.otdel == naryad2.otdel))
+          {
+            s1s:= naryad2.s1;
+            s2s:= naryad2.s2;
+            dzps:= dzps + naryad2.s3;
+          }
+
+          counter++;
+        }
+
+        znum:= naryad.zakaznmb;
+
+        xlmergecells(counter,1,counter,2);
+        xlmergecells(counter,3,counter,4);
+        xlsetcellstringvalue(naryad.sch, counter,1,counter,1);
+        xlsetcellstringvalue(naryad.zakaznmb, counter,3,counter,3);
+        xlsetcellstringvalue(naryad.otdel, counter,5,counter,5);
+        xlsetcellnumbervalue(naryad.ozp, counter,6,counter,6);
+        xlsetcellnumbervalue(naryad.dzp, counter,7,counter,7);
+        xlsetcellnumbervalue(naryad.prem, counter,8,counter,8);
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,9,counter,9);
+        xlsetcellnumbervalue(0, counter,10,counter,10);
+        xlsetcellnumbervalue(0, counter,11,counter,11);
+
+        _loop naryad2 where ((naryad.sch == naryad2.sch and naryad.zakaznmb == naryad2.zakaznmb and naryad.otdel == naryad2.otdel))
+        {
+          xlsetcellnumbervalue(naryad2.s1, counter,10,counter,10);
+          xlsetcellnumbervalue(naryad2.s2, counter,11,counter,11);
+          xlsetcellnumbervalue(naryad.dzp + naryad2.s3, counter,7,counter,7);
+        }
+
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,12,counter,12);
+      }
+
+      if getlast naryad = tsok
+      {
+        counter++;
+        xlmergecells(counter,1,counter,5);
+        xlsetcellstringvalue('Итого по заказу:', counter,1,counter,1);
+        xlsetcellnumbervalue(ozps, counter,6,counter,6);
+        xlsetcellnumbervalue(dzps, counter,7,counter,7);
+        xlsetcellnumbervalue(prems, counter,8,counter,8);
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,9,counter,9);
+        xlsetfontstyle(1, counter, 1, counter, 12);
+        xlsetcellnumbervalue(s1s, counter,10,counter,10);
+        xlsetcellnumbervalue(s2s, counter,11,counter,11);
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,12,counter,12);
+      }
+
+      delete all from podr;
+
+      ClearQuery(vliSQLCommand);
+      PrepareSQLQuery('select substring(mnplan.number,1,4), sum(nachisl1.summa), sum(nachisl2.summa), sum(nachisl3.summa)');
+      PrepareSQLQuery('from mnplan');
+      PrepareSQLQuery('left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7');
+      PrepareSQLQuery('left join katpodr on katpodr.nrec = nachislzakaz.cexoz');
+      PrepareSQLQuery('inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)  ');
+      PrepareSQLQuery('left join klvidopl on klvidopl.vidopl = nachislzakaz.vidopls');
+      PrepareSQLQuery('left join stzatr on stzatr.nrec = klvidopl.kauextr[1]');
+      PrepareSQLQuery('left join nachislzakaz nachisl1 on nachisl1.nrec = nachislzakaz.nrec and nachisl1.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec ');
+      PrepareSQLQuery('and (stzatr.name in(''01 Основная з/плата''                                 ');
+      PrepareSQLQuery('                  ,''01.1 Основная  з/плата не уменьшающая налогообл.базу'' ');
+      PrepareSQLQuery('                  ,''Основная з/плата, включая Премии''                     ');
+      PrepareSQLQuery('                   )                                                        ');
+      PrepareSQLQuery('    )                                                                       ');
+      PrepareSQLQuery('left join nachislzakaz nachisl2 on nachisl2.nrec = nachislzakaz.nrec and nachisl2.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec ');
+      PrepareSQLQuery('and (stzatr.name in (''02 Дополнительная з/плата''                                 ');
+      PrepareSQLQuery('                    ,''02.1 Дополнительная з/плата не уменьшающая налогообл.базу'' ');
+      PrepareSQLQuery('                    ,''Дополнительная з/плата''                                    ');
+      PrepareSQLQuery('                    )                                                              ');
+      PrepareSQLQuery('    )                                                                              ');
+      PrepareSQLQuery('left join nachislzakaz nachisl3 on nachisl3.nrec = nachislzakaz.nrec and nachisl3.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec ');
+      PrepareSQLQuery('and (stzatr.name = ''04 Премии'' or stzatr.name = ''04.1 Премия не уменьшающая налогообл.базу'' or stzatr.name = ''104 Проект "Управление качеством:автоматизированный учет отступлений от КД и ТД '' ');
+      PrepareSQLQuery('or stzatr.name = ''106 Проект "Управление качеством: разработка и внедрение системы учета затрат ка'')');
+      PrepareSQLQuery('where nachislzakaz.mesn = '+mes+' and nachislzakaz.yearn = '+god+' and (katpodr1.nrec in (select tSelPodrUser.nrec from tSelPodrUser))');
+      PrepareSQLQuery('group by substring(mnplan.number,1,4)');
+      stmt:=0;
+      stmt := sqlAllocStmt;
+      wErr:=ExecDSQLex(tnpodr);
+
+      delete all from podr2;
+
+      ClearQuery(vliSQLCommand);
+      PrepareSQLQuery('select substring(mnplan.number,1,4)');
+      PrepareSQLQuery('sum(coalesce(perevodtekzakaz8.sumper,0)),');
+      PrepareSQLQuery('sum(coalesce(perevodtekzakaz2.sumper,0)) + sum(coalesce(perevodtekzakaz3.sumper,0)) + sum(coalesce(perevodtekzakaz5.sumper,0)) + sum(coalesce(perevodtekzakaz11.sumper,0)) +');
+      PrepareSQLQuery('sum(coalesce(perevodtekzakaz12.sumper,0)) + sum(coalesce(perevodtekzakaz14.sumper,0)), sum(coalesce(perevodtekzakaz13.sumper,0))');
+      PrepareSQLQuery('from mnplan');
+      PrepareSQLQuery('left join perevodtekzakaz on perevodtekzakaz.mesn = '+mes+'');
+      PrepareSQLQuery('    and perevodtekzakaz.yearn = '+god+'');
+      PrepareSQLQuery('    and perevodtekzakaz.vidper = 8');
+      PrepareSQLQuery('    and perevodtekzakaz.ckaud[1] = mnplan.nrec');
+      PrepareSQLQuery('    and perevodtekzakaz.tbld[1] = 7');
+      PrepareSQLQuery('left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz');
+      PrepareSQLQuery('inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)');
+      PrepareSQLQuery('    and (katpodr1.nrec in (select tSelPodrUser.nrec from tSelPodrUser))');
+
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.cnach = perevodtekzakaz.cnach and perevodtekzakaz2.mesn = perevodtekzakaz.mesn and perevodtekzakaz2.vidper =2');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.cnach = perevodtekzakaz.cnach and perevodtekzakaz3.mesn = perevodtekzakaz.mesn and perevodtekzakaz3.vidper =3');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.cnach = perevodtekzakaz.cnach and perevodtekzakaz5.mesn = perevodtekzakaz.mesn and perevodtekzakaz5.vidper =5');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.cnach = perevodtekzakaz.cnach and perevodtekzakaz8.mesn = perevodtekzakaz.mesn and perevodtekzakaz8.vidper =8');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.cnach = perevodtekzakaz.cnach and perevodtekzakaz11.mesn = perevodtekzakaz.mesn and perevodtekzakaz11.vidper =11');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.cnach = perevodtekzakaz.cnach and perevodtekzakaz12.mesn = perevodtekzakaz.mesn and perevodtekzakaz12.vidper =12');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.cnach = perevodtekzakaz.cnach and perevodtekzakaz14.mesn = perevodtekzakaz.mesn and perevodtekzakaz14.vidper =14');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz13 on perevodtekzakaz13.cnach = perevodtekzakaz.cnach and perevodtekzakaz13.mesn = perevodtekzakaz.mesn and perevodtekzakaz13.vidper = 13');
+      PrepareSQLQuery('group by substring(mnplan.number,1,4)');
+      stmt:=0;
+      stmt:= sqlAllocStmt;
+      wErr:=ExecDSQLex(tnpodr2);
+
+      _loop podr
+      {
+        counter++;
+        xlmergecells(counter,1,counter,5);
+        xlsetcellstringvalue('Итого ' + podr.otdzakvid + ':', counter,1,counter,1);
+        xlsetcellnumbervalue(podr.ozp, counter,6,counter,6);
+        xlsetcellnumbervalue(podr.dzp, counter,7,counter,7);
+        xlsetcellnumbervalue(podr.prem, counter,8,counter,8);
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,9,counter,9);
+        xlsetcellnumbervalue(0, counter,10,counter,10);
+        xlsetcellnumbervalue(0, counter,11,counter,11);
+
+        _loop podr2 where ((podr.otdzakvid == podr2.otdzakvid))
+        {
+          xlsetcellnumbervalue(podr2.s1, counter,10,counter,10);
+          xlsetcellnumbervalue(podr2.s2, counter,11,counter,11);
+          xlsetcellnumbervalue(podr.dzp + podr2.s3, counter,7,counter,7);
+        }
+
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,12,counter,12);
+      }
+
+      delete all from podr;
+_loop pMarkerPodr
+{
+  Filtr_cKatPODR := tSelPodr.nrec;
+
+      sql
+      select katpodr1.kod, sum(nachisl1.summa), sum(nachisl2.summa), sum(nachisl3.summa)
+      from mnplan
+      left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7
+      left join klvidopl on klvidopl.vidopl = nachislzakaz.vidopls
+      left join katpodr on katpodr.nrec = nachislzakaz.cexoz
+      inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)
+      left join stzatr on stzatr.nrec = klvidopl.kauextr[1]
+      left join nachislzakaz nachisl1 on nachisl1.nrec = nachislzakaz.nrec and nachisl1.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec
+                                                                                                  and (stzatr.name in ('01 Основная з/плата'
+                                                                                                                      ,'01.1 Основная  з/плата не уменьшающая налогообл.базу'
+                                                                                                                      ,'Основная з/плата, включая Премии'
+                                                                                                                      )
+                                                                                                      )
+      left join nachislzakaz nachisl2 on nachisl2.nrec = nachislzakaz.nrec and nachisl2.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec
+                                                                                                  and (stzatr.name in ('02 Дополнительная з/плата'
+                                                                                                                      ,'02.1 Дополнительная з/плата не уменьшающая налогообл.базу'
+                                                                                                                      ,'Дополнительная з/плата'
+                                                                                                                      )
+                                                                                                      )
+      left join nachislzakaz nachisl3 on nachisl3.nrec = nachislzakaz.nrec and nachisl3.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec and (stzatr.name = '04 Премии' or stzatr.name = '04.1 Премия не уменьшающая налогообл.базу' or stzatr.name = '104 Проект "Управление качеством:автоматизированный учет отступлений от КД и ТД ' or stzatr.name = '106 Проект "Управление качеством: разработка и внедрение системы учета затрат ка')
+      where nachislzakaz.mesn = :(mes) and nachislzakaz.yearn = :(god) and katpodr1.nrec = :(Filtr_cKatpodr)
+      group by katpodr1.kod
+      into podr
+      ;
+}
+
+      delete all from podr2;
+
+_loop pMarkerPodr
+{
+  Filtr_cKatPODR := tSelPodr.nrec;
+
+      sql
+      select katpodr1.kod,
+      sum(coalesce(perevodtekzakaz8.sumper,0)),
+      sum(coalesce(perevodtekzakaz2.sumper,0)) + sum(coalesce(perevodtekzakaz3.sumper,0)) + sum(coalesce(perevodtekzakaz5.sumper,0)) + sum(coalesce(perevodtekzakaz11.sumper,0)) +
+      sum(coalesce(perevodtekzakaz12.sumper,0)) + sum(coalesce(perevodtekzakaz14.sumper,0)), sum(coalesce(perevodtekzakaz13.sumper,0))
+      from mnplan
+      left join perevodtekzakaz on perevodtekzakaz.mesn = :(mes)
+          and perevodtekzakaz.yearn = :(god)
+          and perevodtekzakaz.vidper = 8
+          and perevodtekzakaz.ckaud[1] = mnplan.nrec
+          and perevodtekzakaz.tbld[1] = 7
+      left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz
+      inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)
+          and katpodr1.nrec = :(Filtr_cKatpodr)
+      left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.cnach = perevodtekzakaz.cnach and perevodtekzakaz2.mesn = perevodtekzakaz.mesn and perevodtekzakaz2.vidper =2
+      left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.cnach = perevodtekzakaz.cnach and perevodtekzakaz3.mesn = perevodtekzakaz.mesn and perevodtekzakaz3.vidper =3
+      left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.cnach = perevodtekzakaz.cnach and perevodtekzakaz5.mesn = perevodtekzakaz.mesn and perevodtekzakaz5.vidper =5
+      left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.cnach = perevodtekzakaz.cnach and perevodtekzakaz8.mesn = perevodtekzakaz.mesn and perevodtekzakaz8.vidper =8
+      left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.cnach = perevodtekzakaz.cnach and perevodtekzakaz11.mesn = perevodtekzakaz.mesn and perevodtekzakaz11.vidper =11
+      left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.cnach = perevodtekzakaz.cnach and perevodtekzakaz12.mesn = perevodtekzakaz.mesn and perevodtekzakaz12.vidper =12
+      left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.cnach = perevodtekzakaz.cnach and perevodtekzakaz14.mesn = perevodtekzakaz.mesn and perevodtekzakaz14.vidper =14
+      left join perevodtekzakaz perevodtekzakaz13 on perevodtekzakaz13.cnach = perevodtekzakaz.cnach and perevodtekzakaz13.mesn = perevodtekzakaz.mesn and perevodtekzakaz13.vidper = 13
+      group by katpodr1.kod
+      into podr2
+      ;
+}
+
+      counter++;
+      xlmergecells(counter,1,counter,5);
+      xlsetcellstringvalue('В т.ч. по отделам:', counter,1,counter,1);
+      xlsetfontstyle(1, counter, 1, counter, 12);
+
+      _loop podr
+      {
+        counter++;
+        xlmergecells(counter,1,counter,2);
+        xlmergecells(counter,3,counter,4);
+        xlsetcellstringvalue(podr.otdzakvid, counter,5,counter,5);
+        xlsetcellnumbervalue(podr.ozp, counter,6,counter,6);
+        xlsetcellnumbervalue(podr.dzp, counter,7,counter,7);
+        xlsetcellnumbervalue(podr.prem, counter,8,counter,8);
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,9,counter,9);
+        xlsetcellnumbervalue(0, counter,10,counter,10);
+        xlsetcellnumbervalue(0, counter,11,counter,11);
+
+        _loop podr2 where ((podr.otdzakvid == podr2.otdzakvid))
+        {
+          xlsetcellnumbervalue(podr2.s1, counter,10,counter,10);
+          xlsetcellnumbervalue(podr2.s2, counter,11,counter,11);
+          xlsetcellnumbervalue(podr.dzp + podr2.s3, counter,7,counter,7);
+        }
+
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,12,counter,12);
+      }
+
+      delete all from podr;
+
+     ClearQuery(vliSQLCommand);
+      PrepareSQLQuery('select attrval.vstring, sum(nachisl1.summa), sum(nachisl2.summa), sum(nachisl3.summa)');
+      PrepareSQLQuery('from mnplan');
+      PrepareSQLQuery('left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7');
+      PrepareSQLQuery('left join katpodr on katpodr.nrec = nachislzakaz.cexoz');
+      PrepareSQLQuery('inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)  ');
+      PrepareSQLQuery('inner join extcatlinks on extcatlinks.extcat = katpodr.nrec');
+      PrepareSQLQuery('inner join catalogs on catalogs.nrec = extcatlinks.staffcat');
+      PrepareSQLQuery('inner join attrval on attrval.crec = catalogs.nrec');
+      PrepareSQLQuery('inner join attrnam on attrnam.nrec = attrval.cattrnam and attrnam.name = ''Вид производства'' ');
+      PrepareSQLQuery('left join klvidopl on klvidopl.vidopl = nachislzakaz.vidopls');
+      PrepareSQLQuery('left join stzatr on stzatr.nrec = klvidopl.kauextr[1]');
+      PrepareSQLQuery('left join nachislzakaz nachisl1 on nachisl1.nrec = nachislzakaz.nrec and nachisl1.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec ');
+      PrepareSQLQuery('and (stzatr.name in (''01 Основная з/плата''                                  ');
+      PrepareSQLQuery('                    ,''01.1 Основная  з/плата не уменьшающая налогообл.базу'' ');
+      PrepareSQLQuery('                    ,''Основная з/плата, включая Премии''                     ');
+      PrepareSQLQuery('                    )                                                         ');
+      PrepareSQLQuery('                    )                                                         ');
+      PrepareSQLQuery('left join nachislzakaz nachisl2 on nachisl2.nrec = nachislzakaz.nrec and nachisl2.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec ');
+      PrepareSQLQuery('and (stzatr.name in (''02 Дополнительная з/плата''                                ');
+      PrepareSQLQuery('                    ,''02.1 Дополнительная з/плата не уменьшающая налогообл.базу''');
+      PrepareSQLQuery('                    ,''Дополнительная з/плата''                                   ');
+      PrepareSQLQuery('                    )                                                             ');
+      PrepareSQLQuery('                    )                                                             ');
+      PrepareSQLQuery('left join nachislzakaz nachisl3 on nachisl3.nrec = nachislzakaz.nrec and nachisl3.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec ');
+      PrepareSQLQuery('and (stzatr.name = ''04 Премии'' or stzatr.name = ''04.1 Премия не уменьшающая налогообл.базу'' or stzatr.name = ''104 Проект "Управление качеством:автоматизированный учет отступлений от КД и ТД '' ');
+      PrepareSQLQuery('or stzatr.name = ''106 Проект "Управление качеством: разработка и внедрение системы учета затрат ка'')');
+      PrepareSQLQuery('where nachislzakaz.mesn = '+mes+' and nachislzakaz.yearn = '+god+' and (katpodr1.nrec in (select tSelPodrUser.nrec from tSelPodrUser))');
+      PrepareSQLQuery('group by attrval.vstring');
+      stmt:=0;
+      stmt := sqlAllocStmt;
+      wErr:=ExecDSQLex(tnpodr);
+
+      delete all from podr2;
+
+
+    ClearQuery(vliSQLCommand);
+      PrepareSQLQuery('select attrval.vstring,');
+      PrepareSQLQuery(' sum(coalesce(perevodtekzakaz8.sumper,0)),');
+      PrepareSQLQuery('sum(coalesce(perevodtekzakaz2.sumper,0)) + sum(coalesce(perevodtekzakaz3.sumper,0)) + sum(coalesce(perevodtekzakaz5.sumper,0)) + sum(coalesce(perevodtekzakaz11.sumper,0)) +');
+      PrepareSQLQuery('sum(coalesce(perevodtekzakaz12.sumper,0)) + sum(coalesce(perevodtekzakaz14.sumper,0)), sum(coalesce(perevodtekzakaz13.sumper,0))');
+      PrepareSQLQuery('from mnplan');
+      PrepareSQLQuery('left join perevodtekzakaz on perevodtekzakaz.mesn = 8');
+      PrepareSQLQuery('    and perevodtekzakaz.yearn = 2021');
+      PrepareSQLQuery('    and perevodtekzakaz.vidper = 8');
+      PrepareSQLQuery('    and perevodtekzakaz.ckaud[1] = mnplan.nrec');
+      PrepareSQLQuery('    and perevodtekzakaz.tbld[1] = 7');
+      PrepareSQLQuery('left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz');
+      PrepareSQLQuery('inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)');
+      PrepareSQLQuery('//    and (katpodr1.nrec in (select tSelPodrUser.nrec from tSelPodrUser))');
+      PrepareSQLQuery('inner join extcatlinks on extcatlinks.extcat = katpodr.nrec');
+      PrepareSQLQuery('inner join catalogs on catalogs.nrec = extcatlinks.staffcat');
+      PrepareSQLQuery('inner join attrval on attrval.crec = catalogs.nrec');
+      PrepareSQLQuery('inner join attrnam on attrnam.nrec = attrval.cattrnam and attrnam.name = ''Вид производства'' ');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.cnach = perevodtekzakaz.cnach and perevodtekzakaz2.mesn = perevodtekzakaz.mesn and perevodtekzakaz2.vidper =2');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.cnach = perevodtekzakaz.cnach and perevodtekzakaz3.mesn = perevodtekzakaz.mesn and perevodtekzakaz3.vidper =3');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.cnach = perevodtekzakaz.cnach and perevodtekzakaz5.mesn = perevodtekzakaz.mesn and perevodtekzakaz5.vidper =5');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.cnach = perevodtekzakaz.cnach and perevodtekzakaz8.mesn = perevodtekzakaz.mesn and perevodtekzakaz8.vidper =8');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.cnach = perevodtekzakaz.cnach and perevodtekzakaz11.mesn = perevodtekzakaz.mesn and perevodtekzakaz11.vidper =11');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.cnach = perevodtekzakaz.cnach and perevodtekzakaz12.mesn = perevodtekzakaz.mesn and perevodtekzakaz12.vidper =12');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.cnach = perevodtekzakaz.cnach and perevodtekzakaz14.mesn = perevodtekzakaz.mesn and perevodtekzakaz14.vidper =14');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz13 on perevodtekzakaz13.cnach = perevodtekzakaz.cnach and perevodtekzakaz13.mesn = perevodtekzakaz.mesn and perevodtekzakaz13.vidper = 13');
+      PrepareSQLQuery('group by attrval.vstring');
+      stmt:=0;
+      stmt := sqlAllocStmt;
+      wErr:=ExecDSQLex(tnpodr2);
+
+
+      counter++;
+      xlmergecells(counter,1,counter,5);
+      xlsetcellstringvalue('В т.ч. по комплексам:', counter,1,counter,1);
+      xlsetfontstyle(1, counter, 1, counter, 12);
+
+      _loop podr
+      {
+        counter++;
+        xlmergecells(counter,1,counter,2);
+        xlmergecells(counter,3,counter,4);
+        xlsetcellstringvalue(podr.otdzakvid, counter,5,counter,5);
+        xlsetcellnumbervalue(podr.ozp, counter,6,counter,6);
+        xlsetcellnumbervalue(podr.dzp, counter,7,counter,7);
+        xlsetcellnumbervalue(podr.prem, counter,8,counter,8);
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,9,counter,9);
+        xlsetcellnumbervalue(0, counter,10,counter,10);
+        xlsetcellnumbervalue(0, counter,11,counter,11);
+
+        _loop podr2 where ((podr.otdzakvid == podr2.otdzakvid))
+        {
+          xlsetcellnumbervalue(podr2.s1, counter,10,counter,10);
+          xlsetcellnumbervalue(podr2.s2, counter,11,counter,11);
+          xlsetcellnumbervalue(podr.dzp + podr2.s3, counter,7,counter,7);
+        }
+
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,12,counter,12);
+      }
+
+      delete all from complex;
+
+    ClearQuery(vliSQLCommand);
+      PrepareSQLQuery('select sum(nachisl1.summa), sum(nachisl2.summa), sum(nachisl3.summa)');
+      PrepareSQLQuery('from mnplan');
+      PrepareSQLQuery('left join nachislzakaz on nachislzakaz.ckaud[1] = mnplan.nrec and nachislzakaz.tbld[1] = 7');
+      PrepareSQLQuery('left join katpodr on katpodr.nrec = nachislzakaz.cexoz');
+      PrepareSQLQuery('inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)  ');
+      PrepareSQLQuery('inner join extcatlinks on extcatlinks.extcat = katpodr.nrec');
+      PrepareSQLQuery('inner join catalogs on catalogs.nrec = extcatlinks.staffcat');
+      PrepareSQLQuery('inner join attrval on attrval.crec = catalogs.nrec');
+      PrepareSQLQuery('inner join attrnam on attrnam.nrec = attrval.cattrnam and attrnam.name = ''Вид производства'' ');
+      PrepareSQLQuery('left join klvidopl on klvidopl.vidopl = nachislzakaz.vidopls');
+      PrepareSQLQuery('left join stzatr on stzatr.nrec = klvidopl.kauextr[1]');
+      PrepareSQLQuery('left join nachislzakaz nachisl1 on nachisl1.nrec = nachislzakaz.nrec and nachisl1.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec ');
+      PrepareSQLQuery('and (stzatr.name in(''01 Основная з/плата''                                 ');
+      PrepareSQLQuery('                   ,''01.1 Основная  з/плата не уменьшающая налогообл.базу''');
+      PrepareSQLQuery('                   ,''Основная з/плата, включая Премии''      ');
+      PrepareSQLQuery('                    ))     ');
+      PrepareSQLQuery('left join nachislzakaz nachisl2 on nachisl2.nrec = nachislzakaz.nrec and nachisl2.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec ');
+      PrepareSQLQuery('and (stzatr.name in (''02 Дополнительная з/плата''                                 ');
+      PrepareSQLQuery('                    ,''02.1 Дополнительная з/плата не уменьшающая налогообл.базу'' ');
+      PrepareSQLQuery('                    ,''Дополнительная з/плата'' ');
+      PrepareSQLQuery('                    )) ');
+      PrepareSQLQuery('left join nachislzakaz nachisl3 on nachisl3.nrec = nachislzakaz.nrec and nachisl3.vidopls = klvidopl.vidopl and klvidopl.kauextr[1] = stzatr.nrec ');
+      PrepareSQLQuery('and (stzatr.name = ''04 Премии'' or stzatr.name = ''04.1 Премия не уменьшающая налогообл.базу'' or stzatr.name = ''104 Проект "Управление качеством:автоматизированный учет отступлений от КД и ТД '' ');
+      PrepareSQLQuery('or stzatr.name = ''106 Проект "Управление качеством: разработка и внедрение системы учета затрат ка'')');
+      PrepareSQLQuery('where nachislzakaz.mesn = '+mes+' and nachislzakaz.yearn = '+god+' and (katpodr1.nrec in (select tSelPodrUser.nrec from tSelPodrUser))');
+      stmt:=0;
+      stmt := sqlAllocStmt;
+      wErr:=ExecDSQLex(tncomplex);
+
+      delete all from complex2;
+
+
+     ClearQuery(vliSQLCommand);
+      PrepareSQLQuery('select');
+      PrepareSQLQuery(' sum(coalesce(perevodtekzakaz8.sumper,0)),');
+      PrepareSQLQuery('sum(coalesce(perevodtekzakaz2.sumper,0)) + sum(coalesce(perevodtekzakaz3.sumper,0)) + sum(coalesce(perevodtekzakaz5.sumper,0)) + sum(coalesce(perevodtekzakaz11.sumper,0)) +');
+      PrepareSQLQuery('sum(coalesce(perevodtekzakaz12.sumper,0)) + sum(coalesce(perevodtekzakaz14.sumper,0)), sum(coalesce(perevodtekzakaz13.sumper,0))');
+      PrepareSQLQuery('from mnplan');
+      PrepareSQLQuery('left join perevodtekzakaz on perevodtekzakaz.mesn = '+mes+'');
+      PrepareSQLQuery('    and perevodtekzakaz.yearn = '+god+'');
+      PrepareSQLQuery('    and perevodtekzakaz.vidper = 8');
+      PrepareSQLQuery('    and perevodtekzakaz.ckaud[1] = mnplan.nrec');
+      PrepareSQLQuery('    and perevodtekzakaz.tbld[1] = 7');
+      PrepareSQLQuery('left join katpodr on katpodr.nrec = perevodtekzakaz.cexoz');
+      PrepareSQLQuery('inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)');
+      PrepareSQLQuery('    and (katpodr1.nrec in (select tSelPodrUser.nrec from tSelPodrUser))');
+      PrepareSQLQuery('inner join extcatlinks on extcatlinks.extcat = katpodr.nrec');
+      PrepareSQLQuery('inner join catalogs on catalogs.nrec = extcatlinks.staffcat');
+      PrepareSQLQuery('inner join attrval on attrval.crec = catalogs.nrec');
+      PrepareSQLQuery('inner join attrnam on attrnam.nrec = attrval.cattrnam and attrnam.name = ''Вид производства'' ');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz2 on perevodtekzakaz2.cnach = perevodtekzakaz.cnach and perevodtekzakaz2.mesn = perevodtekzakaz.mesn and perevodtekzakaz2.vidper =2');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz3 on perevodtekzakaz3.cnach = perevodtekzakaz.cnach and perevodtekzakaz3.mesn = perevodtekzakaz.mesn and perevodtekzakaz3.vidper =3');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz5 on perevodtekzakaz5.cnach = perevodtekzakaz.cnach and perevodtekzakaz5.mesn = perevodtekzakaz.mesn and perevodtekzakaz5.vidper =5');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz8 on perevodtekzakaz8.cnach = perevodtekzakaz.cnach and perevodtekzakaz8.mesn = perevodtekzakaz.mesn and perevodtekzakaz8.vidper =8');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz11 on perevodtekzakaz11.cnach = perevodtekzakaz.cnach and perevodtekzakaz11.mesn = perevodtekzakaz.mesn and perevodtekzakaz11.vidper =11');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz12 on perevodtekzakaz12.cnach = perevodtekzakaz.cnach and perevodtekzakaz12.mesn = perevodtekzakaz.mesn and perevodtekzakaz12.vidper =12');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz14 on perevodtekzakaz14.cnach = perevodtekzakaz.cnach and perevodtekzakaz14.mesn = perevodtekzakaz.mesn and perevodtekzakaz14.vidper =14');
+      PrepareSQLQuery('left join perevodtekzakaz perevodtekzakaz13 on perevodtekzakaz13.cnach = perevodtekzakaz.cnach and perevodtekzakaz13.mesn = perevodtekzakaz.mesn and perevodtekzakaz13.vidper = 13');
+     stmt:=0;
+      stmt := sqlAllocStmt;
+      wErr:=ExecDSQLex(tncomplex2);
+
+        counter++;
+        xlmergecells(counter,1,counter,5);
+        xlsetcellstringvalue('Всего по комплексам:', counter,1,counter,1);
+        xlsetcellnumbervalue(complex.ozp, counter,6,counter,6);
+        xlsetcellnumbervalue(complex.dzp + complex2.s3, counter,7,counter,7);
+        xlsetcellnumbervalue(complex.prem, counter,8,counter,8);
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,9,counter,9);
+        xlsetfontstyle(1, counter, 1, counter, 12);
+        xlsetcellnumbervalue(complex2.s1, counter,10,counter,10);
+        xlsetcellnumbervalue(complex2.s2, counter,11,counter,11);
+        xlsetcellstringvalue('=RC[-3]+RC[-2]+RC[-1]', counter,12,counter,12);
+
+SubBounds(tbRmtSelPodr2);
+AddBounds(tbRmtSelPodr1);
+
+xlframecells(1+2+4+8+16+32, 3, 1, 1, 7, 1, counter, 12);
+
+StopVisual('',0);
+xlkillExcel;
+
+}
+}
+
+end;
+
+windowevent wnSelmnf;
+
+cmdefault:
+{
+
+  sqlDropTmpTable ('tSelmnfUser');
+  sqlCreateTmpTable('table tSelmnfUser (name: string) with index (i1 = name);', ctmNormal);
+
+    SubBounds(tbRmtSelmnf1);
+    AddBounds(tbRmtSelmnf2);
+
+    _loop pmarkermnf
+    {
+      Filtr_cmnf := tSelmnf.name;
+
+      stmt := sqlAllocStmt;
+      ClearQuery(vliSQLCommand);
+      PrepareSQLQuery('insert into tSelmnfUser (name) values ('''+Filtr_cmnf+''') ');
+      ExecDSQLex(0);
+    }
+
+    delete all from tSelPodr;
+
+    ClearQuery(vliSQLCommand);
+    PrepareSQLQuery('select katpodr1.nrec, katpodr1.kod, katpodr1.name');
+    PrepareSQLQuery('from katpodr');
+    PrepareSQLQuery('inner join katpodr katpodr1 on katpodr1.kod = substring(katpodr.kod,1,3)  ');
+    PrepareSQLQuery('inner join extcatlinks on extcatlinks.extcat = katpodr.nrec');
+    PrepareSQLQuery('inner join catalogs on catalogs.nrec = extcatlinks.staffcat');
+    PrepareSQLQuery('inner join attrval on attrval.crec = catalogs.nrec');
+    PrepareSQLQuery('inner join attrnam on attrnam.nrec = attrval.cattrnam');
+    PrepareSQLQuery('inner join zar_user on (upper(zar_user.ownname) = upper('''+pUserName+'''))');
+    PrepareSQLQuery('where attrnam.name = ''Вид производства'' and (attrval.vstring in (select tSelmnfUser.name from tSelmnfUser)) and (zar_user.podrshare <> ''+'' or (katpodr.nrec in (select userrights.crecds from userrights where zar_user.ownname = userrights.ownname)))');
+    PrepareSQLQuery('group by katpodr1.nrec, katpodr1.kod, katpodr1.name');
+    PrepareSQLQuery('order by katpodr1.kod');
+    stmt:=0;
+    stmt := sqlAllocStmt;
+    wErr:=ExecDSQLex(tntSelPodr);
+
+    pMarkerpodr.UnselectAll;
+
+    if pMarkermnf.count = 0
+    {
+      Filtr_mnf:= 'Не выбрано';
+      Filtr_katpodr:= 'Выберете вид производства';
+    }
+
+    _loop pMarkermnf
+    {
+      if pMarkermnf.count = 1
+      {
+        Filtr_mnf:= tSelmnf.name;
+        Filtr_katpodr:= 'Не выбрано';
+      }
+    }
+
+    SubBounds(tbRmtSelmnf2);
+    AddBounds(tbRmtSelmnf1);
+
+    if pMarkermnf.count > 1
+    {
+      Filtr_mnf:= 'Выбрано ' + pMarkermnf.count;
+      Filtr_katpodr:= 'Не выбрано';
+    }
+}
+
+end;
+
+windowevent wnSelPodr;
+
+cmdefault:
+{
+    if pMarkerpodr.count = 0 and pMarkermnf.count <> 0
+    {
+      Filtr_katpodr:= 'Не выбрано';
+    }
+
+    if pMarkerpodr.count = 0 and pMarkermnf.count = 0
+    {
+      Filtr_katpodr:= 'Выберете вид производства';
+    }
+
+    SubBounds(tbRmtSelPodr1);
+    AddBounds(tbRmtSelPodr2);
+
+    _loop pMarkerpodr
+    {
+      if pMarkerpodr.count = 1
+      {
+        Filtr_katpodr:= tSelPodr.kod + ' ' + tSelpodr.name;
+      }
+    }
+
+    SubBounds(tbRmtSelPodr2);
+    AddBounds(tbRmtSelPodr1);
+
+    if pMarkerpodr.count > 1
+    {
+      Filtr_katpodr:= 'Выбрано ' + pMarkerpodr.count;
+    }
+}
+
+end;
+
+end.
+
+VipInterface UserReport_zpbalsch Implements IUserReport;
+Interface UserReport_zpbalsch;
+
+Procedure Run;
+Begin
+  runinterface(gp_zpbalsch);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Ведомость распределения з/п по балансовым счетам (с резервом на отпуска)';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Экономическая и статистическая отчетность';
+  End;
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'menuzarp';
+  end;
+end;
+
+End.

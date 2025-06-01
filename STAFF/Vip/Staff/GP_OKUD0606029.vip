@@ -1,0 +1,355 @@
+#include UserReport.vih
+#include CatFunc.vih
+#include StrFunc.vih
+#include AppFuncs.vih
+#include TotalOrganizationAttributes.vih
+
+#define GPInt GP_OKUD0606029 // #(GPInt)
+#define GPNam Сведения о численности и потребности организации в работниках по профессиональным группам // #(GPNam)
+
+Interface #(GPInt) '#(GPNam) (ЭМ)' EscClose, Gray;
+  show (,,76,11);
+
+const
+#include Excel.inc;
+end;
+#include TotalOrganizationAttributes.var
+
+table struct ttStat
+(
+  sKvGrp : string
+, iSpis  : integer
+, iVac   : integer 
+)
+with index
+(
+  ttStat01 = sKvGrp
+);
+
+var
+  dBeg, dEnd    : date;
+  dRep          : date;
+  wPeriodMonth
+ ,wPeriodYear   : word;  
+  iCatFunc      : CatalogsFunctions;
+  iStrFunc      : StringFunctions;
+  iAppFunc      : AppointmentsFunctions;
+  sFullName     : string;
+  sPodr1        : string;
+  mPodr1        : TPtr;
+  iPodr         : integer;
+  sKvGrpT       : string;
+  sPsnV
+ ,sPsnP
+ ,sPsnT
+ ,sPsnE         : string;
+
+create view
+var
+  cPodrV : comp;
+  cPsnV  : comp;
+  cPsnP  : comp;
+from
+  ttStat
+, ExtCatLinks
+, StaffStruct
+, HistoryStr
+, Appointments
+, LSchet     
+, Persons
+, Catalogs
+, Communications
+where
+((
+    11 == ExtCatLinks.ObjType
+and cPodrV == ExtCatLinks.StaffCat
+and cPodrV == StaffStruct.Department and ((dRep<=StaffStruct.dClose or StaffStruct.dClose=0) and dRep>=StaffStruct.dInput)
+and StaffStruct.nRec == Appointments.StaffStr and ((dRep<=Appointments.DismissDate or Appointments.DismissDate=0) and dRep>=Appointments.AppointDate)
+and StaffStruct.nRec == HistoryStr.StaffStr
+and             dRep>>= HistoryStr.dHist
+and Appointments.cAddnRec2 == LSchet.nRec
+and StaffStruct.Post == Catalogs.nRec
+))
+;
+
+//++++++++++++++++++++++++++++++++++++++++++++++++
+Screen s1(,,sci1Esc);
+  show at (,,75,10);
+  fields
+    dRep   ('Дата формирования'):
+           {Font = {BackColor = if(dRep = 0, ColorNeed, 0)}},
+           noprotect;
+    sPodr1 ('Выбранные подразделения',hcStaffAppDepartment,sci13Esc):
+           {Font = {BackColor = if(sPodr1 = 'Не выбраны подразделения', ColorNeed, 0)}},
+           Protect, PickButton ;
+    sPsnV  ('Сотрудник, ответственный за предоставление информации. Выбор по <F3>.',,sci13Esc):
+           {Font = {BackColor = if(sPsnV = '', ColorNeed, 0)}},
+           protect, PickButton;
+    sPsnP : skip;
+    sPsnT ('Контактный телефон.'): noprotect;
+    sPsnE ('E-Mail.'): noprotect;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+<< 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Ответственный сотрудник `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Должность               `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Контактный телефон      `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Электронная почта       `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ <. ~С~формировать .>                                      <. ~З~акрыть .>
+>>
+end;
+//++++++++++++++++++++++++++++++++++++++++++++++++
+
+procedure sSetPsn(cPsnVT : comp); //sPsnV
+{
+  if (getfirst Persons where((cPsnVT==Persons.nRec))=tsok)
+  {
+    set sPsnV:= iStrFunc.GetFIO(Persons.FIO);
+    set sPsnP:= iAppFunc.GetAppPost(iAppFunc.GetAppNrec_OnDate(cPsnVT,dRep));
+    if getfirst Communications where((cPsnV==Communications.Person and 2==Communications.ObjType))=tsOk
+      set sPsnT := Communications.Addr;
+    if getfirst Communications where((cPsnV==Communications.Person and 3==Communications.ObjType))=tsOk
+      set sPsnE := Communications.eMail;
+  };
+}
+
+function sSetPodrName(mSetPdr: TPtr): string;
+{
+  if (getMarkerCount(mSetPdr) = 0)
+  {
+    result := 'Не выбраны подразделения';
+    exit;
+  }
+  else
+    if (getMarkerCount(mSetPdr) = 1)
+    {
+      var cTmp: comp;
+      GetMarker(mSetPdr, 0, cTmp);
+        result := iCatFunc.GetCatalogsName(cTmp);
+    }
+    else
+      result := 'Несколько подразделений (' + string(getMarkerCount(mSetPdr)) + ')';
+}
+
+
+procedure MakeStatData;
+{
+  var i      : integer;
+  var dbChas : double;
+
+  iNextVisual('Обрабатываю данные для отчета.');
+  for(iPodr:= 0;iPodr<GetMarkerCount(mPodr1);iPodr++)
+  {
+    if (not GetMarker(mPodr1,iPodr,cPodrV)) continue;
+    if isvalid(#ExtCatLinks)
+    _loop ExtCatLinks
+    {
+      if isvalid(#StaffStruct)
+      _loop StaffStruct
+      {
+        if (not NextVisual) break;
+        sKvGrpT:='';
+        if isvalid(#Catalogs)
+          sKvGrpT := iCatFunc.GetCatalogsCode(Catalogs.cRef1);
+        if sKvGrpT<>''
+        {
+          if getfirst ttStat where((sKvGrpT == ttStat.sKvGrp))<>tsOk
+          {
+            ClearBuffer(#ttStat);
+            ttStat.sKvGrp := sKvGrpT;
+            if isvalid(#HistoryStr)
+            _loop HistoryStr
+              if ((HistoryStr.wCodOper=20) or (HistoryStr.wCodOper=22)) ttStat.iVac := round(HistoryStr.HWORKSTATIONS,0);
+            insert current ttStat;
+          }
+          else
+          {ttStat.iVac+=round(StaffStruct.WORKSTATIONS,0); update current ttStat;}
+
+          if isvalid(#Appointments)
+          _loop Appointments
+          {
+            if (not NextVisual) break;
+            if isvalid(#LSchet)
+              if LSchet.Sovm <> 1 and LSchet.Sovm <> 2 and Appointments.lPrizn=0 and Appointments.Rate<>0
+                if getfirst ttStat where((sKvGrpT == ttStat.sKvGrp))=tsOk
+                  {ttStat.iSpis+=1; update current ttStat;}
+          }
+        }
+      }
+    }
+  }
+}
+
+procedure PrintReport;
+{
+  var lRow : longint;
+
+  iNextVisual('Выгружаю данные в Excel.');
+  for(lRow:=6;lRow<=340;lRow++) 
+  {
+    if (not NextVisual) break;
+    xlGetCellValue(lRow, 1,sKvGrpT);
+    if getfirst ttStat where((trim(sKvGrpT)==ttStat.sKvGrp)) = tsOk
+    {
+      xlSetCellNumberValue(ttStat.iSpis,lRow,77,lRow,77);
+      xlSetCellNumberValue(ttStat.iVac-ttStat.iSpis,lRow,93,lRow,93);
+    }
+  }
+  xlSetCellStringValue(sPsnP,347,24,347,24);
+  xlSetCellStringValue(sPsnV,347,51,347,51);
+  xlSetCellStringValue(sPsnT,351,24,351,24);
+  xlSetCellStringValue(sPsnE,351,59,351,59);
+  xlSetCellStringValue(Day(cur_date),351,83,351,83);
+  xlSetCellStringValue(DateToStr(cur_date,'mon'),351,89,351,89);
+  xlSetCellStringValue(DateToStr(cur_date,'YY'),351,101,351,101);
+  xlAddCellStringValue(DateToStr(dRep,'DD mon YYYY года'),1,2);
+}
+
+procedure PrintTitle;
+{
+  xlSetCellStringValue('на 31 октября '+Year(dRep)+' года',13,16,13,16);
+  xlSetCellStringValue(Trim(TOA1.GetNaming.GetFullName()),29,48,29,48);
+  xlSetCellStringValue(Trim(TOA.GetJuridicalInfo.GetJuridicalAddressStr),31,19,31,19);
+  xlSetCellStringValue(Trim(TOA.GetJuridicalInfo.GetOkpoCode),36,16,36,16);
+}
+
+
+procedure run;
+{
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+  MakeStatData;
+  if isvalid(#ttStat)
+  {
+    sFullName := TranslatePath('%ClientStartPath%') +'XLS_ЭМ\Staff\#(GPInt).xlt';
+    if xlCreateExcelWithTemplate(sFullName, true)
+    {
+      xlSetActiveSheet(2);
+      PrintReport;
+      xlSetActiveSheet(1);
+      PrintTitle;
+      xlKillExcel;
+    }
+    else message('Проверте наличие файла шаблона по пути EXE\XLS_ЭМ\Staff');
+  }
+  else
+  {
+    message('Нет данных для отчета.');
+  }
+  StopVisual;
+}
+
+#declare CloseGpInterface
+  DoneMarker(mPodr1,     '#(GPInt)_mPodr1_' + UserName());
+  SaveMyDsk(dRep, '#(GPInt)_dRep' );
+  SaveMyDsk(cPsnV,'#(GPInt)_cPsnV' );
+  SaveMyDsk(sPsnT,'#(GPInt)_sPsnT' );
+  SaveMyDsk(sPsnE,'#(GPInt)_sPsnE' );
+  FreeVipInterface(iCatFunc);
+  FreeVipInterface(iStrFunc);
+  FreeVipInterface(iAppFunc);
+  FreeVipInterface(TOA     );
+  FreeVipInterface(TOA1    );
+
+  closeinterface(cmDefault);
+#end
+
+handleevent
+  cmInit:
+  {
+    if (not (ReadMyDsk(dRep, '#(GPInt)_dRep', false)))
+      set dRep  := To_Date(31,10,Year(Cur_Date));
+    if (not (ReadMyDsk(cPsnV, '#(GPInt)_cPsnV', false)))
+      cPsnV     := coGetTune('UP.STAFF.SIGNATORYAUTHORITY');
+    sSetPsn(cPsnV);
+    if (not (ReadMyDsk(sPsnT, '#(GPInt)_sPsnT', false)))
+      set sPsnT := '';
+    if (not (ReadMyDsk(sPsnE, '#(GPInt)_sPsnE', false)))
+      set sPsnE := '';
+    mPodr1      := initMarker('#(GPInt)_mPodr1_' + UserName(), 8, 1000, 100);
+    set sPodr1  := sSetPodrName(mPodr1);
+    TOA.Bind(0);
+  }
+  cmPick:
+  {
+    case CurField of
+      #sPodr1:
+        if (RunInterface('PICKCATALOGEX', -11, 0, Comp(100), mPodr1) = cmDefault)
+          set sPodr1 := sSetPodrName(mPodr1);
+      #sPsnV:
+        if (RunInterface(GetPers,cPsnV)<>cmCancel)
+          sSetPsn(cPsnV);
+    end;
+  }
+  cmDelOnprotect:
+  {
+    case CurField of
+      #sPodr1: {ClearMarker(mPodr1); set sPodr1 := sSetPodrName(mPodr1);}
+      #sPsnV:  {set sPsnV := ''; set sPsnP := '';set sPsnT := ''; set sPsnE := '';}
+    end;
+  }
+  cmOk:
+  {
+    if (dRep = 0)
+    {
+      message('Задан некорректный период!');
+    }
+    else
+    if sPsnV='' {message('Не задан сотрудник, ответственный за предоставление информации.');}
+    else
+    {
+      if GetMarkerCount(sPodr1) = 0 
+      {message('Не заданы подразделения!');}
+      else
+      {
+        Run;
+        #CloseGpInterface
+      }
+    }
+  }
+  cmCancel:
+  {
+    #CloseGpInterface
+  }
+end;
+end.
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+
+Procedure Run;
+{
+  runinterface(#(GPInt));
+}
+
+Function GetReportName: String;
+{
+  GetReportName := '#(GPNam) (ЭМ)';
+}
+
+Function GetGroupName (Level : Word) : String;
+{
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Ведение картотеки сотрудников';
+  End;
+}
+
+function GetPriority : Integer;
+{
+  GetPriority := 3;
+}
+
+function VisibleInModule(Ind : Byte) : String;
+{
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+}
+
+End.

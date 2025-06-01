@@ -1,0 +1,165 @@
+/*************************************************************************************************\
+* Наименование: Реализация класса GP_DepartIer - расширение стандартного DepartIer                *
+* Контур/Модуль: *                                                                                *
+* Примечание: #180 - Своя реализация CreateDeptIerTabl. Строит иерархию вида 123 / 123-1, 123-2...*
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |              |16/10/17|Евдокимов М.А.           |НПО Энергомаш                    *
+* Разработка  |#180          |22/08/18|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_DepartIer.vih
+
+#component "Z_StaffCat"
+
+interface GP_DepartIer;
+
+create view
+var
+  _gp_cPodr: comp;
+from
+  CatPodrDeptIer gp_CPDIer
+where ((
+  _gp_cPodr == gp_CPDIer.cPodr
+));
+
+//Заполняет несортированный контейнер nrec'ами из иерархии подразделений
+//по тому же алгоритму, что и GetFulDepName. Нулевой элемент - нрек подразделения
+//самого верхнего уровня, последний элемент - DepCatNrec
+Procedure GP_IDepartIer.FillFulDepContainer(DepCatNrec: comp; var DepContainerId: TPtr);
+{
+  if (DepCatNRec = 0)
+    exit;
+
+  var countIer: longInt = 1;
+  countIer := wGetTune('UP.STAFF.LEVEL_IER');
+
+  if DepContainerId = 0
+    DepContainerId := Container_Init('', sizeof(comp), 10, 100);
+
+  var parentNRec: comp = 0;
+
+  if (GetFirst DepCat where ((DepCatNRec == DepCat.NRec)) = tsOk)
+  {
+    parentNRec := DepCat.cParent;
+    if ((word(DepCat.bPick) and word(1)) = 0)
+      Container_Insert(DepContainerId, DepCat.Nrec);
+  }
+  if (countIer < 2) // В иерархии 1 подразделение
+    exit;
+
+  var i: longInt;
+  i := 1;
+  while (i < countIer and DepCat.SysCode <> SetEntry)
+  {
+    if (GetFirst DepCat where ((parentNRec == DepCat.NRec)) = tsOk)
+    {
+      if (DepCat.SysCode <> SetEntry)
+        if ((word(DepCat.bPick) and word(1)) = 0)
+          Container_AtInsert(DepContainerId, DepCat.Nrec, 0);
+
+      parentNRec := DepCat.cParent;
+      inc(i);
+      if (parentNRec = 0)
+        exit;
+    }
+    else
+      exit;
+  }
+}
+
+// Возвращает полный код подразделения по тому же принципу, что и GetFulDepName
+Function GP_IDepartIer.GetFulDepCode(DepCatNRec: Comp; Separator: string = '\'): String;
+{
+  var tmpStr: string;
+  tmpStr := '';
+
+  var depContainerId: TPtr;
+  depContainerId := Container_Init('', sizeof(comp), 10, 100);
+  FillFulDepContainer(DepCatNRec, depContainerId);
+
+  var cnt: longint;
+  cnt := Container_GetCount(depContainerId);
+
+  var i: longint = 0;
+  for(i := 0; i < cnt; i++)
+  {
+    if GetFirst DepCat where (( Container_AtC(depContainerId, i) == DepCat.Nrec )) = tsOk
+      tmpStr += if(i = 0, '', Separator) + DepCat.Code;
+  }
+
+  Container_Done(depContainerId, '');
+
+  result := tmpStr;
+}
+
+function GetCatPodrDeptIerParent(cRec: comp): comp;
+{
+  result := 0;
+  _gp_cPodr := cRec;
+  if getfirst gp_CPDIer = tsOk
+    if length(gp_CPDIer.Code) <= 3
+      result := gp_CPDIer.cPodr
+    else
+      result := gp_CPDIer.cParent;
+}
+
+procedure ObjDepartIer.CreateDeptIerTabl(DateBuild: date; cIer: word);
+{
+  cIer := cIer;
+
+  ReSetBounds(#CatPodrDeptIer);
+  delete all CatPodrDeptIer;
+
+  set dateSts := DateBuild;
+
+  sql
+  select
+    CatHist.Name as Name,
+    0            as countIer,
+    :(DateBuild) as dateBuild,
+    CatHist.cCat as cPodr,
+    CatHist.cParent as cParent,
+    CatHist.Name as Name1,
+    Catalogs.Code,
+    CatHist.isLeaf,
+    CatHist.Dat1 as DatN,
+    CatHist.Dat2 as DatOk,
+    CatHist.lPr as NRec:comp
+  from
+    Catalogs
+    inner join (
+      select CatHist.cCat, max(CatHist.Dat1) MaxDate:date
+      from CatHist
+      where :(dateSts)>=CatHist.Dat1 and (CatHist.wFld1 <> 2 or #Date(0,0,0) = CatHist.Dat2 or :(dateSts) <= CatHist.Dat2)
+      group by CatHist.cCat
+    ) CatH1 on (Catalogs.NRec = CatH1.cCat)
+    inner join (
+      select CatHist.cCat, CatHist.Dat1, max(cast(CatHist.lastuser as integer)) MaxNpp
+      from CatHist
+      where :(dateSts)>=CatHist.Dat1 and (CatHist.wFld1 <> 2 or #Date(0,0,0) = CatHist.Dat2 or :(dateSts) <= CatHist.Dat2)
+      group by CatHist.cCat, CatHist.Dat1
+    ) CatH2 on (Catalogs.NRec = CatH2.cCat and CatH1.MaxDate = CatH2.Dat1)
+    inner join CatHist on (Catalogs.NRec = CatHist.cCat and CatH1.MaxDate = CatHist.Dat1 and CatH2.MaxNpp = cast(CatHist.lastuser as integer))
+  where
+    Catalogs.lPr = 0 and Catalogs.MainLink = (select NRec from Catalogs where :(SetEntry) = SysCode) and
+    case :(SetEntry) when -11 then 1 else 0 end <> CatHist.bMulti
+  into CatPodrDeptIer ByName;
+  //Формируем двухуровневую иерархию подразделения с кодом длиной <= 3 / подразделения с кодом длиной > 3
+  _loop CatPodrDeptIer
+  {
+    if length(CatPodrDeptIer.Code) <= 3
+      CatPodrDeptIer.cParent := 0;
+    else
+    {
+      CatPodrDeptIer.cParent := GetCatPodrDeptIerParent(CatPodrDeptIer.cParent);
+      _gp_cPodr := CatPodrDeptIer.cParent;
+      if getfirst gp_CPDIer = tsOk
+        CatPodrDeptIer.Name1 := gp_CPDIer.Name + '\' + CatPodrDeptIer.Name;
+    }
+    update current CatPodrDeptIer;
+  }
+}
+
+end.

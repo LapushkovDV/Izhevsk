@@ -1,0 +1,642 @@
+/*************************************************************************************************\
+* Наименование: РПД 120 Погашение подотчетных сумм                                                *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#3349         |08/09/18|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include PlPor.Vih
+#include G_PLPOR.vih
+#include RPD.vih
+#include GP_SetPrVidOplRK.vih
+#include Query.vih
+
+#component "Z_StaffOrders"
+
+VipInterface RPD_120(RPD_Base) licensed(free);
+  public:
+    procedure IRPD_Base.EnableDisable;
+    procedure IRPD_Base.MyDel;
+    function  IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+    procedure IRPD_Base3.PrintRPD(typePrint: TPtr; fcEnter: word);
+end;
+
+interface RPD_120;
+
+var
+  _setZarSignal : GP_SetPrVidOplRK;  //формирование записей в рабочей корзине
+  _qSaldoByPlPor: IQuery; //Запрос, возвращающий сумму остатка по АО
+  _dBeg         : date;
+  _dEnd         : date;
+
+create view
+var
+  _cPlPorStZatr: comp;
+as select
+  IDepartIer.GetFulDepName(ContDoc.cDopRef)
+    (FieldName = fullNamePodr),
+  ShowKau(cgKau_PlPor, GP_RPD120.cPlPor)
+    (FieldName=AOFld),
+  tSum120.Summa
+    (FieldName=Sum120)
+from
+  Appointments
+ ,Catalogs CatPost
+ ,GP_RPD120
+ ,GP_RPD120 GP_RPD120_Chck
+ ,KlVidUd
+ ,PlPor
+ ,ZarSignal
+ ,KatLink
+ ,(select Sum(t.Summa)(fieldname=Summa)
+   from GP_RPD120 t
+   where (( ContDoc.Nrec == t.cContDoc))
+  ) tSum120
+where ((
+      ContDoc.cStr      == Appointments.Nrec
+
+  and Appointments.Post == CatPost.Nrec
+
+  and ContDoc.Nrec      == GP_RPD120.cContDoc
+
+  and GP_RPD120.VidUd   == KlVidUd.VidUd
+
+  and GP_RPD120.cPlPor  == PlPor.Nrec
+
+  and ContDoc.Nrec          == GP_RPD120_Chck.cContDoc
+  and (GP_RPD120_Chck.cPlPor = GP_RPD120.cPlPor
+  and  GP_RPD120_Chck.Nrec  <> GP_RPD120.Nrec)
+
+  and 1                 == ZarSignal.SubSysCode
+  and 116               == ZarSignal.SrcTable
+  and GP_RPD120.Nrec    == ZarSignal.SrcRec
+  and (ZarSignal.Comp4   = ContDoc.Nrec)
+
+  and comp(0)           == KatLink.cUser
+  and coStZatr          == KatLink.CodeTable
+  and word(1)           == KatLink.Code
+  and (KatLink.cRec      = _cPlPorStZatr)
+));
+
+
+create view vKlVidUd
+var
+  _wVidUd: word;
+from klvidud
+where ((
+  _wVidUd == klvidud.vidud
+))
+;
+
+
+//#region Вспомогательные функции
+
+// Возвращает наименование ведомости удержаний по коду вида удержаний
+function GetNMnem(wVidUd: word): string;
+{
+  var s1, s2: string='';
+  s2 := ' (пр. №' + TitleDoc.DocNmb + ')';
+  vKlVidUd._wVidUd := wVidUd;
+  if vKlVidUd.getfirst klvidud = tsOk
+    s1 := vKlVidUd.klvidud.nvidud;
+  else
+    s1 := 'Межрасчетное удержание';
+  result := substr(s1, 1, 39 - length(s2)) + s2;
+}
+
+
+//Устанавливает поля по умолчанию для новой записи ContDoc
+procedure SetNewContDocBuffer;
+{
+  ClearBuffer(tnContDoc);
+  ContDoc.cPart    := PartDoc.Nrec;
+  ContDoc.ObjType  := 1;    // to table Persons
+  ContDoc.NumPart  := 1;
+  ContDoc.SeqNmb   := 1;
+  ContDoc.TypeOper := PartDoc.TypeOper;
+  ContDoc.wRec     := 1;
+  ContDoc.NumPart  := Integer(PartDoc.NRazd);
+  ContDoc.Nrec     := GetNextnRec(tnContDoc, 0);
+  if GetLast ContDocNmb where ((PartDoc.Nrec     == ContDocNmb.cPart    and
+                                PartDoc.TYPEOPER == ContDocNmb.TypeOper and
+                                1                == ContDocNmb.SeqNmb)) = tsOk
+    ContDoc.wRec   := ContDocNmb.wRec + 1
+  else
+    ContDoc.wRec   := 1;
+}
+
+
+function GetVidUdByPlPor(cPlPorNrec: comp): word;
+{
+  _cPlPorStZatr := coGetAttr(coPlPor, cPlPorNrec, sGetTune('UP.STAFF.PRIKAZ_PERS.RPD_120.AttrStZatr'));
+  if getfirst KatLink = tsOk
+    result := coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_120.VIDUDVAL');
+  else
+    result := coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_120.VIDUD');
+}
+
+
+//#region sql query qSaldo
+sql query qSaldo =
+select
+  PlPor.Nrec as cPlPor,
+  LSchet.tPerson as cPerson,
+  sum(Summa) as Summa
+from
+ (select
+    PlPor.Nrec,
+    RashDoc.SumV2 * case when RashDoc.PrOst = 1 or RashDoc.Kol = 0 then 1 else RashDoc.Kol end as Summa
+  from
+    PlPor
+  join RashDoc on
+    RashDoc.TipDoc = PlPor.TiDkGal and
+    RashDoc.cSoprDoc = PlPor.Nrec
+  where
+    PlPor.TiDkGal = 9 and
+    PlPor.DatOb between :dBeg and :dEnd
+
+  union all
+
+  select
+    PlPor.Nrec,
+    case when DocPodot.TipDoc = 99
+         then DocPodot.Summa
+         else PlPor1.SumPlat
+    end * case when DocPodot.TipDoc = 99 then 1 else -1 end as Summa
+  from
+    PlPor
+  join DocPodot on
+    DocPodot.TipDoc in (9, 99, 10) and
+    DocPodot.cPrDoc = PlPor.Nrec
+  left join PlPor PlPor1
+    on PlPor1.Nrec = DocPodot.cVtDoc
+  where
+    PlPor.TiDkGal = 9 and
+    PlPor.DatOb between :dBeg and :dEnd
+ ) t
+join PlPor on
+  PlPor.Nrec = t.Nrec
+join LSchet on
+  LSchet.Nrec = PlPor.cLSchet
+group by
+  PlPor.Nrec,
+  LSchet.tPerson;
+//#endregion sql query qSaldo
+
+procedure FillDoc(wMode: word);
+{
+  PushPos(tnContDoc);
+  if not BoundActive(tbByPersRec)
+    AddBounds(tbByPersRec);
+
+  var rs: IResultSet = queryManager.createQuery(qSaldo)
+                                   .setParam('dBeg', _dBeg)
+                                   .setParam('dEnd', _dEnd)
+                                   .getResultSet;
+  if rs.getFirst = tsOk do {
+
+    var d: double = rs.row.Val('Summa');
+    if (d = 0) or (wMode = 0 and d < 0) or (wMode = 1 and d > 0)
+      Continue;
+
+    cCPRec := rs.row.Val('cPerson');
+    if getfirst ContDoc != tsOk
+    {
+      SetNewContDocBuffer;
+      ContDoc.Person := cCPRec;
+      if getfirst Persons = tsOk
+      {
+        ContDoc.cDopRef := Persons.Department;
+        ContDoc.cStr := if(Persons.DisDate = 0, Persons.AppointCur, Persons.AppointLast);
+      }
+      insert current ContDoc;
+    }
+
+    var c: comp = rs.row.Val('cPlPor');
+    if getfirst GP_RPD120 where ((ContDoc.Nrec == GP_RPD120.cContDoc and
+                                  (GP_RPD120.cPlPor = c) )) != tsOk
+    {
+      ClearBuffer(tnGP_RPD120);
+      GP_RPD120.cContDoc := ContDoc.Nrec;
+      GP_RPD120.VidUd    := GetVidUdByPlPor(c);
+      GP_RPD120.dUd      := dGetTune('UP.DATOTCH');
+      GP_RPD120.cPlPor   := c;
+      GP_RPD120.Summa    := -d;
+      insert current GP_RPD120;
+    }
+    else
+    {
+      GP_RPD120.Summa    := d;
+      update current GP_RPD120;
+    }
+  } while rs.getNext = tsOk;
+
+  SubBounds(tbByPersRec);
+  PopPos(tnContDoc);
+  RescanPanel(tnContDoc);
+}
+
+
+//#region sql query qSaldoByPlPor
+sql query qSaldoByPlPor =
+  select
+    sum(Summa) as Summa
+  from
+    ( select
+        RashDoc.SumV2 * case when RashDoc.PrOst = 1 or RashDoc.Kol = 0 then 1 else RashDoc.Kol end as Summa
+      from
+        PlPor
+      join RashDoc on
+        RashDoc.TipDoc = PlPor.TiDkGal and
+        RashDoc.cSoprDoc = PlPor.Nrec
+      where
+        PlPor.Nrec = :cPlPor
+
+      union all
+
+      select
+        case when DocPodot.TipDoc = 99
+             then DocPodot.Summa
+             else PlPor1.SumPlat
+        end * case when DocPodot.TipDoc = 99 then 1 else -1 end as Summa
+      from
+        PlPor
+      join DocPodot on
+        DocPodot.TipDoc in (9, 99, 10) and
+        DocPodot.cPrDoc = PlPor.Nrec
+      left join PlPor PlPor1
+        on PlPor1.Nrec = DocPodot.cVtDoc
+      where
+        PlPor.Nrec = :cPlPor
+    ) t
+;
+//#endregion
+
+function GetSaldoByAO(cPlPorNrec: comp): double;
+{
+  if _qSaldoByPlPor = NullRef
+    _qSaldoByPlPor := queryManager.createQuery(qSaldoByPlPor);
+  result := _qSaldoByPlPor.setParam('cPlPor', cPlPorNrec).getResultValue;
+}
+
+procedure PrintRPD120;
+{
+  var m: TPtr = InitMarker('', 8, 30, 10, true);
+  PushPos(tnContDoc);
+  _loop ContDoc
+    InsertMarker(m, ContDoc.Nrec);
+  if GetMarkerCount(m) = 0
+    Message('Отсутствуют данные для отчета', Warning);
+  else
+    RunInterface(GP_Staff::GP_RPD120_Report, m);
+  PopPos(tnContDoc);
+  DoneMarker(m, '');
+}
+
+//#endregion Вспомогательные функции
+
+
+//#region Визуальная часть
+
+window wParams 'Параметры заполнения' escClose doAccept;
+  show(,,30, 6);
+
+  screen scParams;
+    fields
+      _dBeg: NoProtect;
+      _dEnd: NoProtect;
+    buttons
+      cmOk, default;
+      cmCancel;
+<<
+
+ Период анализа авансовых отчетов
+`с`.@@@@@@@@@@`по`.@@@@@@@@@@
+
+    <.Продолжить.> <.Отмена.>
+>>
+  end;
+
+  handleevent
+    cmOk: PutCommand(cmDefault);
+  end;
+
+end; //window wParams
+
+
+browse brPsn  (, hcStaffWinPr, sci1378Esc);
+show at (,,,10) fixed_y;
+table ContDoc;
+  fields
+    fullNamePodr    'Подразделение' ('Подразделение', hcStaffWinPr, )       : [25], protect;
+    Persons.FIO     'ФИО'           ('Фамилия имя отчество', hcStaffWinPr, ): [28], protect,
+      {Font = {BackColor = if(not IsValid(#Persons), ColorNeed, 0)}};
+    Persons.StrTabN 'Табельный №'   ('Табельный номер', hcStaffWinPr)       : [12], skip;
+    CatPost.Name    'Должность'     ('Должность', hcStaffWinPr)             : [15], skip;
+    Sum120          'Сумма'         ('Сумма', hcStaffWinPr)                 : [,'\2p[|-]3666`666`666`666.88'], Skip;
+end; //browse brPsn
+
+
+browse brRPD120 (,,sci1378Esc);
+  show(,11,,);
+  table GP_RPD120;
+  fields
+    KlVidUd.NVidUd  'Вид удержания'                       : [30], protect;
+    GP_RPD120.dUd   'Дата удержания'                      : [10], noprotect;
+    AOFld           'Основание для выплаты'               : [30], protect, editbutton;
+    GP_RPD120.Summa 'Сумма' ('Сумма погашения',,sci178Esc): [,'\2p[|-]3666`666`666`666.88'], noprotect;
+end;
+
+//#endregion Визуальная часть
+
+
+//#region Реализация методов объектного интерфейса
+
+procedure IRPD_Base.EnableDisable;
+{
+  var sTitle: string = '';
+  inherited::EnableDisable;
+
+  cfsSetCurrentContainer('Z_STAFFORDERS::GP_ORDERSLISTRPD120');
+  cfsGetProp('WHATISINORDER',cfpTitle, sTitle);
+  cfsSetProp('WHATISINORDER',cfpTitle, replace(sTitle,'Приказ','Список'));
+  cfsSetProp('L_EDITTITLE_N_приказа',cfpTitle,'Номер списка');
+  cfsSetProp('L_EDITTITLE_Дата_приказа',cfpTitle,'Дата списка');
+
+  if fnFieldsOpen // не утвержден
+  {
+    SetHelpAndStatusContext(brPsn   , -1, sci1378Esc, 'StaffWinPr');
+    SetHelpAndStatusContext(brRPD120, -1, sci1378Esc, 'StaffWinPr');
+  }
+  else
+  {
+    SetHelpAndStatusContext(brPsn   , -1, sci1Esc, 'StaffWinPr');
+    SetHelpAndStatusContext(brRPD120, -1, sci1Esc, 'StaffWinPr');
+  }
+  ToggleFieldSelectable(#GP_RPD120.Summa, fnFieldsOpen);
+  ToggleFieldSelectable(#GP_RPD120.dUd  , fnFieldsOpen);
+  SetEnableCommand(cmValue1, fnFieldsOpen);
+  SetEnableCommand(cmValue2, fnFieldsOpen);
+}
+
+
+// Процедура удаления своих записей, привязанных у удаляемому приказу
+Procedure IRPD_Base.MyDel;
+{
+  if funIsOrderConfirm
+  {
+    var bCreateDelZarSignal: boolean = false;
+    _loop GP_RPD120
+    {
+      bCreateDelZarSignal := false;
+
+      if getfirst ZarSignal = tsOk
+      {
+        if (ZarSignal.FilialNo and 1) = 1
+          bCreateDelZarSignal := true
+        else
+          delete current ZarSignal;
+      }
+      else
+        bCreateDelZarSignal := true;
+
+      if bCreateDelZarSignal
+      {
+        var _params: TGP_SetPrVidOplRK_Params;
+        _params.cPers   := persons.nrec;
+        _params.cApp    := appointments.nrec;
+        _params.wTable  := 116;
+        _params.cRec    := GP_RPD120.Nrec;
+        _params.wVidUd  := GP_RPD120.VidUd;
+        _params.dBeg    := GP_RPD120.dUd;
+        _params.dEnd    := GP_RPD120.dUd;
+        _params.dSum    := GP_RPD120.Summa;
+        _params.wChoice := 1;
+        _params.cContDoc:= ContDoc.Nrec;
+        _params.nMnem   := GetNMnem(_params.wVidUd);
+        _setZarSignal.DelRR(_params);
+      }
+
+    } //_loop GP_RPD120
+  }
+
+  delete all GP_RPD120;
+  inherited::MyDel;
+}
+
+
+function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+{
+  var _params: TGP_SetPrVidOplRK_Params;
+  _loop GP_RPD120
+  {
+    _params.cPers   := Persons.nrec;
+    _params.cApp    := Appointments.nrec;
+    _params.wTable  := 116;
+    _params.cRec    := GP_RPD120.Nrec;
+    _params.wVidUd  := GP_RPD120.VidUd;
+    _params.dBeg    := GP_RPD120.dUd;
+    _params.dEnd    := GP_RPD120.dUd;
+    _params.wChoice := 1;
+    _params.cContDoc:= ContDoc.nrec;
+    _params.nMnem   := GetNMnem(_params.wVidUd);
+    _params.dSum    := GP_RPD120.Summa;
+    if _params.dSum != 0
+      _setZarSignal.SetRR(_params);
+  }
+  result := inherited::ChildConfirmOneOrder(cNrec);
+}
+
+
+procedure IRPD_Base3.PrintRPD(typePrint: TPtr; fcEnter: word);
+{
+  fcEnter := fcEnter;
+  if typePrint = 0 PrintRPD120;
+}
+
+//#endregion Реализация методов объектного интерфейса
+
+
+//#region Обработчики событий
+
+tableevent table ContDoc;
+  cmSetDefault:
+  {
+    SetNewContDocBuffer;
+  }
+end; //tableevent table ContDoc
+
+
+tableevent table GP_RPD120;
+
+  cmUpdateRecord: { update current GP_RPD120; RescanPanel(tnContDoc); }
+  cmInsertRecord: { insert current GP_RPD120; RescanPanel(tnContDoc); }
+  cmDeleteRecord: { delete current GP_RPD120; RescanPanel(tnContDoc); }
+  cmSetDefault:
+  {
+    ClearBuffer(tnGP_RPD120);
+    GP_RPD120.cContDoc := ContDoc.Nrec;
+    GP_RPD120.VidUd    := coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_120.VIDUD');
+    GP_RPD120.dUd      := dGetTune('UP.DATOTCH');
+  }
+  cmCheckField:
+  {
+    case curfield of
+      #GP_RPD120.Summa: { UpdateTable; RescanPanel(tnContDoc); }
+    end;
+  }
+end; //tableevent table GP_RPD120;
+
+
+handleevent
+  cmPick:
+  {
+    case curfield of
+      #Persons.FIO:
+      {
+        var cPodr: comp = ContDoc.cDopRef;
+        var DummyMarker: TPtr = InitMarker('', 8, 1, 1);
+
+        ReReadRecord(tnTitleDoc);
+        if RunInterface('PrikAllPsn', TitleDoc.DocDate, cPodr, Longint(0), DummyMarker, vfCanSelect) = cmDefault
+        {
+          var c: comp = 0;
+          if GetMarker(DummyMarker, 0, c)
+           	set ContDoc.Person := c;
+
+          if not FO.FoundMarkerPodr(Persons.Department)
+          {
+            set ContDoc.Person := 0;
+            Message('Установленный фильтр не позволяет выбирать данное подразделение.', Information);
+          }
+          else
+          {
+            set ContDoc.cDopRef := Persons.Department;
+            set ContDoc.cStr := if(Persons.DisDate = 0, Persons.AppointCur, Persons.AppointLast);
+          }
+        }
+        DoneMarker(DummyMarker, '');
+      } //#Persons.FIO:
+      #fullNamePodr:
+      {
+        var c: comp = ContDoc.cDopRef;
+        if RunInterface('PickCatalog2', Integer(-11), c, Comp(0)) = cmDefault
+        {
+          if not FO.FoundMarkerPodr(c)
+            Message('Установленный фильтр не позволяет выбирать данное подразделение.', Information);
+          else
+          {
+            if (ContDoc.Person <> 0) and (ContDoc.cDopRef <> 0) and (ContDoc.cDopRef <> c)
+              Message('Нельзя изменить подразделение у выбранного сотрудника!');
+            else
+              set ContDoc.cDopRef := c;
+            SelectField(#Persons.FIO);
+          }
+        }
+      } //#fullNamePodr:
+      #KlVidUd.NVidUd:
+      {
+        if GP_RPD120.VidUd = coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_120.VIDUD')
+          set GP_RPD120.VidUd := coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_120.VIDUDVAL')
+        else
+          set GP_RPD120.VidUd := coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_120.VIDUD');
+      }
+      #AOFld:
+      {
+        var c: comp = GP_RPD120.cPlPor;
+        if RunInterface(F_PLPOR::G_PlPor, cgiPick, cgTip_DocDefs, 0, 0, ContDoc.Person, 0, c) = cmDefault
+        {
+          var cPlPorOld: comp   = GP_RPD120.cPlPor;
+          set GP_RPD120.cPlPor := c;
+          if getfirst PlPor = tsOk
+          {
+            if PlPor.cPersons != ContDoc.Person
+            {
+              Message('Запрещен выбор авансового отчета по сотруднику, отличному от сотрудника в приказе', error);
+              set GP_RPD120.cPlPor := cPlPorOld;
+              exit;
+            }
+            if getfirst GP_RPD120_Chck = tsOk
+            {
+              Message('Запрещено выбирать один и тот же платежный документ по сотруднику дважды', error);
+              set GP_RPD120.cPlPor := cPlPorOld;
+              exit;
+            }
+            set GP_RPD120.VidUd  := GetVidUdByPlPor(c);
+            if PlPor.TiDkGal = cgDoc_0009
+            {
+              var d: double = GetSaldoByAO(c);
+              if d != GP_RPD120.Summa
+                if Message('Установить в поле "Сумма" сумму остатка по авансовому отчету (' +
+                           DoubleToStr(d, '[|-]3666`666`666`666`666.88') + ')?', YesNo) = cmYes
+                  set GP_RPD120.Summa := d;
+            }
+          }
+        }
+      }
+    end;
+  }
+  cmEdit:
+  {
+    case curfield of
+      #AOFld:
+      {
+        if IsValid(tnPlpor)
+        {
+          PutCommand(cmEdit);
+          RunInterface(F_PLPOR::PlPor, PlPor.TiDkGal, PlPor.TiDk, Plpor.Nrec);
+        }
+      }
+    end;
+  }
+  cmHotKeys:
+  {
+    var menuID: longint = LoadMenu('RPD120_Menu');
+    PutHotCommand(RunLoadMenu(menuID));
+  }
+  cmValue1:
+  {
+    if RunWindowModal(wParams) = cmDefault
+      FillDoc(0);
+    RereadRecord(tnContDoc);
+  }
+  cmValue2:
+  {
+    if RunWindowModal(wParams) = cmDefault
+      FillDoc(1);
+    RereadRecord(tnContDoc);
+  }
+  cmOnVipLoad:
+  {
+    case inherited::handleevent(cmOnVipLoad) of
+      heAbort: Abort;
+      heStop: Stop;
+    end;
+    _dEnd := dGetTune('UP.DATOTCH');
+    _dEnd := Date(Last_Day(_dEnd), Month(_dEnd), Year(_dEnd));
+    _dBeg := Date(1, Month(_dEnd), Year(_dEnd));
+  }
+  cmPrintDoc: PrintRPD120;
+end;
+
+//#endregion Обработчики событий
+
+end.
+
+
+RPD120_Menu menu
+{
+  - 'Печать', cmPrintDoc, 'Печать', hcStaffReceptionMenu, 'Ctrl+P', kbCtrlP,,,,, bmpPrint;
+  - 'Возврат подотчетных сумм', cmValue1;
+  - 'Удержание подотчетных сумм', cmValue2;
+  -----------;
+  - 'Внешняя классификация', cmPickClass, 'Внешняя классификация'
+      ,hcGkatalM1ExtClass,'Alt+C', kbAltC, sci1Esc,,,, bmpClassifierSO;
+  - 'Внешние атрибуты', cmPickAttr, 'Заполнение внешних атрибутов по данной позиции', hcGkatalM1Attr
+      ,'Alt+A', kbAltA, sci1Esc,,,, bmpAttributeSO;
+  -----------;
+  - 'Проверка списка', cmCheckRPD,
+       'Проверка списка', hcNoContext, 'Ctrl+M', kbCtrlM,,,,, bmpCheck16;
+}

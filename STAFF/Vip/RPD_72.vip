@@ -1,0 +1,452 @@
+/*************************************************************************************************\
+* Наименование: Интерфейс приказа "Привлечение сотрудника к сверхурочной работе"                  *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: 175 Доработки для учета в СКУД                                                      *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1143         |06/10/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Разработка  |#175          |18/10/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include GP_SCUD_EventsEdit.Vih
+
+#component "Z_StaffOrders"
+alter interface RPD_72;
+overload
+  Procedure IRPD_Base.EnableDisable;
+  function IRPD_Base.ChildCheckOneOrder(cNrec : comp = 0): boolean;
+  function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+  procedure IRPD_Base3.PrintRPD(typePrint: TPtr; fcEnter: word);
+
+end;
+var
+  iGP_SCUD_EventsEdit:GP_SCUD_EventsEdit;//для работы с картотекой в СКУД
+  pUOWRKTABEL_CV:comp; // условное обозначение сврехурочки
+create view
+var
+  sUO:string;
+as select GP_SCUD_PERS.Nrec
+From GP_SCUD_PERS
+// , ContDoc GP_ContDoc
+// , WorkContracts GP_WorkContracts
+ , UOWRKTABEL  UOWRKTABEL_F
+where ((
+    ContDoc.Person == GP_SCUD_PERS.cPersons
+and sUO  == UOWRKTABEL_F.NUM
+))
+;
+
+//******************************************************************************
+// можно вынести в RPD_BASE, но тогда начинают идти 6 предупреждений на base_Payment
+// да и EnableDisable в 8 перехвачена
+//******************************************************************************
+Create view vNotes
+var
+  nRecTable:comp;
+  wChoice  :word;
+From Notes
+where ((
+      wChoice     == Notes.choice
+  and nRecTable   == Notes.Owner
+));
+
+File FMemo;
+
+Function MyCheckNotes(_wChoice:word):boolean;
+{ Result:=false;
+  vNotes.nRecTable:=ContDoc.Nrec;
+  vNotes.wChoice  :=_wChoice;
+  Result:=vNotes.Getfirst Notes=tsok;
+  if not Result exit;
+  if FMemo.OpenMemo(vNotes.Notes.NOTE)
+  { Result:=FMemo.GetSize()<>0;
+    FMemo.Close;
+  }
+} //Function MyCheckNotes(_wChoice:word):boolean;
+//******************************************************************************
+// Установить надписи на кнопках
+//******************************************************************************
+Procedure MySetButtonTitle(_nm_screen:string='');
+{ //'Z_STAFFORDERS::NOTESFORCONTDOC.Memo_NOTES.NOTE'
+  var ww_str:string;
+  if _nm_screen='' _nm_screen:='b_scrDet72';
+  //cmViewAdvance1
+  ww_str:=if(MyCheckNotes(3002),'Примечан.+','Примечание');
+  cfsSetProp(_nm_screen+'_Примечание',cfpTitle,ww_str);
+  //--
+  //ww_str:=if(MyCheckNotes(3005),'Доп.условия+','Доп. условия');
+  //cfsSetProp(_nm_screen+'_Доп._условия',cfpTitle,ww_str);
+  ReScanPanel(#PERSONS);
+} //Procedure MySetButtonTitle;
+
+
+
+//******************************************************************************
+// Процедура открытия\закрытия полей для редактирования
+//******************************************************************************
+Procedure EnableDisable;
+{
+  MySetButtonTitle();
+  inherited::EnableDisable;
+
+  ToggleFieldSelectable(#WorkContracts.dEnd,false);
+}
+
+function CalcHours(d1,d2:date):double;
+var _itSu:double;
+{
+ _itSu:=0;
+ /*
+  _loop GP_WorkContracts
+  where((
+        ContDoc.Person==GP_WorkContracts.cPers
+    and d1<<=GP_WorkContracts.dBeg
+    and d2>>=GP_WorkContracts.dBeg
+    and GP_WorkContracts.cDoc/==GP_ContDoc.NRec
+    and ContDoc.Person==GP_ContDoc.Person(noindex)
+    and ContDoc.TypeOper==GP_ContDoc.TypeOper(noindex)
+  )) {
+    _itSu+=double(GP_WorkContracts.LastUser);
+  }
+ */
+  SQL select
+     sum(Cast(WorkContracts.LastUser as double))
+  from WorkContracts
+  inner join ContDoc on ContDoc.ObjNrec= WorkContracts.Nrec
+             and ContDoc.TypeOper=:(ContDoc.TypeOper)
+  where WorkContracts.cPers=:(Contdoc.Person)
+  and WorkContracts.dBeg>=:(d1) and WorkContracts.dBeg<=:(d2)
+  into (_itSu);
+  Result:=_itSu;
+  if timelog_status>0
+  { timelog('CalcHours d1= '+string(d1)+',d2='+string(d2)+',Result='+string(Result));
+  }
+
+} //function CalcHours(d1,d2:date):double;
+
+
+function CalcHoursC(d1,d2:date):double;
+var _itSuV:double;
+{
+ _itSuV:=0;
+
+  //Добавим отклонения с кодом С
+  var _wYear:integer=Year(d2);
+  var _wMes_b:word=Month(d1);
+  var _wMes_e:word=Month(d2);
+  var _wDay_b:word=Day(d1);
+  var _wDay_e:word=Day(d2);
+  //-------------------------
+  SQL select
+     sum(Variance.WORKINGHOURS)
+  from Appointments
+  inner join LsTab on LsTab.CLSCHET = Appointments.cAddNrec2
+                  and LsTab.YearN   = :(_wYear)
+                  and LsTab.MesN   >= :(_wMes_b)
+                  and LsTab.MesN   <= :(_wMes_e)
+  inner join Variance on Variance.cLsTab = LsTab.Nrec
+                     and VARIANCE.KIND =2 //увеличение
+                     and (LsTab.MesN   > :(_wMes_b) or VARIANCE.BEGINNING>=:(_wDay_b))
+                     and (LsTab.MesN   < :(_wMes_e) or VARIANCE.ENDING   <=:(_wDay_e))
+  inner join UOWRKTABEL on UOWRKTABEL.NREC= VARIANCE.CUO
+                       and UOWRKTABEL.NUM='С'
+  where Appointments.Nrec = :(ContDoc.cStr)
+  into (_itSuV);
+  Result:=_itSuV;
+  if timelog_status>0
+  { timelog('CalcHoursC d1= '+string(d1)
+    +',d2='+string(d2)
+    +',_itSuV='+string(_itSuV,0,2)
+    +',Result='+string(Result,0,2));
+  }
+
+} //function CalcHoursC(d1,d2:date):double;
+
+function ChildCheckOneOrder(cNrec : comp = 0): boolean;
+var _ch:double;
+{
+  result:=inherited::ChildCheckOneOrder(cNrec);
+  _ch:=CalcHours(Sub_Day(WorkContracts.dBeg,1),WorkContracts.dBeg)+CalcHoursC(Sub_Day(WorkContracts.dBeg,1),WorkContracts.dBeg);
+  if (UOWRKTABEL.NUM = 'С') and (wGetTune('UP.NiimashGAL.Niimash') = 1)
+  {
+    _ch:=CalcHoursC(date(1,1,Year(WorkContracts.dBeg)),date(31,12,Year(WorkContracts.dBeg)) );
+    if (_ch>120)
+    {
+      SetErrorOrder('Приказ утвердить нельзя: отработано более 120 часов в год.('+string(_ch,0,1)+')');
+      result := false;
+    }
+
+  }
+
+  if (UOWRKTABEL.NUM <> 'СД') and (wGetTune('UP.NiimashGAL.Niimash') = 0)
+  {
+    if (_ch>4)
+    {
+      SetErrorOrder('Приказ утвердить нельзя: отработано более 4-х часов в день/два дня подряд.('+string(_ch,0,1)+')');
+      result := false;
+    }
+    else
+    { _ch:=CalcHours(WorkContracts.dBeg,Add_Day(WorkContracts.dBeg,1))+CalcHoursC(WorkContracts.dBeg,Add_Day(WorkContracts.dBeg,1));
+      if (_ch>4)
+      {
+        SetErrorOrder('Приказ утвердить нельзя: отработано более 4-х часов в день/два дня подряд.('+string(_ch,0,1)+')');
+        result := false;
+      }
+    }
+
+    _ch:=CalcHours(date(1,1,Year(WorkContracts.dBeg)),date(31,12,Year(WorkContracts.dBeg)) )+CalcHoursC(date(1,1,Year(WorkContracts.dBeg)),date(31,12,Year(WorkContracts.dBeg)) );
+
+    if (_ch>120) {
+      SetErrorOrder('Приказ утвердить нельзя: отработано более 120 часов в год.('+string(_ch,0,1)+')');
+      result := false;
+    }
+  }
+}
+
+//******************************************************************************
+//  Процедура утверждения индивидуального приказа по текущему работнику (по таблице ContDoc)
+//******************************************************************************
+function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+{ Result:=Inherited::ChildConfirmOneOrder(cNrec);
+  if Result
+  { //iGP_SCUD_PersEdit.MakeBufferPers(Persons.Nrec,ContDoc.ObjNrec,TitleDoc.Nrec,Contdoc.Nrec,PartDoc.TypeOper)
+    if getfirst GP_SCUD_Pers=tsok
+    { _Loop fullcache WorkContracts
+      { iGP_SCUD_EventsEdit.CalcAll(GP_SCUD_PERS.Nrec
+           ,year(WorkContracts.dBeg )
+           ,month(WorkContracts.dBeg )
+           ,2
+           ,true
+           ,0
+           );
+      }
+    }
+  }
+} //function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+
+//------------------------------------------------
+//
+//------------------------------------------------
+Function Import_From_Scud:boolean;
+var _chas:double;
+    _Day:word;
+    _EnhancedTimeFormat:boolean;
+    _Mes:string;
+{ Result:=False;
+  UpdateTable;
+  PushPos(#WorkContracts);
+  PushPos(#ContDoc);
+  StartNewVisual(vtNumericVisual,vfTimer + vfBreak + vfConfirm,'Подготовка данных',0);
+  _EnhancedTimeFormat:=boGetTune('UP.ZAR.WT.EnhancedTimeFormat');
+
+  _Loop fullcache ContDoc
+  { if ContDoc.Person=0 continue;
+    if not iNextVisual('Подготовка данных'+chr(13)+Persons.Fio)
+    { break;
+    }
+    if getfirst GP_SCUD_Pers<>tsok
+    { displ('Не нашли запись в справочнике сотрудников СКУД для '+Persons.Fio)
+
+    }
+    // это не может быть
+    if getfirst WorkContracts<>tsok
+    { continue;
+      ClearBuffer(#WorkContracts);
+      var _pNrec:comp=GetNextNrec(#WorkContracts,0);
+      WorkContracts.Nrec     :=_pNrec;
+      WorkContracts.cPers    := Persons.Nrec;
+      WorkContracts.cApp     := Appointments.Nrec;
+      WorkContracts.FilialNo := 10;
+      WorkContracts.cDoc     := ContDoc.Nrec;
+      insert current WorkContracts;
+      update current ContDoc set ContDoc.ObjNrec := _pNrec;
+    }
+    _Loop fullcache WorkContracts
+    { _Day:=day(WorkContracts.dBeg );
+      _Mes:='Заменили часы для "'+Persons.Fio+ '" c '+WorkContracts.LastUser+' на ';
+      iGP_SCUD_EventsEdit.CalcAll(GP_SCUD_PERS.Nrec
+           ,year(WorkContracts.dBeg)
+           ,month(WorkContracts.dBeg)
+           ,1
+           ,true
+           ,_Day
+           );
+      _chas:=iGP_SCUD_EventsEdit.GetCalc_CH_Over_Day(_Day);
+      WorkContracts.LastUser:=string(_chas,0,2);
+      _mes:=_mes+string(_chas,0,2);
+      update current WorkContracts;
+      displ(_mes);
+    } //_Loop fullcache WorkContracts
+  } //_Loop fullcache ContDoc
+
+  PopPos(#ContDoc);
+  ReScanPanel(#ContDoc);
+  PopPos(#WorkContracts);
+  ReScanPanel(#WorkContracts);
+
+  StopVisual('',0);
+  ShowErrors;
+  Result:=true;
+
+} //Function Import_From_Scud:boolean;
+
+Function GetTypeOpl(_wType:word):string;
+{ Result:='-';
+  case _wType of
+  10: Result:=' ';
+  1 : Result:='за отгул';
+  0 : Result:='за оплату';
+  end;
+} //Function GetTypeOpl(_wType:word):string;
+
+//===========================================
+// Жалуются, что после печати идут ошибки ввода
+procedure PrintRPD(typePrint: TPtr; fcEnter: word);
+{ Pushpos(#ContDoc);
+  Inherited::PrintRPD(typePrint, fcEnter);
+  Poppos(#ContDoc);
+  ReScanPanel(#ContDoc);
+  ReScanPanel(#WorkContracts);
+
+} //procedure IRPD_Base.PrintRPD(typePrint: TPtr; fcEnter: word);
+
+
+//------------------------------------------------
+OverloadFormats scrDet72;
+//------------------------------------------------
+
+//******************************************************************************
+// Окно содержимого приказа: Привлечение сотрудника к сверхурочной работе
+//******************************************************************************
+screen scrDet72 (, hcStaffWinPr, scStaffMyPnl);
+  show at (,5,,);
+  table WorkContracts;
+fields
+  WorkContracts.dBeg ('Дата начала неявки'): [10,'DD/MM/YYYY'], noprotect;
+  WorkContracts.dEnd ('Дата окончания неявки'): [10,'DD/MM/YYYY'], noprotect;
+  UP_CountHours    //( double(WorkContracts.LastUser) )
+    ('Количество сверхурочных часов'): [10.2], noprotect;
+  UOWRKTABEL.NUM ('Условное обозначение',,scStaffMyPnlPick): protect, pickButton;
+
+  WorkContracts.filialNo
+      ('Способ оплаты. Т.е. платить ли сотруднику что-либо или он работает за отгул',, scStaffPr1Pick):
+          [list 10 ' ', 1 'за отгул', 0 'за оплату'], protect
+          ;
+
+!  GetTypeOpl(WorkContracts.filialNo) ('Способ оплаты. Т.е. платить ли сотруднику что-либо или он работает за отгул',, ): Protect;
+  ContDoc.SBottom ('Основание', hcStaffWinPr), noprotect;
+Buttons
+//GP
+  cmValue41,,, 'Забрать часы из СКУД';
+//GP
+  cmViewAdvance1,,, 'Просмотр примечания к приказу', hcStaffWinPr;
+<<
+  `Отработано с`  .@@@@@@@@@@@@        `по`.@@@@@@@@@@@@
+  `Кол-во часов`  .@@@@@@ `Условное обозначение`.@@@@@@@
+  `Способ оплаты` .@@@@@@@@@@@@   <.Часы из СКУД.> <. Примечание .>
+  `Основание`
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end; // screen scrDet72
+
+
+
+//******************************************************************************
+// События таблицы WorkContracts
+//******************************************************************************
+TableEvent Table WorkContracts;
+
+cmSetDefault:
+{
+  ClearBuffer(#WorkContracts);
+  WorkContracts.cPers := Persons.Nrec;
+  WorkContracts.cApp  := Appointments.Nrec;
+  //GP WorkContracts.FilialNo := 10;
+  //---------------------------------
+  WorkContracts.FilialNo:=0;// За оплату.
+  WorkContracts.cVid    := pUOWRKTABEL_CV;
+  WorkContracts.cDoc    := ContDoc.Nrec;
+}
+cmInsertRecord:
+{
+  var _pNrec:comp=GetNextNrec(#WorkContracts,0);
+  WorkContracts.cDoc := ContDoc.Nrec;
+  WorkContracts.Nrec :=_pNrec;
+  if ( insert current WorkContracts <> tsOK )
+  { Message('Ошибка вставки записи о неявке для сотрудника: ' + Persons.FIO + ' (т.н. ' + GetStrTabn(Appointments.AppTabNmb,Appointments.StrTabn) + ')', Error);
+  }
+  else
+  {
+    //set ContDoc.ObjNrec := WorkContracts.Nrec;
+    set ContDoc.ObjNrec := _pNrec;
+    if ( update current ContDoc <> tsOK ) {}
+    ReScanPanel(#WorkContracts);
+  }
+}
+
+cmUpdateRecord:
+{
+  if ( update current WorkContracts <> tsOK )
+  {  Message('Ошибка обновления записи о неявке для сотрудника: ' + Persons.FIO + ' (т.н. ' + GetStrTabn(Appointments.AppTabNmb,Appointments.StrTabn) + ')'
+      +chr(13)+'попробуйте еще раз'
+      , Error);
+     RereadRecord(#WorkContracts);
+  }
+}
+
+cmCheckField:{
+  case CurField of
+  #WorkContracts.dBeg:
+  { set WorkContracts.dEnd:=WorkContracts.dBeg;
+    SetModified(true);
+    UpdateTable();
+  }
+  end;
+
+  case inherited :: handleEvent (cmCheckField) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+}
+
+end;
+
+//------------------------
+// События интерфейса
+//------------------------
+handleevent
+cmOnVipLoad:
+{ timelog_init;
+  sUO:='С';
+  if getfirst UOWRKTABEL_F=tsok // where (( 'С' == UOWRKTABEL_F.NUM ))=tsok
+    pUOWRKTABEL_CV:=UOWRKTABEL_F.Nrec;
+  if inherited::handleEvent(cmOnVipLoad) = heAbort
+        abort;
+}
+cmViewAdvance1: //просмотр примечания к приказу
+{ if  inherited :: handleEvent (cmViewAdvance1)=heAbort then Abort;
+  MySetButtonTitle;
+}
+/*
+cmValue21: //доп. условия
+{ if  inherited :: handleEvent (cmValue21)=heAbort then Abort;
+  MySetButtonTitle;
+  // почему то сразу не обновляется
+  EnableDisable;
+} */
+//GP
+cmValue41: //часы из скуд
+{ if TitleDoc.wStatus =1
+  { message('Приказ не в оформляемом статусе'
+         +', импорт часов запрещен!'
+    ) ;
+    exit;
+  }
+  Import_From_Scud;
+}
+//GP
+end;
+
+
+
+end.

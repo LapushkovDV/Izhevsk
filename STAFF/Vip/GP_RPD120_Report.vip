@@ -1,0 +1,182 @@
+/*************************************************************************************************\
+* Наименование: РПД 120 Погашение подотчетных сумм - отчетная форма                               *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#3349         |11/09/18|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include FeeSigners.vih
+#include Query.vih
+
+#component "GP_Staff"
+
+Interface GP_RPD120_Report 'Погашение подотчетных сумм' doAccept escClose;
+show(,,40,5);
+
+var
+  _feeSigners   : FeeSigners; //Подписанты
+  _mContDoc     : TPtr;       //Маркер с нреками распечатываемых ContDoc
+  _isFirstRecord: boolean;    //Признак первой записи при обработке DataSet
+  _cSelection   : comp;       //Ссылка на группу подписантов
+  _rs           : IResultSet; //Результат выборки данных для вывода
+
+create view
+as select
+  Selection.Name
+from
+  Selection
+where ((
+  _cSelection == Selection.Nrec
+));
+
+parameters _mContDoc;
+
+DataStream dsRPD120
+  (
+    DataSet Persons
+    (
+      [FIO]     GetSurnameWithInitials(_rs.row.Val('FIO'));
+      [StrTabN] _rs.row.Val('StrTabN');
+      [DepCode] SubStr(_rs.row.Val('DepCode'), 1, 3);
+      [AO]      _rs.row.Val('AO');
+      [AONazn1] _rs.row.Val('AONazn1');
+      [AONazn2] _rs.row.Val('AONazn2');
+      [DUd]     _rs.row.Val('dUd');
+      [Summa]   _rs.row.Val('Summa');
+    );
+    DataSet Signers
+    (
+      [FIO]       _feeSigners.GetSignerFIO(1);
+      [TabN]      _feeSigners.GetSignerTabN;
+      [Post]      _feeSigners.GetSignerPosition(1);
+      [Role]      _feeSigners.GetSignerRole;
+    );
+  )
+  handleevent dataset Persons
+    cmPreProcess:
+      _isFirstRecord := true;
+    cmOnProcess:
+    {
+      if _isFirstRecord
+      {
+        if _rs.getFirst = tsOk ContinueDataSet;
+        _isFirstRecord := false;
+      }
+      else
+        if _rs.getNext = tsOk ContinueDataSet;
+    }
+  end;
+  handleevent dataset Signers
+    cmPreProcess:
+      _isFirstRecord := true;
+    cmOnProcess:
+    {
+      if _isFirstRecord
+      {
+        if _feeSigners.GetSignerFirst ContinueDataSet;
+        _isFirstRecord := false;
+      }
+      else
+        if _feeSigners.GetSignerNext ContinueDataSet;
+    }
+  end;
+end; //DataStream dsRPD120
+
+screen scParams;
+  fields
+    Selection.Name ('Группа подписантов',,sci13Esc): protect;
+  buttons
+    cmOk, default;
+    cmCancel;
+<<
+
+`Подписанты`.@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+              <.Продолжить.> <.Отмена.>
+>>
+end; //screen scParams
+
+sql query qData =
+  select
+    Persons.Nrec,
+    Persons.FIO,
+    Persons.StrTabN,
+    coalesce(CatDep.Code, '') as DepCode,
+    coalesce('Авансовый отчет №'+PlPor.NoDok+ ' от ' + Date2Str('%dd.%MM.%YYYY',PlPor.DatVip), '') as AO,
+    coalesce(PlPor.NamePl1, '') as AONazn1,
+    coalesce(PlPor.NamePl2, '') as AONazn2,
+    GP_RPD120.dUd,
+    GP_RPD120.Summa as Summa
+  from tContDoc
+  join ContDoc
+    on ContDoc.Nrec = tContDoc.Nrec
+  join Persons
+    on Persons.Nrec = ContDoc.Person
+  join GP_RPD120
+    on GP_RPD120.cContDoc = tContDoc.Nrec
+  left join Catalogs CatDep
+    on CatDep.Nrec = ContDoc.cDopRef
+  left join PlPor
+    on PlPor.Nrec = GP_RPD120.cPlPor
+;
+
+procedure PrintReport;
+{
+  var s: longint = 0;
+  sqlAddStr(s, 'table tContDoc(Nrec: comp);');
+  sqlCreateTmpTable(s, ctmNormal);
+
+  var q: IQuery = queryManager.createQuery('insert tContDoc (Nrec) values (:nrec)');
+  var i: longint = 0;
+  var c: comp = 0;
+  for(i := 0; GetMarker(_mContDoc, i, c); i++)
+    if q.setParam('nrec', c).execute.errorCode != tsOk
+    {
+      Message('Ошибка формирования отчета: ' + q.errorCode, error);
+      sqlDropTmpTable('tContDoc');
+      exit;
+    }
+
+  _rs := queryManager.createQuery(qData).getResultSet;
+
+  if _rs != NullRef
+    RunFReport(dsRPD120, '', true);
+  else
+    Message('Ошибка формирования отчета', error);
+
+  sqlDropTmpTable('tContDoc');
+}
+
+handleevent
+
+  cmOk: PrintReport;
+
+  cmPick:
+  {
+    case curfield of
+      #Selection.Name:
+      {
+        if _feeSigners.RunMainWindow(cgiPick)
+          set _cSelection := _feeSigners.GetFeeSigners;
+      }
+    end;
+  }
+
+  cmInit:
+  {
+    var c: comp = 0;
+    ReadMyDsk(c, 'GP_RPD120_Report_cSelection', false);
+    set _cSelection := c;
+    _feeSigners.InitFeeSigners(cgReport_KASSFRO);
+    _feeSigners.SetFeeSigners(_cSelection);
+  }
+
+  cmDone:
+  {
+    SaveMyDsk(_cSelection, 'GP_RPD120_Report_cSelection');
+  }
+end;
+
+end.

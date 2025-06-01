@@ -1,0 +1,1026 @@
+/*************************************************************************************************\
+* Наименование: Расчётная ведомость по гос.заказу Ангара                                          *
+* Контур/Модуль: Заработная плата                                                                 *
+* Пункт меню: Отчеты / Отчеты пользователя / Отчеты по распределению затрат / Расчётная ведомость *
+*             по гос.заказу Ангара                                                                *
+* Примечание:                                                                                     *
+* Отличия этого отчёта от GP_GovOrdRep:                                                           *
+* 1. Добавлена колонка "% участия"                                                                *
+* 2. Изменени алгоритмом расчёта колонки "Начислено по проекту, руб. (23)".                       *
+* 3. В колонку "надбавки" добавлены оплаты с польз.кодами 56, 91, 98; исключена оплата с польз.   *
+* кодом 8.                                                                                        *
+* 4. В колонку "премия" включаются оплаты с польз.кодами 21..38 (было 21..31).                    *
+* 5. В колонку "командировка" добавлена оплата с польз.кодом 140.                                 *
+* 4. В колонку "отпуск" включаются оплаты с польз.кодами 111..133 (было 111..113).                *
+*                                                                                                 *
+* P.S. Предлагал сделать параметр, но клиент настоял на отдельном отчёте.                         *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2458         |24/05/18|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include FeeSigners.Vih // Функции работы с подписантами
+#include GP_Signers.vih // Библиотека для вывода подписей в отчетах
+// #include GetKau.Vih
+
+#define GPInt GP_GovOrdRepA // #(GPInt)
+#define GPNam Расчётная ведомость по гос.заказу Ангара// #(GPNam)
+
+interface GP_GovOrdRepA '#(GPNam)' EscClose;
+
+  const
+    SG_CONST_REP = cgReport_7400; // код группы отчётов для выбора подписантов
+    SG_TAG_REP = 'GovOrdRep'; // код группы отчётов для выбора подписантов
+    REP_TITLE = 'Расчётная ведомость'; // Заголовок отчёта
+    TAB_CNT = 1; // Количество закладок в отчёте
+    TAB_TITLE_1 = 'Отчёт'; // Название закладки 1
+    // Константы ошибок при работе с Excel
+    XE_BAD_OP           =  0; // не удалось выполнить операцию с Excel-файлом
+    XE_CREATE_FILE      =  1; // не удалось создать файл
+    XE_OPEN_FILE        =  2; // не удалось открыть файл
+    XE_INIT_FILE        =  3; // не удалось инициализировать Excel
+    XE_CREATE_MATRIX    =  4; // не удалось создать матрицу
+    XE_FREE_MATRIX      =  5; // не удалось освободить матрицу
+    XE_OUT_MATRIX       =  6; // не удалось вывести матрицу в отчёт
+    XE_WRITE_TO_MATRIX  =  7; // не удалось записать значение в матрицу
+    XE_FORMAT_CELL      =  8; // не удалось отформатировать ячейку
+    XE_SET_CELL_VALUE   =  9; // не удалось записать значение в ячейку
+    XE_SET_CELL_FORMULA = 10; // не удалось записать формулу
+    XE_RUN_MACRO        = 11; // не удалось запустить макрос
+    XE_ADD_SHEET        = 12; // не удалось добавить вкладку
+    XE_DEL_SHEET        = 13; // не удалось удалить вкладку
+    XE_RENAME_SHEET     = 14; // не удалось переименовать вкладку
+    XE_WRONG_TEMPLATE   = 15; // в xlt шаблоне не найден лист с именем
+  end;
+
+  // #include GetKau.var
+  #include FeeSigners.var
+  #include GP_Signers.var
+
+  // Данные для отчета
+  table struct SData
+  (
+    cLSchet: tNRec, // Ссылка на лицевой счет работника
+    TabN: tTabN, // Табельный номер
+    StrTabN: TabNStr, // Строковое значение табельного номера
+    PartProc: Double // Процент участия
+  )
+  with index
+  (
+    SData01 = TabN + StrTabN,
+    SData02 = cLSchet
+  );
+
+  create view
+    var
+      pMonth: byte; // Месяц отчётного периода
+      pYear: word; // Год отчётного периода
+      pBegDate: date; // Дата начала отчетного периода
+      pEndDate: date; // Дата окончания отчетного периода
+      pSignerGrp: string; // Группа подписантов
+      pOrderGrp: tNRec; // Группа заказа
+      // pOrder: tNRec; // Заказ
+    from
+      Zar_User,
+      SData (SData01),
+      GP_RaspAvans,
+      Nachisl,
+      SumVidOp,
+      // NeNach,
+      KlVidOpl,
+      Uder,
+      SumVidUd,
+      KlVidUd
+    where ((
+          UserName       == Zar_User.OwnName
+      and pOrderGrp      == VPlan.NRec
+      //and pOrder         == MnPlan.NRec
+      and SData.cLSchet  == LSchet.NRec
+      and LSchet.TPerson == Persons.NRec
+    ));
+
+  var
+    IsAborted: boolean;
+    SumFormat2D: string;
+    // Данные по текущей строке отчета
+    NachOklad: tSumma; // начислено: оклад (4)
+    NachNadb: tSumma; // начислено: надбавки (5)
+    NachPremia: tSumma; // начислено: премия (6)
+    NachCommand: tSumma; // начислено: командировка (7)
+    NachOtp: tSumma; // начислено: отпуск (8)
+    NachPos3Days: tSumma; // начислено: пособие за 3 дня (9)
+    NachOther: tSumma; // начислено: другие доходы (10)
+    NachTotal: tSumma; // начислено: всего (11)
+    InZadOrg: tSumma; // вх.задолж.: За организацией (12)
+    InZadRab: tSumma; // вх.задолж.: За работником (13)
+    UderNDFL: tSumma; // удержано: НДФЛ (14)
+    UderAvans: tSumma; // удержано: аванс (15)
+    UderRazVypl: tSumma; // удержано: разовые выплаты (16)
+    UderOther: tSumma; // удержано: оплата гост., оплата путевок, подотчетн. суммы (17)
+    UderProfVz: tSumma; // удержано: проф. взносы (18)
+    UderTotal: tSumma; // удержано: всего (-)
+    OutZadOrg: tSumma; // исх.задолж.: За организацией (19)
+    OutZadRab: tSumma; // исх.задолж.: За работником (20)
+    PerToBank: tSumma; // удержано: перечислено з/п в банк (-)
+    ToPay: tSumma; // К выплате (21)
+    NachByProj: tSumma; // Начислено по проекту, руб. (23)
+
+  #include GP_Log.var
+
+  window winParam '#(GPNam)' DoAccept, EscClose, Gray;
+    show at (,, 74, 7);
+
+    screen scrParam ('',, sci1EnEsc);
+    fields
+      pMonth ('Месяц'):
+       [LIST
+         1 'Январь',
+         2 'Февраль',
+         3 'Март',
+         4 'Апрель',
+         5 'Май',
+         6 'Июнь',
+         7 'Июль',
+         8 'Август',
+         9 'Сентябрь',
+         10 'Октябрь',
+         11 'Ноябрь',
+         12 'Декабрь'
+       ], protect;
+      pYear ('Год отчетного периода'): noprotect, SpinButton [1, 1, 9999];
+      vPlan.Name ('Группа заказа',, sci13EnEsc): protect;
+      //MnPlan.Number ('Код заказа',, sci13EnEsc): protect;
+      pSignerGrp ('Группа подписантов',, sci13EnEsc): protect;
+    buttons
+      cmOk,,, 'Ввод - принять выбор',,sci1Esc;
+      cmCancel,,, 'Отмена',,sci1Esc;
+    <<
+
+`Отчетный период     `.@@@@@@@@@@@.@@@@@ года
+`Госзаказ            `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+!`Заказ               `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Группа подписантов  `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+                        <.  ~O~K  .> <.О~т~мена.>
+    >>
+    end;
+
+    handleEvent
+      cmPick:
+        case CurField of
+          #vPlan.Name:
+          {
+             var _cVPlan: tNRec;
+             _cVPlan := pOrderGrp;
+             if (RunInterFace('GrvPlan', _cVPlan, 0, 17) != cmCancel)
+               set pOrderGrp := _cVPlan;
+          }
+          /*
+          #MnPlan.Number:
+          {
+             var _cMnPlan: tNRec;
+             _cMnPlan := pOrder;
+             if (iGetKau.GetCodeKau(cgiPick, cgKau_Zakaz, _cMnPlan) != 0)
+               set pOrder := _cMnPlan;
+          }
+          */
+          #pSignerGrp:
+            if (iFeeSigners.RunMainWindow(1))
+              set pSignerGrp := iFeeSigners.GetFeeSignersName;
+        end;
+      cmOk:
+        PutCommand(cmDefault);
+    end;
+  end;
+
+  function InitParam: boolean;
+  {
+    InitParam := False;
+    var pYearRas: integer = 0;
+    var pMonthRas: integer = 0;
+    if (not GetUserDate(pYearRas, pMonthRas, 0, ZeroDate, ZeroDate))
+      exit;
+    if (not ReadMyDsk(pMonth, '#(GPInt)_pMonth', false))
+      pMonth := pMonthRas;
+    if (not ReadMyDsk(pYear, '#(GPInt)_pYear', false))
+      pYear := pYearRas;
+    if (not ReadMyDsk(pOrderGrp, '#(GPInt)_pOrderGrp', false))
+     pOrderGrp := 0;
+    // if (not ReadMyDsk(pOrder, '#(GPInt)_pOrder', false))
+    //   pOrder := 0;
+
+    if (not ReadMyDsk(pSignerGrp, 'FeeSigners_' + To_Char(SG_CONST_REP) + '_' + SG_TAG_REP, true))
+      pSignerGrp := '';
+    InitParam := True;
+  }
+
+  procedure SaveParam;
+  {
+    SaveMyDsk(pMonth, '#(GPInt)_pMonth');
+    SaveMyDsk(pYear, '#(GPInt)_pYear');
+    SaveMyDsk(pOrderGrp, '#(GPInt)_pOrderGrp');
+    // SaveMyDsk(pOrder, '#(GPInt)_pOrder');
+    SaveMyDsk(pSignerGrp, 'FeeSigners_' + To_Char(SG_CONST_REP) + '_' + SG_TAG_REP);
+  }
+
+  function AskParam: boolean;
+  {
+    AskParam := False;
+    if (not InitParam)
+      exit;
+    if (RunWindowModal(winParam) = cmDefault)
+    {
+      AskParam := True;
+      SaveParam;
+    }
+  }
+
+  /*
+  function LSInfo: string;
+  {
+    result := '(Таб.№ ' + GetStrTabn(Lschet.TabN, Lschet.StrTabn) + ' ' + Persons.FIO + ')';
+  }
+  */
+
+  procedure PrepareData;
+  {
+    IsAborted := false;
+
+    pBegDate := To_Date(1, pMonth, pYear);
+    pEndDate := To_Date(Last_Day(pBegDate), pMonth, pYear);
+
+    oGP_Log.SetVerboseMode(true);
+
+    #ifdef __DEBUG__
+    oGP_Log.Info('#(GPNam) за ' + DateToStr(To_Date(1, pMonth, pYear), 'month YYYY') + ' года');
+    #end
+
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Построение списка работников...', 1);
+    _loop GP_RaspAvans where ((0 == GP_RaspAvans.IsArh and pOrderGrp == GP_RaspAvans.CVPLAN (noIndex)))
+    {
+       if (GP_RaspAvans.Datan > pEndDate)
+         continue;
+       if (GP_RaspAvans.DataOk != ZeroDate and GP_RaspAvans.DataOk < pBegDate)
+         continue;
+       if (getFirst SData where ((GP_RaspAvans.cLSchet == SData.cLSchet)) = tsOk)
+         continue;
+       // ClearBuffer(#SData); // Чистить нет нужды - все поля присваиваются
+       SData.cLSchet := GP_RaspAvans.cLSchet;
+       SData.TabN := GP_RaspAvans.TabN;
+       SData.StrTabN := GP_RaspAvans.StrTabN;
+       SData.PartProc := GP_RaspAvans.Procent;
+       if (insert current SData != tsOk)
+         oGP_Log.Error('Не удалось вставить запись в таблицу SData');
+    }
+    StopVisual('', 0);
+  }
+
+  // Обработка одной оплаты
+  #ifdef __DEBUG__
+  procedure ProcessOpl(Prefix: String; M: Byte; Y: Word; VidOplS: Word; DB: Date; DE: Date; Sum: Double; Days: Double; Hours: Double); 
+  #else
+  procedure ProcessOpl(VidOplS: Word; Sum: Double); 
+  #end
+  {
+    if getFirst KlVidOpl where ((VidOplS == KlVidOpl.VidOpl)) != tsOk then
+    begin
+      oGP_Log.Error('Оплата с сист. кодом ' + To_Char(VidOplS) + ' не найдена в классификаторе видов оплат');
+      exit;
+    end;
+    #ifdef __DEBUG__
+    oGP_Log.Info(' ' + Prefix + ': за ' + DateToStr(Date(1, M, Y), 'MM.YYYY') + 
+     ' ' + To_Char(KlVidOpl.VidOplP) +
+     ' Сумма: ' + To_Char(Sum, 0, 2) +
+     ' С ' + DateToStr(DB, 'DD.MM') +
+     ' по ' + DateToStr(DE, 'DD.MM') +
+     ' Дней: ' + To_Char(Days, 0, 2) +
+     ' Часов: ' + To_Char(Hours, 0, 2));
+    #end
+    case KlVidOpl.VidOplP of
+      1..3: 
+        NachOklad += Sum; // начислено: оклад (4)
+      6..7, 51..57, 62, 65, 68, 75, 91, 98:
+        NachNadb += Sum; // начислено: надбавки (5)
+      21..38:
+        NachPremia += Sum; // начислено: премия (6)
+      5, 140: NachCommand += Sum; // начислено: командировка (7)
+      111..133:
+        NachOtp += Sum; // начислено: отпуск (8)
+      83, 84:
+        NachPos3Days += Sum; // начислено: пособие за 3 дня (9)
+      189:
+        InZadOrg += Sum; // вх.задолж.: За организацией (12)
+      else
+        NachOther += Sum; // начислено: другие доходы (10)
+    end;
+  }
+
+  // Обработка одной оплаты
+  #ifdef __DEBUG__
+  procedure ProcessUd(Prefix: String; M: Byte; Y: Word; VidUdS: Word; DB: Date; DE: Date; Sum: Double); 
+  #else
+  procedure ProcessUd(VidUdS: Word; Sum: Double); 
+  #end
+  {
+    if getFirst KlVidUd where ((VidUdS == KlVidUd.VidUd)) != tsOk then
+    begin
+      oGP_Log.Error('Удержание с сист. кодом ' + To_Char(VidUdS) + ' не найдена в классификаторе удержанией');
+      exit;
+    end;
+    #ifdef __DEBUG__
+    oGP_Log.Info(' ' + Prefix + ': за ' + DateToStr(Date(1, M, Y), 'MM.YYYY') + 
+     ' ' + To_Char(KlVidUd.VidUdP) +
+     ' Сумма: ' + To_Char(Sum, 0, 2) +
+     ' С ' + DateToStr(DB, 'DD.MM') +
+     ' по ' + DateToStr(DE, 'DD.MM'));
+    #end
+    case KlVidUd.VidUdP of
+      213: // сист. 182 
+        UderNDFL += Sum; // удержано: НДФЛ (14)
+      225, 226:
+        UderAvans += Sum; // удержано: аванс (15)
+      227, 253:
+        UderRazVypl += Sum; // удержано: разовые выплаты (16)
+      214:
+        UderProfVz += Sum; // удержано: проф. взносы (18)
+      211:
+        InZadRab += Sum; // вх.задолж.: За работником (13)
+      171:
+        OutZadOrg += Sum; // исх.задолж.: За организацией (19)
+      500:
+        PerToBank += Sum; // К выплате (21)
+      else
+        UderOther += Sum; // удержано: оплата гост., оплата путевок, подотчетн. суммы (17)
+    end;
+  }
+
+  procedure ClearRecData;
+  {
+    NachOklad := 0;
+    NachNadb := 0;
+    NachPremia := 0;
+    NachCommand := 0;
+    NachOtp := 0;
+    NachPos3Days := 0;
+    NachOther := 0;
+    InZadOrg := 0;
+    InZadRab := 0;
+    UderNDFL := 0;
+    UderAvans := 0;
+    UderRazVypl := 0;
+    UderOther := 0;
+    UderProfVz := 0;
+    PerToBank := 0;
+    OutZadOrg := 0;
+    OutZadRab := 0;
+  }
+
+  procedure CalcRecData;
+  {
+    #ifdef __DEBUG__
+    oGP_Log.Info('');
+    oGP_Log.Info('Таб.№ ' + GetStrTabN(SData.TabN, SData.StrTabN) + ' ' + Persons.FIO);
+    #end
+    ClearRecData;
+    // Оплаты, начисленные в текущем месяце
+    _loop Nachisl where((
+          LSchet.NRec == Nachisl.cLSch
+      and pYear       == Nachisl.YearN
+      and pMonth      == Nachisl.MesN
+    ))
+    {
+      #ifdef __DEBUG__
+      ProcessOpl('ТО', Nachisl.Mes, Nachisl.YearK, Nachisl.VidOplS, Nachisl.DataN, Nachisl.DatOk,
+       Nachisl.Summa, Nachisl.KolDn, Nachisl.ChasF);
+      #else
+      ProcessOpl(Nachisl.VidOplS, Nachisl.Summa);
+      #end
+    }
+    // Оплаты, начисленные в прошлых месяцах
+    _loop SumVidOp where((
+          LSchet.NRec == SumVidOp.cLSch
+      and pYear       == SumVidOp.YearN
+      and pMonth      == SumVidOp.MesN
+    ))
+    {
+      #ifdef __DEBUG__
+      ProcessOpl('ПО', SumVidOp.Mes, SumVidOp.YearK, SumVidOp.VidOpl, SumVidOp.DataN, SumVidOp.DatOk,
+       SumVidOp.Summa, SumVidOp.KolDn, SumVidOp.ChasF);
+      #else
+      ProcessOpl(SumVidOp.VidOpl, SumVidOp.Summa);
+      #end
+    }
+    // RM #2458, замечание от 09.07.2018 - суммы неначисленные в этой форме не учитываются
+    // Суммы неначисленные
+    /*
+    _loop NeNach where((
+          LSchet.NRec == NeNach.cLSch
+      and pYear       == NeNach.YearN
+      and pMonth      == NeNach.MesN
+    ))
+    {
+      #ifdef __DEBUG__
+      ProcessOpl('НО', NeNach.Mes, NeNach.YearK, NeNach.VidOplS, NeNach.DataN, NeNach.DatOk,
+       NeNach.Summa, NeNach.KolDn, NeNach.ChasF);
+      #else
+      ProcessOpl(NeNach.VidOplS, NeNach.Summa);
+      #end
+    }
+    */
+    // Удержания, удержанные в текущем месяце
+    _loop Uder where((
+          pYear       == Uder.YearN
+      and pMonth      == Uder.MesN
+      and LSchet.NRec == Uder.cLSch
+    ))
+    {
+      #ifdef __DEBUG__
+      ProcessUd('ТУ', Uder.Mes, Uder.YearK, Uder.VidUdS, Uder.DataN, Uder.DatOk, Uder.SumUd);
+      #else
+      ProcessUd(Uder.VidUdS, Uder.SumUd);
+      #end
+    }
+    // Удержания, удержанные в прошлых месяцах
+    _loop SumVidUd where((
+          LSchet.NRec == SumVidUd.cLSch
+      and pYear       == SumVidUd.YearN
+      and pMonth      == SumVidUd.MesN
+    ))
+    {
+      #ifdef __DEBUG__
+      ProcessUd('ПУ', SumVidUd.Mes, SumVidUd.YearK, SumVidUd.VidUd, SumVidUd.DataN, SumVidUd.DatOk, SumVidUd.SumUd);
+      #else
+      ProcessUd(SumVidUd.VidUd, SumVidUd.SumUd);
+      #end
+    }
+    // начислено: всего (11)
+    NachTotal := NachOklad + NachNadb + NachPremia + NachCommand + NachOtp + NachPos3Days + NachOther;
+    // удержано: всего (-)
+    UderTotal := UderNDFL + UderAvans + UderRazVypl + UderOther + UderProfVz;
+    // На руки - расчетная сумма
+    var ToPayCalc: tSumma = InZadOrg - InZadRab + NachTotal - UderTotal - OutZadOrg;
+    // Если удержано больше, чем начислено, образуется задолженность за работником на конец месяца
+    if (ToPayCalc < 0)
+    {
+      // К выплате (21)
+      ToPay := 0;
+      // исх.задолж.: За работником (20)
+      OutZadRab := Abs(ToPay); 
+    }
+    else
+      // К выплате (21)
+      ToPay := ToPayCalc;
+    // Начислено по проекту, руб. (23)
+    if (ToPay > 0)
+      NachByProj := Round(ToPay * SData.PartProc * 0.01, 0);
+    else
+      NachByProj := 0;
+    #ifdef __DEBUG__
+    oGP_Log.Info(' Вх.задолженность: за организацией: ' + To_Char(InZadOrg, 0, 2) + ' за работником: ' + To_Char(InZadRab, 0, 2));
+    oGP_Log.Info(' Итого начислено: ' + To_Char(NachTotal, 0, 2));
+    oGP_Log.Info(' Итого удержано: ' + To_Char(UderTotal, 0, 2));
+    oGP_Log.Info(' Перечислено з/п банк: ' + To_Char(PerToBank, 0, 2));
+    oGP_Log.Info(' На руки (расчетная сумма): ' + To_Char(ToPayCalc, 0, 2));
+    oGP_Log.Info(' На руки: ' + To_Char(ToPay, 0, 2));
+    oGP_Log.Info(' Исх.задолженность: за организацией: ' + To_Char(OutZadOrg, 0, 2) + ' за работником: ' + To_Char(OutZadRab, 0, 2));
+    #end
+  }
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  var
+    // Переменные для работы с Excel
+    RecCnt: longint; // Количество строк в отчёте
+    FirstCol: longint; // Номер первой колонки отчёта
+    LastCol: longint; // Номер последней колонки отчёта
+    FirstHeadRow: longint; // Номер первой строки шапки отчёта
+    LastHeadRow: longint; // Номер последней строки шапки отчёта
+    FirstBodyRow: longint; // Номер первой строки тела отчёта
+    LastBodyRow: longint; // Номер последней строки отчёта
+
+  // Исключение для генерации ошибок, связанных с выводом в Excel файл
+  exception ExOnExecelError;
+
+  // Генерирует ошибку, связанную с выводом в Excel файл
+  procedure ExcelError(ErrCode: word; AddInfo: string);
+  {
+    var ErrText: string;
+    case ErrCode of
+      XE_BAD_OP:
+        ErrText := 'не удалось выполнить операцию с Excel-файлом';
+      XE_CREATE_FILE:
+        ErrText := 'не удалось создать файл';
+      XE_OPEN_FILE:
+        ErrText := 'не удалось открыть файл';
+      XE_INIT_FILE:
+        ErrText := 'не удалось инициализировать Excel';
+      XE_CREATE_MATRIX:
+        ErrText := 'не удалось создать матрицу';
+      XE_OUT_MATRIX:
+        ErrText := 'не удалось вывести матрицу в отчёт';
+      XE_WRITE_TO_MATRIX:
+        ErrText := 'не удалось записать значение в матрицу';
+      XE_WRONG_TEMPLATE:
+        ErrText := 'в xlt шаблоне не найден лист с именем';
+      XE_FORMAT_CELL:
+        ErrText := 'не удалось отформатировать ячейку';
+      XE_SET_CELL_VALUE:
+        ErrText := 'не удалось записать значение в ячейку';
+      XE_RUN_MACRO:
+        ErrText := 'не удалось запустить макрос';
+      XE_ADD_SHEET:
+        ErrText := 'не удалось добавить вкладку';
+      XE_DEL_SHEET:
+        ErrText := 'не удалось удалить вкладку';
+      XE_RENAME_SHEET:
+        ErrText := 'не удалось переименовать вкладку';
+      XE_FREE_MATRIX:
+        ErrText := 'не удалось освободить матрицу';
+      XE_SET_CELL_FORMULA:
+        ErrText := 'не удалось записать формулу';
+    else
+      ErrText := '';
+    end;
+    oGP_Log.Error(ErrText + ' ' + AddInfo);
+    _raise ExOnExecelError;
+  }
+
+  // Эта Функция делает более удобной проверку результата операции с Excel
+  // Первым параметром передаем функцию, которая работает с Excel, а вторым и третьим - информацию об ошибке,
+  // которая будет выведена, если эта функция вернёт false (т.е. выполнится с ошибкой)
+  procedure xlOp(IsCorrect: Boolean; ErrCode: word; AddInfo: string);
+  {
+    if (not IsCorrect)
+      ExcelError(ErrCode, AddInfo);
+  }
+
+  // Создаёт Excel файл и создаёт в нём вкладки для вывода отчёта
+  procedure PrepareExcelFile(OutFileName: string);
+  {
+    if (ExistFile(OutFileName))
+      DeleteFile(OutFileName);
+    SetVisualHeader('Создание Excel-файла...');
+    // Создаем файл Excel
+    xlOp(xlCreateExcel(OutFileName, True), XE_CREATE_FILE, OutFileName);
+    xlOp(xlIsExcelValid, XE_INIT_FILE, '');
+    // Переименуем вкладки
+    // Если в отчете меньше вкладок, чем нам нужно добавим недостающие
+    var TabCnt: word = 0;
+    xlOp(xlGetSheetsCount(TabCnt), XE_ADD_SHEET, '');
+    while TabCnt < TAB_CNT do
+    {
+      xlOp(xlAddSheet, 11, '');
+      TabCnt++;
+    }
+    // Если в больше вкладок, чем нам нужно, удалим лишние
+    while TabCnt > TAB_CNT do
+    {
+      xlOp(xlDeleteSheet(1), XE_DEL_SHEET, '');
+      TabCnt--;
+    }
+    // Переименуем вкладки
+    xlOp(xlSetSheetName(1, TAB_TITLE_1), XE_RENAME_SHEET, '');
+  }
+
+  procedure OutTitle(var R: longint);
+  {
+    // Название собственной организации
+    xlOp(xlSetCellStringValue(Trim(sGetTune('MYORG')), R, 1, R, 1), XE_SET_CELL_VALUE, '');
+    // Название фильтра по подразделению
+    // xlOp(xlSetCellStringValue(FiltrPodr, ++R, 1, R, 1), XE_SET_CELL_VALUE, '');
+    // Выводим заголовок
+    xlOp(xlSetCellStringValue(REP_TITLE + ' по гос.заказу "' + vPlan.Name + '" за ' +
+     DateToStr(To_Date(1, pMonth, pYear), 'month YYYY') + ' года', ++R, 1, R, 1), XE_SET_CELL_VALUE, '');
+    // сделаем его жирным
+    xlOp(xlSetFontStyle(xlBold, R, 1, R + 1, 1), XE_FORMAT_CELL, '');
+    // и крупным
+    xlOp(xlSetFontSize(12, R, 1, R + 1, 1), XE_FORMAT_CELL, '');
+    R++;
+  }
+
+  // Вывод шапки отчёта
+  procedure OutHeader(var R: longint);
+  {
+    SetVisualHeader('Форматирование Excel-файла...');
+    FirstCol := 1;
+
+    var C: word = FirstCol - 1;
+    // ПП (1)
+    xlOp(xlSetCellStringValue('ПП', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(6, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlMergeCells(R, C, R + 3, C), XE_FORMAT_CELL, '');
+    // Таб.№ (2)
+    xlOp(xlSetCellStringValue('Таб.№', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(8, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlMergeCells(R, C, R + 3, C), XE_FORMAT_CELL, '');
+    // Ф И О (3)
+    xlOp(xlSetCellStringValue('Ф И О', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(20, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlMergeCells(R, C, R + 3, C), XE_FORMAT_CELL, '');
+
+    // Начислено, руб. (4 - 11)
+    xlOp(xlSetCellStringValue('Начислено, руб.', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R, C + 7), XE_FORMAT_CELL, '');
+    // За сентябрь 2016 г (по видам оплат) (4 - 10)
+    xlOp(xlSetCellStringValue('За ' + DateToStr(To_Date(1, pMonth, pYear), 'month YYYY') + 
+     ' г. (по видам оплат)', R + 1, C, R + 1, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 1, C, R + 1, C + 6), XE_FORMAT_CELL, '');
+    // оклад (4)
+    xlOp(xlSetCellStringValue('оклад', R + 2, C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // надбавки (5)
+    xlOp(xlSetCellStringValue('надбавки', R + 2, ++C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // премия (6)
+    xlOp(xlSetCellStringValue('премия', R + 2, ++C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // командировка (7)
+    xlOp(xlSetCellStringValue('команди-ровка', R + 2, ++C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // отпуск (8)
+    xlOp(xlSetCellStringValue('отпуск', R + 2, ++C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // пособие за 3 дня (б/лист) (9)
+    xlOp(xlSetCellStringValue('пособие за 3 дня', R + 2, ++C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // другие доходы (10)
+    xlOp(xlSetCellStringValue('другие доходы', R + 2, ++C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // всего (11)
+    xlOp(xlSetCellStringValue('всего', R + 2, ++C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 1, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+
+    // Сумма, руб. (12 - 13)
+    xlOp(xlSetCellStringValue('Сумма задолженности на начало месяца, руб.', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R + 1, C + 1), XE_FORMAT_CELL, '');
+    // За организацией (12)
+    xlOp(xlSetCellStringValue('За органи-зацией', R + 2, C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R + 2, C, R + 2, C), XE_FORMAT_CELL, '');
+    // За работником (13)
+    xlOp(xlSetCellStringValue('За работ-ником', R + 2, ++C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R + 2, C, R + 2, C), XE_FORMAT_CELL, '');
+
+    // Удержано и зачтено, руб. (14 - 18)
+    xlOp(xlSetCellStringValue('Удержано и зачтено, руб.', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R, C + 4), XE_FORMAT_CELL, '');
+    // НДФЛ (14)
+    xlOp(xlSetCellStringValue('НДФЛ', R + 1, C, R + 1, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 1, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // аванс (15)
+    xlOp(xlSetCellStringValue('аванс', R + 1, ++C, R + 1, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 1, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // разовые выплаты (16)
+    xlOp(xlSetCellStringValue('разовые выплаты', R + 1, ++C, R + 1, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 1, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // оплата гост., оплата путевок, подотчетн.суммы (17)
+    xlOp(xlSetCellStringValue('оплата гост., оплата путевок, подотчетн. суммы', R + 1, ++C, R + 1, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 1, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // проф.взносы (18)
+    xlOp(xlSetCellStringValue('проф. взносы', R + 1, ++C, R + 1, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 1, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+
+    // Сумма, руб. (19 - 20)
+    xlOp(xlSetCellStringValue('Сумма задолженности на конец месяца, руб.', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R + 1, C + 1), XE_FORMAT_CELL, '');
+    // За организацией (19)
+    xlOp(xlSetCellStringValue('За органи-зацией', R + 2, C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+    // За работником (20)
+    xlOp(xlSetCellStringValue('За работ-ником', R + 2, ++C, R + 2, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 2, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+
+    // К выплате (21)
+    xlOp(xlSetCellStringValue('К выплате', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+
+    // % участия (22)
+    xlOp(xlSetCellStringValue('% участия', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+
+    // Начислено по проекту, руб. (23)
+    xlOp(xlSetCellStringValue('Начислено по проекту, руб.', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R, C, R + 3, C), XE_FORMAT_CELL, '');
+    xlOp(xlSetColumnWidth(12, R, C, R, C), XE_FORMAT_CELL, '');
+
+    LastCol := C;
+
+    var i: byte = 0;
+    for(C := FirstCol; C <= LastCol; C++)
+    {
+      xlOp(xlSetCellNumberValue(++i, LastHeadRow, C, LastHeadRow, C), XE_SET_CELL_VALUE, '');
+    }
+
+    // Выравниваем содержимое ячеек шапки по верхнему краю и по центру
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, FirstCol, LastHeadRow, LastCol), XE_FORMAT_CELL, '');
+    // Устанавливаем текстовый формат для всех ячеек шапки
+    xlOp(xlSetNumberFormat('@', FirstHeadRow, FirstCol, LastHeadRow, LastCol), XE_FORMAT_CELL, '');
+    // Делаем шрифт шапки жирным
+    xlOp(xlSetFontStyle(xlBold, FirstHeadRow, FirstCol, LastHeadRow - 1, LastCol), XE_FORMAT_CELL, '');;
+    // Увеличиваем высоту шапки
+    xlOp(xlSetRowHeight(45, LastHeadRow - 1, FirstCol, LastHeadRow - 1, LastCol), XE_FORMAT_CELL, '');
+
+    // Для всех ячеек в форме включаем перенос слов
+    xlOp(xlWrapText(FirstHeadRow, FirstCol, LastHeadRow, LastCol), XE_FORMAT_CELL, '');
+    // Рисуем границы ячеек для шапки
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0, 
+     FirstHeadRow, FirstCol, LastHeadRow, LastCol), XE_FORMAT_CELL, '');
+
+    // Задаем текстовый формат для табельного номера и фамилии
+    xlOp(xlSetNumberFormat('@', FirstBodyRow, FirstCol + 1, LastBodyRow + 1, FirstCol + 2), XE_FORMAT_CELL, '');
+    // Выровняем таб.№ по центру
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, FirstBodyRow, FirstCol + 1, LastBodyRow + 1, FirstCol + 1), XE_FORMAT_CELL, '');
+    // Задаем формат с двумя знаками после запятой для всех полей с суммами (кроме "Начислено по проекту, руб.")
+    xlOp(xlSetNumberFormat(SumFormat2D, FirstBodyRow, FirstCol + 3, LastBodyRow + 1, LastCol - 1), XE_FORMAT_CELL, '');
+
+    R += 5;
+  }
+
+  // Преобразовывает номер колонки Excel в буквенный код
+  function xlColCode(C: longint): string;
+  {
+    xlColCode := '';
+    do
+    {
+      xlColCode := Chr(65 + (C - 1) mod 26) + xlColCode;
+      C := (C - 1) div 26;
+    }
+    While (C > 0);
+  }
+
+  // Формирует формулу для подсчёта итогов
+  function GetTotalFormula(RTop, RBottom, Col: longint): string;
+  {
+    var ColCode: string = xlColCode(Col);
+    // result := '=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;' + ColCode + To_Char(RTop) + ':' + ColCode + To_Char(RBottom);
+    result := '=СУММ(' + ColCode + To_Char(RTop) + ':' + ColCode + To_Char(RBottom);
+  }
+
+  procedure OutTotals(var R: longint);
+  {
+    var C: word = FirstCol - 1;
+    // Ф И О
+    xlOp(xlMergeCells(R, ++C, R, C + 2), XE_FORMAT_CELL, '');
+    xlOp(xlSetCellStringValue('ИТОГО', R, C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlAlignCellsEx(xlRight, xlTop, R, C, R, C), XE_FORMAT_CELL, '');
+    // Итоги по всем колонкам, начиная с 4-й
+    for(C := FirstCol + 3; C <= LastCol; C++)
+    {
+      // По колонке % участия итог не нужен
+      if (C = LastCol - 1)
+        continue;
+      xlOp(xlSetCellFormula(GetTotalFormula(FirstBodyRow, LastBodyRow, C), R, C, R, C), XE_SET_CELL_FORMULA, '');
+    }
+
+    // Рисуем границы ячеек
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0,
+     FirstBodyRow, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    R++;
+  }
+
+  // Вывод тела отчёта
+  procedure OutBody(var R: longint);
+  {
+    SetVisualHeader('Вывод данных в отчет...');
+
+    var NPP: longint = 0;
+    _loop SData
+    {
+      if (IsAborted)
+        break;
+      NextVisual;
+      NPP++;
+
+      CalcRecData;
+
+      var C: word = FirstCol - 1;
+
+      // ПП (1)
+      xlOp(xlSetCellNumberValue(NPP, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Таб.№ (2)
+      xlOp(xlSetCellStringValue(GetStrTabN(SData.TabN, SData.StrTabN), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Ф И О (3)
+      xlOp(xlSetCellStringValue(GetSurnameWithInitials(Persons.FIO), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // начислено: оклад (4)
+      xlOp(xlSetCellNumberValue(NachOklad, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // начислено: надбавки (5)
+      xlOp(xlSetCellNumberValue(NachNadb, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // начислено: премия (6)
+      xlOp(xlSetCellNumberValue(NachPremia, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // начислено: командировка (7)
+      xlOp(xlSetCellNumberValue(NachCommand, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // начислено: отпуск (8)
+      xlOp(xlSetCellNumberValue(NachOtp, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // начислено: пособие за 3 дня (9)
+      xlOp(xlSetCellNumberValue(NachPos3Days, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // начислено: другие доходы (10)
+      xlOp(xlSetCellNumberValue(NachOther, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // начислено: всего (11)
+      xlOp(xlSetCellNumberValue(NachTotal, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // вх.задолж.: За организацией (12)
+      xlOp(xlSetCellNumberValue(InZadOrg, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // вх.задолж.: За работником (13)
+      xlOp(xlSetCellNumberValue(InZadRab, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // удержано: НДФЛ (14)
+      xlOp(xlSetCellNumberValue(UderNDFL, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // удержано: аванс (15)
+      xlOp(xlSetCellNumberValue(UderAvans, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // удержано: разовые выплаты (16)
+      xlOp(xlSetCellNumberValue(UderRazVypl, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // удержано: оплата гост., оплата путевок, подотчетн. суммы (17)
+      xlOp(xlSetCellNumberValue(UderOther, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // удержано: проф. взносы (18)
+      xlOp(xlSetCellNumberValue(UderProfVz, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // исх.задолж.: За организацией (19)
+      xlOp(xlSetCellNumberValue(OutZadOrg, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // исх.задолж.: За работником (20)
+      xlOp(xlSetCellNumberValue(OutZadRab, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // К выплате (21)
+      xlOp(xlSetCellNumberValue(ToPay, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // % участия (22)
+      xlOp(xlSetCellNumberValue(SData.PartProc, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      // Начислено по проекту, руб. (23)
+      xlOp(xlSetCellNumberValue(NachByProj, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      R++;
+    }
+  }
+
+  procedure OutFooter(var R: longint);
+  {
+    var D: Date = To_Date(1, pMonth, pYear);
+    D := To_Date(Last_Day(D), pMonth, pYear);
+
+    var GlBuxPosition: string = 'Главный бухгалтер';
+    var GlBuxFIO: string = '';
+    var OtvetstvPosition: string = 'Начальник отдела расчетов с персоналом';
+    var OtvetstvFIO: string = '';
+
+    // Выбираем группу подписантов
+    if oGP_Signers.Init(SG_CONST_REP, SG_TAG_REP, false, D) then
+    {
+      var S: string;
+      if oGP_Signers.GetFirst('GlBux') then // Роль = "Гл. бухгалтер"
+      {
+        S := oGP_Signers.GetPosition(1);
+        if (S != '')
+          GlBuxPosition := S;
+        GlBuxFIO := oGP_Signers.GetFIO(1, 2);
+      }
+      if oGP_Signers.GetFirst('Otvetstv') then // Роль "Ответственный"
+      {
+        S := oGP_Signers.GetPosition(1);
+        if (S != '')
+          OtvetstvPosition := S;
+        OtvetstvFIO := oGP_Signers.GetFIO(1, 2);
+      }
+    }
+    // Номер колонки для вывода фамилии зависит от макс. длины наименования должности
+    var GlBuxPositionLen: byte = Length(GlBuxPosition);
+    var OtvetstvPositionLen: byte = Length(OtvetstvPosition);
+    var L: byte = 0;
+    if (GlBuxPositionLen > OtvetstvPositionLen)
+      L := GlBuxPositionLen;
+    else
+      L := OtvetstvPositionLen;
+    var C: byte = L div 10 + 2;
+    if (C < 6)
+      C := 6;
+    // Главный бухгалтер
+    xlOp(xlSetCellStringValue(GlBuxPosition, R + 1, 1, R + 1, 1), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetCellStringValue(GlBuxFIO, R + 1, C, R + 1, C), XE_SET_CELL_VALUE, '');
+    // Начальник отдела расчетов с персоналом
+    xlOp(xlSetCellStringValue(OtvetstvPosition, R + 3, 1, R + 3, 1), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetCellStringValue(OtvetstvFIO, R + 3, C, R + 3, C), XE_SET_CELL_VALUE, '');
+    R += 4;
+  }
+
+  // Формирует отчёт
+  procedure CreateReport;
+  {
+    oGP_Log.Init('#(GPInt).log', true, true, true);
+    IsAborted := false;
+    PrepareData;
+    if (IsAborted)
+      exit;
+
+    SumFormat2D := '# ##0' + GetDecimalSeparator + '00';
+
+    RecCnt := RecordsInTable(#SData);
+    if (RecCnt = 0)
+    {
+      Message('Нет данных для формирования отчёта');
+      exit;
+    }
+
+    var OutFileName: string = GetDefaultUserPath + '#(GPNam) ' + DateToStr(To_Date(1, pMonth, pYear), 'MM.YYYY') + '.xlsx';
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+    _try
+    {
+      PrepareExcelFile(OutFileName);
+      var R: longint = 1;
+      // Выводим заголовок отчёта
+      OutTitle(R);
+      FirstHeadRow := R;
+      LastHeadRow := FirstHeadRow + 4; // Высота шапки - 5 строк
+      FirstBodyRow := LastHeadRow + 1;
+      LastBodyRow := FirstBodyRow + RecCnt - 1;
+      // Выводим шапку отчёта
+      OutHeader(R);
+      // Выводим тело отчёта
+      OutBody(R);
+      // Выводим итоги
+      OutTotals(R);
+      // Выводим подвал отчёта
+      OutFooter(R);
+    end
+    _except on ExOnExecelError, ExUserBreak:
+    {
+      IsAborted := true;
+    }
+    StopVisual('',0);
+    xlKillExcel;
+    oGP_Log.Done(true);
+  }
+
+  handleEvent
+    cmInit:
+      {
+        iFeeSigners.InitFeeSigners(SG_CONST_REP);
+        if (AskParam)
+          CreateReport;
+        abort;
+      }
+    cmDelOnProtect:
+      case CurField of
+        #vPlan.Name:
+          set pOrderGrp := 0;
+        //#MnPlan.Number:
+        //  set pOrder := 0;
+        #pSignerGrp:
+          set pSignerGrp := '';
+      end;
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_GP_GovOrdRepA implements IUserReport;
+
+interface UserReport_GP_GovOrdRepA;
+
+  procedure Run;
+  {
+    RunInterface('GP_GovOrdRepA');
+  }
+
+  function GetReportName: string;
+  {
+    result := 'Расчётная ведомость по гос.заказу (накладные)';
+  }
+
+  function GetGroupName(Level: word): string;
+  {
+    result := '';
+    case Level of
+      1: result := 'Отчеты по распределению затрат';
+    end;
+  }
+
+  function GetPriority: integer;
+  {
+    result := 0;
+  }
+
+  function VisibleInModule(Ind: byte): string;
+  {
+    result := '';
+    case Ind of
+      1: VisibleInModule := 'MENUZARP';
+    end;
+  }
+
+end.

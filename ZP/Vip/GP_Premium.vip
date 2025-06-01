@@ -1,0 +1,721 @@
+/*************************************************************************************************\
+* Наименование:  Интерфейс, формирующий бухсправку с проводками по выплате квартальных/годовых    *
+*                премий.                                                                          *
+* Контур/Модуль: Заработная плата, ФРО                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#000          |14/05/18|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include Query.vih
+#include PlporSimple.vih
+
+#component "GP_ZP"
+
+interface GP_Premium 'Формирование проводок по начислению квартальных / годовых премий' escClose, doAccept;
+show(,,35,10);
+
+const
+  PLPOR_TIDK = 10;
+  PLPOR_TIDKGAL = 10;
+end;
+
+table struct tPremium (
+  PersonsNrec: comp,
+  KatPodrNrec: comp,
+  MnPlanNrec : comp,
+  TabN       : string[20],
+  FIO        : string[60],
+  Schet      : string[21],
+  SubSchet   : string[21],
+  SumPrem    : double,
+  SumRezerv  : double
+) with index (
+  i01 = FIO
+);
+
+table struct tTaxes (
+  PersonsNrec: comp,
+  KatPodrNrec: comp,
+  MnPlanNrec : comp,
+  VidPer     : word,
+  SumPrem    : double,
+  SumRezerv  : double
+) with index (
+  i01 = PersonsNrec + KatPodrNrec + MnPlanNrec
+);
+
+var
+  _mode        : word;
+  _nachislYear : word;
+  _nachislMonth: byte;
+  _premYear    : word;
+  _premQuarter : byte;
+
+  _plporDenosch6: string;                    //значение служебного поля бухсправки для поиска существующей бухсправки по начислению премии
+  _plporNrec    : comp;
+
+  //Параметры формирования проводок по премиям
+  _cStZatr      : comp;
+  _cElZatr      : comp;
+  _cRezerv      : comp;
+  _wRezerv      : word;
+  _cVidRezerv   : comp;
+  _wVidRezerv   : word;
+  _vidOpl       : word;
+
+  //Параметры формирования проводок по налогам на премии
+  _cStZatrNal    : comp;
+  _cElZatrNal    : comp;
+  _cRezervNal    : comp;
+  _wRezervNal    : word;
+  _cVidRezervNal : comp;
+  _wVidRezervNal : word;
+  _cVidPlatBudNal: comp;
+  _wVidPlatBudNal: word;
+
+  //Прочее
+  _residual     : double;
+  _plansSchNrec : comp;
+  _plporSimple  : PlporSimple;
+
+create view
+as select tPremium.TabN
+from tPremium, KatPodr, MnPlan, tTaxes, Perech, KlVidOpl,
+     PlPor, SoprHoz, PlPor PlPor1, PlansSch, Oborot, SpKau
+where ((
+  tPremium.KatPodrNrec == KatPodr.Nrec and
+  tPremium.MnPlanNrec  == MnPlan.Nrec and
+  tPremium.PersonsNrec == tTaxes.PersonsNrec and
+  tPremium.KatPodrNrec == tTaxes.KatPodrNrec and
+  tPremium.MnPlanNrec  == tTaxes.MnPlanNrec and
+  tTaxes.VidPer        == Perech.VidPer and
+  _vidOpl              == KlVidOpl.VidOpl and
+  PLPOR_TIDK           == PlPor1.TiDk and
+  (PlPor1.Denosch6      = _plporDenosch6) and
+  _plporNrec           == PlPor.Nrec and
+  PlPor.TiDk           == SoprHoz.TipDoc and
+  PlPor.Nrec           == SoprHoz.cSoprDoc and
+  _plansSchNrec        == PlansSch.Nrec
+));
+
+//#region query qPremium
+sql query qPremium =
+select t.PersonsNrec,
+       t.KatPodrNrec,
+       t.Schet,
+       t.SubSchet,
+       t.MnplanNrec,
+       p.StrTabN as TabN,
+       p.FIO as FIO,
+       sum(SumPrem) as SumPrem,
+       sum(SumRezerv) as SumRezerv
+from ( select n.tPerson  as PersonsNrec,
+              n.Cex      as KatPodrNrec,
+              case when n.cSchetD <> '96' then n.cSchetD  else ls.cSchetD  end as Schet,
+              case when n.cSchetD <> '96' then n.cSubSchD else ls.cSubSchD end as SubSchet,
+              case when n.cSchetD <> '96' then n.cKauD[1] else ls.cKauD[1] end as MnplanNrec,
+              n.Summa    as SumPrem,
+              0          as SumRezerv
+       from NachislZakaz n
+       join LSchet ls on ls.nrec = n.cLSch
+       where n.YearN = :PremYear and n.MesN = :PremMonth and n.VidOpl = :PremVidopl
+       union all
+       select o.KauKs[2],
+              o.KodSpk,
+              case when o.DbSchetO = '000' then SubString(coalesce(BuhSchet.Schet, ''), 2, 20) else o.DbSchetO end,
+              case when o.DbSchetO = '000' then coalesce(BuhSchet.SubSch, '') else o.SubOsSch end,
+              coalesce(MnPlan.Nrec, #comp(0)),
+              0,
+              o.SumOb
+       from PlPor
+       join oborot o on o.TiDk = PlPor.TiDk and
+                        o.cSoprDoc  = PlPor.Nrec and
+                        o.cPlansSch = :PlansSchNrec and
+                        o.KrSchetK  = '96' and
+                        o.KauKs[1]  = :RezervNrec and
+                        o.KauKs[5] <> :VidRezervaSocNal
+       left join MnPlan
+         on MnPlan.Nrec = case when o.TblOs[1] = 7 then o.KauOs[1] else o.KauKs[6] end
+       left join BuhSchet
+         on BuhSchet.Nrec = case
+                              when MnPlan.wKodGr1 = 5063 then MnPlan.cAnVal1
+                              when MnPlan.wKodGr2 = 5063 then MnPlan.cAnVal2
+                              when MnPlan.wKodGr3 = 5063 then MnPlan.cAnVal3
+                              when MnPlan.wKodGr4 = 5063 then MnPlan.cAnVal4
+                              when MnPlan.wKodGr5 = 5063 then MnPlan.cAnVal5
+                              else #comp(0)
+                            end
+       where PlPor.Denosch6 = :PlporDenosch6
+      ) t
+
+      left join persons p on p.Nrec = t.PersonsNrec
+
+group by t.PersonsNrec,
+         t.KatPodrNrec,
+         t.Schet,
+         t.SubSchet,
+         t.MnplanNrec,
+         p.StrTabN,
+         p.FIO
+;
+//#endregion query qPremium
+
+//#region query qTaxes
+sql query qTaxes =
+select PersonsNrec,
+       KatPodrNrec,
+       MnPlanNrec,
+       VidPer,
+       Sum(SumPrem) as SumPrem,
+       Sum(SumRezerv) as SumRezerv
+from (
+      select p.tPerson                    as PersonsNrec,
+             p.Cex                        as KatPodrNrec,
+             coalesce(mp.nrec, #comp(0))  as MnPlanNrec,
+             p.VidPer                     as VidPer,
+             p.SumPer                     as SumPrem,
+             case
+               when (sum(p.SumPer) over (partition by p.tPerson, p.Cex, mp.Nrec)) <> 0
+               then coalesce(tTaxRezerv.Summa,0) * p.SumPer / (sum(p.SumPer) over (partition by p.tPerson, p.Cex, mp.Nrec))
+               else 0
+             end                          as SumRezerv
+      from PerevodTekZakaz p
+      join LSchet ls on ls.nrec = p.cLSch
+      left join MnPlan mp
+        on mp.nrec = case when p.cSchetD <> '96' then p.cKauD[1] else ls.cKauD[1] end
+      outer apply (
+        select
+          sum(o.SumOb) as Summa
+        from PlPor
+        join oborot o
+          on o.TiDk      = PlPor.TiDk        and
+             o.cSoprDoc  = PlPor.Nrec        and
+             o.cPlansSch = :PlansSchNrec     and
+             o.KrSchetK  = '96'              and
+             o.KauKs[1]  = :RezervNrec       and
+             o.KauKs[2]  = p.tPerson         and
+             o.KauKs[5]  = :VidRezervaSocNal
+        left join MnPlan
+          on MnPlan.Nrec = case when o.TblOs[1] = 7 then o.KauOs[1] else o.KauKs[6] end
+        where PlPor.Denosch6 = :PlPorDenosch6 and
+              MnPlan.Nrec = mp.nrec
+      ) tTaxRezerv
+      where p.VidOpl = :PremVidopl and p.YearN = :PremYear and p.MesN = :PremMonth and p.cSchetK = '69'
+     ) t
+group by PersonsNrec, KatPodrNrec, MnPlanNrec, VidPer
+;
+
+//#endregion qTaxes
+
+procedure LoadRezerv;
+{
+  var plansSchNrec: comp;
+  plansSchNrec := coGetTune('FIN.USER.CPLANSSCH');
+
+  var premVidOpl: word;
+  premVidOpl := if(_mode = 0,
+                   coGetTune('NPOEM_OWN.BU.RezervKvartPrem.VidOpl'),
+                   coGetTune('NPOEM_OWN.BU.RezervGodPrem.VidOpl'));
+
+  var rezervNrec: comp;
+  rezervNrec := if(_mode = 0,
+                   coGetTune('NPOEM_OWN.BU.RezervKvartPrem.Rezerv.Rezerv'),
+                   coGetTune('NPOEM_OWN.BU.RezervGodPrem.Rezerv.Rezerv'));
+
+  var vidRezervaSocNal: comp;
+  vidRezervaSocNal := if(_mode = 0,
+                         coGetTune('NPOEM_OWN.BU.RezervKvartPrem.Nalog.VidRezerva'),
+                         coGetTune('NPOEM_OWN.BU.RezervGodPrem.Nalog.VidRezerva'));
+
+  var plporDenosch6: string[20];
+  plporDenosch6 := if(_mode = 0, 'РезервКвПрем_', 'РезервГодПрем_') + _premYear + if(_mode = 0, '_' + _premQuarter, '');
+
+  var q: IQuery;
+  q := queryManager.createQuery(qPremium)
+                   .setParam('PremYear'        , _nachislYear)
+                   .setParam('PremMonth'       , _nachislMonth)
+                   .setParam('PremVidOpl'      , premVidOpl)
+                   .setParam('PlansSchNrec'    , plansSchNrec)
+                   .setParam('RezervNrec'      , rezervNrec)
+                   .setParam('VidRezervaSocNal', vidRezervaSocNal)
+                   .setParam('PlporDenosch6'   , plporDenosch6)
+                   .execute;
+  if q.errorCode = tsOk
+  {
+    delete all tPremium;
+    sqlCopyInto(q, #tPremium, true);
+  }
+
+  var q1: IQuery;
+  q1 := queryManager.createQuery(qTaxes)
+                   .setParam('PremYear'        , _nachislYear)
+                   .setParam('PremMonth'       , _nachislMonth)
+                   .setParam('PremVidOpl'      , premVidOpl)
+                   .setParam('PlansSchNrec'    , plansSchNrec)
+                   .setParam('RezervNrec'      , rezervNrec)
+                   .setParam('VidRezervaSocNal', vidRezervaSocNal)
+                   .setParam('PlporDenosch6'   , plporDenosch6)
+                   .execute;
+  if q1.errorCode = tsOk
+  {
+    ResetBounds(#tTaxes);
+    delete all tTaxes;
+    sqlCopyInto(q1, #tTaxes, true);
+    SetBounds(#tTaxes);
+    //Округление налогов
+    _loop tPremium
+    {
+      var residualPrem  : double = 0;
+      var roundedPrem   : double = 0;
+      var residualRezerv: double = 0;
+      var roundedRezerv : double = 0;
+      _loop tTaxes
+      {
+        roundedPrem    := round(tTaxes.SumPrem + residualPrem, 2);
+        residualPrem   += tTaxes.SumPrem - roundedPrem;
+        roundedRezerv  := round(tTaxes.SumRezerv + residualRezerv, 2);
+        residualRezerv += tTaxes.SumRezerv - roundedRezerv;
+        update current tTaxes
+        set tTaxes.SumPrem   := roundedPrem,
+            tTaxes.SumRezerv := roundedRezerv;
+      }
+    }
+  }
+
+  RereadRecord(#tPremium);
+}
+
+procedure SetOborotCommonFields;
+{
+  Oborot.TiDk       := PlPor.TiDk;
+  Oborot.TiDkGal    := PlPor.TiDkGal;
+  Oborot.cSoprDoc   := PlPor.Nrec;
+  Oborot.cSoprHoz   := SoprHoz.Nrec;
+  Oborot.cPlansSch  := PlansSch.Nrec;
+  Oborot.Descr      := PlPor.Descr;
+  Oborot.DesGr      := PlPor.DesGr;
+  Oborot.DatOb      := PlPor.DatVip;
+  Oborot.DataOt     := PlPor.DatVip;
+  Oborot.NoDok      := PlPor.NoDok;
+  Oborot.VhProp     := '+';
+}
+
+//Инициализирует глобальные переменные со значениями аналитик в проводках по начислению резерва по самому резерву и налогам.
+procedure DefineAnalit;
+{
+  var prefix: string;
+  prefix := if(_mode = '0', 'NPOEM_OWN.BU.RezervKvartPrem.', 'NPOEM_OWN.BU.RezervGodPrem.');
+
+  //РЕЗЕРВ
+  _cStZatr        := coGetTune(prefix + 'Rezerv.St_Zatr');
+
+  _cElZatr        := coGetTune(prefix + 'Rezerv.El_Zatr');
+
+  _cRezerv        := coGetTune(prefix + 'Rezerv.Rezerv');
+
+  if getfirst SpKau where ((_cRezerv == SpKau.Nrec)) = tsOk
+    _wRezerv      := SpKau.KodGrKau;
+  else
+    _wRezerv      := 10013;
+
+  _cVidRezerv   := coGetTune(prefix + 'Rezerv.VidRezerva');
+
+  if getfirst SpKau where ((_cVidRezerv == SpKau.Nrec)) = tsOk
+    _wVidRezerv   := SpKau.KodGrKau;
+  else
+    _wVidRezerv   := 10052;
+
+  //НАЛОГИ
+  _cStZatrNal   := coGetTune(prefix + 'Nalog.St_Zatr');
+
+  _cElZatrNal   := coGetTune(prefix + 'Nalog.El_Zatr');
+
+  _cRezervNal   := coGetTune(prefix + 'Nalog.Rezerv');
+
+  if getfirst SpKau where ((_cRezervNal == SpKau.Nrec)) = tsOk
+    _wRezervNal   := SpKau.KodGrKau;
+  else
+    _wRezervNal   := 10013;
+
+  _cVidRezervNal  := coGetTune(prefix + 'Nalog.VidRezerva');
+
+  if getfirst SpKau where ((_cVidRezervNal == SpKau.Nrec)) = tsOk
+    _wVidRezervNal:= SpKau.KodGrKau;
+  else
+    _wVidRezervNal:= 10052;
+
+  _cVidPlatBudNal := coGetTune(prefix + 'Nalog.VidPlatBud');
+
+  if getfirst SpKau where ((_cVidPlatBudNal == SpKau.Nrec)) = tsOk
+    _wVidPlatBudNal := SpKau.KodGrKau;
+  else
+    _wVidPlatBudNal := 10006;
+
+  _vidOpl := coGetTune(prefix + 'VidOpl');
+
+  if getfirst KlVidOpl = tsOk {}
+}
+
+procedure CreatePlPor;
+{
+  var isNewPlPor: boolean = True;
+
+  //Проверяем, существует ли созданная ранее бухсправка по начислению резерва
+  _plporDenosch6 := if(_mode = 0, 'КвПрем_', 'ГодПрем_') + _premYear + if(_mode = 0, '_' + _premQuarter, '');
+
+  if getfirst PlPor1 = tsOk
+  {
+    case Message('Изменить существующую бух. справку №' + PlPor1.NoDok + ' от ' + PlPor1.DatVip + '?'#13'' +
+                 '[Да] - заменить проводки в бух. справке;'#13'' +
+                 '[Нет] - создать новую бух. справку;'#13'' +
+                 '[Отмена] - прервать формирование проводок', mfYesNoCancel) of
+      cmYes:
+      {
+        _plporNrec := PlPor1.Nrec;
+        isNewPlPor := false;
+        delete all oborot where ((PlPor1.TiDk == Oborot.TiDk and PlPor1.Nrec == Oborot.cSoprDoc));
+      }
+
+      cmNo:
+      {
+        isNewPlPor := True;
+      }
+
+      else
+      {
+        exit;
+      }
+
+    end;
+  }
+
+  //Формируем заголовок бухсправки
+  if isNewPlPor
+  {
+    var plporDate: date;
+    plporDate := date(Last_Day(date(1,_nachislMonth,_nachislYear)), _nachislMonth, _nachislYear);
+
+    _plporNrec := _plporSimple.PlPor_InsertBSByParam(
+      _plporSimple.PlPor_GetNewNumber(PLPOR_TIDK, PLPOR_TIDKGAL, sGetTune('USER.DESCR'), plporDate),
+      comp(0),
+      PLPOR_TIDK,
+      plporDate,
+      if(_mode = 0,
+         'Квартальная премия за ' + _premQuarter + ' квартал ' + _premYear + ' года',
+         'Годовая премия за ' + _premYear + ' год '
+        ),
+      ''
+    );
+
+    if getfirst PlPor = tsOk
+      update current PlPor set PlPor.Denosch6 := _plporDenosch6;
+  }
+
+  if getfirst PlPor != tsOk
+  {
+    Message('Ошибка формирования бухгалтерской справки', error);
+    exit;
+  }
+
+  if getfirst SoprHoz != tsOk
+  {
+    Message('Ошибка формирования хозяйственной операции к бухгалтерской справке', error);
+    exit;
+  }
+
+  _plansschNrec := coGetTune('FIN.USER.CPLANSSCH');
+  if getfirst PlansSch != tsOk
+  {
+    Message('Не определен текущий план счетов', error);
+    exit;
+  }
+  var psk: string[1];
+  psk := PlansSch.Kod;
+
+  DefineAnalit;
+
+  var sumTotal: double = 0;
+
+  StartNewVisual(vtIndicatorVisual, vfBreak + vfTimer, 'Формирование бухгалтерской справки', RecordsInTable(tntPremium));
+  //Формируем проводки
+  _loop tPremium
+  {
+
+    var sumPremByRezerv: double;
+    sumPremByRezerv := if(tPremium.SumRezerv < tPremium.SumPrem, tPremium.SumRezerv, tPremium.SumPrem);
+
+    var sumDelta: double;
+    sumDelta := tPremium.SumPrem - tPremium.SumRezerv;
+
+    if sumPremByRezerv > 0
+    {
+      ClearBuffer(tnOborot);
+      SetOborotCommonFields;
+      Oborot.SchetO     := psk + '96';
+      Oborot.TblOs[1]   := _wRezerv;
+      Oborot.TblOs[2]   := cgKau_Persons;
+      Oborot.TblOs[5]   := _wVidRezerv;
+      Oborot.TblOs[6]   := cgKau_Zakaz;
+      Oborot.KauOs[1]   := _cRezerv;
+      Oborot.KauOs[2]   := tPremium.PersonsNrec;
+      Oborot.KauOs[5]   := _cVidRezerv;
+      Oborot.KauOs[6]   := tPremium.MnPlanNrec;
+      Oborot.KodSPO     := tPremium.KatPodrNrec;
+      Oborot.SchetK     := psk + '70';
+      Oborot.TblKs[1]   := cgKau_Persons;
+      Oborot.TblKs[2]   := cgKau_KlVidOpl;
+      Oborot.KauKs[1]   := tPremium.PersonsNrec;
+      Oborot.KauKs[2]   := KlVidOpl.Nrec;
+      Oborot.KodSPK     := tPremium.KatPodrNrec;
+      Oborot.SumOb      := sumPremByRezerv;
+      Oborot.DBSchetO   := '96';
+      Oborot.KrSchetK   := '70';
+      Oborot.SodPr      := 'НУ Премия';
+      insert current Oborot;
+      sumTotal += Oborot.SumOb;
+    }
+
+    if sumDelta > 0  //недостающую сумму добавляем с 70го
+    {
+      ClearBuffer(tnOborot);
+      SetOborotCommonFields;
+      Oborot.SchetO     := psk + tPremium.Schet;
+      Oborot.SubOsSch   := tPremium.SubSchet;
+      Oborot.TblOs[1]   := cgKau_Zakaz;
+      Oborot.TblOs[2]   := cgKau_Zatr;
+      Oborot.TblOs[3]   := cgKau_KaElem;
+      Oborot.TblOs[4]   := 10044;
+      Oborot.KauOs[1]   := tPremium.MnPlanNrec;
+      Oborot.KauOs[2]   := _cStZatr;
+      Oborot.KauOs[3]   := _cElZatr;
+      Oborot.KauOs[4]   := tPremium.KatPodrNrec;
+      Oborot.KodSPO     := tPremium.KatPodrNrec;
+      Oborot.SchetK     := psk + '70';
+      Oborot.TblKs[1]   := cgKau_Persons;
+      Oborot.TblKs[2]   := cgKau_KlVidOpl;
+      Oborot.KauKs[1]   := tPremium.PersonsNrec;
+      Oborot.KauKs[2]   := KlVidOpl.Nrec;
+      Oborot.KodSPK     := tPremium.KatPodrNrec;
+      Oborot.SumOb      := sumDelta;
+      Oborot.DBSchetO   := tPremium.Schet;
+      Oborot.KrSchetK   := '70';
+      insert current Oborot;
+      sumTotal += Oborot.SumOb;
+    }
+
+    _loop tTaxes
+    {
+      if getfirst Perech = tsOk {}
+
+      var oborotSodPr: string;
+      oborotSodPr := '[НалогКод:' + Perech.VidPer + ']';
+
+      var sumTaxPremByRezerv: double;
+      sumTaxPremByRezerv := if(tTaxes.SumRezerv < tTaxes.SumPrem, tTaxes.SumRezerv, tTaxes.SumPrem);
+
+      var sumTaxDelta: double;
+      sumTaxDelta := tTaxes.SumPrem - tTaxes.SumRezerv;
+
+      if sumTaxPremByRezerv > 0
+      {
+        ClearBuffer(tnOborot);
+        SetOborotCommonFields;
+        Oborot.SchetO     := psk + '96';
+        Oborot.TblOs[1]   := _wRezervNal;
+        Oborot.TblOs[2]   := cgKau_Persons;
+        Oborot.TblOs[5]   := _wVidRezervNal;
+        Oborot.TblOs[6]   := cgKau_Zakaz;
+        Oborot.KauOs[1]   := _cRezervNal;
+        Oborot.KauOs[2]   := tPremium.PersonsNrec;
+        Oborot.KauOs[5]   := _cVidRezervNal;
+        Oborot.KauOs[6]   := tPremium.MnPlanNrec;
+        Oborot.KodSPO     := tPremium.KatPodrNrec;
+        Oborot.SchetK     := psk + Perech.cSchetK;
+        Oborot.SubSchK    := Perech.cSubSchK;
+        Oborot.TblKs[1]   := _wVidPlatBudNal;
+        Oborot.TblKs[2]   := cgKau_KlVidOpl;
+        Oborot.KauKs[1]   := _cVidPlatBudNal;
+        Oborot.KauKs[2]   := KlVidOpl.Nrec;
+        Oborot.KodSPK     := tPremium.KatPodrNrec;
+        Oborot.SodPr      := oborotSodPr + ' НУ Премия';
+        Oborot.SumOb      := sumTaxPremByRezerv;
+        Oborot.DBSchetO   := '96';
+        Oborot.KrSchetK   := Perech.cSchetK;
+        insert current Oborot;
+        sumTotal += Oborot.SumOb;
+      }
+
+      if sumTaxDelta > 0  //недостающую сумму добавляем с 69го
+      {
+        ClearBuffer(tnOborot);
+        SetOborotCommonFields;
+        Oborot.SchetO     := psk + tPremium.Schet;
+        Oborot.SubOsSch   := tPremium.SubSchet;
+        Oborot.TblOs[1]   := cgKau_Zakaz;
+        Oborot.TblOs[2]   := cgKau_Zatr;
+        Oborot.TblOs[3]   := cgKau_KaElem;
+        Oborot.TblOs[4]   := 10044;
+        Oborot.KauOs[1]   := tPremium.MnPlanNrec;
+        Oborot.KauOs[2]   := _cStZatrNal;
+        Oborot.KauOs[3]   := _cElZatrNal;
+        Oborot.KauOs[4]   := tPremium.KatPodrNrec;
+        Oborot.KodSPO     := tPremium.KatPodrNrec;
+        Oborot.SchetK     := psk + Perech.cSchetK;
+        Oborot.SubSchK    := Perech.cSubSchK;
+        Oborot.TblKs[1]   := _wVidPlatBudNal;
+        Oborot.TblKs[2]   := cgKau_KlVidOpl;
+        Oborot.KauKs[1]   := _cVidPlatBudNal;
+        Oborot.KauKs[2]   := KlVidOpl.Nrec;
+        Oborot.KodSPK     := tPremium.KatPodrNrec;
+        Oborot.SodPr      := oborotSodPr;
+        Oborot.SumOb      := sumTaxDelta;
+        Oborot.DBSchetO   := tPremium.Schet;
+        Oborot.KrSchetK   := Perech.cSchetK;
+        insert current Oborot;
+        sumTotal += Oborot.SumOb;
+      }
+
+    } //_loop tTaxes
+
+    if not NextVisual break;
+  } //_loop tPremium
+
+  SoprHoz.Summa := sumTotal;
+  update current SoprHoz;
+  PlPor.SumPlat := sumTotal;
+  update current PlPor;
+
+  StopVisual('', 0);
+
+  if isNewPlPor
+    Message('Сформирована бухгалтерская справка №' + PlPor.NoDok + ' от ' + PlPor.DatVip, Information);
+  else
+    Message('Сформированы проводки по бухгалтерской справке №' + PlPor.NoDok + ' от ' + PlPor.DatVip, Information);
+}
+
+window wPremium 'Премии' escClose, doAccept;
+
+  browse brPremium;
+    show(,,,15);
+    table tPremium;
+    fields
+      tPremium.TabN      'Таб. №': [5], protect, noautosize;
+      tPremium.FIO       'ФИО': [30], protect;
+      KatPodr.Kod        'Подразделение': [5], protect, noautosize;
+      tPremium.Schet + if(tPremium.SubSchet = '', '', '.' + tPremium.SubSchet)
+                         'Счет': [5], protect, noautosize;
+      MnPlan.Number      'Заказ': [10], protect;
+      tPremium.SumPrem   'Премия': [10,2], protect;
+      tPremium.SumRezerv 'Резерв': [10, 2], protect;
+  end;
+
+  browse brTaxes;
+    show(,16,,20);
+    table tTaxes;
+    fields
+      tTaxes.VidPer    'Код налога': [10], protect;
+      Perech.NamePer   'Наименование налога': [50], protect;
+      tTaxes.SumPrem   'Сумма по премии': [10, 2], protect;
+      tTaxes.SumRezerv 'Сумма по резерву': [10, 2], protect;
+  end;
+
+  screen scReserve;
+    show(,21,,) fixed_y;
+    buttons
+      cmCreatePlPor, default;
+<<
+                          <. Сформировать бухгалтерскую справку .>
+>>
+  end;
+
+  handleevent
+
+    cmCreatePlPor: CreatePlPor;
+
+  end;
+
+end; //wPremium
+
+procedure RefreshFields;
+{
+  if _mode = 0
+  {
+    rereadrecord;
+    SetFieldState(#_premQuarter, sfVisible);
+    ShowLabel4Field(#_premQuarter);
+  }
+  else
+  {
+    ClearFieldState(#_premQuarter, sfVisible);
+    HideLabel4Field(#_premQuarter);
+    rereadrecord;
+  }
+}
+
+screen scParams;
+  fields
+    _mode: noprotect;
+    _premQuarter: noprotect, spinbutton[1, 1, 4];
+    _premYear: noprotect, spinbutton[1, 2000, 2100];
+    _nachislYear: noprotect, spinbutton[1,2000,2100];
+    _nachislMonth: noprotect, spinbutton[1,1,12];
+  buttons
+    cmOk, default;
+    cmCancel;
+<<
+
+  Вид премии       Премия за
+  (.) Квартальная` `Квартал`.@@@
+  (.) Годовая`     `Год`    .@@@@@
+
+  Анализировать начисления за
+  `Год`.@@@@@ `Месяц`.@@@@
+
+  <. Продолжить .> <. Отмена .>
+>>
+end;
+
+handleevent
+
+  cmOk:
+  {
+    LoadRezerv;
+    RunWindow(wPremium);
+  }
+
+  cmCheckField:
+  {
+    case curfield of
+      #_mode: RefreshFields;
+    end;
+  }
+
+  cmInit:
+  {
+    if not ReadMyDsk(_mode, 'GP_Premium_mode', false) _mode := 0;
+    if not ReadMyDsk(_nachislYear, 'GP_Premium_nachislYear', false) _nachislYear := Year(dGetTune('UP.ZAR.MONEY_DATE'));
+    if not ReadMyDsk(_nachislMonth, 'GP_Premium_nachislMonth', false) _nachislMonth := Month(dGetTune('UP.ZAR.MONEY_DATE'));
+
+    var d: date;
+    d := Sub_Months(Date(1, _nachislMonth, _nachislYear), 1);
+    if not ReadMyDsk(_premYear, 'GP_Premium_premYear', false) _premYear := Year(d);
+    if not ReadMyDsk(_premQuarter, 'GP_Premium_premQuarter', false) _premQuarter := case(Month(d); 1: 1, 2: 1, 3: 1, 4: 2, 5: 2, 6: 2, 7: 3, 8: 3, 9: 3; 4);
+
+    RefreshFields;
+  }
+
+  cmDone:
+  {
+    SaveMyDsk(_mode, 'GP_Premium_mode');
+    SaveMyDsk(_nachislYear, 'GP_Premium_nachislYear');
+    SaveMyDsk(_nachislMonth, 'GP_Premium_nachislMonth');
+    SaveMyDsk(_premYear, 'GP_Premium_premYear');
+    SaveMyDsk(_premQuarter, 'GP_Premium_premQuarter');
+  }
+
+end;
+
+end.

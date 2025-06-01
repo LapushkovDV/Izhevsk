@@ -1,0 +1,729 @@
+/*************************************************************************************************\
+* Наименование: Расчет табеля в Галактике и сверка с данными из Excel                             *
+* Контур/Модуль: Табельный учет                                                                   *
+* Примечание:  Нужен только на этапе импорта и сверки данных из КИС. Запускается из АРД отчетов.  *
+*              Версия для Excel с колонкой  PO                                                    *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1800         |29/12/17|Шунин А.Г.               |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+Interface GP_TABELCHECK2 'Табель. Расчет табеля в Галактике и сверка с данными из Excel c PO' gray dialog;
+show (, , 100, 15);
+
+const
+  stPlanned = 0;
+  stActual = 1;
+  hkWorking =1; // рабочие часы
+  hkEvening =2; // часы работы вечером
+  hkNight   =3; // часы работы ночью
+  hkHoliday =4; // часы работы в праздничные дни, кроме работы за отгул hkWorkingHoliday и hkWeekendHoliday
+  hkWeekend =5; // часы работы в выходные за оплату
+  hkOverwork=6; // сверхурочные
+
+  cfDisregardPeriod = 64;
+end;
+
+var
+ Counter, MaxLine, MaxCol , ii, Coli: longint;
+ pStr: string;
+
+ NrecPers: longint;
+ ExcelFileName: string;
+
+ WORKTYPE: String;
+ cLSCH: comp;
+ wSOVM : word;
+
+ KodCex: string;
+ DatNach1,DatNach2: date;
+
+ // номера колонок в Excel по заголовку
+ lRO_HOURS, lCITEZENID,lDYEAR, lDMONTH , lWORKTYPE, lSkipFlag: Longint;
+
+ xDMONTH, xDYEAR: word;
+
+ bSkipByFlag:boolean;
+ nm_file: string;
+
+
+
+table struct TabelRA
+(
+nREC:COMP,
+Kod:string,
+Name:string,
+PriznA:double,
+NameA:string
+)
+with index (VH01=kod,VH02=Name);
+
+table struct PersAv
+(
+nrec:comp,
+Line: longint,
+SOVM: word,
+fio:string,
+tabn:longint,
+DatProvTab:date,
+Datpos:date,
+DatUv:date,
+AvRasch:double,
+Otrab:double,
+Night:double,
+Holiday:double,
+Weekend:double,
+OtrabNO:double,
+OtrabNN:double,
+OtrabNO_R:string,
+OtrabNN_R:string,
+OtrabV:double,
+PlanCh:double,
+razr:word,
+tarsetka:word,
+Dolzhn:string
+)
+with index (p01=tabn, p02=fio);
+
+table struct NeyavAV
+(
+Priznak:integer,
+Kod :string     ,
+Col :longint // Колонка в шаблоне с кем сравнивать
+)
+with index (N01 = Priznak + Kod);
+ 
+create view vM
+  as
+select * from  persons, lschet, lstab, catalogs, PersAv, NeyavAv // ,movelsc
+,katpodr katpodrSynonym
+//,katpodr
+where ((KodCex == katpodrSynonym.kod));
+
+  screen createdScreen;
+    fields
+  //   KodCex ('Код подразделения'): noProtect;
+  //   katpodrSynonym.name ('Наименование подразделения'): protect;
+      bSkipByFlag: noProtect;
+      nm_file:NoProtect, PickButton;
+
+    buttons
+      cmRassch;
+<<
+
+ `Формировать`
+ (.) Cчитать все записи из Excel. Долго!`
+ (.) Считать только по флагу`
+     Флаг- ячейка в колонке R ( Cal_FLAG ) в шаблоне.
+     Если в ячейке значение 1 - делать расчет по строке.
+     Любое другое значение - пропускать строку.
+
+  Файл КИС.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+                  <. Пуск .>
+>>
+  end;
+
+
+function ReadColNumByNamesOK: boolean;
+Var str: string;
+   lCol:longint;
+{
+str := '';
+lCITEZENID  := 0; lDYEAR  := 0; lDMONTH := 0; lWORKTYPE := 0; lRO_HOURS := 0;
+
+lCol:=0;
+    while lCol <= MaxCol // по Колонкам первой строки
+    do
+    {
+      lCol++;
+
+        xlgetcellvalue(1, lCol   ,str );
+        str  := UpCase(trim( str ));
+
+            Case str of
+        'CITEZENID': lCITEZENID :=lCol;
+            'DYEAR': lDYEAR     :=lCol;
+           'DMONTH': lDMONTH    :=lCol;
+         'WORKTYPE': lWORKTYPE  :=lCol;
+         'SUM_RO_HOURS','РАБ В ВЫХ РО': lRO_HOURS  :=lCol;
+
+            end; // Case
+    }
+
+    if lCITEZENID  = 0 or lDYEAR  = 0 or lDMONTH = 0 or lWORKTYPE=0
+    {
+        message ( 'Ошибка формата файла. Не найдена колонка'
+                +''#13'CITEZENID='+ lCITEZENID
+                +''#13'DYEAR    ='+ lDYEAR
+                +''#13'DMONTH   ='+ lDMONTH
+                +''#13'WORKTYPE ='+ lWORKTYPE
+
+                );
+       ReadColNumByNamesOK := False;
+    }
+    else
+    ReadColNumByNamesOK := true;
+
+
+}
+
+Procedure FormUO;
+begin
+        clearbuffer(#NeyavAv);
+
+        NeyavAv.Priznak:=1 ;
+        NeyavAv.Kod:='К';
+        NeyavAv.COL:= 15;
+        insert current NeyavAv;
+
+        NeyavAv.Priznak:=1 ;
+        NeyavAv.Kod:='РВ';
+        NeyavAv.COL:= 13;
+        insert current NeyavAv;
+
+
+        NeyavAv.Priznak:=1 ;
+        NeyavAv.Kod:='РО';
+        NeyavAv.COL:= 20;
+        insert current NeyavAv;
+
+        NeyavAv.Priznak:=1 ;
+        NeyavAv.Kod:='С';
+        NeyavAv.COL:= 12;
+        insert current NeyavAv;
+end;
+
+procedure xlOut1(pCol:longint;pStr: string);
+{
+  xlSetCellStringValue(pStr,Counter,MaxCol+pCol,Counter,MaxCol+pCol);
+}
+#define _DateS(_Str) date(substr(#_Str,1,2),substr(#_Str,4,2),substr(#_Str,7,4))
+
+
+Function LschetFound:boolean;
+{
+
+wSOVM := 0; // основной
+if WORKTYPE='СОВМ.' wSOVM := 1;
+
+   result := true;
+                                                                                                //LSCHET.CEX  <> НПО "Энергомаш"
+   if getfirst lschet where ((persons.nrec==lschet.tperson and wSOVM == LSCHET.SOVM (noindex) and (LSCHET.CEX <> 000A000000000006h) )) <>tsok
+   {
+        if wSOVM = 0 result := False
+        else
+        {
+          wSOVM := 5; // Внешнее совместительство
+          if getfirst lschet where ((persons.nrec==lschet.tperson and wSOVM == LSCHET.SOVM (noindex) and (LSCHET.CEX <> 000A000000000006h) )) <>tsok
+          {
+              wSOVM := 3; // Внутреннее совместительство
+              if getfirst lschet where ((persons.nrec==lschet.tperson and wSOVM == LSCHET.SOVM (noindex) and (LSCHET.CEX <> 000A000000000006h) )) <>tsok
+              {
+                xlOut1( 1, 'Не найден Л/С' );
+                result := False;
+              }
+          }
+
+        }
+   }
+
+}
+
+
+HandleEvent
+
+cmInit: {
+  startNewVisual(vtRotateVisual, vfThread + vfTimer, 'Пожалуйста, подождите...', 100);
+    InitWorkingTable;
+    KodCex:='';//'0148'; в коде 017 и 968
+    insert current PersAv; //служебная запись, не обращать внимания
+    FormUO;
+  stopVisual('', 0);
+
+  if not ReadMyDsk(bSkipByFlag, 'Tabel2_bSkipByFlag',false) bSkipByFlag := True;
+  if not ReadMyDsk(nm_file    , 'Tabel2_nm_file',    false) nm_file := '';
+
+}
+
+
+cmDone:
+ DoneWorkingTable;
+
+cmCheckField:
+{
+update current PersAV;
+}
+
+
+
+/*
+
+cmSohr:
+{
+  vM.PutTableToDBF (#PersAv,'PersAv.XLS',0);
+}
+
+*/
+
+
+cmRassch:
+{
+
+ SaveMyDsk(bSkipByFlag, 'Tabel2_bSkipByFlag');
+ SaveMyDsk(nm_file    , 'Tabel2_nm_file');
+
+delete all from PersAv;
+
+
+  if nm_file <> '' then ExcelFileName := nm_file
+  else
+  {
+    ExcelFileName := 'GP_TABELCHECK2.xlsx';
+    ExcelFileName := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' + ExcelFileName ;
+  }
+
+
+  if (not ExistFile(ExcelFileName))
+  { message('Не найден шаблон файла "'+ExcelFileName+'"',error);
+    exit;
+  }
+
+  if (not xlCreateExcelWithTemplate(ExcelFileName,true))
+  { message('Ошибка создания нового файла в Excel"'+ExcelFileName+'".',error);
+    exit;
+  }
+
+    if (xlIsExcelValid) xlSetActiveSheetByName('1');
+
+    xlGetUsedRange(0,0,MaxLine,MaxCol);
+
+StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Импорт из Excel ...', MaxLine div 5);
+
+// Читаем заголовок и находим номера колонок по названию полей
+Counter:=1;
+// xlOut1( 20, STRING(_CurDateTime));
+
+
+if ReadColNumByNamesOK
+while counter < MaxLine
+do
+{
+  Counter++;
+
+  if Counter mod 5 = 0
+  if not nextvisual break;
+
+  if bSkipByFlag
+  {
+    xlgetcellvalue(Counter, 18 ,lSkipFlag );  // R Ночные 40% - пустой - пропускать 1-считать
+    if lSkipFlag <> 1 continue;
+
+  }
+  xlgetcellvalue(Counter, lCITEZENID,NrecPers );
+
+  xlgetcellvalue(Counter, lDYEAR,xDYEAR ); // TB008
+  xlgetcellvalue(Counter,lDMONTH,xDMONTH ); // TB009
+
+
+if xDYEAR = 0 or xDMONTH = 0
+{
+ xlOut1(1, 'нет даты периода');
+
+ xlOut1( 2, STRING(xDYEAR));
+ xlOut1( 3, STRING(xDMONTH));
+
+ xlOut1( 4, STRING(lDYEAR));
+ xlOut1( 5, STRING(lDMONTH));
+ continue;
+}
+
+DatNach1 := Date(            01    ,xDMONTH,xDYEAR);
+DatNach2 := Date(Last_Day(DatNach1),xDMONTH,xDYEAR);
+// признак лицевого счета основной или совмещение
+xlgetcellvalue(Counter, lWORKTYPE, WORKTYPE); WORKTYPE := UpCase(trim(WORKTYPE));
+
+cLSCH := comp(0);
+
+
+    if getfirst persons where ((NrecPers==persons.nrec))<>tsok
+    {
+      xlgetcellvalue(Counter, 7 ,pStr );    pStr := Trim(pStr);
+
+      if Instr('.', pStr) > 0
+      {
+        // Ищем по Фамилия И.О.
+
+        _Loop persons where (ExtractWord(1,pStr,' ') = ExtractWord(1,persons.fio,' ') )
+        if pStr = ( ExtractWord(1,persons.fio,' ') + ' ' + Substr(ExtractWord(2,persons.fio,' '),1,1) + '. '+ Substr(ExtractWord(3,persons.fio,' '),1,1) + '.' )
+        if LschetFound
+        {
+           cLSCH := lschet.nRec;
+           xlSetBackColor( 49407 , Counter, MaxCol+3 , Counter,  MaxCol+3);
+           break;
+        }
+
+        if cLSCH = comp(0)
+        {
+           // Берём первый попавшийся лицевой счет по Фамилия И.О.
+            _Loop persons where (ExtractWord(1,pStr,' ') = ExtractWord(1,persons.fio,' ') )
+            if pStr = ( ExtractWord(1,persons.fio,' ') + ' ' + Substr(ExtractWord(2,persons.fio,' '),1,1) + '. '+ Substr(ExtractWord(3,persons.fio,' '),1,1) + '.' )
+            if Getfirst lschet where (( Persons.nRec== lschet.tperson   and (LSCHET.CEX <> 000A000000000006h) )) = tsOK
+            {
+               cLSCH := lschet.nRec;
+
+               xlSetBackColor( 49407 , Counter, lWORKTYPE, Counter, lWORKTYPE);
+               xlSetBackColor( 49407 , Counter, MaxCol+1 , Counter,  MaxCol+3);
+
+               break;
+            }
+
+            if cLSCH = comp(0)
+            {
+              xlOut1( 1, 'Не найден сотрудник' );
+              continue;
+            }
+        }
+      }
+      else
+      {
+        // Ищем по Полному ФИО
+
+        _Loop persons where ( pStr = persons.fio )
+        if LschetFound
+        {
+           cLSCH := lschet.nRec;
+           xlSetBackColor( 49407 , Counter, MaxCol+3 , Counter,  MaxCol+3);
+           break;
+        }
+
+        if cLSCH = comp(0)
+        {
+           // Берём первый попавшийся лицевой счет по Фамилия И.О.
+            _Loop persons where ( pStr = persons.fio )
+            if Getfirst lschet where (( Persons.nRec== lschet.tperson  and (LSCHET.CEX <> 000A000000000006h)  )) = tsOK
+            {
+               cLSCH := lschet.nRec;
+
+               xlSetBackColor( 49407 , Counter, lWORKTYPE, Counter, lWORKTYPE);
+               xlSetBackColor( 49407 , Counter, MaxCol+1 , Counter,  MaxCol+3);
+
+               break;
+            }
+
+            if cLSCH = comp(0)
+            {
+              xlOut1( 1, 'Не найден сотрудник' );
+              continue;
+            }
+        }
+
+      }
+    }
+    else
+    {
+        xlOut1( 2, string(Persons.nRec,0,0) );
+        xlOut1( 3, Persons.FIO              );
+
+        if not LschetFound
+        {   // Excel из КИС есть 5 записей с ссылкой на Persons с другим LSchet.SOVM
+            // у таких сотрудников есть вторая запись в Persons c "парвильным" LSchet.SOVM
+            // Ищем запись в Persons с таким-же ФИО, но c "парвильным" LSchet.SOVM
+
+            pStr :=Persons.FIO;
+
+            _Loop persons where (pStr = Persons.FIO)
+            {
+              xlOut1( 2, string(Persons.nRec,0,0) );
+              xlOut1( 3, Persons.FIO              );
+
+              if LschetFound
+              {
+                 cLSCH := lschet.nRec;
+                 xlSetBackColor( 49407 , Counter, MaxCol+1 , Counter,  MaxCol+3);
+                 break;
+              }
+
+            }
+
+            if cLSCH = comp(0)
+            {
+               // Берём первый попавшийся
+               if Getfirst lschet where (( Persons.nRec== lschet.tperson  and (LSCHET.CEX <> 000A000000000006h) )) = tsOK
+               {
+                 cLSCH := lschet.nRec;
+                 xlSetBackColor( 49407 , Counter, lWORKTYPE, Counter, lWORKTYPE);
+                 xlSetBackColor( 49407 , Counter, MaxCol+1 , Counter,  MaxCol+3);
+
+                 // 00000FFh , Counter, lWORKTYPE, Counter, lWORKTYPE); Красный для фона темновато
+               }
+               else
+               {
+                 xlOut1( 1, 'Не найден сотрудник' );
+                 continue;
+               }
+            }
+
+        }
+        else  cLSCH := lschet.nRec
+
+    }
+
+        xlOut1( 2, string(cLSCH,0,0) );
+        xlOut1( 3, Persons.FIO       );
+
+  SetVisualHeader(counter + '/' + MaxLine + ' расчет по ' + Persons.FIO);
+
+
+
+   _Loop lschet where (( cLSCH == lschet.nRec )) // tperson and wSOVM == LSCHET.SOVM (noindex) ))
+   {
+//     if KodCex <>''
+/*
+     if getfirst katpodr where ((lschet.cex == katpodr.nrec)) <> tsok
+     {
+       xlOut1( 1, 'Нет Цеха у Lschet' );
+     }
+     else
+     {
+        KodCex:='017';
+        if substr(katpodr.kod, 1, length(KodCex)) <> KodCex
+        {
+         KodCex:='968';
+           if substr(katpodr.kod, 1, length(KodCex)) <> KodCex
+           {
+            xlOut1( 1, 'Цех не по фильтру' );
+            continue;
+           }
+        }
+     }
+         */
+         clearbuffer(#PersAv);
+         PersAv.Line:=Counter;
+         PersAv.Sovm:=lschet.Sovm;
+         PersAv.tabn:=lschet.tabn;
+         PersAv.razr:=lschet.razr;
+         PersAv.tarsetka:=lschet.codtar;
+
+        if getfirst catalogs where ((lschet.cappoint==catalogs.nrec))=tsok
+        {
+        PersAv.Dolzhn:=catalogs.name;
+        }
+
+         PersAv.nrec:=lschet.nrec;
+         PersAv.datuv:=lschet.datuv;
+         PersAv.datpos:=lschet.datpos;
+
+         PersAv.fio:=persons.fio;
+
+        if PersAv.Datuv <> date(0, 0, 0)
+        if PersAv.Datuv <= date(Last_Day(DatNach1), month(DatNach1), year(DatNach1))
+        {
+
+          xlOut1( 1, 'Сотрудник уволен' );
+          xlOut1( 6, DateToStr(PersAv.Datuv,'x_DD.MM.YYYY') );
+
+        }
+
+        xlSetCellDateValue(datNach1 ,Counter,MaxCol+4,Counter,MaxCol+4);
+        xlSetCellDateValue(datNach2 ,Counter,MaxCol+5,Counter,MaxCol+5);
+
+        if getfirst lstab where ((year(DatNach1)==lstab.yearn and month(DatNach1)==lstab.mesn and lschet.nrec==lstab.CLSCHET))=tsok
+        {
+        PersAv.DatProvTab:=LSTAB.LASTDATE;
+        }
+        else
+        {
+          xlOut1( 1, 'нет данных по табелю' );
+
+        }
+
+
+
+            if LoadWorkingTable(LSchet.Nrec, month(DatNach1), year(DatNach1)) = 0
+            {
+
+               PersAv.PlanCh := WT_GHBD(hkWorking or cfDisregardPeriod, 0, 0, stPlanned, datNach1, DatNach2) - WT_GetAbsencesHours(stActual, 'НВ', datNach1, DatNach2);
+               PersAv.Otrab  := WT_GHBD(hkWorking, 0, 0, stActual, datNach1, DatNach2);
+
+               PersAv.Night  := WT_GHBD(hkNight  , 0, 0, stActual, datNach1, DatNach2);
+               PersAv.Holiday:= WT_GHBD(hkHoliday, 0, 0, stActual, datNach1, DatNach2);
+
+//               if lRO_HOURS > 0  // Есть колонка "Раб в вых РО"
+  //             PersAv.Weekend:= WT_GHBD(hkWeekend, 0, 0, stActual, datNach1, DatNach2);
+
+                xlOut1( 1, 'Расчитано' );
+
+                xlOut1( 6, PersAv.PlanCh);
+//                    ( 7, 'Факт часов КИС' );
+                xlOut1( 8, PersAv.Otrab );
+                xlOut1( 9, PersAv.Night );
+                xlOut1(10, PersAv.Holiday);
+
+
+               //if lRO_HOURS > 0  // Есть колонка "Раб в вых РО"
+//                xlOut1(10+1, PersAv.Weekend);
+
+
+                        var dHH: double;
+                        ii := 10;
+                        _loop NeyavAv where ((1==NeyavAv.Priznak))
+                        {
+                         // if NeyavAv.Kod =  'РО'
+                         // dHH := WT_GHBD(hkWeekend, 0, 0, stActual, datNach1, DatNach2)
+                         // else
+                          dHH := WT_GetAbsencesHours(stActual, NeyavAv.Kod, datNach1, DatNach2);
+                          if NeyavAv.Kod = 'К' // в Галактике командировки К и КП
+                          dHH := dHH + WT_GetAbsencesHours(stActual, 'КП', datNach1, DatNach2);
+
+                          PersAv.OtrabNO:=PersAv.OtrabNO + dHH;
+                          ii++; xlOut1(ii, dHH);
+
+                        }
+
+
+            }
+            else
+            {
+               xlOut1( 1, 'нет данных по табелю2' );
+            }
+
+       insert current PersAv;
+  }//  _loop lschet
+
+} // while counter < MaxLine
+
+// ------------ Формулы для сравнения колонок
+
+if lRO_HOURS = 0  // Нет колонки "Раб в вых РО"
+{
+ XLSETCELLFORMULA('=RC[-8]=RC[-24]',2,35,Counter,35);
+ XLSETCELLFORMULA('=RC[-8]=RC[-19]',2,36,Counter,36);
+// XLSETCELLFORMULA('=RC[-7]=RC[-24]',2,37,Counter,37); // Выходные за оплату
+
+ XLSETCELLFORMULA('=RC[-7]=RC[-26]',2,39,Counter,39);
+ XLSETCELLFORMULA('=RC[-6]=RC[-28]',2,40,Counter,40);
+ XLSETCELLFORMULA('=И(AI2:AN2)'    ,2,41,Counter,41);
+
+}
+else
+{
+
+ XLSETCELLFORMULA('=RC[-7]=RC[-24]',2,35,Counter,35);
+ XLSETCELLFORMULA('=RC[-7]=RC[-19]',2,36,Counter,36);
+
+ XLSETCELLFORMULA('=RC[-6]=RC[-25]',2,38,Counter,38); // Выходные за оплату
+ XLSETCELLFORMULA('=RC[-5]=RC[-27]',2,39,Counter,39);
+ XLSETCELLFORMULA('=RC[-7]=RC[-20]',2,40,Counter,40);
+ XLSETCELLFORMULA('=И(RC[-6]:RC[-1])' ,2,41,Counter,41);
+
+}
+
+// ------------ Заголовки
+
+Counter := 1;
+        xlOut1( 1, 'Статус'       );
+        xlOut1( 2, 'LSCHET.nRec' );
+        xlOut1( 3, 'FIO'          );
+        xlOut1( 4, 'С'          );
+        xlOut1( 5, 'ПО'         );
+        xlOut1( 6, 'План часов ГАЛ' );
+        xlOut1( 7, 'Факт часов КИС' );
+        xlOut1( 8, 'Факт часов ГАЛ' );
+        xlOut1( 9, 'Ночные часы ГАЛ' );
+        xlOut1(10, 'Праздничный рабочие по плану ГАЛ');
+//        xlOut1(11, 'Выходные за оплату' );
+
+var Formula, FormulaItog : string;
+        ii := 10; Coli := RecordsInTable(#NeyavAv)+3;
+//        FormulaItog:= '=И(';
+        _loop NeyavAv where ((1==NeyavAv.Priznak))
+        {
+          ii++; xlOut1(ii, NeyavAv.Kod);
+
+          if NeyavAv.Col >0
+          {
+            xlOut1(Coli + ii, 'Сверка ' + NeyavAv.Kod);
+
+            Formula := '=RC['+String(-Coli)+ ']=RC['+String(NeyavAv.Col-(MaxCol+ii+Coli))+']';
+            XLSETCELLFORMULA(Formula,2,MaxCol+ii+Coli,MaxLine,MaxCol+ii+Coli);
+//            FormulaItog := FormulaItog + 'RC[' + (Coli-3-ii-10) + '];';
+           // xlSetCellStringValue(pStr,Counter,MaxCol+pCol,Counter,MaxCol+pCol);
+          }
+
+        }
+        xlOut1(ii+1, 'Факт' );
+        xlOut1(ii+2, 'Ночные' );
+        xlOut1(ii+3, 'Выходные' );
+
+        xlOut1(ii+Coli+1, 'ИТОГО' );
+        FormulaItog := '=И(RC[-'+(Coli)+']:RC[-1])';
+        FormulaItog := SubStr(FormulaItog,1,length(FormulaItog)-1) + ')';
+        XLSETCELLFORMULA(FormulaItog,2,MaxCol+ii+Coli+1,MaxLine,MaxCol+ii+Coli+1);
+
+
+
+        xlCopyToBuff(1,11,MaxLine+100,11);
+        xlPasteAllFromBuff(1,MaxCol+7,MaxLine+100,MaxCol+7);
+
+/*
+  xlSetActiveSheetByName('2');
+  xlCopyToBuff(1,1,1,41);
+  xlSetActiveSheetByName('1');
+  xlPasteAllFromBuff(1,1,1,41 );
+*/
+
+  xlSetRowHeight(55,1,1,1,1);
+  xlAlignCellsEx(xlCenter,xlCenter ,1,1,1,MaxCol+ii+Coli+1);
+  xlWrapText(1,1,1,MaxCol+ii+Coli+1);
+
+/*
+  xlDeleteRange(xlShiftToLeft, 1, 37 , MaxLine +100, 37);
+  xlDeleteRange(xlShiftToLeft, 1, 30 , MaxLine +100, 30);
+*/
+
+
+// xlDeleteSheetByName('2');
+// xlOut1( 21, STRING(_CurDateTime));
+
+xlkillExcel;
+
+
+StopVisual('',0);
+
+  reScanPanel(#PersAV);
+  if recordsInTable(#PersAV) <> 0 {
+    getFirst PersAV;
+  }
+}
+  cmPick:
+  { case CurField of
+    #nm_file:
+    { var ww_str:string=GetFileName('*.xlsx','Выберите файл c данными по Табелям из КИС');
+      if ww_str<>''
+      {
+
+
+         //if Yes=Message('Заменить шаблон этим файлом? ',YesNo)
+         {
+
+
+         }
+
+         set nm_file:=ww_str;
+      }
+    }
+    end;
+  }
+
+end;
+end.
+
+.form GP_TABELCHECKfrm2
+.nameInlist 'Табель. Расчет табеля в Галактике и сверка с данными из Excel c PO'
+.ard
+.f 'NUL'
+.begin
+ runInterface(GP_TABELCHECK2);
+ end.
+.endForm

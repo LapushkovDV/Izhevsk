@@ -1,0 +1,1383 @@
+/*************************************************************************************************\
+* Наименование: Библиотека для подготовки данных для формы Т-12                                   *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1138         |06/11/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+* Разработка  |#175          |06/11/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#87938        |16/01/25|Семичев П.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+/*
+SD-87938
+Изменение логики сохранения исходных табелей - при сохранении копии табеля происходит перезаписывание ранее
+сделанной копии, если табель находится не в закрытом периоде. Так же происходит удаление всех копий табеля по
+указанному сотруднику, за позапрошлый год и ранее (в 2025 году будут удаляться копии за 2023 и ранее)
+*/
+#include GP_FormT12.vih
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include GP_StrFunc.vih
+#include CatFunc.vih // Функции работы с каталогом
+#include WeekendMarker.vih // условное обозначение выходного
+#include AbsenceCoding.vih
+#include GP_SCUD_EventsEdit.Vih
+#doc
+Библиотека для подготовки данных для формы Т-12
+<p>#175 - интеграция со скуд
+#end
+interface GP_FormT12;
+
+  const
+    ST_SHOW_VERBOSE_LOG = 1; // Показывать подробный лог
+    MAX_ABSENCE_COUNT = 14; // Максимально кол-во неявок
+    MAX_ORDER_COUNT = 14; // Максимально кол-во заказов
+    // Предопределённые условные обозначения
+    MARK_WEEKEND = 'В'; // Выходные и праздничные дни
+    MARK_WORK_ON_WEEKEND = 'РВ'; // Работа в выходные
+    MARK_WORK_ON_WEEKEND_COMP = 'РО'; // Работа в выходные с компенсацией отпуском
+    MARK_NIGHT_WORK = 'Н'; // Работа ночью
+    MARK_OVERTIME_WORK = 'С'; // Работа по приказу на сверхурочную работу за оплату 
+    MARK_PARTIAL_WORK = 'ЛЧ'; // Не полный день по согла-ию, предусмотренный зак-м
+  end;
+
+  // Периоды по одному лицевому счету
+  table struct SPeriods
+  (
+    DBeg: Date,        // Дата с
+    DEnd: Date,        // Дата по
+    cPosition: Comp,   // Ссылка на должность
+    cTmpFormT12: Comp, // Ссылка на запись таблицы TmpFormT12
+    Kateg: Word        // Код категории
+  )
+  with index
+  (
+    SPeriods01 = DBeg
+  );
+  //---------------------------
+  var
+    pGP_SCUD_EventsEdit: GP_SCUD_EventsEdit;
+  //---------------------------
+  create view
+    var
+      pDBeg: Date;
+      pDEnd: Date;
+      pDBegPer: Date;
+      pMonth: Byte;
+      pYear: Word;
+      pSettings: Word;
+      IsAborted: Boolean;
+      pcCurLSchet: Comp;
+      pMnPlan: Comp;
+    as select TmpFormT12.*
+    from 
+      TmpFormT12 (tmpTabWorkTime03),
+      Perexod (Perexod05),
+      SPeriods (SPeriods01),
+      GP_TimeTable (GP_TimeTable02),
+      GP_SCUD_PERS,
+      synonym GP_TimeTable GP_TimeTableS
+
+    where ((
+          pcCurLSchet       == LSchet.NRec
+      and LSchet.tPerson    == Persons.NRec
+      and Lschet.tPerson == GP_SCUD_PERS.cPersons
+
+      and LSchet.NRec       == LStab.cLschet
+      and pYear             == LStab.YearN
+      and pMonth            == LStab.MesN
+
+      and LSchet.NRec       == Perexod.cLSch
+      and pDBegPer         <<= Perexod.DatIzm
+      and pDEnd            >>= Perexod.DatIzm
+
+      and pcCostSharing     == PrVidOpl.Choice
+      and LSchet.NRec       == PrVidOpl.cLSch
+      and pDBegPer          == PrVidOpl.DataN (noindex)
+      and pMnPlan           == MnPlan.Nrec
+
+      and pcCurLSchet       == GP_TimeTable.cLSchet
+      and pYear             == GP_TimeTable.YearN
+      and pMonth            == GP_TimeTable.MonthN
+    ))
+  ;
+
+  #include GP_Log.var
+  #include GP_StrFunc.var
+  #include GP_Log.var
+
+  var
+    ICatFunc: CatalogsFunctions;
+    // Переменные для стандартного расчёта
+    Weekend: IWeekendMarker;
+    AC: AbsenceCoding;
+    ChildVacationCode1: Word; // Код отпуска по уходу за ребёнком до полутора лет
+    ChildVacationCode2: Word; // Код отпуска по уходу за ребёнком от полутора до 3 лет
+    PreferredAbsenceCoding: Word; // Если 0 используются типовые пометки, иначе - пользовательские
+    EmptyDay: String[2]; // Обозначение дней, не относящихся к периоду табеля
+
+  // Очищает таблицу TmpFormT12
+  procedure Clear;
+  begin
+    delete all from TmpFormT12;
+  end;
+
+  // Инициализирует форму
+  function Init(_pDBeg: Date; _pDEnd: Date; _pSettings: Word): Boolean;
+  begin
+    result := false;
+    pDBeg := _pDBeg;
+    pDEnd := _pDEnd;
+    pSettings := _pSettings;
+    oGP_Log.Init('GP_FormT12.log', true, true, true);
+    oGP_Log.SetVerboseMode((pSettings and ST_SHOW_VERBOSE_LOG) != 0); // Показывать подробный лог
+    if To_Date(1, Month(pDBeg), Year(pDBeg)) != To_Date(1, Month(pDEnd), Year(pDEnd)) then
+    begin
+      oGP_Log.Error('Дата начала (' + oGP_SF.DateToStrE(pDBeg) + ') и дата окончания отчетного периода (' + 
+       oGP_SF.DateToStrE(pDEnd) + ') должны быть в одном месяце');
+      exit;
+    end;
+
+    if not InitWorkingTable then
+    begin
+      oGP_Log.Error('Не удалось инициализировать функции работы с табелем');
+      exit;
+    end;
+
+    pMonth := Month(pDBeg);
+    pYear := Year(pDEnd);
+    // Переходы нужно просматривать с начала месяца, так как может быть переход до начала отчетного периода
+    pDBegPer := To_Date(1, pMonth, pYear);
+    oGP_Log.Info('');
+    oGP_Log.Info('Отчетный период с ' + oGP_SF.DateToStrE(pDBeg) + ' по ' + oGP_SF.DateToStrE(pDEnd));
+
+    Clear;
+
+    // Инициализация переменных для стандартного расчёта
+    // Коды отпусков по уходу за ребёнком
+    ChildVacationCode1 := wGetTune('UP.ZAR.CODE_OF_CHIELDVAC');
+    if ExistTune('UP.ZAR.CODE_OF_CHIELDVACSECOND') then
+      ChildVacationCode2 := wGetTune('UP.ZAR.CODE_OF_CHIELDVACSECOND')
+    else
+      ChildVacationCode2 := 0;
+    // Используем типовые пометки
+    PreferredAbsenceCoding := 0;
+    EmptyDay := 'X'; // Обозначение дней, не относящихся к периоду табеля
+
+    result := true;
+  end;
+
+  // Деинициализирует расчет
+  procedure Done;
+  begin
+    DoneWorkingTable;
+    oGP_Log.Done(true);
+  end;
+
+  // Добавляет данные по виду затрат
+  procedure AddOrder(_OCode: Word; _OAcc: String[20]; _OHours: Double);
+  var 
+    I: Integer;
+  begin
+    for (I := 1; I <= MAX_ORDER_COUNT; I++)
+    begin
+      if TmpFormT12.OAcc[I] = '' or TmpFormT12.OAcc[I] = _OAcc then
+      begin
+        TmpFormT12.OCode[I] := _OCode;
+        TmpFormT12.OAcc[I] := _OAcc;
+        TmpFormT12.OHours[I] := TmpFormT12.OHours[I] + _OHours;
+        break;
+      end;
+    end;
+  end;
+
+  // Добавляет данные по видам и направлениям затрат
+  procedure ProcessOrders;
+  var
+    OrderFound: Boolean;
+    I: Byte;
+  begin
+    if SPeriods.Kateg = 1 then // Если код катергории 1, данные видам и направлениям затрат не заполняем
+      exit;
+    // Анализируем распределение затрат за отчетный месяц
+    OrderFound := false;
+    _loop PrVidOpl
+    begin
+      // Ищем аналитику по заказам
+      for (I := 1; I <= 6; I++)
+      begin 
+        if PrVidOpl.TblD[I] = cgKau_Zakaz then
+        begin
+          // Ищем заказ
+          pMnPlan := PrVidOpl.cKauD[I];
+          if GetFirst MnPlan = tsOk then
+          begin
+            AddOrder(0, MnPlan.Number, PrVidOpl.ChasF);
+            OrderFound := true;
+          end;
+          break;
+        end;
+      end;
+    end;
+
+    if not OrderFound then
+    begin
+      // Анализируем данные в интерфейсе "Настройка распределения затрат" с смежных данных лицевого счета
+      for (I := 1; I <= 6; I++)
+      begin
+        if LSchet.TblD[I] = cgKau_Zakaz then
+        begin
+          // Ищем заказ
+          pMnPlan := LSchet.cKauD[I];
+          if GetFirst MnPlan = tsOk then
+            AddOrder(0, MnPlan.Number, PrVidOpl.ChasF);
+          break;
+        end;
+      end;
+    end;
+  end;
+
+  // Доп. обработка неявки для формы ЭМ
+  procedure ProcessAbsenceEM(absenceIndex: Integer; dayNo: Byte; kind: Word); forward;
+
+  //------------------------------------------------------------------------------------------------
+  // Заполнение данных на основании алгоритмов из стандартной формы (PrintT13.vip)
+  //------------------------------------------------------------------------------------------------
+
+  var
+    // Пометки дней как бы "второго слоя". В настоящее время второй слой появляется у нас
+    // в случае наличия работы во время отпуска по уходу за ребёнком, или больничного
+    // во время работы во время такого отпуска.
+    // В форме ЭМ мы вторую строку выводим всегда, но у нее свои нюансы заполнения. Чтобы можно
+    // было использовать при заполнении второй строки в форме ЭМ данные из второй строки стандартной
+    // формы, сохраним ее в отдельном массиве
+    MarkDaySecondary: array[31] of String[5];
+    // Признак того, что для печати табеля необходимо использовать "второй слой" пометок дней
+    UseSecondaryDays: Boolean;
+
+  // формирование итогов по неявкам
+  procedure SummableAbsence(MarkDay: String[5]; AbsenceHours: Double; AbsenceDays: Double);
+  var 
+    I: Integer;
+  begin
+    for (I := 1; I <= MAX_ABSENCE_COUNT; I++)
+    begin
+      if TmpFormT12.ACode[I] = '' or TmpFormT12.ACode[I] = MarkDay then
+      begin
+        TmpFormT12.ACode[I] := MarkDay;
+        TmpFormT12.ADays[I] := TmpFormT12.ADays[I] + AbsenceDays;
+        TmpFormT12.AHours[I] := TmpFormT12.AHours[I] + AbsenceHours;
+        break;
+      end;
+    end;
+  end;
+
+  // Проверяет, является ли неявка с индексом absenceIndex отпуском по уходу за ребёнком.
+  // В предположении, что уже известно, что это отпуск (т.е. на отпуск проверяется снаружи)
+  function IsForCareVacation(absenceIndex: Integer): Boolean;
+  begin
+    var AbsenceCode: Word;
+    AbsenceCode := 0;
+    // Получаем код вида пособия или вида отпуска
+    WT_GetMonthlyAbsenceAttribute(absenceIndex, aaCode, absenceCode);
+    result := ChildVacationCode1 != 0 and absenceCode = ChildVacationCode1
+      or ChildVacationCode2 != 0 and absenceCode = ChildVacationCode2;
+  end;
+
+  // Ищет в загруженных неявках отпуск по уходу на дату searchDate, и если находит,
+  // то возвращает его индекс неявки. Если отпуска нет, возвращает -1.
+  function DetectForCareVacation(searchDate: date): Integer;
+  begin
+    var mapFirstOn, mapLastOn: Integer;
+    mapFirstOn := WT_AbsencesMapFirstOn(atMonthly, searchDate);
+    mapLastOn := WT_AbsencesMapLastOn(atMonthly, searchDate);
+    if mapFirstOn >= 0 and mapLastOn >= 0 then
+    begin
+      // Цикл по элементам карты, соответствующим дате searchDate
+      var I: Integer;
+      for (I := mapFirstOn; I <= mapLastOn; I++)
+      begin
+        var absenceIndex: Integer;
+        var kind: word;
+        kind := 0;
+        absenceIndex := WT_AbsencesMapAbsenceAt(atMonthly, I);
+        // Получаем вид неявки в kind
+        if WT_GetMonthlyAbsenceAttribute(absenceIndex, aaKind, kind) then
+        begin
+          // Если это отпуск
+          if kind = akVacation then
+          begin
+            // И это отпуск по уходу за ребёнком
+            if IsForCareVacation(absenceIndex) then
+            begin
+              // Найдено
+              result := absenceIndex;
+              exit;
+            end;
+          end;
+        end;
+      end;
+    end;
+    result := -1;
+  end;
+
+  // Ищет в загруженных неявках больничный на дату searchDate, и если находит,
+  // то возвращает его индекс неявки. Если больничного нет, возвращает -1.
+  function DetectSickList(searchDate: date): Integer;
+  begin
+    var mapFirstOn, mapLastOn: Integer;
+    mapFirstOn := WT_AbsencesMapFirstOn(atMonthly, searchDate);
+    mapLastOn := WT_AbsencesMapLastOn(atMonthly, searchDate);
+    if mapFirstOn >= 0 and mapLastOn >= 0 then
+    begin
+      // Цикл по элементам карты, соответствующим дате searchDate
+      var I: Integer;
+      for (I := mapFirstOn; I <= mapLastOn; I++)
+      begin
+        var absenceIndex: Integer;
+        var kind: word;
+        kind := 0;
+        absenceIndex := WT_AbsencesMapAbsenceAt(atMonthly, I);
+        if WT_GetMonthlyAbsenceAttribute(absenceIndex, aaKind, kind) then
+        begin
+          if kind = akSickList then
+          begin
+            // Найдено
+            result := absenceIndex;
+            exit;
+          end;
+        end;
+      end;
+    end;
+    result := -1;
+  end;
+
+  // Если строка mark пустая, заменяет её на условное обозначение выходного,
+  // актуальное для дня dayNo текущего месяца табеля.
+  // Возвращает true, если была произведена замена на УО выходного.
+  function EmptyMarkToWeekendMark(var mark: String; dayNo: Integer): Boolean;
+  begin
+    result := false;
+    if mark = '' then
+    begin
+      // в зависимости от настройки берем либо системное, либо пользовательское УО выходного
+      if PreferredAbsenceCoding = 0 then
+        mark := Weekend.StandardMark(dayNo)
+      else
+        mark := Weekend.Mark(dayNo);
+      result := true;
+    end;
+  end;
+
+  // Заполнить массивы условных обозначений по дням и часов по дням,
+  // рассчитать сумму отработанных дней и часов за половины месяца. + посчитать всякую ерунду.
+  procedure ProcessNotation;
+  begin
+    // Обнуляем массивы
+    UseSecondaryDays := false; // Необходимость использования дополнительного массива обозначений дней
+    // Чистим "второй слой"
+    var J: Byte;
+    for (J := AD_DayNo(TmpFormT12.DBeg); J <= AD_DayNo(TmpFormT12.DEnd); J++)
+      TmpFormT12.DMark[J] := '';
+    // Итоги: отработано за 
+    TmpFormT12.Day1P := 0;   // отработано дней за 1-ю половину месяца
+    TmpFormT12.Chas1P := 0;  // отработано часов за 1-ю половину месяца
+    TmpFormT12.Day2P := 0;   // отработано дней за 2-ю половину месяца
+    TmpFormT12.Chas2P := 0;  // отработано часов за 2-ю половину месяца
+
+    // Если найден табель
+    if IsValid(#LSTab) then
+    begin
+      // Пробуем загрузить информацию по отклонениям
+      var AbsencesLoaded: Boolean;
+      AbsencesLoaded := WT_LoadMonthlyAbsences = 0;
+
+      // Устанавливаем фильтр по диапазону дней
+      // AD_DayNo порядковый номер дня в учетном периоде по дате (то же, что и Day, но с учетом возможности смещения периода)
+      WT_AddDayRangeFilter(AD_DayNo(TmpFormT12.DBeg), AD_DayNo(TmpFormT12.DEnd));
+
+      // Расщепление на два слоя будет у нас в случае:
+      // - работы во время отпуска по уходу за ребёнком
+      // - больничного во время работы во время отпуска по уходу за ребёнком
+      UseSecondaryDays := (WT_GetDaysBwDatesEx(dkWorkingWhileVacation, stActual, TmpFormT12.DBeg, TmpFormT12.DEnd, 0) > 0)
+        or (WT_GetDaysBwDatesEx(dkSchrodingersDay, stActual, TmpFormT12.DBeg, TmpFormT12.DEnd, 0) > 0);
+
+      var PeriodDay: date;
+      // помечаем дни условными обозначениями
+      // Проходим по всем дням периода
+      var I: Integer;
+      for (I := AD_DayNo(TmpFormT12.DBeg); I <= AD_DayNo(TmpFormT12.DEnd); I++)
+      begin
+        // если в этот день работник еще не был принятым на работу
+        // или день не относится к рассматриваемому табелю или переходу
+        if not WT_IsDayValid(I, false) or not WT_IsDayEnabled(I)
+        begin
+          TmpFormT12.DMark[I] := EmptyDay;
+          MarkDaySecondary[I] := EmptyDay;
+          continue;
+        end;
+
+        var AbsenceHours: Double; // количество приходящихся на текущую дату часов неявки
+        AbsenceHours := 0;
+        // обрабатываем все учитываемые дни
+        var CurDate: date;
+        CurDate := AD_Date(I, pMonth, pYear); // AD_Date - Дата по порядковому номеру дня, месяцу и году учетного периода
+
+        // Если день содержит отработанное время
+        if WT_TestDay(I, dkWholeWorking, stActual) then
+        begin
+          // по умолчанию дни помечаются как явки
+          TmpFormT12.DMark[I] := 'Я';
+          // получим все отработанные часы работы за этот день
+          TmpFormT12.DHours[I] := WT_GetHoursInDay(I, hkWholeWorking, stActual);
+          // в пометках второго слоя изначально - пусто
+          MarkDaySecondary[I] := '';
+
+          // Неявки, требующие особого отношения в день, когда были рабочие часы.
+          // 1) Неоплачиваемая командировка (вид оплаты не задан в её условном обозначении)
+          // 2) Приказ на работу в выходной, который сделал день рабочим
+          // 3) Отпуск по уходу за ребёнком, если вдруг человек работал во время этого отпуска
+          var Kind: word; // Вид неявки
+          var AbsenceIndex: Integer; // Индекс неявки
+          AbsenceIndex := -1; // Изначально нет таковых
+          Kind := 0;
+          if AbsencesLoaded then // Если неявки загружены
+          begin
+            // Обработаем все неявки, которые приходятся на эту дату
+            var MapFirstOn: Integer; // индекс первого элемента в карте неявок на этот день
+            var MapLastOn: Integer; // индекс КРАЙНЕГО элемента в карте неявок на этот день
+            // Получаем индекс первой из приходящихся на дату месячной неявки
+            MapFirstOn := WT_AbsencesMapFirstOn(atMonthly, CurDate);
+            // Получаем индекс последней из приходящихся на дату месячной неявки
+            MapLastOn := WT_AbsencesMapLastOn(atMonthly, CurDate);
+
+            if MapFirstOn >= 0 and MapLastOn >= 0 then
+            begin
+              // определим неявку, которую надо отобразить в табеле
+              // Ищем КРАЙНЮЮ неявку в карте, которая особенная:
+              // Перебираем все неявки, начиная с последней
+              while MapLastOn >= MapFirstOn do
+              begin
+                // Получаем индекс последней неявки
+                AbsenceIndex := WT_AbsencesMapAbsenceAt(atMonthly, MapLastOn);
+                // Определяем вид неявки и помещаем в переменную Kind
+                if WT_GetAbsenceAttribute(atMonthly, AbsenceIndex, aaKind, Kind) then
+                begin
+                  // Added by Magic: begin
+                  // Чтобы не бежать по неявкам еще раз, вызовем доп. обработку неявки для формы ЭМ здесь
+                  ProcessAbsenceEM(absenceIndex, I, kind);
+                  // Added by Magic: end
+
+                  // Если это Командировка или работа в выходной, который сделан рабочим по приказу
+                  if Kind = akBusinessTrip or Kind = akWeekendWorkOrder then
+                    // Найдено, выходим из цикла:
+                    break
+                  else 
+                    // Если это отпуск
+                    if Kind = akVacation then
+                    begin
+                      // Факта наличия рабочих часов и отпуска одновременно по идее уже достаточно,
+                      // чтобы понять, что это отпуск по уходу за ребёнком, так что дополнительные проверки
+                      // здесь для красоты.
+                      // Проверяем, является ли неявка с индексом absenceIndex отпуском по уходу за ребёнком
+                      if IsForCareVacation(AbsenceIndex) then
+                        // Найдено.
+                        break;
+                    end;
+                end;
+                // Не подошло. Переходим к следующей неявке
+                MapLastOn--;
+              end;
+
+              if MapLastOn < MapFirstOn then
+                AbsenceIndex := -1;
+            end; // if (MapFirstOn >= 0) and (MapLastOn >= 0) then
+
+            // В AbsenceIndex индекс неявки, которую будем отображать в табеле
+            if AbsenceIndex >= 0 then
+            begin
+              // Проверяем вид неявки
+              case Kind of
+                akBusinessTrip: // Командировка
+                  begin
+                    // если именно командировка последняя в карте, помечаем УО командировки, либо УО выходного
+                    var MappedOn: Boolean;
+                    // в зависимости от настройки берем либо системный, либо пользовательский код
+                    if PreferredAbsenceCoding = 0 then
+                      TmpFormT12.DMark[I] := AC.GetStandardCode(atMonthly, AbsenceIndex, CurDate, MappedOn)
+                    else
+                      TmpFormT12.DMark[I] := AC.GetUserCode(atMonthly, AbsenceIndex, CurDate, MappedOn);
+                    // учтем как неявку командировку, учет которых ведется в днях
+                    // Получим в AbsenceHours количество приходящихся на эту дату часов неявки
+                    WT_GetAbsenceHoursOn(atMonthly, AbsenceIndex, CurDate, AbsenceHours);
+                    // Увеличим итоги по неявкам
+                    SummableAbsence(TmpFormT12.DMark[I], AbsenceHours, 1);
+                  end;
+                akWeekendWorkOrder: // День, который стал рабочим в связи с приказом на работу в выходной
+                  begin
+                    // берем напрямую, чтобы наличие возможной командировки не перекрыло своим условным обозначением
+                    // в зависимости от настройки берем либо системный, либо пользовательский код
+                    if PreferredAbsenceCoding = 0 then
+                      WT_GetAbsenceAttribute(atMonthly, AbsenceIndex, aaStandardCode, TmpFormT12.DMark[I]);
+                    else
+                      WT_GetAbsenceAttribute(atMonthly, AbsenceIndex, aaMark, TmpFormT12.DMark[I]);
+                    var AbsenceIndex2: Integer; // индекс отображаемой неявки по слоям
+                    // Проверяем, есть ли на эту дату отпуск по уходу
+                    AbsenceIndex2 := DetectForCareVacation(CurDate);
+                    if AbsenceIndex2 >= 0 then
+                    begin
+                      // УО отпуска
+                      var MappedOn: Boolean;
+                      MappedOn := true;
+                      // Отмечаем день в дополнительном массиве обозначений дней
+                      if PreferredAbsenceCoding = 0 then
+                        MarkDaySecondary[I] := AC.GetStandardCode(atMonthly, AbsenceIndex2, CurDate, MappedOn)
+                      else
+                        MarkDaySecondary[I] := AC.GetUserCode(atMonthly, AbsenceIndex2, CurDate, MappedOn);
+                      // Получим в AbsenceHours количество приходящихся на эту дату часов неявки
+                      WT_GetAbsenceHoursOn(atMonthly, AbsenceIndex, CurDate, AbsenceHours);
+                      // Увеличим итоги по неявкам
+                      SummableAbsence(MarkDaySecondary[I], AbsenceHours, 1);
+                    end;
+                  end;
+                akVacation: // Отпуск [по уходу за ребёнком]
+                  begin
+                    // Надо засчитать за этот день и отпуск, и работу.
+                    // Во втором слое поставить УО отпуска в/за этот день.
+                    // в зависимости от настройки берем либо системный, либо пользовательский код
+                    var MappedOn: Boolean;
+                    MappedOn := true;
+                    if PreferredAbsenceCoding = 0 then
+                      // Получаем типовой код УО неявки (MappedOn = true, есди неявка пришлась на CurDate)
+                      // или условное обозначение выходного дня (MappedOn = false)
+                      MarkDaySecondary[I] := AC.GetStandardCode(atMonthly, AbsenceIndex, CurDate, MappedOn)
+                    else
+                      MarkDaySecondary[I] := AC.GetUserCode(atMonthly, AbsenceIndex, CurDate, MappedOn);
+                    // Если отпуск не помечен УО выходного
+                    if MappedOn then
+                    begin
+                      // Получим в AbsenceHours количество приходящихся на эту дату часов неявки
+                      WT_GetAbsenceHoursOn(atMonthly, AbsenceIndex, CurDate, AbsenceHours);
+                      // Увеличим итоги по неявкам
+                      SummableAbsence(MarkDaySecondary[I], AbsenceHours, 1);
+                    end;
+                  end
+              end;
+            end; // if AbsenceIndex >= 0
+          end; // if AbsencesLoaded
+
+          // Если неявки нет, но имеет место работа в выходной/праздник (например, вследствие ручной корректировки)
+          // Помечаем день нужно пометить не Я, а РВ. При этом не важно, был ли праздник рабочим по плану.
+          if ((AbsenceIndex < 0) or (Kind = akVacation)) // нет неявки или есть неявка, и это отпуск
+            and (WT_GetHoursInDay(I, hkWeekend, stActual) > 0 or // выходной
+                 WT_GetHoursInDay(I, hkHoliday, stActual) > 0 or // праздник
+                 WT_GetHoursInDay(I, hkOrderedWeekendWork, stActual) > 0) // день стал рабочим по приказу
+          then
+            TmpFormT12.DMark[I] := MARK_WORK_ON_WEEKEND; // обозначение работы в выходной (РВ)
+
+          // Увеличиваем итоги по дням
+          if I <= 15 then
+            TmpFormT12.Day1P := TmpFormT12.Day1P + 1 // день первой половины месяца
+          else
+            TmpFormT12.Day2P := TmpFormT12.Day2P + 1; // день второй половины месяца
+        end else
+        begin
+          // день считается нерабочим по каким то причинам (в том числе оплачиваемые командировки, отпуска и больничные)
+          var Kind: word; // Вид неявки
+          var MappedOn: Boolean;
+          var AbsenceIndex, AbsenceIndex2: Integer; // индекс отображаемой неявки по слоям
+          var MarkOfCurrentAbsence: String;
+          var ItsWeekendMark, ItsWeekendMark2: Boolean; // признак, что день будет отмечен именно УО выходного, а не мало ли там буква совпадает
+          var WeekendSummed: Boolean; // просуммирован ли итог по выходным за текущий день
+          MappedOn := false;
+          AbsenceIndex := -1;
+          AbsenceIndex2 := -1;
+          MarkOfCurrentAbsence := '';
+          ItsWeekendMark := false;
+          ItsWeekendMark2 := false;
+          WeekendSummed := false;
+          kind := 0;
+
+          // Презумпция пустоты второго слоя: второй слой пуст до тех пор, пока не обнаружится отпуск по уходу за ребёнком
+          MarkDaySecondary[I] := '';
+
+          // если загружены неявки, получим номер КРАЙНЕЙ в списке на этот день
+          if AbsencesLoaded then
+            AbsenceIndex := WT_AbsencesMapAbsenceAt(atMonthly, WT_AbsencesMapLastOn(atMonthly, CurDate));
+          // если есть неявка
+          if AbsenceIndex >= 0 then
+          begin
+            // в зависимости от настройки берем либо системный, либо пользовательский код
+            if PreferredAbsenceCoding = 0 then
+              MarkOfCurrentAbsence := AC.GetStandardCode(atMonthly, AbsenceIndex, CurDate, MappedOn)
+            else
+              MarkOfCurrentAbsence := AC.GetUserCode(atMonthly, AbsenceIndex, CurDate, MappedOn);
+
+            // Если не определили условное обозначение, обозначаем выходным
+            if EmptyMarkToWeekendMark(MarkOfCurrentAbsence, I) then
+              ItsWeekendMark := true; // А если мы так сделали, то запоминаем, что мы так сделали
+
+            // Получаем тип неявки
+            WT_GetMonthlyAbsenceAttribute(AbsenceIndex, aaKind, Kind);
+
+            // Выполняем коррекцию для решения следующей проблемы:
+            // Если в табеле за какой-то период введено отклонение НН, и за этот период есть больничный,
+            // Табель после ввода больнисного не пересчитывался, в нем за этот период НН, но при создании копии
+            // в форму за этот период выводится "Б".
+            // Обработка специально вынесена за пределы case, так как теоретически может понадобиться подмена
+            // не только для больничных
+            if Kind = akSickList then
+              if IsValidAll(tnLSTab) then
+                if MarkOfCurrentAbsence != LSTab.Days[I] then
+                begin
+                  /*
+                  // Пока оставим - может придётся тестировать другие ситуации
+                  oGP_Log.Info('Коррекция: ' + DateToStr(CurDate, 'DD.MM.YYYY') + ': Kind: ' + To_Char(Kind) + 
+                   ' MarkOfCurrentAbsence: ' + MarkOfCurrentAbsence + ' LSTab.Days[' + To_Char(I) + ']: ' + LSTab.Days[I]
+                  );
+                  */
+                  MarkOfCurrentAbsence := LSTab.Days[I];
+                end;
+
+            // Заносим полученное УО в основной массив пометок дней
+            TmpFormT12.DMark[I] := MarkOfCurrentAbsence;
+
+            // Обработка особых случаев с неявками
+            case Kind of // Проверяем тип неявки
+              akVacation: // Отпуск
+                begin
+                  // Неоплачиваемый день отпуска отображается УО выходного
+                  if not MappedOn then
+                    ItsWeekendMark := true;
+                  // Если отпуск по уходу за ребёнком, и при этом пишем в два слоя,
+                  // то УО этого отпуска йдёт во второй слой.
+                  if UseSecondaryDays and IsForCareVacation(AbsenceIndex) then
+                  begin
+                    MarkDaySecondary[I] := TmpFormT12.DMark[I];
+                    AbsenceIndex2 := AbsenceIndex;
+                    ItsWeekendMark2 := ItsWeekendMark;
+                    // Во время отпуска по уходу за ребёнком может быть больничный.
+                    // Если это так, кидаем в первый слой его.
+                    AbsenceIndex := DetectSickList(CurDate);
+                    if AbsenceIndex >= 0 then
+                    begin
+                      if PreferredAbsenceCoding = 0 then
+                        TmpFormT12.DMark[I] := AC.GetStandardCode(atMonthly, AbsenceIndex, CurDate, MappedOn)
+                      else
+                        TmpFormT12.DMark[I] := AC.GetUserCode(atMonthly, AbsenceIndex, CurDate, MappedOn);
+                      // Неоплачиваемый день больничного отображается УО выходного
+                      if not MappedOn then
+                        ItsWeekendMark := true;
+                    end else
+                    begin
+                      // Зарегистрирован ли выходной по плану день как "выходной во время работы во время отпуска"
+                      if WT_TestDayEx(I, dkWeekendWhileVacation, stActual, cfDisregardFilters or cfDisregardPeriod) then
+                      begin
+                        // Тогда в первый слой - УО выходного.
+                        if PreferredAbsenceCoding = 0 then
+                          TmpFormT12.DMark[I] := Weekend.StandardMark(I);
+                        else
+                          TmpFormT12.DMark[I] := Weekend.Mark(I);
+                        ItsWeekendMark := true;
+                      end else
+                      begin
+                        // Если больше ничего особенного во время отпуска нет, первый слой становится пустым
+                        TmpFormT12.DMark[I] := '';
+                        AbsenceIndex := -1;
+                        ItsWeekendMark := false;
+                      end;
+                    end;
+                  end;
+                end;
+              akSickList: // Больничный
+                begin
+                  // Неоплачиваемый день больничного отображается УО выходного
+                  if not MappedOn then
+                    ItsWeekendMark := true;
+                  // Если больничный во время отпуска по уходу за ребёнком, и при этом без больничного работали бы, 
+                  // то "наверху" будет больничный, но под ним - отпуск, который надо отобразить. Смотрим, есть ли отпуск.
+                  if UseSecondaryDays then
+                  begin
+                    AbsenceIndex2 := DetectForCareVacation(CurDate);
+                    if AbsenceIndex2 >= 0 then
+                    begin
+                      // УО отпуска
+                      var MappedOn2: Boolean;
+                      MappedOn2 := true;
+                      if PreferredAbsenceCoding = 0 then
+                        MarkDaySecondary[I] := AC.GetStandardCode(atMonthly, AbsenceIndex2, CurDate, MappedOn2)
+                      else
+                        MarkDaySecondary[I] := AC.GetUserCode(atMonthly, AbsenceIndex2, CurDate, MappedOn2);
+                      // Неоплачиваемый день отпуска отображается УО выходного
+                      if not MappedOn2 then
+                        ItsWeekendMark2 := true;
+                    end;
+                  end;
+                end;
+              akBusinessTrip: // Командировка
+                begin
+                  // Неоплачиваемый день командировки помечается УО выходного
+                  if not MappedOn
+                    // за исключением случаев, когда это выходной день по плану,
+                    // а в настройке при этом сказано, что помечать как камандзiроўку
+                    and not ((WT_TestDay(I, dkWeekEnd, stPlanned)) and (wGetTune('UP.ZAR.WT.BUSINESSTRIPWEEKENDMARK') = 1)) then
+                  begin
+                    ItsWeekendMark := true;
+                  end;
+                end;
+              akWeekendMark: // Выходной (обычный или неоплачиваемый день больничного или отпуска)
+                ItsWeekendMark := true;
+            else
+              // На текущий момент в этой ветке не будут ловиться несмапленные неявки,
+              // т.к. наличие несмапленных неявок в карте возможно только для больничных, отпусков, командировок.
+              // Поэтому это только страховка:
+              if not MappedOn then
+                ItsWeekendMark := true;
+            end;
+          end else
+          begin
+            // При отсутствии неявок остаётся записать в текущую пометку УО выходного.
+            EmptyMarkToWeekendMark(MarkOfCurrentAbsence, I); // всегда труъ возвращаетъ
+            // Запомним, что эта буква - УО выходного
+            ItsWeekendMark := true;
+            // Пишем в основной слой:
+            TmpFormT12.DMark[I] := MarkOfCurrentAbsence;
+          end; // if AbsenceIndex >= 0
+
+          // Подсуммация
+          // Если день отмечен УО выходного
+          if not ItsWeekendMark then
+          begin
+            if AbsenceIndex >= 0 then
+            begin
+              // Кол-во часов, пришедшихся на неявку
+              WT_GetAbsenceHoursOn(atMonthly, AbsenceIndex, CurDate, AbsenceHours);
+              // Подсуммируем найденную неявку
+              // Обр. внимание: в рабчас заносим часы всех "явок",
+              // а в неявки по причинам - часы не всех.
+              SummableAbsence(TmpFormT12.DMark[I], AbsenceHours, 1);
+            end;
+          /*
+          end else
+          begin
+            if (TabEmpty and 2) != 0 then // 2 - включать выходные в неявки
+            begin
+              SummableAbsence(TmpFormT12.DMark[I], 0, 1);
+              WeekendSummed := true;
+            end;
+          */
+          end;
+
+          // Вторая неявка, если надо:
+          if not ItsWeekendMark2 then
+          begin
+            if AbsenceIndex2 >= 0 then
+            begin
+              WT_GetAbsenceHoursOn(atMonthly, AbsenceIndex2, CurDate, AbsenceHours);
+              SummableAbsence(MarkDaySecondary[I], AbsenceHours, 1);
+            end;
+          /*
+          end else
+          begin
+            // 2 - включать выходные в неявки
+            // Для второго слоя УО выходного суммируем только если не было УО выходного в предыдущих слоях
+            if (TabEmpty and 2) != 0 and not WeekendSummed then
+            begin
+              SummableAbsence(MarkDaySecondary[I], 0, 1);
+              WeekendSummed := true; // здесь это не обязательно, но просто лучше раскрывает замысел автора
+            end;
+          */
+          end;
+
+          // Если день считается явкой (имеется в виду признак "Явка" в УО), наращивается ещё и отработанное время.
+          if WT_TestDay(I, dkAppearance, stActual) then
+          begin
+            // Учитываем часы всех пришедшихся на день "явок"
+            TmpFormT12.DHours[I] := WT_GetHoursInDayEx(I, hkAppearance, stActual, 0);
+            if I <= 15 then
+              TmpFormT12.Day1P := TmpFormT12.Day1P + 1 // день первой половины месяца
+            else
+              TmpFormT12.Day2P := TmpFormT12.Day2P + 1; // день второй половины месяца
+          end;
+        end; // WT_TestDay(I, dkWholeWorking, stActual) // Если день содержит отработанное время
+      end; // for (I := AD_DayNo(TmpFormT12.DBeg); I <= AD_DayNo(TmpFormT12.DEnd); I++)
+    end; // if IsValid(#LSTab)
+
+    // Посчитаем сумму часов по половинам месяца
+    var I: Byte;
+    for (I := 1; I <= 15; I++)
+      TmpFormT12.Chas1P := TmpFormT12.Chas1P + TmpFormT12.DHours[I];
+    for (I := 16; I <= 31; I++)
+      TmpFormT12.Chas2P := TmpFormT12.Chas2P + TmpFormT12.DHours[I];
+  end;
+
+  //------------------------------------------------------------------------------------------------
+
+  // Записывает информацию в третью и четвёртую строку 
+  procedure SetMarkAdd(_Day: Byte; _Mark: String[20]; _Hours: Double);
+  begin
+    // Теоретически двух разных отметок в третьей строке быть не должно (например ночные и сверхурочные
+    // в один день), поэтому пока пишем в нее только в случае, если она пустая
+    if TmpFormT12.DMarkAdd[_Day] = '' then
+    begin
+      TmpFormT12.DMarkAdd[_Day] := _Mark;
+      TmpFormT12.DHoursAdd[_Day] := _Hours;
+    end;
+  end;
+
+  // ***************
+  /*
+  // Пока оставлю, может еще пригодится для тестирования, если найдутся глюки
+  procedure TestAbsences;
+  begin
+    oGP_Log.Info('*** TestAbsences ***');
+    var I: Byte;
+    for (I := AD_DayNo(TmpFormT12.DBeg); I <= AD_DayNo(TmpFormT12.DEnd); I++)
+    begin
+      var CurDate: date;
+      CurDate := AD_Date(I, pMonth, pYear); // AD_Date - Дата по порядковому номеру дня, месяцу и году учетного периода
+      var mapFirstOn, mapLastOn: Integer;
+      MapFirstOn := WT_AbsencesMapFirstOn(atMonthly, CurDate);
+      MapLastOn := WT_AbsencesMapLastOn(atMonthly, CurDate);
+      if mapFirstOn >= 0 and mapLastOn >= 0 then
+      begin
+        // Цикл по элементам карты, соответствующим дате searchDate
+        var J: Integer;
+        for (J := mapFirstOn; J <= mapLastOn; J++)
+        begin
+          var absenceIndex: Integer;
+          var kind: word;
+          var mark: String[5];
+          kind := 0;
+          mark := '';
+          absenceIndex := WT_AbsencesMapAbsenceAt(atMonthly, J);
+          // Получаем вид неявки в kind
+          if WT_GetMonthlyAbsenceAttribute(absenceIndex, aaKind, kind) 
+            and WT_GetMonthlyAbsenceAttribute(absenceIndex, aaMark, mark) 
+          then
+          begin
+            if kind = akTableAbsence then
+            oGP_Log.Info('День: ' + To_Char(I) + ' absenceIndex: ' + To_Char(J) + ' kind: ' + To_Char(kind) + ' mark: ' + mark);
+          end;
+        end;
+      end;
+    end;
+  end;
+  */
+  // ***************
+
+  // Доп. обработка неявки для формы ЭМ
+  procedure ProcessAbsenceEM(absenceIndex: Integer; dayNo: Byte; kind: Word);
+  var
+    mark: String[5];
+    hours: Double;
+    hoursGr: Double;
+    days: Double;
+    MappedOn: Boolean;
+  begin
+    // отклонение с типом "уменьшение" либо "увеличение"  
+    if kind = akTableAbsence then
+    begin
+      hours := 0;
+      // получаем условное обозначение неявки
+      if // WT_GetMonthlyAbsenceAttribute(absenceIndex, aaMark, mark) and
+        WT_GetMonthlyAbsenceAttribute(absenceIndex, aaHours, hours) then
+      begin
+        if hours = 0 then
+          exit;
+        // в зависимости от настройки берем либо системный, либо пользовательский код
+        if PreferredAbsenceCoding = 0 then
+          mark := AC.GetStandardCode(atMonthly, AbsenceIndex, To_Date(dayNo, pMonth, pYear), MappedOn)
+        else
+          mark := AC.GetUserCode(atMonthly, AbsenceIndex, To_Date(dayNo, pMonth, pYear), MappedOn);
+        /*
+        oGP_Log.Info('*** День: ' + To_Char(dayNo) + ' kind: ' + To_Char(kind) + ' mark: ' + mark + ' ' + 
+         ' hours: ' + To_Char(hours, 0, 2) + 
+         ' TmpFormT12.DHours[' + To_Char(dayNo) + ']: ' + To_Char(TmpFormT12.DHours[dayNo], 0, 2) +
+         ' MappedOn: ' + To_Char(MappedOn));
+        */
+        if MappedOn then
+        begin
+          // Рассчитываем кол-во дней
+          hoursGr := WT_GetHoursInDay(dayNo, hkWholeWorking, stPlanned);
+          if hoursGr != 0 then
+            days := Round(hours / hoursGr, 2)
+          else
+            days := 1;
+          oGP_Log.Info('hoursGr: ' + To_Char(hoursGr, 0, 2) + ' days: ' + To_Char(days, 0, 2));
+          // помечаем день в третьей строке
+          SetMarkAdd(dayNo, mark, hours);
+          SummableAbsence(mark, hours, days);
+        end;
+      end;
+    end;
+  end;
+
+  // Дополнительный анализ табеля для расчета показателей, которых нет в оригинальной форме табеля
+  // В момент запуска функции табель уже загружен и установлен фильтр по датам периода
+  procedure AnalysisForEM;
+  var
+    I: Byte;
+    _Hours: Double;
+  begin
+    // Если есть "второй слой" пометок дней, скопируем его в третью строку
+    if UseSecondaryDays then
+      for (I := AD_DayNo(TmpFormT12.DBeg); I <= AD_DayNo(TmpFormT12.DEnd); I++)
+        SetMarkAdd(I, MarkDaySecondary[I], 0);
+
+    for (I := AD_DayNo(TmpFormT12.DBeg); I <= AD_DayNo(TmpFormT12.DEnd); I++)
+    begin
+      if TmpFormT12.DMark[I] = MARK_WEEKEND then
+        TmpFormT12.TV += 1; // Кол-во выходных и праздничных дней
+      // Ночные
+      _Hours := WT_GetHoursInDayEx(I, hkNight, stActual, 0);
+      if _Hours != 0 then
+      begin
+        SetMarkAdd(I, MARK_NIGHT_WORK, _Hours);
+        TmpFormT12.TN += _Hours;
+      end;
+      // Часы работы по приказу на сверхурочную работу за оплату 
+      _Hours := WT_GetHoursInDayEx(I, hkOvertimeWorkOrder, stActual, 0);
+      if _Hours != 0 then
+      begin
+        SetMarkAdd(I, MARK_OVERTIME_WORK, _Hours);
+        TmpFormT12.TN += _Hours;
+      end;
+      // Работа в выходные
+      if TmpFormT12.DMark[I] = MARK_WORK_ON_WEEKEND then
+      begin
+        TmpFormT12.TRBDays += 1;
+        TmpFormT12.TRBHours += TmpFormT12.DHours[I];
+      end;
+      // Работа в выходные с компенсацией отпуском
+      if TmpFormT12.DMark[I] = MARK_WORK_ON_WEEKEND_COMP then
+      begin
+        TmpFormT12.TRODays += 1;
+        TmpFormT12.TROHours += TmpFormT12.DHours[I];
+      end;
+    end;
+    // TestAbsences;
+  end;
+
+  function ProcessPeriod(_DBeg: Date; _DEnd: Date; _cPosition: Comp; _Kateg: Word): Boolean;
+  begin
+    // Если дата окончания периода меньше даты начала отчетного периода
+    if _DEnd < pDBeg then
+      exit;
+    // Если дата начала периода больше даты окончания отчетного периода
+    if _DBeg > pDEnd then
+      exit;
+    if _DBeg < pDBeg then
+      _DBeg := pDBeg;
+    if _DBeg < LSchet.DatPos then
+      _DBeg := LSchet.DatPos;
+    if LSchet.DatUv != ZeroDate then
+      if _DEnd > LSchet.DatUv then
+        _DEnd := LSchet.DatUv;
+    ClearBuffer(#SPeriods);
+    SPeriods.DBeg := _DBeg;
+    SPeriods.DEnd := _DEnd;
+    SPeriods.cPosition := _cPosition;
+    SPeriods.Kateg := _Kateg;
+    if insert current SPeriods != tsOk then
+    begin
+      result := false;
+      oGP_Log.Error('Не удалось добавить запись в таблицу SPeriods');
+    end else
+      result := true;
+  end;
+
+  // Формирует список периодов по текущему лицевому счету
+  function FillSPeriods: Boolean;
+  var
+    _DBeg: Date;
+    _cPosition: Comp;
+    _Kateg: Word;
+  begin
+    result := false;
+
+    if (delete all from SPeriods) != tsOk then
+      exit;
+
+    oGP_Log.Info(' Табель: Должность: ' + ICatFunc.GetCatalogsName(LSTab.cAppoint));
+
+    _DBeg := pDBegPer;
+    if _DBeg < LSchet.DatPos then
+      _DBeg := LSchet.DatPos;
+    _cPosition := LSTab.cAppoint;
+    _Kateg := LSTab.Kateg;
+
+    _loop Perexod
+    begin
+      // Обрабатываем только переходы, в которых изменялась должность или категория
+      if _cPosition = Perexod.cAppoint and _Kateg = Perexod.Kateg then
+        continue;
+      oGP_Log.Info(' Переход: с ' + oGP_SF.DateToStrE(Perexod.DatIzm) + ' Должность: ' + ICatFunc.GetCatalogsName(Perexod.cAppoint));
+      // if Perexod.DatIzm != pDBeg then
+      // begin
+      if not ProcessPeriod(_DBeg, Add_Day(Perexod.DatIzm, -1), _cPosition, _Kateg) then
+        exit;
+      _DBeg := Perexod.DatIzm;
+      // end;
+      _cPosition := Perexod.cAppoint;
+      _Kateg := Perexod.Kateg;
+    end;
+
+    if not ProcessPeriod(_DBeg, pDEnd, _cPosition, _Kateg) then
+      exit;
+    result := true;
+  end;
+
+  // Анализирует данные по одному лицевому счету, формирует одну или несколько строк формы
+  // и записывает результат в таблицу TmpFormT12
+  function GenerateFormData(_cLSchet: Comp): Boolean;
+  begin
+    result := false;
+    set pcCurLSchet := _cLSchet;
+    if not IsValidAll(tnLSchet) then
+    begin
+      oGP_Log.Error('Не найдена запись в таблице LSchet (LSchet.NRec = ' + To_Char(_cLSchet, 0, 0) + ')');
+      exit;
+    end;
+    oGP_Log.Info('');
+    oGP_Log.Info('Таб.№ ' + GetStrTabN(LSchet.TabN, LSchet.StrTabN) + ' ' + Persons.FIO + 
+     '  принят: ' + oGP_SF.DateToStrE(LSchet.DatPos) + 
+     '  уволен: ' + oGP_SF.DateToStrE(LSchet.DatUv)
+    );
+    // Если поступил после окончания отчетного периода
+    if LSchet.DatPos > pDEnd then
+      exit;
+    // Если уволен до начала отчетного периода
+    if LSchet.DatUv != ZeroDate then
+      if LSchet.DatUv < pDBeg then
+        exit;
+
+    if not IsValidAll(tnLSTab) then
+    begin
+      oGP_Log.Error('Не найден табель работника за ' + DateToStr(pDBeg, 'MM.YYYY') + 
+       ' (Таб.№ ' + GetStrTabN(LSchet.TabN, LSchet.StrTabN) + ')');
+      exit;
+    end;
+
+    if LoadWorkingTable(LSchet.NRec, pMonth, pYear) != 0 then
+    begin
+      oGP_Log.Error('Не удалось загрузить табель работника за ' + DateToStr(pDBeg, 'MM.YYYY') + 
+       ' (Таб.№ ' + GetStrTabN(LSchet.TabN, LSchet.StrTabN) + ')');
+      exit;
+    end;
+
+    if not FillSPeriods then
+      exit;
+
+    oGP_Log.Info(' Периоды:');
+    _loop SPeriods
+    begin
+      oGP_Log.Info('  с ' + oGP_SF.DateToStrE(SPeriods.DBeg) + 
+       ' по ' + oGP_SF.DateToStrE(SPeriods.DEnd) +
+       ' должность: ' + ICatFunc.GetCatalogsName(SPeriods.cPosition)
+      );
+      ClearBuffer(#TmpFormT12);
+      TmpFormT12.DBeg := SPeriods.DBeg;
+      TmpFormT12.DEnd := SPeriods.DEnd;
+      TmpFormT12.cLSchet := LSchet.NRec;
+      TmpFormT12.TabN := LSchet.TabN;
+      TmpFormT12.StrTabN := LSchet.StrTabN;
+      TmpFormT12.PersonName := Persons.FIO;
+      TmpFormT12.cPosition := SPeriods.cPosition;
+      TmpFormT12.Kateg := SPeriods.Kateg;
+
+      // Заполняем данные по дням на основании алгоритмов из стандартной формы (PrintT13.vip)
+      WT_ResetFilter;
+      ProcessNotation;
+      AnalysisForEM;
+      ProcessOrders;
+
+      if insert current TmpFormT12 != tsOk then
+      begin
+        oGP_Log.Error('Не удалось добавить запись в таблицу TmpFormT12');
+        exit;
+      end;
+
+      SPeriods.cTmpFormT12 := TmpFormT12.NRec;
+      if update current SPeriods != tsOk then
+      begin
+        oGP_Log.Error('Не удалось обновить запись в таблице SPeriods');
+        exit;
+      end;
+    end;
+
+    result := true;
+  end;
+
+  //------------------------------------------------------------------------------------------------
+  // Функции для создания копий табеля и работы с ними
+  //------------------------------------------------------------------------------------------------
+   // Создаёт копию табеля по лицевому счету с указанным NRec за указанный месяц
+  function CreateCopy_Ex(_DForm: Date; _cLSchet: tNRec; _Month: Byte; _Year: Word; _ShowInfo: Boolean): Boolean;
+  var
+    dBeg, dEnd: Date;
+  begin
+    result := true;
+    pcCurLSchet := _cLSchet;
+    pYear       := _Year;
+    set pMonth  := _Month;
+    // Если нет табеля за указанный месяц нечего и копировать
+    if not IsValidAll(tnLSTab) then
+      exit;
+
+    // Формируем форму в таблице в памяти
+    Clear;
+    dBeg := To_Date(1, _Month, _Year);
+    dEnd := To_Date(Last_Day(dBeg), _Month, _Year);
+    if Init(dBeg, dEnd, 0) then
+    // if Init(_DBeg, _DEnd, ST_SHOW_VERBOSE_LOG) then
+    begin
+      // Наполняем форму данными
+      GenerateFormData(_cLSchet);
+      // Создаём копию
+      _loop TmpFormT12
+      begin
+        ClearBuffer(#GP_TimeTable);
+        GP_TimeTable.TabN       := LSchet.TabN;
+        GP_TimeTable.StrTabN    := LSchet.StrTabN;
+        GP_TimeTable.cLSchet    := _cLSchet;
+        GP_TimeTable.Cex        := LSTab.Cex;
+        GP_TimeTable.MonthN     := _Month;
+        GP_TimeTable.YearN      := _Year;
+        GP_TimeTable.DForm      := _DForm;
+        GP_TimeTable.DBeg       := TmpFormT12.DBeg;
+        GP_TimeTable.DEnd       := TmpFormT12.DEnd;
+        GP_TimeTable.PersonName := TmpFormT12.PersonName;
+        GP_TimeTable.cPosition  := TmpFormT12.cPosition;
+        GP_TimeTable.Kateg      := TmpFormT12.Kateg;
+        GP_TimeTable.DMark      := TmpFormT12.DMark;
+        GP_TimeTable.DHours     := TmpFormT12.DHours;
+        GP_TimeTable.DMarkAdd   := TmpFormT12.DMarkAdd;
+        GP_TimeTable.DHoursAdd  := TmpFormT12.DHoursAdd;
+        GP_TimeTable.OCode      := TmpFormT12.OCode;
+        GP_TimeTable.OAcc       := TmpFormT12.OAcc;
+        GP_TimeTable.OHours     := TmpFormT12.OHours;
+        GP_TimeTable.ACode      := TmpFormT12.ACode;
+        GP_TimeTable.ADays      := TmpFormT12.ADays;
+        GP_TimeTable.AHours     := TmpFormT12.AHours;
+        GP_TimeTable.Day1P      := TmpFormT12.Day1P;
+        GP_TimeTable.Chas1P     := TmpFormT12.Chas1P;
+        GP_TimeTable.Day2P      := TmpFormT12.Day2P;
+        GP_TimeTable.Chas2P     := TmpFormT12.Chas2P;
+        GP_TimeTable.TN         := TmpFormT12.TN;
+        GP_TimeTable.TS         := TmpFormT12.TS;
+        GP_TimeTable.TRBDays    := TmpFormT12.TRBDays;
+        GP_TimeTable.TRBHours   := TmpFormT12.TRBHours;
+        GP_TimeTable.TRODays    := TmpFormT12.TRODays;
+        GP_TimeTable.TROHours   := TmpFormT12.TROHours;
+        GP_TimeTable.TV         := TmpFormT12.TV;
+        if insert current GP_TimeTable != tsOk then
+        begin
+          result := false;
+          Message('Ошибка: Не удалось добавить запись в таблицу GP_TimeTable');
+          break;
+        end else begin
+          if year(Cur_date)>GP_TimeTable.YearN
+          or (  year(Cur_date)>GP_TimeTable.YearN
+            and month(Cur_date)>GP_TimeTable.MonthN
+            )
+          { if getfirst GP_SCUD_PERS=tsok
+             pGP_SCUD_EventsEdit.CalcAll(GP_SCUD_PERS.Nrec
+             ,GP_TimeTable.YearN
+             ,GP_TimeTable.MonthN
+             ,2 //1
+             ,true
+             ,0
+             );
+          }
+          if _ShowInfo then
+            Message('Создан корректировочный табель за ' +
+             DateToStr(To_Date(1, GP_TimeTable.MonthN, GP_TimeTable.YearN), 'month YYYY') + ' г.', Information);
+        end;
+      end;
+    end;
+
+    Done;
+  end;
+
+  // Создаёт копию табеля по лицевому счету с указанным NRec за указанный месяц (если она еще не создана),
+  // в отличие от прежней версии перезаписывает копию, если табель находится в текущем бух.периоде
+function CreateCopy(_DForm: Date; _cLSchet: tNRec; _Month: Byte; _Year: Word; _ReplIfExists: Boolean; _ShowInfo: Boolean): Boolean;
+var dDate, dDatePer : Date;
+{
+  result := true;
+
+  pcCurLSchet := _cLSchet;
+  pYear       := _Year;
+  set pMonth  := _Month;
+  dDate := date(1,_Month, _Year);
+  dDatePer := date(1, month(dGetTune('UP.DATOTCH')), year(dGetTune('UP.DATOTCH')));
+    // Если нет табеля за указанный месяц нечего и копировать
+  if not IsValidAll(tnLSTab) then
+    exit;
+
+    // С параметром _ReplIfExists = true эта функция вызывается вручную
+  if _ReplIfExists then
+  {
+    if IsValidAll(tnGP_TimeTable) //Есть уже копия
+    {
+      if (dDatePer > dDate)//если табель за прошлый бух период - копию не перезаписываем
+        exit;
+
+      if delete GP_TimeTableS where ((_cLSchet == GP_TimeTableS.cLSchet
+                                  and _Year    == GP_TimeTableS.YearN
+                                  and _Month   == GP_TimeTableS.MonthN)) != tsOk
+      {
+        Message('Ошибка: Не удалось удалось удалить запись из таблицы GP_TimeTable');
+        exit;
+      }
+    }
+  }
+  else
+  {
+    // С параметром _ReplIfExists = false эта функция вызывается автоматически при создании больничного за прошлый период
+    // если уже есть хоть одна копия
+    if IsValidAll(tnGP_TimeTable) then
+      exit;// новую копию не создаём
+  }
+  //удалим записи, за позапрошлый год
+  var wYear : word = _Year-1;
+  delete all GP_TimeTableS where ((_cLSchet == GP_TimeTableS.cLSchet
+                                  and wYear >> GP_TimeTableS.YearN));
+
+
+  Result := CreateCopy_Ex(_DForm, _cLSchet, _Month, _Year, _ShowInfo);
+}
+
+  // Копирует текущую запись из таблицы GP_TimeTable в таблицу TmpFormT12
+  function LoadCurRec: Boolean;
+  begin
+    result := true;
+    ClearBuffer(#TmpFormT12);
+    TmpFormT12.TabN         := GP_TimeTableS.TabN;
+    TmpFormT12.StrTabN      := GP_TimeTableS.StrTabN;
+    TmpFormT12.cLSchet      := GP_TimeTableS.cLSchet;
+    TmpFormT12.DBeg         := GP_TimeTableS.DBeg;
+    TmpFormT12.DEnd         := GP_TimeTableS.DEnd;
+    TmpFormT12.PersonName   := GP_TimeTableS.PersonName;
+    TmpFormT12.cPosition    := GP_TimeTableS.cPosition;
+    TmpFormT12.Kateg        := GP_TimeTableS.Kateg;
+    TmpFormT12.DMark        := GP_TimeTableS.DMark;
+    TmpFormT12.DHours       := GP_TimeTableS.DHours;
+    TmpFormT12.DMarkAdd     := GP_TimeTableS.DMarkAdd;
+    TmpFormT12.DHoursAdd    := GP_TimeTableS.DHoursAdd;
+    TmpFormT12.OCode        := GP_TimeTableS.OCode;
+    TmpFormT12.OAcc         := GP_TimeTableS.OAcc;
+    TmpFormT12.OHours       := GP_TimeTableS.OHours;
+    TmpFormT12.ACode        := GP_TimeTableS.ACode;
+    TmpFormT12.ADays        := GP_TimeTableS.ADays;
+    TmpFormT12.AHours       := GP_TimeTableS.AHours;
+    TmpFormT12.Day1P        := GP_TimeTableS.Day1P;
+    TmpFormT12.Chas1P       := GP_TimeTableS.Chas1P;
+    TmpFormT12.Day2P        := GP_TimeTableS.Day2P;
+    TmpFormT12.Chas2P       := GP_TimeTableS.Chas2P;
+    TmpFormT12.TN           := GP_TimeTableS.TN;
+    TmpFormT12.TS           := GP_TimeTableS.TS;
+    TmpFormT12.TRBDays      := GP_TimeTableS.TRBDays;
+    TmpFormT12.TRBHours     := GP_TimeTableS.TRBHours;
+    TmpFormT12.TRODays      := GP_TimeTableS.TRODays;
+    TmpFormT12.TROHours     := GP_TimeTableS.TROHours;
+    TmpFormT12.TV           := GP_TimeTableS.TV;
+    if insert current TmpFormT12 != tsOk then
+    begin
+      result := false;
+      Message('Ошибка: Не удалось добавить запись в таблицу TmpFormT12');
+      exit;
+    end;
+  end;
+
+  // Копирует указанную запись из таблицы GP_TimeTableS в таблицу TmpFormT12
+  function LoadCopy(_cGP_TimeTable: tNRec): Boolean;
+  begin
+    result := false;
+    if getFirst GP_TimeTableS where ((_cGP_TimeTable == GP_TimeTableS.NRec)) != tsOk then
+    begin
+      Message('Ошибка: Не найдена запись в таблице GP_TimeTable (GP_TimeTable.NRec = ' + To_Char(_cGP_TimeTable, 0, 0) + ')');
+      exit;
+    end;
+    result := LoadCurRec;
+  end;
+
+  // Копирует все копии табеля по лицевому счету с указанным NRec за указанный месяц из таблицы GP_TimeTableS в таблицу TmpFormT12
+  /*
+  function LoadCopies(_cLSchet: tNRec; _Month: Byte; _Year: Word): Boolean;
+  begin
+    result := true;
+    _loop GP_TimeTableS where ((
+          _cLSchet == GP_TimeTableS.cLSchet
+      and _Month   == GP_TimeTableS.MonthN
+      and _Year    == GP_TimeTableS.YearN
+    ))
+    begin
+      if not LoadCurRec then
+      begin
+        Result := false;
+        exit;
+      end;
+    end;
+  end;
+  */
+
+  // Удаляет все копии табеля по лицевому счету с указанным NRec за указанный месяц
+  /*
+  function DeleteCopies(_cLSchet: tNRec; _Month: Byte; _Year: Word): Boolean;
+  begin
+    result := delete GP_TimeTableS where ((
+          _cLSchet == GP_TimeTableS.cLSchet
+      and _Month   == GP_TimeTableS.MonthN
+      and _Year    == GP_TimeTableS.YearN
+    )) = tsOk;
+  end;
+  */
+
+  // Копирует табели за указанный период, если дата начала периода меньше даты начала отчетного периода модуля Зарплата
+  procedure CopyLSTabs(_DForm: Date; _cLSchet: tNRec; _FromDate: Date; _ToDate: Date; _ReplIfExists: Boolean; _ShowInfo: Boolean);
+  var
+    DatOtch: Date;
+    D: Date;
+    M: Byte;
+    Y: Word;
+  begin
+    // Если дата с или дата по пустая, ничего не копируем
+    if _FromDate = ZeroDate or _ToDate = ZeroDate then
+      exit;
+    DatOtch := dGetTune('UP.DATOTCH');
+    M := Month(_FromDate);
+    Y := Year(_FromDate);
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, ''#3'Создание копии табеля...'#13, 0);
+    while true do
+    begin
+      if not NextVisual then
+        break;
+      D := To_Date(1, M, Y);
+      if D >= DatOtch then
+        break;
+      if D > _ToDate then
+        break;
+      CreateCopy(_DForm, _cLSchet, M, Y, _ReplIfExists, _ShowInfo);
+      if M = 12 then
+      begin
+        M := 1;
+        Y++;
+      end else
+        M++;
+    end;
+    StopVisual('', 0);
+  end;
+
+  handleEvent
+    cmOnVipLoad:
+      begin
+        pDBeg := ZeroDate;
+        pDEnd := ZeroDate;
+        // объект работа с условными обозначениями выходного
+        LoadVipRef(Weekend, 'WeekendMarker');
+      end;
+  end;
+
+end.

@@ -1,0 +1,687 @@
+/*************************************************************************************************\
+ Наименование: Отчет по суммам выплат за период в разрезе подразделений
+ Примечание: ЗП \ Отчеты \ Отчеты пользователя
+
+ Вид работы  |Номер         |Дата      |Исполнитель              |Проект
+ ---------------------------------------------------------------------------------------------
+ Разработка  |#56210        |03/08/23  |kurennykh                |НПО Энергомаш
+\*************************************************************************************************/
+
+
+#include GetKau.vih
+#include Query.vih
+
+#include UserReport.vih
+
+VipInterface Rep_SumUdPodr Licensed(free);
+
+Interface Rep_SumUdPodr 'Отчет по суммам выплат за период в разрезе подразделений', EscClose;
+Show at (,,50,7);
+
+Table Struct tSums
+(
+    sPodr   : string
+  , MesN    : word
+  , YearN   : word
+  , wType   : word
+  , dSum    : double
+)
+With Index
+(
+    i01 = sPodr
+  , i02 = MesN + YearN + sPodr
+  , i03 = MesN + YearN + wType
+);
+
+Table Struct tPodr
+(
+    sPodr : string
+  , wPodr : word
+)
+With Index
+(
+    i01 = sPodr
+  , i02 = wPodr
+);
+
+Table Struct tPeriod
+(
+    sPeriod : string
+  , cPeriod : comp
+  , MesN    : word
+  , YearN   : word
+)
+With Index
+(
+    i01 = sPeriod
+  , i02 = cPeriod
+  , i03 = MesN + YearN
+);
+
+
+#include GetKau.var
+
+Create View rView
+
+var
+  RowNo   : longint;
+  ColNo   : longint;
+
+  _dBeg   : date;
+  _dEnd   : date;
+  _dOtch  : date;
+
+  _cPodr  : comp;
+  _sPodr  : string;
+  _AgrPodr: word;
+
+  _getKau : GetKau;
+
+  _log    : string;
+
+As
+select
+  1
+from
+  KatPodr
+, FpPeriod
+, tSums
+, tSums tSums2
+, tPodr
+, tPeriod
+;
+
+
+Screen scr1 'Отчет по суммам выплат за период в разрезе подразделений' (,,sci13Esc);
+Show at (,,,);
+Fields
+  _dBeg       : noProtect;
+  _dEnd       : noProtect;
+  _sPodr      :   Protect, PickButton;
+  _AgrPodr      noProtect, NoFrame;
+Buttons
+  cmCancel,,, 'Отмена'      ,,sci1Esc;
+  cmOk    ,,, 'Сформировать',,sci1Esc;
+<<
+ `Период обработки с` .@@@@@@@@@@ `по` .@@@@@@@@@@
+ `Подразделение` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ [:] при печати сворачивать подразделения до 3 зн.`
+
+ <. Отмена .>                   <. Сформировать .>
+>>
+end;
+
+Procedure MyLog(_str: string);
+{
+  //Exit;
+  LogStrToFile(_log,_str);
+}
+
+Procedure MysqlAddStr(var query_handle: longInt; add_query_str: string);
+{
+  sqlAddStr(query_handle, add_query_str);
+  MyLog('sql: ' + add_query_str);
+}
+
+Procedure DelPick(_w : word);
+{
+  var objQuery: iQuery;
+  var qStr    : LongInt;
+
+  sqlFreeStr(qStr);
+  qStr := 0;
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Очистка фильтра', 0);
+
+  MysqlAddStr(qStr, ' delete from tmpFlt where wKau = ' + string(_w));
+
+  objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка очистки (DelPick) ' + objQuery.errorCode,error);
+    StopVisual;
+    Exit;
+  }
+  StopVisual;
+}
+
+Procedure InsPick(_w : word; _c : comp);
+{
+  var objQuery: iQuery;
+  var qStr    : LongInt;
+
+  sqlFreeStr(qStr);
+  qStr := 0;
+
+  MysqlAddStr(qStr, ' insert tmpFlt (wKau, cRec)                                                                         ');
+  MysqlAddStr(qStr, ' select ' + string(_w) + ', #comp(' + string(_c) + ')                                               ');
+  MysqlAddStr(qStr, ' where #comp(' + string(_c) + ') not in (select cRec from tmpFlt where wKau = ' + string(_w) + ' )  ');
+
+  objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка заполнения (InsPick) ' + objQuery.errorCode,error);
+    Exit;
+  }
+  sqlFreeStr(qStr);
+}
+
+Procedure CreateTmpFlt();
+{
+  var objQuery: iQuery;
+  var qStr    : LongInt;
+
+  qStr := 0;
+  sqlFreeStr(qStr);
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Создание временной таблицы для фильтров', 0);
+
+  MysqlAddStr(qStr, ' table tmpFlt           ');
+  MysqlAddStr(qStr, ' (                      ');
+  MysqlAddStr(qStr, '     wKau : word        ');
+  MysqlAddStr(qStr, '   , cRec : comp        ');
+  MysqlAddStr(qStr, ' )                      ');
+  MysqlAddStr(qStr, ' with index             ');
+  MysqlAddStr(qStr, ' (                      ');
+  MysqlAddStr(qStr, '     i01 = wKau + cRec  ');
+  MysqlAddStr(qStr, '   , i02 = cRec         ');
+  MysqlAddStr(qStr, '   , i03 = wKau         ');
+  MysqlAddStr(qStr, ' );                     ');
+
+  sqlDropTmpTable('tmpFlt');
+
+  if sqlCreateTmpTable(qStr, ctmNormal) <> tsOk
+  {
+    Message('Ошибка создания временной таблицы tmpFlt (CreateTmpFlt) ', error);
+    StopVisual;
+    Exit;
+  }
+
+  sqlFreeStr(qStr);
+  StopVisual;
+}
+
+Function GetSums() : longint;
+{
+  _dOtch := dGetTune('UP.DATOTCH');
+
+  result := 0;
+
+  var qStr : longInt;
+
+  sqlFreeStr(qStr);
+  qStr := 0;
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Обработка удержаний'#13 +
+                                          'Период : ' + DateToStr(_dBeg,'DD/MM/YYYY') + ' - ' + DateToStr(_dEnd,'DD/MM/YYYY') + ';'#13 +
+                                          'Подразделения : ' + _sPodr, 0);
+
+  MysqlAddStr(qStr, '    select                                                                                                                           ');
+  if (_AgrPodr = 0) then
+    MysqlAddStr(qStr, '    t.sPodr     as sPodr                                                                                                           ');
+  else
+    MysqlAddStr(qStr, '    SubString(t.sPodr, 1, 3) as sPodr                                                                                              ');
+  MysqlAddStr(qStr, '    , t.mesn      as MesN                                                                                                            ');
+  MysqlAddStr(qStr, '    , t.yearn     as YearN                                                                                                           ');
+  MysqlAddStr(qStr, '    , t.wType     as wType                                                                                                           ');
+  MysqlAddStr(qStr, '    , sum(t.dsum) as dSum                                                                                                            ');
+  MysqlAddStr(qStr, '    from (                                                                                                                           ');
+  MysqlAddStr(qStr, '          select                                                                                                                     ');
+  MysqlAddStr(qStr, '            katpodr.kod   as sPodr                                                                                                   ');
+  MysqlAddStr(qStr, '          , katpodr.nrec  as cPodr                                                                                                   ');
+  MysqlAddStr(qStr, '          , s.mesn        as mesn                                                                                                    ');
+  MysqlAddStr(qStr, '          , s.yearn       as yearn                                                                                                   ');
+  MysqlAddStr(qStr, '          , 0             as wType                                                                                                   ');
+  MysqlAddStr(qStr, '          , s.sumud       as dSum                                                                                                    ');
+  MysqlAddStr(qStr, '          from sumvidud s                                                                                                            ');
+  MysqlAddStr(qStr, '          left join katpodr on s.cexoz = katpodr.nrec                                                                                ');
+  MysqlAddStr(qStr, '          where     s.vidudp in (226)                                                                                                ');
+  //MysqlAddStr(qStr, '                and s.mesn  between ' + string(Month(_dBeg)) + ' and ' + string(Month(_dEnd)) + '                                  ');
+  MysqlAddStr(qStr, '                and s.yearn between ' + string(Year(_dBeg))  + ' and ' + string(Year(_dEnd))  + '                                    ');
+  MysqlAddStr(qStr, '                and (s.mesn <> ' + string(Month(_dOtch)) + ' and s.yearn <> ' + string(Month(_dOtch)) + ')                           ');
+  MysqlAddStr(qStr, '                                                                                                                                     ');
+  MysqlAddStr(qStr, '          union all                                                                                                                  ');
+  MysqlAddStr(qStr, '                                                                                                                                     ');
+  MysqlAddStr(qStr, '          select                                                                                                                     ');
+  MysqlAddStr(qStr, '            katpodr.kod   as sPodr                                                                                                   ');
+  MysqlAddStr(qStr, '          , katpodr.nrec  as cPodr                                                                                                   ');
+  MysqlAddStr(qStr, '          , s.mesn        as mesn                                                                                                    ');
+  MysqlAddStr(qStr, '          , s.yearn       as yearn                                                                                                   ');
+  MysqlAddStr(qStr, '          , 1             as wType                                                                                                   ');
+  MysqlAddStr(qStr, '          , s.sumud       as dSum                                                                                                    ');
+  MysqlAddStr(qStr, '          from sumvidud s                                                                                                            ');
+  MysqlAddStr(qStr, '          left join katpodr on s.cexoz = katpodr.nrec                                                                                ');
+  MysqlAddStr(qStr, '          where     s.vidudp in (500, 501, 502)                                                                                      ');
+  //MysqlAddStr(qStr, '                and s.mesn  between ' + string(Month(_dBeg)) + ' and ' + string(Month(_dEnd)) + '                                  ');
+  MysqlAddStr(qStr, '                and s.yearn between ' + string(Year(_dBeg))  + ' and ' + string(Year(_dEnd))  + '                                    ');
+  MysqlAddStr(qStr, '                and (s.mesn <> ' + string(Month(_dOtch)) + ' and s.yearn <> ' + string(Month(_dOtch)) + ')                           ');
+
+  if ((_dOtch >= _dBeg) and (_dOtch <= _dEnd)) then
+  {
+    MysqlAddStr(qStr, '        union all                                                                                                                  ');
+    MysqlAddStr(qStr, '                                                                                                                                   ');
+    MysqlAddStr(qStr, '        select                                                                                                                     ');
+    MysqlAddStr(qStr, '          katpodr.kod   as sPodr                                                                                                   ');
+    MysqlAddStr(qStr, '        , katpodr.nrec  as cPodr                                                                                                   ');
+    MysqlAddStr(qStr, '        , s.mesn        as mesn                                                                                                    ');
+    MysqlAddStr(qStr, '        , s.yearn       as yearn                                                                                                   ');
+    MysqlAddStr(qStr, '        , 0             as wType                                                                                                   ');
+    MysqlAddStr(qStr, '        , s.sumud       as dSum                                                                                                    ');
+    MysqlAddStr(qStr, '        from uder s                                                                                                                ');
+    MysqlAddStr(qStr, '        left join katpodr on s.cexoz = katpodr.nrec                                                                                ');
+    MysqlAddStr(qStr, '        where     s.vidud in (226)                                                                                                 ');
+    MysqlAddStr(qStr, '              and (s.mesn = ' + string(Month(_dOtch)) + ' and s.yearn = ' + string(Year(_dOtch)) + ')                             ');
+    MysqlAddStr(qStr, '                                                                                                                                   ');
+    MysqlAddStr(qStr, '        union all                                                                                                                  ');
+    MysqlAddStr(qStr, '                                                                                                                                   ');
+    MysqlAddStr(qStr, '        select                                                                                                                     ');
+    MysqlAddStr(qStr, '          katpodr.kod   as sPodr                                                                                                   ');
+    MysqlAddStr(qStr, '        , katpodr.nrec  as cPodr                                                                                                   ');
+    MysqlAddStr(qStr, '        , s.mesn        as mesn                                                                                                    ');
+    MysqlAddStr(qStr, '        , s.yearn       as yearn                                                                                                   ');
+    MysqlAddStr(qStr, '        , 1             as wType                                                                                                   ');
+    MysqlAddStr(qStr, '        , s.sumud       as dSum                                                                                                    ');
+    MysqlAddStr(qStr, '        from uder s                                                                                                                ');
+    MysqlAddStr(qStr, '        left join katpodr on s.cexoz = katpodr.nrec                                                                                ');
+    MysqlAddStr(qStr, '        where     s.vidud in (500, 501, 502)                                                                                       ');
+    MysqlAddStr(qStr, '              and (s.mesn = ' + string(Month(_dOtch)) + ' and s.yearn = ' + string(Year(_dOtch)) + ')                             ');
+  }
+
+  MysqlAddStr(qStr, '                                                                                                                                     ');
+  MysqlAddStr(qStr, '          union all                                                                                                                  ');
+  MysqlAddStr(qStr, '                                                                                                                                     ');
+  MysqlAddStr(qStr, '          select                                                                                                                     ');
+  MysqlAddStr(qStr, '            katpodr.kod   as sPodr                                                                                                   ');
+  MysqlAddStr(qStr, '          , katpodr.nrec  as cPodr                                                                                                   ');
+  MysqlAddStr(qStr, '          , case when (p.mesn = 1) then 12 else p.mesn - 1 end as mesn                                                               ');
+  MysqlAddStr(qStr, '          , case when (p.mesn = 1) then p.yearn - 1 else p.yearn end as yearn                                                        ');
+  MysqlAddStr(qStr, '          , 1             as wType                                                                                                   ');
+  MysqlAddStr(qStr, '          , -1.0 * p.dolg as dSum                                                                                                    ');
+  MysqlAddStr(qStr, '          from prmonth p                                                                                                             ');
+  MysqlAddStr(qStr, '          left join katpodr on p.cex = katpodr.nrec                                                                                  ');
+  MysqlAddStr(qStr, '          where     p.yearn between ' + string(Year(Add_Months(_dBeg, 1)))  + ' and ' + string(Year(Add_Months(_dEnd, 1)))  + '      ');
+  //MysqlAddStr(qStr, '                and p.mesn  between ' + string(Month(Add_Months(_dBeg, 1))) + ' and ' + string(Month(Add_Months(_dEnd, 1))) + '    ');
+  MysqlAddStr(qStr, '                                                                                                                                     ');
+  MysqlAddStr(qStr, '          union all                                                                                                                  ');
+  MysqlAddStr(qStr, '                                                                                                                                     ');
+  MysqlAddStr(qStr, '          select                                                                                                                     ');
+  MysqlAddStr(qStr, '            katpodr.kod   as sPodr                                                                                                   ');
+  MysqlAddStr(qStr, '          , katpodr.nrec  as cPodr                                                                                                   ');
+  MysqlAddStr(qStr, '          , case when (p.mesn = 1) then 12 else p.mesn - 1 end as mesn                                                               ');
+  MysqlAddStr(qStr, '          , case when (p.mesn = 1) then p.yearn - 1 else p.yearn end as yearn                                                        ');
+  MysqlAddStr(qStr, '          , 1             as wType                                                                                                   ');
+  MysqlAddStr(qStr, '          , p.summa9      as dSum                                                                                                    ');
+  MysqlAddStr(qStr, '          from prmonth p                                                                                                             ');
+  MysqlAddStr(qStr, '          left join katpodr on p.cex = katpodr.nrec                                                                                  ');
+  MysqlAddStr(qStr, '          where     p.yearn between ' + string(Year(Add_Months(_dBeg, 1)))  + ' and ' + string(Year(Add_Months(_dEnd, 1)))  + '      ');
+  //MysqlAddStr(qStr, '                and p.mesn  between ' + string(Month(Add_Months(_dBeg, 1))) + ' and ' + string(Month(Add_Months(_dEnd, 1))) + '    ');
+  MysqlAddStr(qStr, '    ) t                                                                                                                              ');
+  if ((_sPodr <> 'все') and (_sPodr <> ''))
+    MysqlAddStr(qStr, '  inner join tmpFlt on t.cPodr = tmpFlt.cRec                                                                                       ');
+  MysqlAddStr(qStr, '    group by                                                                                                                         ');
+  if (_AgrPodr = 0) then
+    MysqlAddStr(qStr, '    t.sPodr                                                                                                                        ');
+  else
+    MysqlAddStr(qStr, '    SubString(t.sPodr, 1, 3)                                                                                                       ');
+  MysqlAddStr(qStr, '    , t.mesn, t.yearn, t.wType                                                                                                       ');
+
+  var objQuery :  iQuery;
+      objQuery := queryManager.createQuery(qStr);
+
+  if (objQuery.Execute.ErrorCode <> tsOk) then
+  {
+    Message('Ошибка выполнения запроса GetSums ' + objQuery.ErrorCode, Error);
+  }
+  else
+  {
+    sqlCopyInto(objQuery, tntSums, true);
+    result := RecordsInTable(tntSums);
+  }
+
+  sqlFreeStr(qStr);
+
+  SetVisualHeader('Compton!');
+
+  StopVisual;
+
+  result := result;
+}
+
+Function MakeData() : longint;
+{
+  delete all tSums;
+  delete all tPeriod;
+  delete all tPodr;
+
+  result := GetSums();
+
+  if (result = 0) then
+  {
+    Exit;
+  }
+
+  var _i : word = 1;
+  var _dt : date = ZeroDate;
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Обработка выборки', 0);
+  SetVisualHeader('Формирование аналитических разрезов');
+
+  ClearBuffer(#tPodr);
+    tPodr.sPodr := 'ИТОГО';
+    tPodr.wPodr := word(9999);
+  Insert Current tPodr;
+
+  Delete From tSums where ((0.0 == tSums.dSum (noIndex)));
+
+  _Loop tSums
+  {
+    if (getFirst FastFirstRow tPodr where ((tSums.sPodr == tPodr.sPodr)) <> tsOk) then
+    {
+      ClearBuffer(#tPodr);
+        tPodr.sPodr := tSums.sPodr;
+        tPodr.wPodr := word(SubStr(tSums.sPodr, 1, 3));
+      Insert Current tPodr;
+    }
+
+    if (getFirst FastFirstRow tPeriod where ((tSums.MesN == tPeriod.MesN and tSums.YearN == tPeriod.YearN)) <> tsOk) then
+    {
+      _dt := Date(01, word(tSums.MesN), word(tSums.YearN));
+      if ((_dt >= _dBeg) and (_dt <= _dEnd)) then
+      {
+        if (getFirst FpPeriod where ((_dt == FpPeriod.dBeg and 4h == FpPeriod.cTPer)) = tsOk) then
+        {
+          ClearBuffer(#tPeriod);
+            tPeriod.sPeriod := FpPeriod.Name;
+            tPeriod.cPeriod := FpPeriod.nRec;
+            tPeriod.MesN    := tSums.MesN;
+            tPeriod.YearN   := tSums.YearN;
+          Insert Current tPeriod;
+
+          ClearBuffer(#tSums2);
+            tSums2.sPodr   := 'ИТОГО';
+            tSums2.MesN    := tPeriod.MesN;
+            tSums2.YearN   := tPeriod.YearN;
+            tSums2.wType   := 0;
+            tSums2.dSum    := 0.0;
+          Insert Current tSums2;
+
+          ClearBuffer(#tSums2);
+            tSums2.sPodr   := 'ИТОГО';
+            tSums2.MesN    := tPeriod.MesN;
+            tSums2.YearN   := tPeriod.YearN;
+            tSums2.wType   := 1;
+            tSums2.dSum    := 0.0;
+          Insert Current tSums2;
+        }
+      }
+    }
+  }
+
+  var _d : double;
+
+  _Loop tSums where (('ИТОГО' == tSums.sPodr))
+  {
+    _d := 0.0;
+    _Loop tSums2 where ((tSums.MesN == tSums2.MesN and tSums.YearN == tSums2.YearN and tSums.wType == tSums2.wType))
+    {
+      _d := _d + tSums2.dSum;
+    }
+    Set tSums.dSum := _d;
+    Update Current tSums;
+  }
+
+  StopVisual;
+}
+
+Procedure PrintData();
+{
+  var _k  : longint = 0;
+  var _nc : longint = 0;
+  var _d  : double  = 0.0;
+
+  _k := MakeData();
+
+  if (_k = 0) then
+  {
+    Message('По указанным параметрам не были найдены данные для построения отчета');
+    Exit;
+  }
+  else
+  {
+    if (not xlCreateExcel('RepSumUdPodr' + DateToStr(Cur_Date(), '_YYYYMMDD') + TimeToStr(Cur_Time(), '_HHMMSS') + '.xlsx', true)) then
+    {
+      Message('Ошибка создания нового файла Excel', Error);
+      Exit;
+    }
+    else
+    {
+      StartNewVisual(vtNumericVisual, vfTimer, 'Выгрузка отчета в Excel', 0);
+
+      RowNo := 3;
+      ColNo := 1;
+
+      var i : longint = 0;
+
+      if (xlIsExcelValid) then
+      {
+        xlSetActiveWorkBookByName('1');
+      }
+
+      xlSetCellStringValue('Код подр.', RowNo, ColNo, RowNo, ColNo);
+      xlSetFontStyle(xlBold, RowNo, ColNo, RowNo, ColNo);
+      xlMergeCells(RowNo, ColNo, RowNo + 2, ColNo);
+      xlAlignCellsEx(xlCenter, xlCenter, RowNo, ColNo, RowNo + 2, ColNo);
+      ColNo++;
+
+      xlSetCellStringValue('Сумма выплат, руб. за период с ' + DateToStr(_dBeg, 'DD.MM.YYYY') + ' по ' + DateToStr(_dEnd, 'DD.MM.YYYY'), RowNo, ColNo, RowNo, ColNo);
+      xlSetFontStyle(xlBold, RowNo, ColNo, RowNo, ColNo);
+      xlMergeCells(RowNo, ColNo, RowNo, ColNo + RecordsInTable(tntPeriod) * 3 - 1);
+      xlAlignCellsEx(xlCenter, xlCenter, RowNo, ColNo, RowNo, ColNo + RecordsInTable(tntPeriod) * 3 - 1);
+      RowNo++;
+
+      _Loop tPeriod ordered by tPeriod.cPeriod
+      {
+        RowNo := 4;
+
+        xlSetCellStringValue(chr(39) + tPeriod.sPeriod, RowNo, ColNo, RowNo, ColNo);
+        xlSetFontStyle(xlBold, RowNo, ColNo, RowNo, ColNo);
+        xlMergeCells(RowNo, ColNo, RowNo, ColNo + 2);
+        xlAlignCellsEx(xlCenter, xlCenter, RowNo, ColNo, RowNo, ColNo + 2);
+        RowNo++;
+
+        xlSetCellStringValue(chr(39) + 'аванс', RowNo, ColNo, RowNo, ColNo);
+        xlSetFontStyle(xlBold, RowNo, ColNo, RowNo, ColNo);
+        xlAlignCellsEx(xlCenter, xlCenter, RowNo, ColNo, RowNo, ColNo);
+
+        xlSetCellStringValue(chr(39) + 'зп за 2-ю пол.', RowNo, ColNo + 1, RowNo, ColNo + 1);
+        xlSetFontStyle(xlBold, RowNo, ColNo + 1, RowNo, ColNo + 1);
+        xlAlignCellsEx(xlCenter, xlCenter, RowNo, ColNo + 1, RowNo, ColNo + 1);
+
+        xlSetCellStringValue(chr(39) + 'итого', RowNo, ColNo + 2, RowNo, ColNo + 2);
+        xlSetFontStyle(xlBold, RowNo, ColNo + 2, RowNo, ColNo + 2);
+        xlAlignCellsEx(xlCenter, xlCenter, RowNo, ColNo + 2, RowNo, ColNo + 2);
+
+        RowNo++;
+
+        _nc := ColNo;
+
+        _Loop tPodr ordered by tPodr.wPodr
+        {
+          if (SubStr(tPodr.sPodr, 1, 1) = '_') then
+          {
+            Continue;
+          }
+
+          ColNo := 1;
+
+          xlSetCellStringValue(chr(39) + tPodr.sPodr, RowNo, ColNo, RowNo, ColNo);
+          xlSetFontStyle(xlBold, RowNo, ColNo, RowNo, ColNo);
+          xlAlignCellsEx(xlCenter, xlCenter, RowNo, ColNo, RowNo, ColNo);
+
+          ColNo := _nc;
+          _d := 0.0;
+          _Loop tSums where ((tPeriod.YearN == tSums.YearN and tPeriod.MesN == tSums.MesN and tPodr.sPodr == tSums.sPodr))
+          {
+            xlSetCellStringValue(tSums.dSum, RowNo, ColNo + if(tSums.wType = 0, 0, 1), RowNo, ColNo + if(tSums.wType = 0, 0, 1));
+            _d := _d + tSums.dSum;
+          }
+          xlSetCellStringValue(_d, RowNo, ColNo + 2, RowNo, ColNo + 2);
+
+          RowNo++;
+        }
+
+        ColNo := ColNo + 3;
+
+      }
+
+      xlSetNumberFormat('### ### ### ##0' + xlGetDecimalSeparator + ' 00', 6, 2, 6 + RecordsInTable(tntPodr), RecordsInTable(tntPeriod) * 3 + 1);
+
+      xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, xlContinuous, 0, 3, 1, 3 + RecordsInTable(tntPodr) + 2, RecordsInTable(tntPeriod) * 3 + 1);
+
+      xlAutoFit(1, 1, 3 + RecordsInTable(tntPodr) + 2, RecordsInTable(tntPeriod) * 3 + 1);
+
+      xlKillExcel;
+      StopVisual;
+    }
+  }
+}
+
+HandleEvent
+cmInit:
+{
+  ReadMyDsk(_dBeg, 'CO_Rep78_dBeg', false);
+  ReadMyDsk(_dEnd, 'CO_Rep78_dEnd', false);
+  _sPodr := '';
+  CreateTmpFlt();
+}
+
+cmPick:
+{
+  var _i : longint;
+  case CurField of
+    #_sPodr:
+    {
+      DelPick(cgKau_KatPodr);
+      var _tmpMarkerName : string;
+      var stMarker       : longint;
+
+      if (iGetKau.GetCodeKau(cgiMulti, cgKau_KatPodr, _cPodr) <> 0) then
+      {
+        _tmpMarkerName := iGetKau.GetMarkerName(cgKau_KatPodr);
+        stMarker       := InitMarker(_tmpMarkerName, 8, 10, 100, true);
+        _i             := 0;
+
+        while getmarker(stMarker, _i, _cPodr)
+        {
+          if (getFirst KatPodr where ((_cPodr == KatPodr.nRec)) = tsOk) then
+          {
+            InsPick(cgKau_KatPodr, _cPodr);
+          }
+          _i++;
+        }
+
+        DoneMarker(stMarker, _tmpMarkerName);
+      }
+      if (getFirst KatPodr where ((_cPodr == KatPodr.nRec)) = tsOk) then
+      {
+        set _sPodr := KatPodr.Kod + if((_i - 1) > 0, ' и еще ' + string(_i - 1), '');
+      }
+    }
+  end;
+  ReReadRecord;
+}
+
+cmDelOnProtect:
+{
+  case CurField of
+    #_sPodr:
+    {
+      DelPick(cgKau_KatPodr);
+
+      set _sPodr := '';
+      set _cPodr := 0h;
+    }
+  end;
+  ReReadRecord;
+}
+
+cmOk:
+{
+  if (_sPodr = '') then
+  {
+    _sPodr := 'все';
+  }
+
+  if (_dBeg = ZeroDate) then
+  {
+    if (Message('Внимание! Не указана дата начала для поиска затрат!'#13 +
+                'Обработка будет идти с начала времен.'#13 +
+                'Продолжить?',YesNo) = cmNo) then
+    {
+      Exit;
+    }
+  }
+
+  if (_dEnd = ZeroDate) then
+  {
+    if (Message('Внимание! Не указана дата окончания для поиска затрат!'#13 +
+                'Продолжить?',YesNo) = cmNo) then
+    {
+      Exit;
+    }
+    _dEnd := Date(31, 12, 9999);
+  }
+
+  if (_dBeg > _dEnd) then
+  {
+    Message('Дата начала не может быть больше даты окончания', Error);
+    Exit;
+  }
+
+  if (_log = '') then
+    _log := 'Rep_SumUdPodr' + DateToStr(cur_date,'_YYYYMMDD') + TimeToStr(cur_time,'_HHMMSS') + '.log';
+
+  SaveMyDsk(_dBeg, 'CO_Rep78_dBeg');
+  SaveMyDsk(_dEnd, 'CO_Rep78_dEnd');
+
+  PrintData();
+}
+End;
+
+End.
+
+#include UserReport.vih
+
+VipInterface UserReport_Rep_SumUdPodr Implements IUserReport;
+Interface UserReport_Rep_SumUdPodr;
+
+Procedure Run;
+Begin
+  RunInterface(Rep_SumUdPodr);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Отчет по суммам выплат за период в разрезе подразделений';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'MENUZARP';
+  end;
+end;
+
+End.

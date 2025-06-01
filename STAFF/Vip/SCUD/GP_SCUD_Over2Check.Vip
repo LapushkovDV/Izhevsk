@@ -1,0 +1,616 @@
+/*************************************************************************************************\
+* Наименование: Сальдо часов СКУД                                                               *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#175          |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include GetKau.Vih
+#include GP_SCUD_SaldoEdit.Vih
+#include GP_SCUD_Function.Vih
+#include GP_SCUD_StateMentOnAbsent.Vih
+VipInterface GP_SCUD_Over2Check Licensed(free) Parameters(wRejim:word;wYear:word;wMes:word);
+#doc
+Контроль переработки
+#end
+//==================================================
+Interface GP_SCUD_Over2Check 'Контроль переработки' , EscClose;
+Show at (,,50,11);
+//==================================================
+table Struct tmp_Pers
+( cGp_SCUD_PERS :comp
+ ,Fio :string[100]
+ ,Code:string[50]
+ ,cPersons:comp
+ ,cKatPodr:comp
+)
+with index
+( tmp_Pers01 = Fio
+)
+;
+
+table Struct tmp_Doc_SP
+( cGp_SCUD_PERS:comp
+ ,EventDate : date "Дата события"
+ ,EventTmB  : time "Время события с"
+ ,EventTmE  : time "Время события по"
+ ,wType     : word
+ ,DocNMB    :string[100]
+ ,cGP_SCUD_DOC_SP:comp
+ ,cGP_SCUD_DOC   :comp
+ ,Diff:double
+)
+with index
+( tmp_Doc_SP01 = cGp_SCUD_PERS+EventDate
+)
+;
+
+table Struct tmp_pers_mes
+( cGp_SCUD_PERS :comp
+ ,Mes           :word
+ ,Year          :word
+ ,CH_Over2_Ost   :double
+ ,CH_Over2_Cur   :double
+ ,CH_Over2_Opl   :double
+ ,CH_Over2_OplF  :double
+ ,cGP_SCUD_Saldo:comp
+)
+with index
+( tmp_pers_mes01 = cGp_SCUD_PERS+Year+Mes
+);
+
+
+#include GetKau.Var
+//Нужна функция GetPlanTime
+#include GP_SCUD_StateMentOnAbsent.Var
+var iGP_SCUD_SaldoEdit:GP_SCUD_SaldoEdit;
+var iGP_SCUD_Function :GP_SCUD_Function;
+var
+ wRejim :word;
+ wMesB,wMes :word;
+ wYearB,wYear:word;
+ DT_OST:date; //срок учета переработки
+ wOption:word;
+//--- настройки
+  NPOEM_OWN_SCUD_OVER2_SROC :word; // 'Кол-во месяцев учета переработки', ftword,36,'','');
+  NPOEM_OWN_SCUD_OVER2_SROC_D:date;// 'Дата, до которой не учитывать переработку ', ftdate,'','','');
+  NPOEM_OWN_SCUD_CAN_CHANGE_STATUS:word;//Разрешать изменение статуса в любых документах
+  NPOEM_OWN_HEAD_V_VID:word;//В интерфейсе руководителя отображать
+  NPOEM_OWN_SCUD_ZAbsent_Over2:word;// 'Отображать сальдо по переработке в заявлении на отсутствие
+  NPOEM_OWN_SCUD_ZAbsent_REASON:word;//Аналитика для ведения причин заявления на отсутствие
+//---------------------------------
+#include Excel_Var.Vpp
+//-----------------------------------------
+// Фильтры
+//-----------------------------------------
+   wFilter:word;
+   Marker_Count :longint;
+    wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   KauMarkerName:string;
+   Marker_Tmp :longint;
+
+   #mrkfld_(KatPodr)
+   #mrkfld_(Persons)
+
+Create view
+as select GP_SCUD_SALDO.Nrec ,tmp_Pers.*,tmp_Pers_Mes.*,tmp_Doc_SP.*
+from
+   GP_SCUD_SALDO
+  ,tmp_Pers(tmp_Pers01),tmp_Pers_Mes,tmp_Doc_SP
+
+//------- фильтры
+ , KatPodr    KatPodr_Flt
+ , Persons    Persons_Flt
+where ((
+  tmp_pers_mes.cGP_SCUD_Saldo == GP_SCUD_SALDO.Nrec
+//------- фильтры
+and wc_nrec == KatPodr_Flt.Nrec
+and wc_nrec == Persons_Flt.Nrec
+))
+;
+
+
+Parameters
+  wRejim
+#doc
+  3- авто, 0 контроль, 1 отчет
+#end
+, wYearB
+#doc
+ год
+#end
+, wMesB
+#doc
+ месяц
+#end
+;
+
+#include Excel_Fun.Vpp
+
+  //------------------------------------
+  // сохранить параметры
+  //------------------------------------
+  Procedure SaveParam;
+  { SaveMyDsk(wFilter  ,GetInterfaceName+'_wFilter');
+    //-----------------------
+    DoneMarker(Marker_Persons, GetInterfaceName+'_Persons' );
+    DoneMarker(Marker_KatPodr, GetInterfaceName+'_KatPodr' );
+  } //Procedure SaveParam;
+
+  //------------------------------------
+  // восстановить параметры
+  //------------------------------------
+  Procedure ReadParam;
+  { if not ReadMyDsk(wFilter,GetInterfaceName+'_wFilter',false) wFilter:=0;
+    //--------------------
+    Marker_Persons  :=InitMarker(GetInterfaceName+'_Persons' , 8, 50, 10, True);
+    Marker_KatPodr  :=InitMarker(GetInterfaceName+'_KatPodr' , 8, 50, 10, True);
+
+
+  } //  Procedure ReadParam;
+
+
+Function SborData :boolean;
+var _DTB:date;
+    _pStatus:comp;
+    ww_str:string;
+{ Result:=false;
+  delete all tmp_Pers;
+  delete all tmp_Pers_Mes;
+  delete all tmp_Doc_SP;
+  Result:=true;
+  _DTB:=Date(1,wMesB,wYearB);
+  _pStatus:=pGP_SCUD_A.GetStatus_Default;
+  timelog('GP_SCUD_Over2Check->SborData:_pStatus='+string(_pStatus,0,0) );
+  //----------------------------------------
+  _Try
+  { SQL
+     select Distinct
+       GP_SCUD_PERS.Nrec
+      ,GP_SCUD_PERS.FIO
+      ,GP_SCUD_PERS.CODE
+      ,GP_SCUD_PERS.cPersons
+      ,GP_SCUD_PERS.cKAtPodr
+    from GP_SCUD_Doc_SP
+    Inner join GP_SCUD_Doc on GP_SCUD_Doc.Nrec = GP_SCUD_Doc_SP.cGP_SCUD_Doc
+                  and GP_SCUD_Doc.wType=1010 //GP_iSC_statement_on_absence;//1010
+                  and (GP_SCUD_Doc.cStatus<>:(_pStatus))
+                  and :(_DTB)<=GP_SCUD_Doc.DocDate
+
+    Inner join GP_SCUD_Reason on
+            GP_SCUD_Reason.Nrec =GP_SCUD_Doc.cReason
+            /*CASE WHEN GP_SCUD_Doc_SP.cReason  <>#Comp(0)
+                                       THEN GP_SCUD_Doc_SP.cReason
+                                       ELSE GP_SCUD_Doc.cReason END
+                                       */
+             and GP_SCUD_Reason.wType=1
+    inner join GP_SCUD_PERS on GP_SCUD_PERS.Nrec = GP_SCUD_Doc_SP.cGP_SCUD_PERS
+    into tmp_pers;
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса 001 '+ExploreException);
+  }
+  timelog('GP_SCUD_Over2Check->SborData:отобрали tmp_pers ='+string(RecordsInTable(#tmp_pers),0,0) );
+
+  //----------------------------------------
+  _Try
+  { SQL select
+       GP_SCUD_Doc_SP.cGP_SCUD_PERS as cGp_SCUD_PERS//:comp
+      ,GP_SCUD_Doc.DocDate  as EventDate //: date "Дата события"
+      ,GP_SCUD_Doc_SP.EventTmB  //: time "Время события с"
+      ,GP_SCUD_Doc_SP.EventTmE  //: "Время события по"
+      ,GP_SCUD_Reason.wType wType //    : word
+      ,GP_SCUD_DOC.DocNMB   // :string[100]
+      ,GP_SCUD_DOC_SP.Nrec as cGP_SCUD_DOC_SP//:comp
+      ,GP_SCUD_DOC_SP.cGP_SCUD_DOC   //:comp
+      ,0.00 as Diff
+    from GP_SCUD_Doc_SP
+    Inner join GP_SCUD_Doc on GP_SCUD_Doc.Nrec = GP_SCUD_Doc_SP.cGP_SCUD_Doc
+                  and GP_SCUD_Doc.wType=1010 //GP_iSC_statement_on_absence;//1010
+                  and (GP_SCUD_Doc.cStatus<>:(_pStatus))
+                  and :(_DTB)<=GP_SCUD_Doc.DocDate
+
+    Inner join GP_SCUD_Reason on
+            GP_SCUD_Reason.Nrec =GP_SCUD_Doc.cReason
+            /* CASE WHEN GP_SCUD_Doc_SP.cReason  <>#Comp(0)
+                                       THEN GP_SCUD_Doc_SP.cReason
+                                       ELSE GP_SCUD_Doc.cReason END*/
+             and GP_SCUD_Reason.wType=1
+    inner join GP_SCUD_PERS on GP_SCUD_PERS.Nrec = GP_SCUD_Doc_SP.cGP_SCUD_PERS
+    into tmp_doc_sp;
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса 002 '+ExploreException);
+  }
+  timelog('GP_SCUD_Over2Check->SborData:отобрали tmp_doc_sp ='+string(RecordsInTable(#tmp_doc_sp),0,0) );
+  _Try
+  { SQL select
+      GP_SCUD_SALDO.cGp_SCUD_PERS // :comp
+     ,GP_SCUD_SALDO.MesN as Mes //          :word
+     ,GP_SCUD_SALDO.YearN as Year //         :word
+     ,GP_SCUD_SALDO.CH_Over2_Ost //  :double
+     ,GP_SCUD_SALDO.CH_Over2_Cur//   :double
+     ,0.00 as CH_Over2_Opl    //:double
+     ,GP_SCUD_SALDO.CH_Over2_Opl as CH_Over2_OplF//  :double
+     ,GP_SCUD_SALDO.Nrec cGP_SCUD_Saldo :comp
+    From GP_SCUD_SALDO
+    where GP_SCUD_SALDO.YearN>:(wYearB)
+      or (GP_SCUD_SALDO.YearN=:(wYearB) and GP_SCUD_SALDO.MesN>=:(wMesB) )
+    into tmp_pers_mes;
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса 003 '+ExploreException);
+  }
+
+
+  // будем по каждом челу искать,
+  // изначально считаем что использование еще не распределено.
+  var _DT :date;
+  var buf:Type$GP_SCUD_SALDO ;
+
+  StopVisual('',0);
+  StartNewVisual(vtIndicatorVisual,vfTimer + vfBreak + vfConfirm,'Подготовка данных',RecordsInTable(#tmp_Pers));
+  _Loop fullcache tmp_pers
+  { var _wMes :word;
+    var _wYear:word;
+    var _chas1,_chas:double=0;
+    if not NextVisual then Exit;
+    if isBitCTW(wFilter,1)
+    { if not FoundMarker(Marker_KatPodr,tmp_pers.cKAtpodr)
+      { delete current tmp_pers;
+        continue;
+      }
+    }
+    if isBitCTW(wFilter,2)
+    { if not FoundMarker(Marker_Persons,tmp_pers.cPersons)
+      { delete current tmp_pers;
+        continue;
+      }
+    }
+    _Loop tmp_doc_sp where (( tmp_pers.cGp_SCUD_PERS == tmp_doc_sp.cGp_SCUD_PERS ))
+    ordered by Index tmp_doc_sp01
+    { _wMes :=month(tmp_doc_sp.EventDate);
+      _wYear:=year(tmp_doc_sp.EventDate);
+      _chas1:=iGP_SCUD_Function.GetDoubleFromTime(pGP_SCUD_A.GetPlanTime(tmp_pers.cGp_SCUD_PERS,tmp_doc_sp.EventDate
+           ,tmp_doc_sp.EventTmB,tmp_doc_sp.EventTmE));
+      do
+      { timelog('GP_SCUD_Over2Check->SborData:ФИО='+tmp_pers.Fio
+           +', номер '+tmp_doc_sp.DocNMB
+           +'  Mes= '+string(_wMes)
+           +', Year='+string(_wyear)
+           +', Часы='+string(_chas1)
+           +' Ищем сальдо');
+        do {
+          if getfirst tmp_pers_mes where (( tmp_pers.cGp_SCUD_PERS ==  tmp_pers_mes.cGp_SCUD_PERS
+            and _wYear == tmp_pers_mes.Year and _wMes == tmp_pers_mes.Mes )) <>0
+          { //шансов сюда попасть мало, но оставим проверку
+            if not  iGP_SCUD_SaldoEdit.GetSaldoBuf(tmp_pers.cGp_SCUD_PERS,_wYear,_wMes,false,buf)
+            { continue;
+
+            }
+            ClearBuffer(#tmp_pers_mes);
+            tmp_pers_mes.cGp_SCUD_PERS:=tmp_pers.cGp_SCUD_PERS;
+            tmp_pers_mes.Year:=_wYear ;
+            tmp_pers_mes.Mes :=_wMes;
+            tmp_pers_mes.CH_Over2_Ost  :=buf.CH_Over2_Ost;
+            tmp_pers_mes.CH_Over2_Cur  :=buf.CH_Over2_Cur;
+            tmp_pers_mes.CH_Over2_OplF :=buf.CH_Over2_Opl;
+            tmp_pers_mes.cGP_SCUD_Saldo:=buf.Nrec;
+            insert current tmp_pers_mes;
+          }
+          _chas:=//buf.CH_Over2_Ost
+                 tmp_pers_mes.CH_Over2_Cur
+                -tmp_pers_mes.CH_Over2_Opl; //уже израсходовано
+          if _chas<>0
+          { timelog(' _Mes= '+string(_wMes)+', _wYear='+string(_wyear)
+                  +', остаток='+string(_chas,0,2)+', погасить='+string(_chas1,0,2) );
+            if _Chas>=_chas1 //есть остатки
+            { tmp_pers_mes.CH_Over2_Opl:=tmp_pers_mes.CH_Over2_Opl+_chas1;
+              _chas1:=0;
+            }
+            else
+            { tmp_pers_mes.CH_Over2_Opl:=tmp_pers_mes.CH_Over2_Opl+_chas;
+              _chas1:=_chas1-_Chas;
+            }
+            timelog('  _Mes= '+string(_wMes)+', _wYear='+string(_wyear)
+               +', осталось погасить='+string(_chas1,0,2) );
+            update current tmp_pers_mes;
+            if _chas1=0 break;
+          } //if _chas<>0
+        } While False;
+        _wMes:=_wMes-1;
+        if _wMes=0
+        { _wMes:=12;
+          _wYear:=_wYear-1;
+        }
+        if DT_OST>date(1,_wMes,_wYear) break;
+      } while _chas1>0 and _wYear>=year(tmp_doc_sp.EventDate)-3;
+
+      // есть не распределенный остаток
+      if _Chas1>0
+      { ww_str:='Для "'+tmp_pers.Fio+'" не хватает переработок на '+string(_chas1,0,2)+' ч.';
+        timelog(ww_Str);
+        _wMes:=month(tmp_doc_sp.EventDate);
+        _wYear:=year(tmp_doc_sp.EventDate);
+        if getfirst tmp_pers_mes where (( tmp_pers.cGp_SCUD_PERS ==  tmp_pers_mes.cGp_SCUD_PERS
+          and _wYear == tmp_pers_mes.Year and _wMes == tmp_pers_mes.Mes )) =tsok
+        { tmp_pers_mes.CH_Over2_Opl:=tmp_pers_mes.CH_Over2_Opl+_Chas1;
+          update current tmp_pers;
+        }
+      } //if _Chas1>0 and _koef>0
+    } //_Loop tmp_doc_sp where
+  } //_Loop tmp_pers
+  delete all tmp_pers_mes where Abs(tmp_pers_mes.CH_Over2_OplF-tmp_pers_mes.CH_Over2_Opl)<0.01;
+  Result:=true;
+} //Function SborData :boolean;
+
+
+//--------------------------
+// Печать данных
+//--------------------------
+Function PrintDoc :boolean;
+var maxColCount:longint;
+{ Result:=false;
+  StopVisual('',0);
+  StartNewVisual(vtIndicatorVisual,vfTimer + vfBreak + vfConfirm,'Печать данных',RecordsInTable(#tmp_Pers));
+  HeaderStrCount:=2;
+  maxColCount:=8;
+  wexrow:=HeaderStrCount+1;
+  MyXlCreaMatrix(1000,maxColCount);
+  wexrow:=wexrow-1;
+
+  _Loop fullcache tmp_Pers
+  { if not NextVisual then exit;
+    _Loop tmp_pers_mes where (( tmp_pers.cGp_Scud_Pers == tmp_pers_mes.cGp_Scud_Pers  ))
+    { wexrow++; wexcol:=1;
+      MyPutExcel(chr(39)+tmp_pers.code,10,0,-1,-1);
+      MyPutExcel(tmp_pers.Fio,10,0,-1,-1);
+      MyPutExcel(tmp_pers_mes.Year,10,0,-1,-1);
+      MyPutExcel(tmp_pers_mes.Mes,10,0,-1,-1);
+      MyPutExcelNumber(tmp_pers_mes.CH_Over2_Cur,2,10,0,-1,-1);
+      MyPutExcelNumber(tmp_pers_mes.CH_Over2_Oplf,2,10,0,-1,-1);
+      MyPutExcelNumber(tmp_pers_mes.CH_Over2_Opl,2,10,0,-1,-1);
+      MyPutExcelNumber(tmp_pers_mes.CH_Over2_Oplf-tmp_pers_mes.CH_Over2_Opl,2,10,0,-1,-1);
+    } //_Loop tmp_pers_mes where (( tmp_pers.cGp_Scud_Pers == tmp_pers_mes.cGp_Scud_Pers  ))
+  } //_Loop tmp_Pers
+  MyxlWriteMatrix(wexrow);
+  xlFreeMatrix;
+  matrixkl:=False;
+  MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount+1 ,1,wexrow,maxColCount); //Обрамление
+  xlWrapText(HeaderStrCount, 1, wexrow, maxColCount);
+
+  Result:=true
+
+} //Function PrintDoc :boolean;
+
+
+Procedure CorrSaldo;
+var
+  _DTB:date;
+  buf:Type$GP_SCUD_SALDO ;
+  _Over:tSumma;
+  _Over2:tSumma; _Holiday:tSumma;
+  _Over_Opl:tSumma;_Over2_Opl:tSumma;_Holiday_Opl:tSumma;
+{
+  StopVisual('',0);
+  StartNewVisual(vtIndicatorVisual,vfTimer + vfBreak + vfConfirm,'Исправление данных',RecordsInTable(#tmp_Pers));
+  _Loop tmp_Pers
+  { _DTB:=Date(1,month(Cur_Date),year(Cur_Date));
+    if not NextVisual then break;
+    _Loop tmp_pers_mes where (( tmp_pers.cGp_Scud_Pers == tmp_pers_mes.cGp_Scud_Pers  ))
+    { if _DTB>date(1,tmp_pers_mes.Mes,tmp_pers_mes.Year)
+        _DTB:=date(1,tmp_pers_mes.Mes,tmp_pers_mes.Year);
+      if getfirst GP_SCUD_SALDO where (( tmp_pers_mes.cGP_SCUD_Saldo == GP_SCUD_SALDO.Nrec )) = tsok
+      { update current GP_SCUD_SALDO set GP_SCUD_SALDO.CH_Over2_Opl :=tmp_pers_mes.CH_Over2_Opl;
+      }
+    }//_Loop tmp_pers_mes where (( tmp_pers.cGp_Scud_Pers == tmp_pers_mes.cGp_Scud_Pers  ))
+    _DTB:=Add_months(_DTB,1);
+    if (wOption and 1)>0 _DTB:=DT_OST;
+    while _DTB<date(1,Month(Cur_Date),Year(Cur_Date))
+    { var _wMes :word;
+      var _wYear:word;
+      _wMes :=month(_DTB);
+      _wYear:=Year (_DTB);
+      _Over:=_Over2:=_Holiday:=0;
+      _Over_Opl:=_Over2_Opl:=_Holiday_Opl:=0;
+      do
+      {
+        if _DTB=DT_OST //На дату остатка никогда не считаем!
+        { if  (wOption and 1)>0
+          { if not iGP_SCUD_SaldoEdit.GetSaldoBuf(tmp_pers.cGP_SCUD_Pers,_wYear,_wMes,false,buf) continue;
+            buf.CH_Over2_Ost:=0;
+            iGP_SCUD_SaldoEdit.SetSaldoBuf(buf);
+            Continue;
+          }
+        } //if _DTB=DT_OST
+        if not iGP_SCUD_SaldoEdit.GetSaldo(tmp_pers.cGP_SCUD_Pers,_wYear,_wMes,true
+          ,_Over,_Over2,_Holiday
+          ,_Over_Opl,_Over2_Opl,_Holiday_Opl
+          ,false) then continue;
+        if not iGP_SCUD_SaldoEdit.GetSaldoBuf(tmp_pers.cGP_SCUD_Pers,_wYear,_wMes,false,buf) continue;
+        buf.CH_Over2_Ost:=_Over2;
+        iGP_SCUD_SaldoEdit.SetSaldoBuf(buf);
+      } while False;
+      _DTB:=Add_months(_DTB,1);
+    } //while _DTB<date(1,Month(CurDate),Year(CurDate))
+  } //_Loop tmp_Pers
+
+} //Procedure CorrSaldo;
+
+
+//----------------------------------
+// Формирование отчета
+//----------------------------------
+Function FormDoc:boolean;
+var  werr:word;
+{ Result:=true;
+
+  if Date(1,wMesB,wYearB)<DT_OST
+  { Message('Расчет возможен только с '+DateToStr(DT_OST,'month YYYY'));
+    set wMesB :=month(DT_OST);
+    set wYearB:=Year (DT_OST);
+    Exit;
+  }
+  LogFileNm:=GetStringParameter('Files','OutputFilesDirectory',0)
+                               +'!GP_SCUD_Over2Check.log';
+
+  werr:=ExcelInit('GP_SCUD_Over2Check.xlsx',true);
+  if FileExist(LogFileNm) DeleteFile(LogFileNm);
+  MyLogWrite(true,'START');
+
+
+  if not SborData then exit;
+  if not PrintDoc then exit;
+  myXlEnd;
+  if wRejim=1
+  { if message('Посмотрите отчет'
+      +chr(13)+'Исправлять использование переработки?'
+    ,YesNo) = cmYes
+      CorrSaldo;
+
+  }
+  Result:=true;
+} //Function FormDoc:boolean;
+
+  //---------------------------------------
+  // Установка наименований фильтров
+  //---------------------------------------
+  Procedure SetFilterNM(_Field:longint=0);
+  { if _Field=0 or _Field=#Filtr_Katpodr
+    { #mrkfiltr_(Katpodr_Flt,Katpodr,Nrec,wc_nrec,Katpodr_Flt.Kod+','+Katpodr_Flt.Name)
+    }
+    if _Field=0 or _Field=#Filtr_Persons
+    { #mrkfiltr_(Persons_Flt,Persons,Nrec,wc_nrec,Persons_Flt.Fio)
+    }
+    ReScanPanel(#KatPodr_Flt);
+  } //Procedure SetFilterNM(_Field:longint)
+
+
+//-------------------------------------
+Screen scrParam 'Параметры формирования' (,,sci1Esc);
+Table KatPodr_Flt;
+Fields
+  wRejim:NoProtect;
+  wMesB: #(Month_List)
+  wYearB:noprotect,spinButton [1, 2017, 2200];
+  wOption:NoProtect;
+  DT_OST :Protect,NoDel;
+
+  wFilter :NoProtect;
+  Filtr_Katpodr  : PickButton,Protect;
+  Filtr_Persons  : PickButton,Protect;
+
+Buttons
+  cmOk,default,,'Сформировать отчет', hcOplTrudhlp, sci1Esc;
+  cmCancel,,,'Выход', hcOplTrudhlp, sci1Esc;
+<<
+  `Режим` (.) Отчет`
+          (.) Исправление`
+
+  `Начать с`.@@@@@@@@@ мес. .@@@@@@@@@ года
+  [.] Обнулить входящее сальдо`.@@@@@@@@@@@
+  `Фильтр по`
+ [.] подразделению` .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ [.] Сотруднику`    .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   <.~П~родолжить.>        <.   ~О~тмена   .>
+>>
+end; //scrParam 'Параметры формирования' (,,sci1Esc), Cyan;
+//--------------------------------------------
+// Обработчик событий интерфейса
+//--------------------------------------------
+
+
+HandleEvent
+cmInit:
+{ wMesB :=MonthRas;
+  wYearB:=YearRas;
+  ReadParam;
+  SetFilterNM;
+  //срок учета переработки
+  NPOEM_OWN_SCUD_OVER2_SROC  :=wGetTune('NPOEM_OWN.SCUD.OVER2_SROC'); // 'Кол-во месяцев учета переработки', ftword,36,'','');
+  NPOEM_OWN_SCUD_OVER2_SROC_D:=dGetTune('NPOEM_OWN.SCUD.OVER2_SROC_D');// 'Дата, до которой не учитывать переработку ', ftdate,'','','');
+  NPOEM_OWN_SCUD_CAN_CHANGE_STATUS:=wGetTune('NPOEM_OWN.SCUD.CAN_CHANGE_STATUS');//Разрешать изменение статуса в любых документах
+  NPOEM_OWN_HEAD_V_VID:=wGetTune('NPOEM_OWN.HEAD_V_VID');//В интерфейсе руководителя отображать
+  NPOEM_OWN_SCUD_ZAbsent_Over2:=wGetTune('NPOEM_OWN.SCUD.ZAbsent_Over2');// 'Отображать сальдо по переработке в заявлении на отсутствие
+  DT_OST:=Sub_months(date(1,MonthRas,YearRas),NPOEM_OWN_SCUD_OVER2_SROC);
+  if  NPOEM_OWN_SCUD_OVER2_SROC_D<>ZeroDate
+    if NPOEM_OWN_SCUD_OVER2_SROC_D>DT_OST
+     DT_OST:=NPOEM_OWN_SCUD_OVER2_SROC_D;
+
+}
+cmDone:
+{ SaveParam;
+
+}
+cmOk:
+{  if wMesB=0 or wMesB>12
+   { Message('Некорректно задан месяц');
+     exit;
+   }
+   if YearRas<wYearB
+   { message('Расчет возможен по '+String(YearRas)+' год' );
+     exit;
+   }
+   if wRejim=1
+   { if message('Работаем в режиме исправления?',YesNo)<>cmYes
+     { Exit;
+     }
+
+   }
+   StartNewVisual(vtNumericVisual,vfTimer + vfBreak + vfConfirm,'Подготовка данных для отчета',0);
+   if not FormDoc then message('Ошибки при формировании');
+   StopVisual('',0);
+   xlKillExcel;
+   //CloseInterFace(cmDone);
+}
+    //----------------------
+    cmPick:
+    { case CurField of
+      #Filtr_Katpodr:
+      { if RunInterface('GetPodaLN',12, Marker_KatPodr, 1)=cmDefault
+        { SetFilterNm(#Filtr_Katpodr);
+          BitOnW(wFilter,1);
+        }
+      }
+      //------------------------------
+      #Filtr_Persons:
+      { KauMarkerName := iGetKau.GetMarkerName(cgKau_Persons);
+        StoreMarker(Marker_Persons,KauMarkerName);
+        If (iGetKau.GetCodeKau(cgiPickMult,cgKau_Persons,Comp(0)) <> 0)
+        { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+          CopyMarker(Marker_Persons,Marker_Tmp);
+          DoneMarker(Marker_Tmp,'');
+          SetFilterNm(#Filtr_Persons);
+          BitOnW(wFilter,2);
+        }
+      }
+      end;
+      ReScanPanel(#KatPodr_Flt);
+    } //cmPick
+    //----------------------
+    cmDelOnProtect:
+    { Case Curfield of
+      //------------------------------
+      #Filtr_KatPodr:
+      { ClearMarker(Marker_KatPodr);
+        BitOffW(wFilter,1);
+        SetFilterNm(#Filtr_KatPodr);
+      }
+      //------------------------------
+      #Filtr_Persons:
+      { ClearMarker(Marker_Persons);
+        BitOffW(wFilter,2);
+        SetFilterNm(#Filtr_Persons);
+      }
+      end;
+    }
+
+
+end;
+end.

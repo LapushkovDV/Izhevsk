@@ -1,0 +1,331 @@
+/*************************************************************************************************\
+* Наименование: Интерфейс формирования формы "Приказ о производственной практике студентов"       *
+* Контур/Модуль: Управление персоналом                                                            *
+* Пункт меню: Документы / Все приказы по персоналу                                                *
+* Примечание:                                                                                     *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#173          |22/06/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include CatFunc.vih // Функции работы с Catalogs
+#include DeptIer.vih // Функции работы с подразделениями
+#include TotalOrganizationAttributes.vih // Работа с атрибутами организации
+#include GP_Signers.vih // Библиотека для вывода подписей в отчетах
+#include AppFuncs.vih // Функции работы с назначениями
+#include AdrFunc.vih // Функции работы с адресами
+#include GP_DepChief.vih
+
+interface GP_NFormRD35;
+
+  const
+    SG_CONST_REP = cgReport_KASSFRO; // код группы отчётов для выбора подписантов
+    SG_TAG_REP = 'StOrderRPD'; // код отчёта для выбора подписантов
+  end;
+
+  table struct SChiefs
+  (
+    cPerson: tNRec,
+    FIO: String[50],
+    cDep: tNRec,
+    cPosition: tNRec
+  )
+  With index
+  (
+    SChiefs01 = FIO,
+    SChiefs02 = cPerson
+  );
+
+  create view
+    var
+      pcTitleDoc: tNRec;
+      pcPersons: tNRec;
+      pContDoc: tNRec;
+      pTypeOper: Integer;
+      pPartDoc: tNRec;
+    from
+      Catalogs,
+      AddressN,
+      Notes,
+      PrMemo,
+      Education (EducByDate),
+      SChiefs (SChiefs01),
+      synonym Persons PersonsA,
+      synonym Persons PersonsC,
+      synonym ContDoc ContDocA,
+      synonym ContDoc ContDocB,
+      synonym Education EducationB,
+      synonym Appointments AppointmentsA
+    where((
+          pPartDoc         == PartDoc.NRec
+      and PartDoc.cDoc     == TitleDoc.NRec
+      and PartDoc.NRec     == ContDoc.cPart
+      and ContDoc.Person   == Persons.NRec
+      and ContDoc.cStr     == Appointments.NRec
+      and PartDoc.NRec     == ContDocB.cPart
+      and ContDocB.NRec    == EducationB.cContDoc
+      and SChiefs.cPerson  == PersonsC.NRec
+     //---  Шапка приказа
+     and    pPartDoc == PrMemo.cDoc
+     and    2 == PrMemo.wRef
+    ));
+
+  parameters pcTitleDoc, pcPersons, pContDoc, pTypeOper;
+
+  form Frm ('GP_NFormRD35.out','GP_NFormRD35');
+
+  var
+    IsAborted: Boolean;
+    ICatFunc: CatalogsFunctions;
+    IDepartIer: DepartIer;
+    VAppFuncs: AppointmentsFunctions;
+    iAdrFunc: AddressFunc;
+
+  #include TotalOrganizationAttributes.var // объявление и инициализация TOA
+  #include GP_Signers.var
+  #include GP_DepChief.var
+
+  file mFile;
+
+  function NoteToStr(_cContDoc: tNRec): String;
+  var
+    S: String;
+  begin
+    result := '';
+    if getFirst Notes where ((cKadryDisNotes == Notes.Choice and _cContDoc == Notes.Owner)) = tsOk then
+    begin
+      _try
+      begin
+        mFile.OpenMemo(Notes.Note);
+        while not mFile.Eof do
+        begin
+          mFile.ReadLn(S);
+          if result != '' then
+            result := result + ' ' + S
+          else
+            result := S;
+        end;
+      end
+      _except
+        on ExFile:
+          begin
+          end;
+        on ExFileNotFound:
+          begin
+          end;
+      _finally
+      begin
+        mFile.Close;
+      end;
+    end;
+  end;
+
+  // Выводит в поток формы данные об указанном человеке на указанную дату
+  procedure WritePersonData(_cPerson: tNRec; _Date: Date);
+  var
+    cApp: tNRec;
+  begin
+    cApp := 0;
+    if _cPerson != 0 then
+      if getFirst fastFirstRow PersonsA where ((_cPerson == PersonsA.NRec)) != tsok then
+        _cPerson := 0;
+    if _cPerson != 0 then
+    begin
+      cApp := VAppFuncs.GetAppNRec_OnDate(_cPerson, _Date);
+      if cApp != 0 then
+        if getFirst fastFirstRow AppointmentsA where ((cApp == AppointmentsA.NRec)) != tsok then
+          cApp := 0;
+    end;
+    if _cPerson != 0 then
+    begin
+      Frm.Write(PersonsA.NRec); // ...NRec
+      Frm.Write(PersonsA.FIO); // ...FIO
+      Frm.Write(GetStrTabn(PersonsA.TabNmb, PersonsA.StrTabn)); // ...TabN
+    end else
+      Frm.SkipFormat(3);
+    if cApp != 0 then
+    begin
+      Frm.Write(ICatFunc.GetCatalogsCode(AppointmentsA.Department)); // ...DepCode
+      Frm.Write(ICatFunc.GetCatalogsName(AppointmentsA.Department)); // ...DepName
+    end else
+      Frm.SkipFormat(2);
+  end;
+
+  procedure LocateChief(_cPerson: tNRec);
+  begin
+    /*
+    var _cTopDep: Comp = oGP_DepChief.GetPersTopDep(_cPerson, TitleDoc.DocDate);
+    if _cTopDep = 0 then
+      exit;
+    var _cPosition: Comp = 0;
+    var _cDepChief: Comp = oGP_DepChief.GetDepChief(_cTopDep, TitleDoc.DocDate, _cPosition);
+    */
+    var _cPosition: Comp = 0;
+    var _cDep: Comp = 0;
+    var _cDepChief: Comp = oGP_DepChief.GetPersChief(_cPerson, TitleDoc.DocDate, _cPosition, _cDep);
+    if _cDepChief = 0 then
+      exit;
+    if getFirst fastFirstRow PersonsA where ((_cDepChief == PersonsA.NRec)) != tsok then
+      exit;
+    if getFirst SChiefs where ((_cDepChief == SChiefs.cPerson)) != tsOk then
+    begin
+      // ClearBuffer(#SChiefs);
+      SChiefs.cPerson := _cDepChief;
+      SChiefs.FIO := PersonsA.FIO;
+      SChiefs.cDep := _cDep;
+      SChiefs.cPosition := _cPosition;
+      insert current SChiefs;
+    end;
+  end;
+
+  // Вывод в форму значения поля приказа Шапка раздела
+  procedure OutPrMemo(_cDoc: tNRec; _wRef: tNRec);
+  var
+    S: String;
+  begin
+    if getFirst PrMemo where ((_cDoc == PrMemo.cDoc and _wRef == PrMemo.wRef)) = tsOk then
+    begin
+      _try
+      begin
+        mFile.OpenMemo(PrMemo.Info);
+        while not mFile.Eof do
+        begin
+          mFile.ReadLn(S);
+          Frm.PutEventByID(feDoLoop, fcPDocMemoRD35);
+          Frm.Write(S); // PartDocMemoText
+        end;
+      end
+      _except
+        on ExFile:
+          begin
+          end;
+        on ExFileNotFound:
+          begin
+          end;
+      _finally
+      begin
+        mFile.Close;
+      end;
+    end;
+  end;
+
+  // Формирование потока для формы
+  procedure GenerateForm;
+  var
+    CommonSchedule: String;
+    CommonNote: String;
+    Note: String;
+  begin
+    // Выбираем группу подписантов
+    if not oGP_Signers.Init(SG_CONST_REP, SG_TAG_REP + To_Char(pTypeOper), true, TitleDoc.DocDate) then
+      exit;
+    Frm.SetGroup('РПД ' + To_Char(pTypeOper));
+
+    Frm.Write(pTypeOper); // TypeOper
+    Frm.Write(pcTitleDoc); // TitleDocNRec
+    Frm.Write(pContDoc); // ContDocNRec
+    Frm.Write(pcPersons); // PersonsNRec
+    
+    TOA.Bind(0); // связываем TOA с собственной организацией
+    Frm.Write(ObjDepartIer4(IDepartIer).GetOrgName(coGetTune('MyOrg'))); // OrgName
+    Frm.Write(Trim(TOA.GetJuridicalInfo.GetOkpoCode)); // OrgOKPO
+
+    Frm.Write(TitleDoc.DocNmb); // OrderNum
+    Frm.Write(TitleDoc.DocDate); // OrderDate
+
+    Frm.Write(EducationB.FromDate); // DateBeg
+    Frm.Write(EducationB.ToDate); // DateEnd
+    Frm.Write(EducationB.LastDate); // TestDate
+    Frm.Write(EducationB.LastTime); // TestTime
+
+    if getFirst Catalogs where ((EducationB.Name == Catalogs.NRec)) = tsOk then
+    begin
+      // Frm.Write(ICatFunc.GetCatalogsName(EducationB.Name)); // Institution
+      Frm.Write(Catalogs.Name); // Institution
+      Frm.Write(Catalogs.LongName); // InstLongName
+      var CityName: String;
+      CityName := '';
+      // Frm.Write(iAdrFunc.GetFullAddressInd(Catalogs.cRef1)); // InstCity
+      // Frm.Write(iAdrFunc.GetNamePlace_City(Catalogs.cRef1)); // InstCity
+      if Catalogs.cRef1 != 0 then
+        if getFirst AddressN where ((Catalogs.cRef1 == AddressN.NRec)) = tsOK then
+          CityName := iAdrFunc.GetNamePlace_City(AddressN.cSterr);
+      Frm.Write(CityName); // InstCity
+    end else
+      Frm.SkipFormat(3);
+
+    Frm.Write(ICatFunc.GetCatalogsName(EducationB.Level)); // EducLevel
+    Frm.Write(ICatFunc.GetCatalogsName(EducationB.Speciality)); // Speciality
+    Frm.Write(ICatFunc.GetCatalogsName(EducationB.cAddInf1)); // Subject
+    Frm.Write(EducationB.PaySum); // Sum
+    Frm.Write(ICatFunc.GetCatalogsName(EducationB.cReason)); // EducReason
+
+    WritePersonData(EducationB.cInf2, EducationB.FromDate); // Teacher...
+
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчётной формы...', 1);
+    _try
+      begin
+        OutPrMemo(PartDoc.NRec, 2);
+        CommonSchedule := '';
+        CommonNote := '';
+        _loop ContDoc
+        begin
+          NextVisual;
+          if CommonSchedule = '' and ContDoc.SBottom != '' then
+            CommonSchedule := ContDoc.SBottom;
+          Note := Trim(NoteToStr(ContDoc.NRec));
+          if CommonNote = '' and Note != '' then
+            CommonNote := Note;
+        end;
+        Frm.Write(CommonSchedule); // CommonSchedule
+        Frm.Write(CommonNote); // CommonNote
+        _loop ContDoc
+        begin
+          NextVisual;
+          Frm.PutEventByID(feDoLoop, fcPersons);
+          Frm.Write(Persons.NRec); // PersNRec
+          Frm.Write(Persons.FIO); // PersFIO
+          Frm.Write(GetStrTabn(Persons.TabNmb, Persons.StrTabn)); // PersTabN
+          Frm.Write(ICatFunc.GetCatalogsCode(Appointments.Department)); // PersDepCode
+          Frm.Write(ICatFunc.GetCatalogsName(Appointments.Department)); // PersDepDepName
+          Frm.Write(ICatFunc.GetCatalogsName(Appointments.Post)); // PersPosition
+          Frm.Write(ContDoc.SBottom); // PersSchedule
+          LocateChief(Persons.NRec);
+        end;
+        _loop SChiefs
+        begin
+          NextVisual;
+          Frm.PutEventByID(feDoLoop, fcChiefs);
+          Frm.Write(SChiefs.cPerson); // ChiefNRec
+          Frm.Write(PersonsC.FIO); // ChiefFIO
+          Frm.Write(GetStrTabn(PersonsC.TabNmb, PersonsC.StrTabn)); // ChiefTabN
+          Frm.Write(ICatFunc.GetCatalogsCode(SChiefs.cDep)); // ChiefDepCode
+          Frm.Write(ICatFunc.GetCatalogsName(SChiefs.cDep)); // ChiefDepDepName
+          Frm.Write(ICatFunc.GetCatalogsName(SChiefs.cPosition)); // ChiefPosition
+        end;
+      end
+    _except
+      on ExUserBreak:
+        begin
+          IsAborted := true;
+        end;
+    StopVisual('', 0);
+
+    if not IsAborted and not Frm.Error then
+      Frm.ShowFile();
+  end;
+
+  handleEvent
+    cmInit:
+      begin
+        IsAborted := false;
+        pPartDoc := 0;
+        if getFirst ContDocA where ((pContDoc == ContDocA.NRec)) = tsOk then
+          set pPartDoc := ContDocA.cPart;
+        if not IsAborted then
+          GenerateForm;
+        abort;
+      end;
+  end;
+
+end.

@@ -1,0 +1,685 @@
+/*************************************************************************************************\
+* Наименование:  Интерфейс для формирования проводок по резерву на годовые и квартальные премии   *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:                                                                                     *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#000          |09/04/17|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_PerOpl_Helper.vih
+#include Query.vih
+#include DateInterim.vih
+#include FRRecordDefinition.vih
+#include PlporSimple.vih
+
+#component "GP_ZP"
+
+interface GP_PremiumReserve 'Формирование проводок по резерву на премии' escClose DoAccept;
+show(,,49, 13);
+
+table struct tPremiumReserve (
+  Nrec      : comp,
+  LSchetNrec: comp,
+  Year      : word,
+  Month     : byte,
+  FIO       : string[60],
+  TabN      : string[20],
+  PodrKod   : string[20],
+  ZakazNum  : string[20],
+  Schet     : string[42],
+  SumReserve: double,
+  SumTaxes  : double
+) with index (
+  i01 = Nrec (Unique, Surrogate),
+  i02 = Schet + FIO
+);
+
+table struct tTaxReserve (
+  PremiumReserveNrec: comp,
+  VidPer: word,
+  Percent: double,
+  Sum: double
+) with index (
+  i01 = PremiumReserveNrec + VidPer
+);
+
+const
+  PLPOR_TIDK = 10;
+  PLPOR_TIDKGAL = 10;
+end;
+
+var
+  _plporSimple : PlporSimple;
+  _perOplHelper: GP_PerOpl_Helper;
+  //Параметры
+  _mode        : byte;                       //режим: 0-квартальные премии, 1-годовые премии
+  _period      : DateInterimInterval new;    //период, за который отбирать ведомости премирования
+  _typeFlag    : byte;                       //флаг отбора ведомостей премирования по виду: 0 бит - среднего звена, 1 бит - высшего звена
+  _quarter     : byte;                       //квартал за который выплачивается премия
+  _year        : word;                       //год за который выплачивается премия
+  _plporNrec   : comp;                       //нрек создаваемой бухсправки
+  //Параметры формирования проводок по резерву премий
+  _cStZatr      : comp;
+  _cElZatr      : comp;
+  _cRezerv      : comp;
+  _wRezerv      : word;
+  _cVidRezerv   : comp;
+  _wVidRezerv   : word;
+  //Параметры формирования проводок по резерву налогов на премии
+  _cStZatrNal   : comp;
+  _cElZatrNal   : comp;
+  _cRezervNal   : comp;
+  _wRezervNal   : word;
+  _cVidRezervNal: comp;
+  _wVidRezervNal: word;
+  //Прочее
+  _plansschNrec: comp;                       //нрек плана счетов, в котором будут формироваться проводки
+  _plporDenosch6: string;                    //значение служебного поля бухсправки для поиска существующей бухсправки по резерву на премию
+
+create view
+as select tPremiumReserve.LSchetNrec
+from tPremiumReserve, LSchet, tTaxReserve, Perech,
+     PlPor, SoprHoz, PlansSch, PlPor PlPor1, Oborot, SpKau
+where ((
+  tPremiumReserve.LSchetNrec == LSchet.Nrec and
+  tPremiumReserve.Nrec       == tTaxReserve.PremiumReserveNrec and
+  tTaxReserve.VidPer         == Perech.VidPer and
+  _plporNrec                 == PlPor.Nrec and
+  PlPor.TiDk                 == SoprHoz.TipDoc and
+  PlPor.Nrec                 == SoprHoz.cSoprDoc and
+  _plansschNrec              == PlansSch.Nrec and
+  PLPOR_TIDK                 == PlPor1.TiDk and
+  (PlPor1.Denosch6            = _plporDenosch6)
+))
+bounds OrderBySchet ordered by tPremiumReserve.Schet, tPremiumReserve.FIO;
+
+DataStream dsPremiumReserve
+(
+  [Mode]     _mode;
+  [BegDate]  _period.BegDate;
+  [EndDate]  _period.EndDate;
+  [TypeFlag] _typeFlag;
+  [Quarter]  _quarter;
+  [Year]     _year;
+  [Ispoln]   sGetTune('USER.FIO');
+  [GlavBuh]  sGetTune('MAINBUH');
+  table tPremiumReserve
+  (
+    [TabNmb]     tPremiumReserve.TabN;
+    [FIO]        tPremiumReserve.FIO;
+    [PodrKod]    tPremiumReserve.PodrKod;
+    [ZakazNmb]   tPremiumReserve.ZakazNum;
+    [Schet]      tPremiumReserve.Schet;
+    [SumReserve] tPremiumReserve.SumReserve;
+    [SumTaxes]   tPremiumReserve.SumTaxes;
+  );
+)
+end;
+
+//Устанавливает видимость полей в интерфейсе
+procedure SetFieldsVisiblity;
+{
+  if _mode = 0
+  {
+    rereadrecord;
+    SetFieldState(#_quarter, sfVisible);
+    ShowLabel4Field(#_quarter);
+  }
+  else
+  {
+    ClearFieldState(#_quarter, sfVisible);
+    HideLabel4Field(#_quarter);
+    rereadrecord;
+  }
+}
+
+//#region Query
+sql query qPremiumReserve =
+  select lschet.nrec as LSchetNrec,
+         doc.wYear as Year,
+         doc.wMonth as Month,
+         coalesce(Persons.FIO, '') as FIO,
+         coalesce(Persons.StrTabN, '') as TabN,
+         substring(coalesce(KatPodr.Kod, ''), 1, 3) as PodrKod,
+         coalesce(MnPlan.Number, '') as ZakazNum,
+         coalesce(BuhSchet.Code, '') as Schet,
+         cast(
+           case f.Npp
+                when 1  then sp.fArrValue[1]
+                when 2  then sp.fArrValue[2]
+                when 3  then sp.fArrValue[3]
+                when 4  then sp.fArrValue[4]
+                when 5  then sp.fArrValue[5]
+                when 6  then sp.fArrValue[6]
+                when 7  then sp.fArrValue[7]
+                when 8  then sp.fArrValue[8]
+                when 9  then sp.fArrValue[9]
+                when 10 then sp.fArrValue[10]
+                when 11 then sp.fArrValue[11]
+                when 12 then sp.fArrValue[12]
+                when 13 then sp.fArrValue[13]
+                when 14 then sp.fArrValue[14]
+                when 15 then sp.fArrValue[15]
+                when 16 then sp.fArrValue[16]
+                when 17 then sp.fArrValue[17]
+                when 18 then sp.fArrValue[18]
+                when 19 then sp.fArrValue[19]
+                when 20 then sp.fArrValue[20]
+           end
+         as double) as SumReserve
+  from gp_kpi_doc doc
+  join gp_kpi_doc_sp sp on sp.cgp_kpi_doc = doc.Nrec and sp.cgp_kpi_raise = #comp(0)
+  join gp_typedocs on gp_typedocs.wType = doc.wType
+  join gp_kpi_fields f on f.wType = gp_typedocs.wType and f.cDoc = gp_typedocs.Nrec and f.Name = :PremiumReserveFieldName
+  join lschet on lschet.Nrec = sp.cLSchet
+  left join Persons on Persons.Nrec = lschet.tPerson
+  left join KatPodr on KatPodr.Nrec = lschet.cex
+  left join MnPlan on MnPlan.Nrec = lschet.cKauD[1]
+  left join BuhSchet on BuhSchet.Nrec = MnPlan.cAnVal2
+  where doc.wType       = :Type and
+        doc.wYear       = :Year and
+        doc.wMonth      = :Month
+;
+//#endregion Query
+
+//Заполняет временную таблицу tPremiumReserve, отбирая ведомости премирования с типом aType (премирование работников высшего или среднего звена),
+//за месяц aMonth, год aYear, с кварталом aPremiumQuarter и годом aPremiumYear, за который будет начислена премия,
+//и признаком aMode (0 - квартальная премия, 1 - годовая премия)
+function FillPremiumReserveTable(aType: word; aMonth: word; aYear: word;
+                                 aPremiumQuarter: comp; aPremiumYear: comp; aMode: byte; aFieldName: string): boolean;
+{
+  result := false;
+
+  var s: longint = 0;
+  sqlAddStr(s, qPremiumReserve);
+  case aMode of
+    0:
+    {
+      sqlAddStr(s, 'and doc.hArrComp[1] = #comp(' + aPremiumQuarter + ')');
+      sqlAddStr(s, 'and doc.hArrComp[2] = #comp(' + aPremiumYear + ')');
+      sqlAddStr(s, 'and BitAnd(doc.hArrComp[4], 1) = 1');
+    }
+    1:
+    {
+      sqlAddStr(s, 'and doc.hArrComp[3] = #comp(' + aPremiumYear + ')');
+      sqlAddStr(s, 'and BitAnd(doc.hArrComp[4], 2) = 2');
+    }
+  end;
+
+  var rs: IResultSet;
+  rs := queryManager.createQuery(s)
+                    .setParam('Type', aType)
+                    .setParam('Year', aYear)
+                    .setParam('Month', aMonth)
+                    .setParam('PremiumReserveFieldName', aFieldName)
+                    .getResultSet;
+  if rs != nullref
+    if rs.count > 0
+      result := sqlCopyInto(rs, #tPremiumReserve, true) = tsOk;
+    else
+      result := true;
+}
+
+//Инициализирует глобальные переменные со значениями аналитик в проводках по начислению резерва по самому резерву и налогам.
+procedure DefineAnalit;
+{
+  var prefix: string;
+  prefix := if(_mode = '0', 'NPOEM_OWN.BU.RezervKvartPrem.', 'NPOEM_OWN.BU.RezervGodPrem.');
+
+  //РЕЗЕРВ
+  _cStZatr        := coGetTune(prefix + 'Rezerv.St_Zatr');
+
+  _cElZatr        := coGetTune(prefix + 'Rezerv.El_Zatr');
+
+  _cRezerv        := coGetTune(prefix + 'Rezerv.Rezerv');
+
+  if getfirst SpKau where ((_cRezerv == SpKau.Nrec)) = tsOk
+    _wRezerv      := SpKau.KodGrKau;
+  else
+    _wRezerv      := 10013;
+
+  _cVidRezerv   := coGetTune(prefix + 'Rezerv.VidRezerva');
+
+  if getfirst SpKau where ((_cVidRezerv == SpKau.Nrec)) = tsOk
+    _wVidRezerv   := SpKau.KodGrKau;
+  else
+    _wVidRezerv   := 10052;
+
+  //НАЛОГИ
+  _cStZatrNal   := coGetTune(prefix + 'Nalog.St_Zatr');
+
+  _cElZatrNal   := coGetTune(prefix + 'Nalog.El_Zatr');
+
+  _cRezervNal   := coGetTune(prefix + 'Nalog.Rezerv');
+
+  if getfirst SpKau where ((_cRezervNal == SpKau.Nrec)) = tsOk
+    _wRezervNal   := SpKau.KodGrKau;
+  else
+    _wRezervNal   := 10013;
+
+  _cVidRezervNal  := coGetTune(prefix + 'Nalog.VidRezerva');
+
+  if getfirst SpKau where ((_cVidRezervNal == SpKau.Nrec)) = tsOk
+    _wVidRezervNal:= SpKau.KodGrKau;
+  else
+    _wVidRezervNal:= 10052;
+}
+
+//Загружает параметры интерфейса из DSK. В имена параметров добавляет суффикс sSuffix
+procedure LoadParams(sSuffix: string);
+{
+  _period.LoadDateInterim(sSuffix);
+  if not ReadMyDSK(_mode,     'Mode'     + sSuffix, false) _mode := 0;
+  if not ReadMyDSK(_quarter,  'Quarter'  + sSuffix, false) _quarter := 1;
+  if not ReadMyDSK(_year,     'Year'     + sSuffix, false) _year := year(cur_date);
+  if not ReadMyDSK(_typeFlag, 'TypeFlag' + sSuffix, false) _typeFlag := 3;
+}
+
+//Сохраняет параметры интерфейса в DSK. В имена параметров добавляет суффикс sSuffix
+procedure SaveParams(sSuffix: string);
+{
+  _period.SaveDateInterim(sSuffix);
+  SaveMyDSK(_mode,     'Mode'     + sSuffix);
+  SaveMyDSK(_quarter,  'Quarter'  + sSuffix);
+  SaveMyDSK(_year,     'Year'     + sSuffix);
+  SaveMyDSK(_typeFlag, 'TypeFlag' + sSuffix);
+}
+
+//Заполняет временную таблицу tPremiumReserve в соответствии с параметрами интерфейса
+function InitPremiumReserve: boolean;
+{
+  result := true;
+
+  delete all tPremiumReserve;
+  ResetBounds(#tTaxReserve);
+  delete all tTaxReserve;
+  SetBounds(#tTaxReserve);
+
+  //Определяем имя поля с суммой по резерву в ведомостях премирования
+  var sFieldName: string;
+  sFieldName := if(_mode = 0,
+                   sGetTune('NPOEM_OWN.BU.RezervKvartPrem.FieldName'),
+                   sGetTune('NPOEM_OWN.BU.RezervGodPrem.FieldName'));
+
+  //Заполняем таблицу tPremiumReserve по данным ведомостей премирования
+  StartNewVisual(vtIndicatorVisual, vfBreak + vfTimer, '', Months_Between(_period.BegDate, _period.EndDate));
+  var d: date;
+  for(d := _period.BegDate; d < _period.EndDate; d := Add_Months(d, 1))
+  {
+    SetVisualHeader(DateToStr(d, 'Выборка данных за Month YYYY г.'));
+    if (_typeFlag and 1) = 1
+      result := result and FillPremiumReserveTable(102, month(d), year(d), _quarter, _year, _mode, sFieldName);
+    if (_typeFlag and 2) = 2
+      result := result and FillPremiumReserveTable(103, month(d), year(d), _quarter, _year, _mode, sFieldName);
+    if not NextVisual break;
+  }
+  StopVisual('', 0);
+
+  //Определяем перечень кодов налогов на ФОТ, на которые необходимо сформировать резерв. Заполняем массив perechArr
+  var s: string;
+  s := if(_mode = 0,
+          sGetTune('NPOEM_OWN.BU.RezervKvartPrem.Perech'),
+          sGetTune('NPOEM_OWN.BU.RezervGodPrem.Perech'));
+  s := replace(s, ' ', '') + ',';
+
+  var i, cnt: byte = 0;
+  var k: word = 0;
+  var perechArr: array[0..0] of word;
+  while s != ''
+  {
+    k := SubStr(s, 1, pos(',',s) - 1);
+    if k > 0
+    {
+      perechArr[cnt] := k;
+      cnt++;
+    }
+    s := SubStr(s, pos(',',s) + 1, 255);
+  }
+
+  //Рассчитываем суммы резерва по налогам на ФОТ, заполняем таблицу tTaxReserve
+  StartNewVisual(vtIndicatorVisual, vfBreak + vfTimer, 'Расчет соц. налогов', RecordsInTable(tntPremiumReserve));
+  _loop tPremiumReserve
+  {
+
+        tTaxReserve.PremiumReserveNrec := tPremiumReserve.Nrec;
+        tTaxReserve.VidPer := 0 ; //perechArr[i];
+        tTaxReserve.Sum := round(tPremiumReserve.SumReserve * 30.2 / 100, 2);
+        insert current tTaxReserve;
+        tPremiumReserve.SumTaxes := tPremiumReserve.SumTaxes + tTaxReserve.Sum;
+
+/*20190219 Алешина Л.П, убираем всю разбивку по налогам, оставляем одну запись по 30.2
+  for(i := 0; i < cnt; i++)
+    {
+      clearbuffer(#tTaxReserve);
+      tTaxReserve.Percent := _perOplHelper.GetPerechPercent(tPremiumReserve.LSchetNrec, perechArr[i], date(1, tPremiumReserve.Month, tPremiumReserve.Year));
+      if tTaxReserve.Percent > 0
+      {
+        tTaxReserve.PremiumReserveNrec := tPremiumReserve.Nrec;
+        tTaxReserve.VidPer := perechArr[i];
+        tTaxReserve.Sum := round(tPremiumReserve.SumReserve * tTaxReserve.Percent / 100, 2);
+        insert current tTaxReserve;
+        tPremiumReserve.SumTaxes := tPremiumReserve.SumTaxes + tTaxReserve.Sum;
+      }
+    }
+*/
+    update current tPremiumReserve;
+    if not NextVisual break;
+  }
+  StopVisual('', 0);
+}
+
+//Формирует бухгалтерскую справку с проводками
+procedure CreatePlPor;
+{
+  var i: integer;
+
+  var isNewPlPor: boolean = True;
+
+  //Проверяем, существует ли созданная ранее бухсправка по начислению резерва
+  _plporDenosch6 := if(_mode = 0, 'РезервКвПрем_', 'РезервГодПрем_') + _year + if(_mode = 0, '_' + _quarter, '');
+  if getfirst PlPor1 = tsOk
+  {
+    case Message('Изменить существующую бух. справку №' + PlPor1.NoDok + ' от ' + PlPor1.DatVip + '?'#13'' +
+                 '[Да] - заменить проводки в бух. справке;'#13'' +
+                 '[Нет] - создать новую бух. справку;'#13'' +
+                 '[Отмена] - прервать формирование проводок', mfYesNoCancel) of
+      cmYes:
+      {
+        _plporNrec := PlPor1.Nrec;
+        isNewPlPor := false;
+        delete all oborot where ((PlPor1.TiDk == Oborot.TiDk and PlPor1.Nrec == Oborot.cSoprDoc));
+      }
+
+      cmNo:
+      {
+        isNewPlPor := True;
+      }
+
+      else
+      {
+        exit;
+      }
+
+    end;
+  }
+
+  //Формируем заголовок бухсправки
+  if isNewPlPor
+  {
+    var plporDate: date;
+    plporDate := if(_mode = 0,
+                    date(1, case(_quarter; 1: 3, 2: 6, 3: 9, 4: 12; 12), _year),
+                    //date(31, 12, _year) теперь формируем каждый месяц, поэтому и ставим последниее число месяца
+                    _period.EndDate
+                   );
+    plporDate := date(Last_Day(plporDate), Month(plporDate), Year(plporDate));
+
+    _plporNrec := _plporSimple.PlPor_InsertBSByParam(
+      _plporSimple.PlPor_GetNewNumber(PLPOR_TIDK, PLPOR_TIDKGAL, sGetTune('USER.DESCR'), plporDate),
+      comp(0),
+      PLPOR_TIDK,
+      plporDate,
+      if(_mode = 0,
+         'Резерв на выплату квартальной премии за ' + _quarter + ' квартал ' + _year + ' года',
+         'Резерв на выплату годовой премии за ' + _year + ' год '
+        ),
+      ''
+    );
+
+    if getfirst PlPor = tsOk
+      update current PlPor set PlPor.Denosch6 := _plporDenosch6;
+  }
+
+  if getfirst PlPor != tsOk
+  {
+    Message('Ошибка формирования бухгалтерской справки', error);
+    exit;
+  }
+
+  if getfirst SoprHoz != tsOk
+  {
+    Message('Ошибка формирования хозяйственной операции к бухгалтерской справке', error);
+    exit;
+  }
+
+  _plansschNrec := coGetTune('FIN.USER.CPLANSSCH');
+  if getfirst PlansSch != tsOk
+  {
+    Message('Не определен текущий план счетов', error);
+    exit;
+  }
+  var psk: string[1];
+  psk := PlansSch.Kod;
+
+  //Определяем аналитики проводок
+  DefineAnalit;
+
+  var sumTotal: double = 0;
+
+  StartNewVisual(vtIndicatorVisual, vfBreak + vfTimer, 'Формирование бухгалтерской справки', RecordsInTable(tntPremiumReserve));
+  //Формируем проводки
+  _loop tPremiumReserve
+  {
+    if tPremiumReserve.SumReserve = 0 Continue;
+
+    if GetFirst LSchet != tsOk
+    {
+      Message('Не определен лицевой счет', error);
+      exit;
+    }
+
+    ClearBuffer(tnOborot);
+    Oborot.TiDk       := PlPor.TiDk;
+    Oborot.TiDkGal    := PlPor.TiDkGal;
+    Oborot.cSoprDoc   := PlPor.Nrec;
+    Oborot.cSoprHoz   := SoprHoz.Nrec;
+    Oborot.cPlansSch  := PlansSch.Nrec;
+    Oborot.Descr      := PlPor.Descr;
+    Oborot.DesGr      := PlPor.DesGr;
+    Oborot.SchetO     := psk + LSchet.cSchetD;
+    Oborot.SubOsSch   := LSchet.cSubSchD;
+    Oborot.TblOs[1]   := cgKau_Zakaz;
+    Oborot.TblOs[2]   := cgKau_Zatr;
+    Oborot.TblOs[3]   := cgKau_KaElem;
+    Oborot.TblOs[4]   := 10044;
+    Oborot.KauOs[1]   := LSchet.cKauD[1];
+    Oborot.KauOs[2]   := _cStZatr;
+    Oborot.KauOs[3]   := _cElZatr;
+    Oborot.KauOs[4]   := LSchet.Cex;
+    Oborot.KodSPO     := LSchet.Cex;
+    Oborot.SchetK     := psk + '96';
+    Oborot.TblKs[1]   := _wRezerv;
+    Oborot.TblKs[2]   := cgKau_Persons;
+    Oborot.TblKs[5]   := _wVidRezerv;
+    Oborot.TblKs[6]   := cgKau_Zakaz;
+    Oborot.KauKs[1]   := _cRezerv;
+    Oborot.KauKs[2]   := LSchet.tPerson;
+    Oborot.KauKs[5]   := _cVidRezerv;
+    Oborot.KauKs[6]   := LSchet.cKauD[1];
+    Oborot.KodSPK     := LSchet.Cex;
+    Oborot.DatOb      := PlPor.DatVip;
+    Oborot.DataOt     := PlPor.DatVip;
+    Oborot.NoDok      := PlPor.NoDok;
+    Oborot.SumOb      := tPremiumReserve.SumReserve;
+    Oborot.VhProp     := '+';
+    Oborot.DBSchetO   := LSchet.cSchetD;
+    Oborot.KrSchetK   := '96';
+    insert current Oborot;
+    sumTotal += Oborot.SumOb;
+
+    _loop tTaxReserve
+    {
+      if getfirst Perech = tsOk {}
+      Oborot.Nrec := 0;
+      Oborot.KauOs[2]   := _cStZatrNal;
+      Oborot.KauOs[3]   := _cElZatrNal;
+      Oborot.TblKs[1]   := _wRezervNal;
+      Oborot.TblKs[5]   := _wVidRezervNal;
+      Oborot.KauKs[1]   := _cRezervNal;
+      Oborot.KauKs[5]   := _cVidRezervNal;
+      Oborot.SodPr      := '[НалогКод:' + Perech.VidPer + '][НалогНаименование:' + Perech.NamePer + ']';
+      Oborot.SumOb      := tTaxReserve.Sum;
+      insert current Oborot;
+      sumTotal += Oborot.SumOb;
+    }
+
+    if not NextVisual break;
+
+  }
+
+  SoprHoz.Summa := sumTotal;
+  update current SoprHoz;
+  PlPor.SumPlat := sumTotal;
+  update current PlPor;
+
+  StopVisual('', 0);
+
+  if isNewPlPor
+    Message('Сформирована бухгалтерская справка №' + PlPor.NoDok + ' от ' + PlPor.DatVip, Information);
+  else
+    Message('Сформированы проводки по бухгалтерской справке №' + PlPor.NoDok + ' от ' + PlPor.DatVip, Information);
+}
+
+//Формирует отчетную форму
+procedure PrintReport;
+var fRep: longint;
+    repNames: array [0..0] of String;
+#IFDEF _2019_02_13_
+    ExportParam:String;
+#ELSE
+    ExportParam: frxBiffExportParam;
+#ENDIF
+{
+  AddBounds(tbOrderBySchet);
+  fRep := FRCreate(dsPremiumReserve);
+  FRGetReportNames(fRep, repNames);
+  if count(repNames) > 0
+    if (FROpenReport(fRep, repNames[0]))
+    {
+#IFDEF _2019_02_13_
+      //'Pages=1-5;Picture=False;DeleteEmptyRows=True;OpenAfterExport=True'
+      ExportParam:='ShowDialog=False;OpenAfterExport=True';
+#ELSE
+      ClearAdvRecord(ExportParam);
+      FRGetDefaultParameters(frExportBIFF, ExportParam);
+      ExportParam.Pages           := '';
+      ExportParam.PageBreaks      := True;
+      ExportParam.ShowDialog      := False;
+      ExportParam.OpenAfterExport := True;
+#ENDIF
+      if (FRSetParameters(fRep, frExportBIFF, ExportParam))
+        FRExportReport(fRep, frExportBIFF, '');
+    }
+    else
+      FRDesignReport(fRep);
+  FRDestroy(fRep);
+  SubBounds(tbOrderBySchet);
+}
+
+screen scParams;
+fields
+  _mode: noprotect;
+  _quarter: noprotect, spinbutton[1,1,4];
+  _year: noprotect, spinbutton[1,2000,2100];
+  _typeFlag: noprotect;
+  _period.BegDate: noprotect;
+  _period.EndDate: noprotect;
+buttons
+  cmPickPeriod, [singleLine];
+  cmOk, default;
+  cmCancel;
+<<
+
+  Вид премии        Премия за
+  (.) Квартальная`  `Квартал`.@@@
+  (.) Годовая`      `Год`    .@@@@@
+
+  Обрабатывать
+  [.] Ведомости премирования среднего звена`
+  [.] Ведомости премирования высшего звена`
+
+ `За период с`.@@@@@@@@@@`по`.@@@@@@@@@@ <.....>
+
+                   <. Продолжить .> <. Отмена .>
+>>
+end; //screen scParams
+
+window wReserve 'Формирование проводок по резерву на премии' escClose doAccept;
+  browse brReserve;
+    show(,,,15);
+    table tPremiumReserve;
+    fields
+      tPremiumReserve.TabN 'Таб. №': [10], protect;
+      tPremiumReserve.FIO 'ФИО': [30], protect;
+      tPremiumReserve.PodrKod 'Код подразделения': [5], protect, noautosize;
+      tPremiumReserve.ZakazNum 'Заказ': [10], protect;
+      tPremiumReserve.SumReserve 'Сумма резерва': [10, 2], protect;
+      tPremiumReserve.SumTaxes 'Сумма налогов': [10, 2], protect;
+  end; //browse brReserve
+  browse brTaxes;
+    show(,16,,20);
+    table tTaxReserve;
+    fields
+      Perech.VidPer 'Код': [5], protect, noautosize;
+      Perech.NamePer 'Наименование': [30], protect;
+      tTaxReserve.Percent 'Процент': [5, 2], protect;
+      tTaxReserve.Sum 'Сумма': [10,2], protect;
+  end;
+  screen scReserve;
+    show(,21,,) fixed_y;
+    buttons
+      cmCreatePlPor, default;
+      cmPrintDoc;
+<<
+                          <. Сформировать бухгалтерскую справку .>  <. Печать .>
+>>
+  end;
+  handleevent
+    cmCreatePlPor:
+    {
+      CreatePlpor;
+    }
+    cmPrintDoc:
+    {
+      PrintReport;
+    }
+  end;
+end; //window wReserve
+
+handleevent
+
+  cmInit:
+  {
+    LoadParams('GP_PremiumReserve');
+    _period.SetHiddenFields(DIF_TIME);
+    SetFieldsVisiblity;
+  }
+
+  cmCheckField:
+  {
+    case curfield of
+      #_mode: SetFieldsVisiblity;
+    end;
+  }
+
+  cmPickPeriod:
+  {
+    _period.SelectDateInterim;
+    RereadRecord;
+  }
+
+  cmOk:
+  {
+    InitPremiumReserve;
+    RunWindow(wReserve);
+  }
+
+  cmDone:
+  {
+    SaveParams('GP_PremiumReserve');
+  }
+
+end;
+
+end.

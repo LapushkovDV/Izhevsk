@@ -1,0 +1,707 @@
+/*************************************************************************************************\
+* Наименование: Отчет "Сводная информация по табелям" за произвольный период                     *
+* Контур/Модуль: ЗП                                                                               *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2258         |05/03/18|Синяк Е.П.             |НПО Энергомаш                      *
+	\*************************************************************************************************/
+
+#include WTMirage.vih //подмена условных обозначений
+#include IDepartmentValidator.obj
+
+Interface Gp_AllByTabel1;
+
+
+ table struct reptable
+ (
+   clsch   : comp
+  ,strtabn : string[20]
+  ,fio     : string[60]
+  ,cex     : comp
+  ,namepodr : string[150]
+  ,kodpodr : string[20]
+ )
+ with index
+ (
+  in1=kodpodr+strtabn
+ );
+
+table struct SABSENCE
+(
+  StrTabn  : string[20] ,
+  FIO      : string[50] ,
+  KODPODR   : string[5]  ,
+  SIGN: string,
+  MARK: string[5],
+  DESCRIPTION: string,
+  DAYS: byte,
+  HOURS: double,
+  PLANHOURS : double,
+  BEGINNING: date,
+  ENDING: date,
+  KIND: word,
+  ADDITIVE: boolean,
+  CSOURCE: comp,
+  SSOURCE: string,
+  Remark  : string[15],
+  tiprec  : word
+) with index
+(
+ in1 = Strtabn+tiprec
+);
+
+var DepMarker: TPtr;
+var DepartmentValidator: IDepartmentValidator;
+var   Mrg: WTMirage;
+
+ create view
+  var i,i1: integer;
+      AbsenceType: byte;
+      pmes   : word;
+      pyearn : integer;
+      stmt, stmt_str, curcount,cntmrk ,cnt ,cnt1: longint;
+      filtrpodr : string;
+      nrecn : comp ;
+      yesbrk : boolean;
+      dbeg,dend : date ;
+      PH: double;
+      XlRes : boolean;
+      rowshp,row,first,tgt,kol_mon : longint ;
+      prevtab : string[20];
+
+      dayNomberBegin: word;
+      dayNomberEnd: word;
+      beg_period,end_period : date;
+
+      SABSENCEMARK : string[5];
+      SABSENCEDESCRIPTION : string; 
+      SABSENCEDAYS : byte;
+      SABSENCEHOURS : double;
+      SABSENCEBEGINNING, SABSENCEENDING : date;
+
+   as select
+     *
+   from 
+        reptable
+       ,SABSENCE
+ ;
+
+var blkbeg,blkend : array[1] of integer;
+
+var databeg,dataend   : array [1..12] of date ;
+
+Screen param;
+! Viewtable;
+  notablenavigation;
+  fields
+
+     dbeg       : noprotect;
+     dend       : noprotect;
+     FiltrPodr : protect,pickbutton;
+
+ Buttons
+   CmYes,Default;
+   CmCancel;
+<<
+
+    За период с .@@@@@@@@@@ по .@@@@@@@@@@
+
+   `Подразделения` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+    <.Сформировать.>     <.Отмена.>
+>>
+
+end;
+
+Procedure ClearQuery(Var liHandle: Longint);
+{
+  if (liHandle != 0)
+  {
+    sqlFreeStr(liHandle);
+    liHandle := 0;
+  }
+}
+
+
+Window WinTest;
+browse AbsenceBrowse 'Неявки' (, hcZar_ViewTabel, sci1Esc);
+table SABSENCE;
+  fields
+
+    SABSENCE.StrTabn
+     'Таб№' : [12], protect, noautosize;
+    SABSENCE.Fio
+     'Сотрудник' : [30], protect, noautosize;
+    SABSENCE.kodpodr
+     'КодПодр' : [30], protect, noautosize;
+!    SABSENCE.SIGN:
+!      [3], protect, noautosize;
+    SABSENCE.MARK
+      'Код' ('Условное обозначение неявки'): [5], protect, noautosize;
+    SABSENCE.DESCRIPTION
+      'Описание' ('Описание неявки'): [25], protect;
+    SABSENCE.DAYS
+      'Дни' ('Количество дней неявки'): [5], protect, noautosize;
+    Time2StrDef(SABSENCE.HOURS)
+      'Часы' ('Количество часов неявки'): [6], protect, noautosize, left;
+    Time2StrDef(SABSENCE.PLANHOURS)
+      'Часов План' ('Количество часов плановое'): [6], protect, noautosize, left;
+    SABSENCE.Remark
+      'Признак' : [10], protect, noautosize;
+end; //browse AbsenceBrowse
+end;
+
+
+// условное обозначение неявки
+//------------------------------------------------------------------------------
+function GetSign(_kind: word; _additive: boolean): string;
+{
+  result := '';
+
+  case _kind of
+    // командировка
+    akBusinessTrip:
+      result := 'к';
+
+    // отзыв из отпуска
+    akVacationRecall:
+      result:= 'О';
+
+    // больничный
+    akSickList:
+      result := 'б';
+
+    // отпуск
+    akVacation:
+      result := 'о';
+
+    // табельное отклонение
+    akTableAbsence:
+      result := if(_additive, '+', '-');
+
+    // нарушение режима
+    akIrregularity:
+      result := '!';
+
+    // уточнение
+    akRefinement:
+      result := '=';
+
+    akOvertimeWorkOrder:
+      result := 'п/с';
+
+    akWeekendWorkOrder:
+      result := 'п/в';
+
+    akHoursAbsenceOrder:
+      result := 'п/о';
+  end;
+}
+
+
+ HandleEvent
+
+   CmInit: {
+
+            dbeg :=Sub_Months(dgettune('UP.DATOTCH'),1);
+            dend :=date(Last_Day(dbeg),Month(dbeg),Year(dbeg));
+
+            pyearn:=Year(dbeg);
+            pmes:=Month(dbeg);
+
+            FiltrPodr:='По всем';
+            DepMarker := InitMarker('', 8, 1, 1);
+
+           }
+
+  CmCheckField :{
+                  case curfield of
+                   #dbeg,#dend :{ 
+                                  pyearn:=Year(dbeg); pmes:=Month(dbeg);
+                                }
+                  end;
+                }
+
+  CmPick: {
+
+           Case curfield of
+             #filtrPodr : {
+  
+                           if RunInterface('SelectSalaryDepartments', 12, comp(DepMarker),
+                                               DepartmentValidator, ZeroDate, 0) = cmDefault
+                           {
+                            cntmrk:=GetMarkerCount(DepMarker);
+                             if cntmrk>0 filtrPodr  :='выбрано '+DoubleToStr(cntmrk,'666 666 667')+' подразд.'
+                                else filtrPodr  :='По всем';
+                           }
+                
+                         }
+            end;
+             ReScanPanel(tnNotable);
+          }
+
+cmDelOnProtect:{
+
+                Case curfield of
+                 #filtrPodr : {  
+                                ClearMarker(DepMarker);
+                                filtrPodr  :='По всем';
+                              }
+                end;
+                ReScanPanel(tnNotable);
+               }
+
+   CmYes: {
+
+          
+           kol_mon:=Months_Between(dbeg,dend)+1;
+
+           beg_period:=dbeg;
+           i:=1;
+           if Month(dbeg)<Month(dend)
+            end_period:=sub_day(Add_Months(beg_period,1),1)
+           else
+            end_period:=dend;
+
+            while i<=kol_mon
+            do
+            {
+              databeg[i]:=beg_period;
+              dataend[i]:=end_period;
+              beg_period:=Add_Months(databeg[i],1);
+              if Month(beg_period)<Month(dend)
+                end_period:=sub_day(Add_Months(beg_period,1),1); 
+              else
+                end_period:=dend;
+
+              i:=i+1;
+            }
+
+
+          if filtrPodr<>'По всем'
+          {
+
+            sqlDropTmpTable('selpodr');
+            sqlAddStr(stmt_str, 'TABLE selpodr ( nrecpodr   : Comp ) WITH INDEX (selpodr1 = nrecpodr);');
+            sqlCreateTmpTable(stmt_str,ctmDynamicIndex);
+            sqlFreeStr(stmt_str);
+            stmt_str:=0;
+
+
+            for(
+                i:=0;
+                i<GetMarkerCount(DepMarker);
+                inc(i)
+               )
+
+           {
+!             stmt := sqlAllocStmt;
+             GetMarker(DepMarker,i,nrecn);
+             ClearQuery(stmt);
+             sqlAddStr(stmt, 'INSERT INTO selpodr');
+             sqlAddStr(stmt, '(');
+             sqlAddStr(stmt, '  nrecpodr');
+             sqlAddStr(stmt, ')');
+             sqlAddStr(stmt, 'VALUES');
+             sqlAddStr(stmt, '(');
+             sqlAddStr(stmt, '  #comp(' + nrecn + ')');
+             sqlAddStr(stmt, ')');
+             sqlExecDirect(stmt);
+           }  
+
+          }
+
+           MtClear(#reptable,mfNormal);
+
+           stmt := sqlAllocStmt;
+		   sqlAddStr(stmt_str, 'select distinct');
+		   sqlAddStr(stmt_str, '     l.clschet as clsch  ');
+		   sqlAddStr(stmt_str, '   , l.strtabn         ');
+		   sqlAddStr(stmt_str, '   ,Coalesce(p.fio,'+''''+'не определено'+''''+') as fio');
+		   sqlAddStr(stmt_str, '   ,l.cex         ');
+		   sqlAddStr(stmt_str, '   ,Coalesce(podr.name,'+''''+'не определено'+''''+') as namepodr');
+		   sqlAddStr(stmt_str, '   ,Coalesce(Substring(podr.kod,1,3),'+''''+'не определено'+''''+') as kodpodr');
+		   sqlAddStr(stmt_str, 'from lstab l left join persons p on l.tperson=p.nrec');
+    		   sqlAddStr(stmt_str, '               inner join katpodr podr on l.cex=podr.nrec');
+           if filtrpodr<>'По всем'
+    		   sqlAddStr(stmt_str, '               inner join selpodr on l.cex=selpodr.nrecpodr');
+
+!		   sqlAddStr(stmt_str, '        where l.yearn=? and l.mesn<=? and (p.disdate=#date(0,0,0) or p.disdate>?) and l.strtabn='+''''+'000433'+'''');
+		   sqlAddStr(stmt_str, '        where l.yearn=? and l.mesn<=? and (p.disdate=#date(0,0,0) or p.disdate>?)');
+           sqlPrepare(stmt,stmt_str);
+       	   sqlbindparam(stmt,1,pyearn);
+       	   sqlbindparam(stmt,2,pmes);
+       	   sqlbindparam(stmt,3,dbeg);
+
+   		   sqlExecute(stmt);
+
+ 		   if (sqlFetchInto(stmt,#reptable) != tsOk)
+			        Message('not tsOk select (');
+			sqlFreeStmt(stmt);
+            sqlFreeStr(stmt);
+
+
+            cnt:=Recordsintable(#reptable);
+
+            mtClear(#SABSENCE,fmNormal);
+
+            StartNewVisual(vtIndicatorVisual,vfBreak+vftimer,
+                         ''#3'Выбираю данные по табелю...ожидайте'#13#3,cnt) ;
+
+             if InitWorkingTable
+             _loop reptable
+              {                     
+
+              if not nextvisual
+               {
+                Message('Формирование отчета было прервано...переформируйте заново');
+                yesbrk:=true;
+                break;
+               }            
+
+              for(i1:=1;i1<=kol_mon;i1:=i1+1)               
+              {
+
+               dayNomberBegin := AD_DayNo(databeg[i1]/* dbeg*/);
+               dayNomberEnd := AD_DayNo(dataend[i1]/*dend */);
+
+
+!                if (RecordExists lstab)=tsok
+                 if LoadWorkingTable(reptable.clsch, Month(databeg[i1])/*i1*/, pyearn)=0
+                 {
+
+                  PH:=WT_GHBD(1 or 64, 0, 0, stPlanned,databeg[i1] /*dbeg*/, dataend[i1] /*dend*/);
+
+                   // сбросить сведения о ранее загруженных неявках
+                   WT_ReSetSystemAbsences;
+
+                   WT_AddDayRangeFilter(dayNomberBegin, dayNomberEnd);
+
+                   WT_LoadMonthlyAbsences;
+                   AbsenceType := atMonthly;
+
+
+                   for (I := 0; I < WT_GetAbsenceCount(AbsenceType); I := I + 1)
+                   {
+
+                    // выбрать значения атрибутов неявки
+                    if WT_GetAbsenceAttribute(AbsenceType, I, aaMark, SABSENCEMARK)
+                    and WT_GetAbsenceAttribute(AbsenceType, I, aaDescription, SABSENCEDESCRIPTION)
+                    and WT_GetAbsenceAttribute(AbsenceType, I, aaDays, SABSENCEDAYS)
+                    and WT_GetAbsenceAttribute(AbsenceType, I, aaHours, SABSENCEHOURS)
+                    and WT_GetAbsenceAttribute(AbsenceType, I, aaBeginning, SABSENCEBEGINNING)
+                    and WT_GetAbsenceAttribute(AbsenceType, I, aaEnding, SABSENCEENDING)
+!                    and WT_GetAbsenceAttribute(AbsenceType, I, aaKind, SABSENCE.KIND)
+!                    and WT_GetAbsenceAttribute(AbsenceType, I, aaAdditive, SABSENCE.ADDITIVE)
+                    and WT_GetAbsenceAttribute(AbsenceType, I, aaSourceRecord, SABSENCE.CSOURCE)
+                    {
+
+                     if getfirst SABSENCE where (( reptable.strtabn == sAbsence.Strtabn and  1 == SABSENCE.TIPREC and  Mrg.MirageDayS(SABSENCEMARK)== SABSENCE.MARK (noindex) /*and (SABSENCE.MARK<>'В')*/ ))<>tsok
+                     {                     
+
+                      ClearBuffer(#SABSENCE);   
+                      SABSENCE.Strtabn:=reptable.strtabn;
+                      SABSENCE.SIGN := GetSign(SABSENCE.KIND, SABSENCE.ADDITIVE);
+!                     SABSENCE.SSOURCE := GetSource(SABSENCE.KIND, SABSENCE.CSOURCE);
+                      SABSENCE.DESCRIPTION :=SABSENCEDESCRIPTION;
+                      SABSENCE.DAYS := SABSENCEDAYS;
+                      SABSENCE.HOURS:= SABSENCEHOURS;
+                      SABSENCE.BEGINNING := SABSENCEBEGINNING;
+                      SABSENCE.ENDING := SABSENCEENDING;
+                      SABSENCE.MARK := Mrg.MirageDayS(SABSENCEMARK);
+                      SABSENCE.FIO  :=Reptable.fio;
+                      SABSENCE.Kodpodr  :=Reptable.kodpodr;
+                      SABSENCE.TIPREC :=word(1);
+                      SABSENCE.Remark :='Неявка';
+                      SABSENCE.PLANHOURS :=PH;
+
+                       if SABSENCE.MARK<>'В'
+                       {
+                        insert current SABSENCE;
+                       }
+                     }
+                     else
+                     {
+                      update current sAbsence set
+                      SABSENCE.DAYS :=SABSENCE.DAYS+SABSENCEDAYS,
+                      SABSENCE.HOURS:=SABSENCE.HOURS+SABSENCEHOURS;
+                     }
+                    }
+                   }
+
+                   // добавим еще явки....
+                      //РАБОЧИЕ
+
+                   if getfirst SABSENCE where (( reptable.strtabn == sAbsence.Strtabn and  0 == SABSENCE.TIPREC and  'Рабоч' == SABSENCE.MARK (noindex) ))<>tsok 
+                   {
+                    ClearBuffer(#SABSENCE);
+                    SABSENCE.Strtabn:=reptable.strtabn  ;
+                    SABSENCE.MARK   :='Рабоч'           ;
+                    SABSENCE.DESCRIPTION :='Рабочие'    ;
+                    SABSENCE.DAYS        :=WT_GetDaysBwDates(dkWorking  or cfDisregardPeriod, stActual, databeg[i1], dataend[i1]);
+                    SABSENCE.HOURS       :=WT_GetHoursBwDates(hkWorking  or cfDisregardPeriod, 0, 0, stActual , databeg[i1], dataend[i1]);
+                    SABSENCE.TIPREC      :=word(0);
+                    SABSENCE.FIO  :=Reptable.fio;
+                    SABSENCE.Kodpodr  :=Reptable.kodpodr;
+                    SABSENCE.Remark      :='Явка';
+                    SABSENCE.PLANHOURS :=PH;
+                    insert current SABSENCE;
+                   }
+                   else
+                   {
+                      update current sAbsence set
+                      SABSENCE.DAYS        :=SABSENCE.DAYS+WT_GetDaysBwDates(dkWorking  or cfDisregardPeriod, stActual, databeg[i1], dataend[i1]),
+                      SABSENCE.HOURS       :=SABSENCE.HOURS+WT_GetHoursBwDates(hkWorking  or cfDisregardPeriod, 0, 0, stActual , databeg[i1], dataend[i1]);
+                   }
+
+                      //Ночные
+
+                   if getfirst SABSENCE where (( reptable.strtabn == sAbsence.Strtabn and  0 == SABSENCE.TIPREC and  'Вечер' == SABSENCE.MARK (noindex) ))<>tsok 
+                   {
+
+                    ClearBuffer(#SABSENCE);
+                    SABSENCE.Strtabn:=reptable.strtabn  ;
+                    SABSENCE.MARK   :='Вечер'           ;
+                    SABSENCE.DESCRIPTION :='Вечерние'    ;
+                    SABSENCE.DAYS        :=WT_GetDaysBwDates(dkEvening or cfDisregardPeriod, stActual, databeg[i1], dataend[i1]);
+                    SABSENCE.HOURS       :=WT_GetHoursBwDates(hkEvening or cfDisregardPeriod, 0, 0, stActual , databeg[i1], dataend[i1]);
+                    SABSENCE.TIPREC      :=word(0);
+                    SABSENCE.FIO  :=Reptable.fio;
+                    SABSENCE.Kodpodr  :=Reptable.kodpodr;
+                    SABSENCE.Remark      :='Явка';            
+                    SABSENCE.PLANHOURS :=PH;
+                    if not (SABSENCE.DAYS=0 and SABSENCE.HOURS=0)
+                     insert current SABSENCE;
+                   }
+                   else
+                   {
+                     update current sAbsence set
+                     SABSENCE.DAYS        :=SABSENCE.DAYS+WT_GetDaysBwDates(dkEvening  or cfDisregardPeriod, stActual, databeg[i1], dataend[i1]),
+                     SABSENCE.HOURS       :=SABSENCE.HOURS+WT_GetHoursBwDates(hkEvening  or cfDisregardPeriod, 0, 0, stActual , databeg[i1], dataend[i1]);
+                   }
+
+                      //Ночные
+                   if getfirst SABSENCE where (( reptable.strtabn == sAbsence.Strtabn and  0 == SABSENCE.TIPREC and  'Ночн' == SABSENCE.MARK (noindex) ))<>tsok 
+                   {
+                    ClearBuffer(#SABSENCE);
+                    SABSENCE.Strtabn:=reptable.strtabn  ;
+                    SABSENCE.MARK   :='Ночн'           ;
+                    SABSENCE.DESCRIPTION :='Ночные'    ;
+                    SABSENCE.DAYS        :=WT_GetDaysBwDates(dkNight or cfDisregardPeriod, stActual, databeg[i1], dataend[i1]);
+                    SABSENCE.HOURS       :=WT_GetHoursBwDates(hkNight or cfDisregardPeriod, 0, 0, stActual , databeg[i1], dataend[i1]);
+                    SABSENCE.TIPREC      :=word(0);
+                    SABSENCE.FIO  :=Reptable.fio;
+                    SABSENCE.Kodpodr  :=Reptable.kodpodr;
+                    SABSENCE.Remark      :='Явка';
+                    SABSENCE.PLANHOURS :=PH;
+                    if not (SABSENCE.DAYS=0 and SABSENCE.HOURS=0)
+                     insert current SABSENCE;
+                   }
+                   else
+                   {
+                    update current sAbsence set
+                    SABSENCE.DAYS        :=SABSENCE.DAYS+WT_GetDaysBwDates(dkNight or cfDisregardPeriod, stActual, databeg[i1], dataend[i1]),
+                    SABSENCE.HOURS       :=SABSENCE.HOURS+WT_GetHoursBwDates(hkNight or cfDisregardPeriod, 0, 0, stActual , databeg[i1], dataend[i1]);
+                   }
+
+                      //Выходные
+                   if getfirst SABSENCE where (( reptable.strtabn == sAbsence.Strtabn and  0 == SABSENCE.TIPREC and  'Вых' == SABSENCE.MARK (noindex) ))<>tsok 
+                   {
+                    ClearBuffer(#SABSENCE);
+                    SABSENCE.Strtabn:=reptable.strtabn  ;
+                    SABSENCE.MARK   :='Вых'           ;
+                    SABSENCE.DESCRIPTION :='Выходные'    ;
+                    SABSENCE.DAYS        :=WT_GetDaysBwDates(dkWeekEnd or cfDisregardPeriod, stActual, databeg[i1], dataend[i1]);
+                    SABSENCE.HOURS       :=WT_GetHoursBwDates(hkWeekend or cfDisregardPeriod, 0, 0, stActual , databeg[i1], dataend[i1]);
+                    SABSENCE.TIPREC      :=word(0);
+                    SABSENCE.FIO  :=Reptable.fio;
+                    SABSENCE.Kodpodr  :=Reptable.kodpodr;
+                    SABSENCE.Remark      :='Явка';
+                    SABSENCE.PLANHOURS :=PH;
+                    if not (SABSENCE.DAYS=0 and SABSENCE.HOURS=0)
+                     insert current SABSENCE;
+                   } 
+                   else
+                   {
+                    update current sAbsence set
+                    SABSENCE.DAYS        :=SABSENCE.DAYS+WT_GetDaysBwDates(dkWeekEnd or cfDisregardPeriod, stActual, databeg[i1], dataend[i1]),
+                    SABSENCE.HOURS       :=SABSENCE.HOURS+WT_GetHoursBwDates(hkWeekend or cfDisregardPeriod, 0, 0, stActual , databeg[i1], dataend[i1]);
+                   }
+
+                 } // load
+
+                }
+              }
+
+
+           DoneWorkingTable;
+           if (not yesbrk)
+            StopVisual('',0);
+
+!            RunWindow(WinTest);
+!            Exit;
+            cnt:=Recordsintable(#Sabsence);
+           Setlimit(blkbeg,1);
+           Setlimit(blkend,1);
+           cnt1 :=0;
+           first:=1;
+           prevtab:='';
+
+
+           StartNewVisual(vtIndicatorVisual,vfBreak+vftimer,
+                         ''#3'Выгружаю данные в Excel...'#13#3,cnt) ;
+
+
+                XlRes := xlCreateExcel((''), true);
+                if (XlRes)
+                XlRes := xlIsExcelValid;
+                 if (not XlRes)
+                 Message('не иннициализирован excel');
+
+                 row:=1;
+                 xlSetCellStringValue('Общая информация по табелю по сотрудникам c '+dateTostr(dbeg,'DD.MM.YYYY')+' по '+dateTostr(dend,'DD.MM.YYYY'),1,2,1,2);
+                                                           
+                inc(row);
+                inc(row);
+
+                 rowshp:=row+1;
+                 xlSetCellStringValue('Таб №',row,1,row,1);
+                 xlSetColumnWidth(10,row,1,row,1);
+
+                 xlSetCellStringValue('ФИО',row,2,row,2);
+                 xlSetColumnWidth(35,row,2,row,2);
+
+                 xlSetCellStringValue('Цех',row,3,row,3);
+                 xlSetColumnWidth(5,row,3,row,3);
+
+                 xlSetCellStringValue('Вид',row,4,row,4);
+                 xlSetColumnWidth(6,row,4,row,4);
+                                                 
+                 xlSetCellStringValue('Дней',row,5,row,5);
+                 xlSetColumnWidth(5,row,5,row,5);
+
+                 xlSetCellStringValue('Часов Факт',row,6,row,6);
+                 xlSetColumnWidth(10,row,6,row,6);
+
+                 xlSetCellStringValue('Часов План',row,7,row,7);
+                 xlSetColumnWidth(10,row,6,row,6);
+
+                 xlSetCellStringValue('Признак',row,8,row,8);
+                 xlSetColumnWidth(7,row,6,row,6);
+
+                 xlSetFontStyle(1, row, 1, row, 8);
+                 xlFreeze(rowshp,1);
+                 xlSetNumberFormat('###0' + xlGetDecimalSeparator + '00', row+1,6,row+cnt,7);
+
+                 _loop Sabsence
+                 {
+
+                  if not nextvisual
+                   {
+                    Message('Формирование отчета было прервано...переформируйте заново');
+                    yesbrk:=true;
+                    xlKillExcel;
+                    StopVisual('',0);
+                    break;
+                    }            
+
+                  inc(row);
+
+                    if prevtab<>Sabsence.strtabn
+                     {
+                        if first=0
+                        {
+                         blkend[cnt1]:=row-1;
+                        }
+                        inc(cnt1);
+                        blkbeg[cnt1]:=row;
+                        prevtab:=Sabsence.strtabn;
+                        first:=0;
+                     }
+
+
+                  xlSetCellStringValue(chr(39)+Sabsence.strtabn,row,1,row,1);
+                  xlSetCellStringValue(Sabsence.fio,row,2,row,2);
+                  xlSetCellStringValue(Sabsence.kodpodr,row,3,row,3);
+                  xlSetCellStringValue(Sabsence.mark,row,4,row,4);
+                  xlSetCellStringValue(Sabsence.Days,row,5,row,5);
+                  xlSetCellNumberValue(Sabsence.Hours,row,6,row,6);
+                  xlSetCellNumberValue(Sabsence.PlanHours,row,7,row,7);
+                  xlSetCellStringValue(Sabsence.remark,row,8,row,8);
+                 }
+
+               blkend[cnt1]:=row;
+               xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideH or xlInsideV,xlThin,xlContinuous,1,rowshp,1,row,8);
+
+            for(i:=1;i<=Count(blkbeg);inc(i))
+             {
+               xlFrameCells (xlBorderL or xlBorderR or xlBorderT or xlBorderB,xlThick,0,0, blkbeg[i], 1, blkend[i], 8);
+             }
+
+
+           if (not yesbrk)
+             {
+               xlKillExcel;
+               StopVisual('',0);
+             }
+
+           }
+ end;
+end.
+
+#include UserReport.vih
+
+VipInterface UserReport_Claim_Gp_AllByTabel1 Implements IUserReport;
+
+Interface UserReport_Claim_Gp_AllByTabel1;
+
+create view;
+
+!-------------------------------------------------------------------------------
+// Запуск отчета на выполнение при выборе его из списка отчетов
+procedure Run;
+begin
+  RunInterfaceNoModal('Gp_AllByTabel1');
+end;
+!-------------------------------------------------------------------------------
+// Наименование отчета в списке
+function GetReportName: String;
+begin
+  GetReportName := 'Сводная информация по табелям /за произвольный период года/';
+end;
+!-------------------------------------------------------------------------------
+// Наименования групп, в которые входит отчет
+// Группа n+1 делается подчиненной группе n
+// В данном случае будет иерархия:
+// [+] Группа 1
+//     [+] Группа 2
+//         Отчет 1
+function GetGroupName (Level : Word) : String;
+begin
+  GetGroupName := '';
+  case Level of
+    1 : GetGroupName := 'Отчеты по табелям';
+  end;
+end;
+!-------------------------------------------------------------------------------
+// Приоритет отчета - сортировка внутри группы выполняется сначала
+// по приоритету, а затем по наименованию
+function GetPriority : Integer;
+begin
+  GetPriority := 0;
+end;
+!-------------------------------------------------------------------------------
+// ModuleID модулей, в которых будет виден отчет
+// '*' - отчет будет виден в любом модуле
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+end;
+!-------------------------------------------------------------------------------
+end.

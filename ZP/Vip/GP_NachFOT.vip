@@ -1,0 +1,1370 @@
+/*************************************************************************************************\
+* Наименование: Отчет о начисленном фонде ЗП t07                                                  *
+* Контур/Модуль: Заработная плата                                                                 *
+* Пункт меню: Отчеты / Отчеты пользователя / Сводные отчеты по зарплате / Отчет о начисленном     *
+*             фонде ЗП t07                                                                        *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#806          |12/04/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+//#define __DEBUG__
+
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include PAFilter.vih // Объектный интерфейс Фильтра по лицевым счетам сотрудников
+#include GP_StrFunc.vih
+#include Query.vih
+#include ExtAttr.vih
+
+#define GPInt GP_NachFOT // #(GPInt)
+#define GPNam Отчет о начисленном фонде ЗП t07 // #(GPNam)
+
+interface GP_NachFOT '#(GPNam)' EscClose;
+
+  const
+    DATA_COL_CNT = 9; // Количество колонок с данными
+    MAX_KATEG_IN_COL = 4; // Кол-во строк в строке шапки с расшифровкой категорий
+    MAX_SOVM_IN_COL = 4; // Кол-во строк в строке шапки с расшифровкой видов работы
+    REP_TITLE = 'Отчет о начисленном фонде ЗП'; // Заголовок отчёта
+    TAB_CNT = 1; // Количество закладок в отчёте
+    TAB_TITLE_1 = 'Отчёт'; // Название закладки 2
+    CAT_CODE_VETERAN = 8; // Код категории "Ветераны" - записи с этой категорие в отчет не включаются
+    EXT_ATTR_VH_FZP = '905 Фонд заработной платы (ОВР)'; // Вн.атрибут для определения входимости в фонд ЗП
+    EXT_ATTR_VH_FZP_OTP_B = '909 Фонд ЗП с отпусков будущих периодов (ОВР)'; // Вн.атрибут для определения входимости в фонд ЗП отп.буд.пер.
+    EXT_ATTR_VH_REPORT_ROSKOSMOS = '910 Отчет РосКосмос'; // Вн.атрибут для определения входимости в фонд ЗП отп.буд.пер.
+    // Блоки отчета
+    BL_NACH_OSN_ZP = 1; // Основная зарплата
+    BL_NACH_DOP_ZP = 2; // Дополн.зарплата
+    BL_NACH_OTH    = 3; // Начисления из других источников
+    BL_NACH_TOTAL  = 4; // Всего начислено
+    BL_UDER        = 5; // Удержания
+    BL_ON_HANDS    = 6; // Сумма на руки
+    BL_DEBT        = 7; // Долг за предпр.на конец месяца
+    BL_FOR_TAXES   = 8; // Для начисл. налогов
+    BL_FOR_STRAH   = 9; // Для страховых взносов
+    BL_FZP         = 10; // Фонд заработной платы
+    BL_FZP_OTP_B   = 11; // ФЗП с отпуском буд.периодов
+    BL_FZP_OTP_RepRoskosmos = 12 ; // СТЕЦЕНКО просила добавить еще по отчетам РОСКОСМоса.. костыль
+    BL_VSH         = 13; // ВСХ для бюджета
+    // Константы ошибок при работе с Excel
+    XE_BAD_OP           =  0; // не удалось выполнить операцию с Excel-файлом
+    XE_CREATE_FILE      =  1; // не удалось создать файл
+    XE_OPEN_FILE        =  2; // не удалось открыть файл
+    XE_INIT_FILE        =  3; // не удалось инициализировать Excel
+    XE_CREATE_MATRIX    =  4; // не удалось создать матрицу
+    XE_FREE_MATRIX      =  5; // не удалось освободить матрицу
+    XE_OUT_MATRIX       =  6; // не удалось вывести матрицу в отчёт
+    XE_WRITE_TO_MATRIX  =  7; // не удалось записать значение в матрицу
+    XE_FORMAT_CELL      =  8; // не удалось отформатировать ячейку
+    XE_SET_CELL_VALUE   =  9; // не удалось записать значение в ячейку
+    XE_SET_CELL_FORMULA = 10; // не удалось записать формулу
+    XE_RUN_MACRO        = 11; // не удалось запустить макрос
+    XE_ADD_SHEET        = 12; // не удалось добавить вкладку
+    XE_DEL_SHEET        = 13; // не удалось удалить вкладку
+    XE_RENAME_SHEET     = 14; // не удалось переименовать вкладку
+    XE_WRONG_TEMPLATE   = 15; // в xlt шаблоне не найден лист с именем
+  end;
+
+  var
+    #include PaFilter.var
+    #include GP_StrFunc.var
+    #include GP_Log.var
+
+  // Блоки данных отчёта
+  table struct SBl
+  (
+    BlNum: byte, // Номер блока
+    Title: string, // Заголовок блока
+    ShowTitle: boolean, // Выводить или нет заголовок блока
+    ColSum: array[1..DATA_COL_CNT] of tSumma, // Сумма по колонке
+    Total: tSumma // Итого
+  )
+  with index
+  (
+    SBl01 = BlNum
+  );
+
+  // Данные по блоку
+  table struct SBlDt
+  (
+    BlNum: byte, // Номер блока
+    VidOplUdP: longint, // Код вида оплаты / удержания польз.
+    ColSum: array[1..DATA_COL_CNT] of tSumma, // Сумма по колонке
+    Total: tSumma // Итого
+  )
+  with index
+  (
+    SBlDt01 = BlNum + VidOplUdP
+  );
+
+  // Данные по оплатам
+  table struct SOpl
+  (
+    VidOplP: longint, // Код вида оплаты польз.
+    VidOplS: longint, // Код вида оплаты сист.
+    Kateg: word, // Код категории
+    Sovm: word, // Код вида работы
+    KaElemKod: string[20], // Код статьи затрат из доп.аналитики "Статьи расходов/доходов" дебетового счета (код 5017)
+    VSH: string[120], // Наименование значения из доп.аналитики "Выплаты социального характера" (код 10062)
+    IsVr: string[1], // Признак временного назначения
+    Sum: tSumma // Сумма
+  )
+  with index
+  (
+    SOpl01 = VidOplP + Kateg + Sovm
+  );
+
+  // Данные по оплатам
+  table struct SUder
+  (
+    VidUdP: word, // Код вида оплаты польз.
+    VidUdS: word, // Код вида оплаты сист.
+    Kateg: word, // Код категории
+    Sovm: word, // Код вида работы
+    IsVr: string[1], // Признак временного назначения
+    Sum: tSumma // Сумма
+  )
+  with index
+  (
+    SUder01 = VidUdP + Kateg + Sovm
+  );
+
+  create view
+    var
+      pYear: word; // Год отчётного периода
+      pMonth: byte; // Месяц отчётного периода
+      pMonthEnd : byte ; // Месяц окончания периода
+      cSpKAUVhFZP: tNRec;
+      cSpKAUVhFZPOtpB: tNRec;
+      cSpKau_REPORT_ROSKOSMOS : tNrec;
+    as select
+      (PAF.GetDepartmentFilterStr) (fieldName = FiltrPodr)  // фильтр по подразделению
+    from
+      Zar_User,
+      KatPodr,
+      SBl (SBl01),
+      SBlDt (SBlDt01),
+      SOpl (SOpl01),
+      SUder (SUder01),
+      synonym SpKAU SpKAUVhFZP,
+      synonym SpKAU SpKAUVhFZPOtpB,
+      synonym SpKAU SpKAUVhFZPReportRosKosmos
+    where ((
+          UserName         == Zar_User.OwnName
+      // and SBl.BlNum        == SBlDt.BlNum
+      and SOpl.VidOplS     == KlVidOpl.VidOpl
+      and SOpl.VidOplS     == KlPerOpl.VidOpl
+      and 5                == KlPerOpl.VidPer
+      and cSpKAUVhFZP      == SpKAUVhFZP.NRec
+      and cSpKAUVhFZPOtpB  == SpKAUVhFZPOtpB.NRec
+      and cSpKau_REPORT_ROSKOSMOS == SpKAUVhFZPReportRosKosmos.NRec
+    ));
+
+  type
+    TColDef = record
+      KategCnt: byte;
+      Kategs: array[1..MAX_KATEG_IN_COL] of word;
+      SovmCnt: byte;
+      Sovms: array[1..MAX_SOVM_IN_COL] of word;
+    end;
+
+  var
+    CLSF: CurLSFunctions;
+    oExtAttr: IExtAttr;
+    PodrMarker: longint;
+    IsAborted: Boolean;
+    Cols: array[1..DATA_COL_CNT] of TColDef; // Список категорий и видов работы по каждой колонке
+    // Переменные для работы с Excel
+    FirstCol: longint; // Номер первой колонки отчёта
+    LastCol: longint; // Номер последней колонки отчёта
+    SumFormat2D: String; // Формат для вывода в Excel сумм с двумя знаками после запятой
+    pYearRas: integer; // Год текущего отчетного периода
+    pMonthRas: integer; // Месяц текущего отчетного периода
+    DepFilterTitle: string; // Название подразделения с кодом или название фильтра по подразделениям
+
+  // Возвращает true, если нужно применить фильтр по выбранным подразделениям
+  function NeedApplyDepFlt: boolean;
+  begin
+    result := (Zar_User.PodrShare = '+') or ((Zar_User.GrupStN and 1) > 0);
+  end;
+
+  // Минимально необходимый код из PAFilter.vpp для использования стандартных зарплатных фильтров
+  // #include PAFilter.vpp : begin
+  procedure ProcessCheck;
+  {
+    case Zar_User.GrupStN xor PAF.GetFilterState of // какой фильтр изменился ?
+      1: // по подразделению
+        if ((Zar_User.GrupStN and 1) > 0)
+        {
+          SelectField(#FiltrPodr);
+          putcommand(cmPick);
+        }
+        else
+        {
+          PAF.ClearDepartmentFilter;
+          ReReadRecord(#Zar_User);
+        }
+    end;
+  }
+
+  procedure PodrPubCheck;
+  {
+    if (CurField = #Zar_User.GrupsTN)
+      ProcessCheck;
+  }
+
+  procedure PodrPubPick;
+  { 
+    case CurField of
+      #FiltrPodr:
+        {
+          PAF.ChangeDepartmentFilter(true);
+          ReReadRecord(#Zar_User);
+        }
+    end;
+  }
+  // #include PAFilter.vpp : end
+
+  window winParam '#(GPNam)' DoAccept, EscClose, Gray;
+    show at (,, 74, 8);
+
+    screen scrParam ('',, sci1EnEsc);
+      fields
+        pMonth ('Месяц окончания отчетного периода',, sci13EnEsc):
+         [LIST  1 'Январь',
+                2 'Февраль',
+                3 'Март',
+                4 'Апрель',
+                5 'Май',
+                6 'Июнь',
+                7 'Июль',
+                8 'Август',
+                9 'Сентябрь',
+               10 'Октябрь',
+               11 'Ноябрь',
+               12 'Декабрь'
+         ], protect;
+        pMonthEnd ('Месяц окончания отчетного периода',, sci13EnEsc):
+         [LIST  1 'Январь',
+                2 'Февраль',
+                3 'Март',
+                4 'Апрель',
+                5 'Май',
+                6 'Июнь',
+                7 'Июль',
+                8 'Август',
+                9 'Сентябрь',
+               10 'Октябрь',
+               11 'Ноябрь',
+               12 'Декабрь'
+         ], protect;
+
+        pYear ('Год отчетного периода'): noprotect, SpinButton [1, 1, 9999];
+        Zar_User.GrupStN ('Выберите фильтр для расчета',, sci1Esc): NoProtect;
+        FiltrPodr ('Заданный фильтр по подразделению',, sci13Esc): Protect, PickButton;
+      buttons
+        cmOk,,, 'Ввод - принять выбор',,sci1Esc;
+        cmCancel,,, 'Отмена',,sci1Esc;
+      <<
+
+`Отчетный период:`     .@@@@@@@@@@@@@ по .@@@@@@@@@@@@@@ .@@@@@ года
+`Фильтры по`
+  [.] подразделению   `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+                        <.  ~O~K  .> <.О~т~мена.>
+      >>
+    end;
+
+    handleEvent
+      cmOk:
+        PutCommand(cmDefault);
+    end;
+  end;
+
+  procedure InitParam;
+  {
+    pYearRas := 0;
+    pMonthRas := 0;
+    if (not GetUserDate(pYearRas, pMonthRas, 0, ZeroDate, ZeroDate))
+      exit;
+    if (not ReadMyDsk(pYear, '#(GPInt)_pYear', false))
+      pYear := pYearRas;
+    if (not ReadMyDsk(pMonth, '#(GPInt)_pMonth', false))
+      pMonth := pMonthRas;
+      pMonthEnd := pMonth;
+  }
+
+  procedure SaveParam;
+  {
+    SaveMyDsk(pYear, '#(GPInt)_pYear');
+    SaveMyDsk(pMonth, '#(GPInt)_pMonth');
+  }
+
+  function AskParam: boolean;
+  {
+    result := False;
+    InitParam;
+    if (RunWindowModal(winParam) = cmDefault)
+    {
+      result := true;
+      SaveParam;
+    }
+  }
+
+  // Возвращает наименование категории с указанным кодом
+  // В заголовки колонок выводятся сокращенные названия категорий, поэтому названия
+  // из каталога категорий (KlKatego) для вывода в отчет не подходят
+  function GetKategColName(_KategCode: word): string;
+  {
+    result := '';
+    case _KategCode of
+      1: result := '1-Основн.ОП';
+      2: result := '2-Вспомог.ОП';
+      3: result := '3-Основн.ВП';
+      4: result := '4-Вспомог.ВП';
+      5: result := '5-Руководит.';
+      6: result := '6-Специал.';
+      7: result := '7-Служащие';
+    end;
+  }
+
+  // Преобразовывает код вида работы из справочника видов работы в код вида работы для формы
+  function ConvSovm(_GalSovmCode: word; _IsVr: string[1]): word;
+  {
+    /*
+    В поле "Вид работы" используется следующий справочник
+    0 Основное место работы
+    1 По совместительству (внешнее)
+    2 По договору ГПХ
+    3 Внутренне совместительство
+    4 Физические лица вне штата
+    5 Внешнее совместительство
+    7 Стажеры
+    8 Уволенные совместители
+    */
+    result := 0;
+    case _GalSovmCode of
+      0: result := if(_IsVr = '+', 2, 1); // 0 Основное место работы = 1-Постоянные или 2-Временные (если заполнено APPOINTMENTS.DateEnd)
+      3: result := 3; // 3 Внутренне совместительство = 3-Совм.внутр
+      1, 5: result := 4; // 1 По совместительству (внешнее), 5 Внешнее совместительство = 4-внеш.совм
+      2: result := 5; // 2 По договору ГПХ = 5-ФЛ по дог
+      // пусто = 6-ИП по дог.
+      4: result := 7; // 4 Физические лица вне штата = 7-ФЛ
+    end;
+  }
+
+  // Возвращает наименование вида работы с указанным кодом
+  // В заголовки колонок выводятся сокращенные названия видов работы, поэтому названия
+  // из каталога видов работы (KlSovm) для вывода в отчет не подходят
+  function GetSovmColName(_SovmCode: word): string;
+  {
+    result := '';
+    case _SovmCode of
+      1: result := '1-Постоянные';
+      2: result := '2-Временные';
+      3: result := '3-Совм.внутр';
+      4: result := '4-внеш.совм';
+      5: result := '5-ФЛ по дог';
+      6: result := '6-ИП по дог.';
+      7: result := '7-ФЛ';
+    end;
+  }
+
+  // Добавляет категорию с кодом _Code в колонку отчета _ColNum
+  procedure AddColKateg(_ColNum: byte; _Code: word);
+  {
+    Cols[_ColNum].KategCnt++;
+    Cols[_ColNum].Kategs[Cols[_ColNum].KategCnt] := _Code;
+  }
+
+  // Добавляет вид работы с кодом _Code в колонку отчета _ColNum
+  procedure AddColSovm(_ColNum: byte; _Code: word);
+  {
+    Cols[_ColNum].SovmCnt++;
+    Cols[_ColNum].Sovms[Cols[_ColNum].SovmCnt] := _Code;
+  }
+
+  // Формирует список колонок отчета
+  procedure FillCols;
+  {
+    // Очищаем список категорий и видов работы по каждой колонке
+    var i: byte;
+    for (i := 1; i <= DATA_COL_CNT; i++)
+    {
+      Cols[i].KategCnt := 0;
+      Cols[i].SovmCnt := 0;
+    }
+    var ColNum: byte = 0;
+    // Формируем структуру колонок отчёта - она нужна только для вывода шапки
+    // Колонка 1
+    AddColKateg(++ColNum, 1); AddColKateg(ColNum, 3);
+    AddColSovm(ColNum, 1); AddColSovm(ColNum, 2);
+    // Колонка 2
+    AddColKateg(++ColNum, 2); AddColKateg(ColNum, 4);
+    AddColSovm(ColNum, 1); AddColSovm(ColNum, 2);
+    // Колонка 3
+    AddColKateg(++ColNum, 5);
+    AddColSovm(ColNum, 1); AddColSovm(ColNum, 2);
+    // Колонка 4
+    AddColKateg(++ColNum, 6);
+    AddColSovm(ColNum, 1); AddColSovm(ColNum, 2);
+    // Колонка 5
+    AddColKateg(++ColNum, 7);
+    AddColSovm(ColNum, 1); AddColSovm(ColNum, 2);
+    // Колонка 6
+    AddColKateg(++ColNum, 1); AddColKateg(ColNum, 3); AddColKateg(ColNum, 2); AddColKateg(ColNum,  4);
+    AddColSovm(ColNum, 3);
+    // Колонка 7
+    AddColKateg(++ColNum, 5); AddColKateg(ColNum, 6); AddColKateg(ColNum, 7);
+    AddColSovm(ColNum, 3);
+    // Колонка 8
+    AddColKateg(++ColNum, 1); AddColKateg(ColNum, 3); AddColKateg(ColNum, 2); AddColKateg(ColNum, 4);
+    AddColSovm(ColNum, 4); AddColSovm(ColNum, 5); AddColSovm(ColNum, 6); AddColSovm(ColNum, 7);
+    // Колонка 9
+    AddColKateg(++ColNum, 5); AddColKateg(ColNum, 6); AddColKateg(ColNum, 7);
+    AddColSovm(ColNum, 4); AddColSovm(ColNum, 5); AddColSovm(ColNum, 6); AddColSovm(ColNum, 7);
+  }
+
+  // Формирует структуру блоков отчета
+  procedure AddBlocks(_BlNum: byte; _Title: string; _ShowTitle: boolean);
+  {
+    ClearBuffer(#SBl);
+    SBl.BlNum := _BlNum;
+    SBl.Title := _Title;
+    SBl.ShowTitle := _ShowTitle;
+    insert current SBl;
+  }
+
+  // Формирует структуру блоков отчета
+  procedure FillBlocks;
+  {
+    AddBlocks(BL_NACH_OSN_ZP, 'Основная зарплата', true);
+    AddBlocks(BL_NACH_DOP_ZP, 'Дополн.зарплата', true);
+    AddBlocks(BL_NACH_OTH, 'Начисления из других источников', true);
+    AddBlocks(BL_NACH_TOTAL, 'Всего начислено', true);
+    AddBlocks(BL_UDER, 'Удержания', true);
+    AddBlocks(BL_ON_HANDS, 'Сумма на руки', true);
+    AddBlocks(BL_DEBT, 'Долг за предпр. на конец месяца', true);
+    AddBlocks(BL_FOR_TAXES, 'Для начисл. налогов', true);
+    AddBlocks(BL_FOR_STRAH, 'Для страховых взносов', true);
+    AddBlocks(BL_FZP, 'Фонд заработной платы', true);
+    AddBlocks(BL_FZP_OTP_B, 'ФЗП с отпуском буд. периодов - форма П4', true);
+    AddBlocks(BL_FZP_OTP_RepRoskosmos, 'ФЗП с отпуском буд. периодов - форма Роскосмоса', true);
+    AddBlocks(BL_VSH, 'ВСХ для бюджета', true);
+  }
+
+  // Определяет колонку соответвсующей переданной комбинации кода категории и вида работы
+  function LocateCol(_KategCode: word; _SovmCode: word): byte;
+  {
+    result := 0;
+    // Здесь можно было бы вычислить по массиву Cols, но, так как набор колонок у нас прописан жестко,
+    // для ускорения работы формы пропишем алгоритм определения нужной колонки тоже жестко
+    case _SovmCode of
+      1, 2: // 1-Постоянные, 2-Временные
+        case _KategCode of
+          1, 3: result := 1; // 1-Основн.ОП, 3-Основн.ВП,
+          2, 4: result := 2; // 2-Вспомог.ОП, 4-Вспомог.ВП
+          5: result := 3; // 5-Руководит.
+          6: result := 4; // 6-Спенциал.
+          7: result := 5; // 7-Служащие
+        end;
+      3: // 3-Совм.внутр
+        case _KategCode of
+          1, 3, 2, 4: result := 6; // 1-Основн.ОП, 3-Основн.ВП, 2-Вспомог.ОП, 4-Вспомог.ВП
+          5, 6, 7: result := 7; // 5-Руководит., 6-Спенциал., 7-Служащие
+        end;
+      4, 5, 6, 7: // 4-внеш.совм, 5-ФЛ по дог, 6-ИП по дог., 7-ФЛ
+        case _KategCode of
+          1, 3, 2, 4: result := 8; // 1-Основн.ОП, 3-Основн.ВП, 2-Вспомог.ОП, 4-Вспомог.ВП
+          5, 6, 7: result := 9; // 5-Руководит., 6-Спенциал., 7-Служащие
+        end;
+    end;
+    if (result = 0)
+      oGP_Log.Error('Не найдена колонка для категории с кодом ' + To_Char(_KategCode) + 
+       ' и вида работы с кодом ' + To_Char(_SovmCode));
+  }
+
+  // Добаляет сумму _Sum в блок отчёта _BlNum в колонку, соответствующую кобинации категории _KategCode и
+  // вида работы _SovmCode.
+  // В _VidOplUdP передается пользовательский код вида оплаты или удержания.
+  // Если _VidOplUdP != 0, данные добавляются также в соответствующую запись таблицы SBlDt
+  procedure AddData(_BlNum: byte; _KategCode: word; _GalSovmCode: word; _IsVr: string[1]; _Sum: tSumma; _VidOplUdP: longint = 0);
+  {
+    var _SovmCode: word = ConvSovm(_GalSovmCode, _IsVr);
+    var _ColNum: byte = LocateCol(_KategCode, _SovmCode);
+    if (_ColNum = 0)
+      exit;
+    if (getFirst SBl where ((_BlNum == SBl.BlNum)) = tsOk)
+    {
+      SBl.ColSum[_ColNum] += _Sum;
+      SBl.Total += _Sum;
+      if (update current SBl != tsOk)
+        oGP_Log.Error('Не удалось обновить запись в таблице SBl');
+      if (_VidOplUdP != 0)
+      {
+        if (getFirst SBlDt where ((_BlNum == SBlDt.BlNum and _VidOplUdP == SBlDt.VidOplUdP)) = tsOk)
+        {
+          SBlDt.ColSum[_ColNum] += _Sum;
+          SBlDt.Total += _Sum;
+          if (update current SBlDt != tsOk)
+            oGP_Log.Error('Не удалось обновить запись в таблице SBlDt');
+        }
+        else
+        {
+          ClearBuffer(#SBlDt);
+          SBlDt.BlNum := _BlNum;
+          SBlDt.VidOplUdP := _VidOplUdP;
+          SBlDt.ColSum[_ColNum] := _Sum;
+          SBlDt.Total := _Sum;
+          if (insert current SBlDt != tsOk)
+            oGP_Log.Error('Не удалось вставить запись в таблицу SBlDt');
+        }
+      }
+    }
+    else
+      oGP_Log.Error('В таблице SBl не найден блок с кодом ' + To_Char(_BlNum));
+  }
+
+  // Создает и заполняет временную таблицу со списком выбранных подразделений
+  procedure FillPodrList;
+  {
+    // Если не установлен фильтр по подразделению
+    if (not NeedApplyDepFlt)
+      exit;
+
+    SqlDropTmpTable('TmpSelKatPodr');
+    if sqlCreateTmpTable('TABLE TmpSelKatPodr (NRec: COMP) WITH INDEX (TmpSelKatPodr01 = NRec);', ctmNormal) != tsOk then
+    {
+      IsAborted := true;
+      oGP_Log.Error('Ошибка создания таблицы TmpSelKatPodr');
+      exit;
+    }
+
+    var i: longint;
+    var _cKatPodr: tNRec;
+    for (i := 0; i < GetMarkerCount(PodrMarker); i++)
+    {
+      if GetMarker(PodrMarker, i, _cKatPodr)
+      {
+        var stmt: longint = sqlAllocStmt;
+        SQLPrepare(stmt, 'insert into TmpSelKatPodr (nrec) values (#comp(' + To_Char(_cKatPodr) + '))');
+        if SQLExecute(stmt) != tsOk then
+          oGP_Log.Error('Не удалось добавить запись в таблицу TmpSelKatPodr');
+        SQLFreeStmt(stmt);
+      }
+    }
+  }
+
+  // Заполняет с помощью DirectSQL запроса данные по оплатам
+  procedure FillSOpl;
+  {
+    SetVisualHeader('Получение данных по оплатам...');
+    #ifdef __DEBUG__
+    oGP_Log.Info('');
+    #end
+    var Q: IQuery new;
+
+    // Если в параметрах выбран прошлый отчётныё период
+    if To_Date(1, pMonth, pYear) < To_Date(1, pMonthRas, pYearRas) then
+    begin
+      // Создаем SQL запрос для отбора данных за прошлый отчётныё период
+      // 5017 - код аналитики ЭлемЗатр (Элементы затрат)
+      Q := QueryManager.CreateQuery(SQLQuery(
+        // MS SQL запрос
+        SELECT
+          SumVidOp.VidOplP,
+          SumVidOp.VidOpl,
+          sumvidop.KATEG, // LSchet.Kateg,
+          LSchet.Sovm,
+          KaElem.Kod,
+          SpKAU.Name,
+          App.IsVr,
+          Sum(SumVidOp.Summa)
+        FROM
+          SumVidOp
+          JOIN LSchet ON SumVidOp.cLSch = LSchet.NRec
+          JOIN Persons ON SumVidOp.tPerson = Persons.NRec
+          LEFT JOIN KaElem ON CASE
+              WHEN Sumvidop.TblExtr[1] = 5017 THEN Sumvidop.KauExtr[1]
+              WHEN Sumvidop.TblExtr[2] = 5017 THEN Sumvidop.KauExtr[2]
+              WHEN Sumvidop.TblExtr[3] = 5017 THEN Sumvidop.KauExtr[3]
+              WHEN Sumvidop.TblExtr[4] = 5017 THEN Sumvidop.KauExtr[4]
+              WHEN Sumvidop.TblExtr[5] = 5017 THEN Sumvidop.KauExtr[5]
+              WHEN Sumvidop.TblExtr[6] = 5017 THEN Sumvidop.KauExtr[6]
+          END = KaElem.NRec
+          LEFT JOIN SpKAU ON CASE
+              WHEN Sumvidop.TblExtr[1] = 10062 THEN Sumvidop.KauExtr[1]
+              WHEN Sumvidop.TblExtr[2] = 10062 THEN Sumvidop.KauExtr[2]
+              WHEN Sumvidop.TblExtr[3] = 10062 THEN Sumvidop.KauExtr[3]
+              WHEN Sumvidop.TblExtr[4] = 10062 THEN Sumvidop.KauExtr[4]
+              WHEN Sumvidop.TblExtr[5] = 10062 THEN Sumvidop.KauExtr[5]
+              WHEN Sumvidop.TblExtr[6] = 10062 THEN Sumvidop.KauExtr[6]
+          END = SpKAU.NRec
+          LEFT JOIN (
+            SELECT
+              NRec,
+              CASE WHEN Appointments.DateEnd <> 0 THEN '+' ELSE '-' END AS IsVr
+            from
+              Appointments
+          ) App on (CASE WHEN Persons.AppointCur <> 0 THEN Persons.AppointCur ELSE Persons.AppointLast END = App.NRec)
+        WHERE
+              :(pYear)  = SumVidOp.YearN
+          and :(pMonth) <= SumVidOp.MesN
+          and :(pMonthEnd) >= SumVidOp.MesN
+          %Filter
+        GROUP BY
+          SumVidOp.VidOplP,
+          SumVidOp.VidOpl,
+          sumvidop.KATEG, //LSchet.Kateg,
+          LSchet.Sovm,
+          KaElem.Kod,
+          SpKAU.Name,
+          App.IsVr
+      ));
+      var hStrFilter: longint = 0;
+      // Если установлен фильтр по подразделению
+      if (NeedApplyDepFlt)
+        sqlAddStr(hStrFilter, 'and SumVidOp.CexOZ in (SELECT NRec FROM TmpSelKatPodr)');
+      else
+        sqlAddStr(hStrFilter, '');
+
+      if (hStrFilter != 0) {
+        Q.setMacro('Filter', hStrFilter);
+        sqlFreeStr(hStrFilter);
+      }
+    }
+    else
+    {
+      // Создаем SQL запрос для отбора данных за текущий или будущий отчётныё период
+      // 5017 - код аналитики ЭлемЗатр (Элементы затрат)
+      Q := QueryManager.CreateQuery(SQLQuery(
+        // MS SQL запрос
+        SELECT
+          Nachisl.VidOpl,
+          Nachisl.VidOplS,
+          Nachisl.KATEG , //LSchet.Kateg,
+          LSchet.Sovm,
+          KaElem.Kod,
+          SpKAU.Name,
+          App.IsVr,
+          Sum(Nachisl.Summa)
+        FROM
+          Nachisl
+          JOIN LSchet ON Nachisl.cLSch = LSchet.NRec
+          JOIN Persons ON Nachisl.tPerson = Persons.NRec
+          LEFT JOIN KaElem ON CASE
+              WHEN Nachisl.TblExtr[1] = 5017 THEN Nachisl.KauExtr[1]
+              WHEN Nachisl.TblExtr[2] = 5017 THEN Nachisl.KauExtr[2]
+              WHEN Nachisl.TblExtr[3] = 5017 THEN Nachisl.KauExtr[3]
+              WHEN Nachisl.TblExtr[4] = 5017 THEN Nachisl.KauExtr[4]
+              WHEN Nachisl.TblExtr[5] = 5017 THEN Nachisl.KauExtr[5]
+              WHEN Nachisl.TblExtr[6] = 5017 THEN Nachisl.KauExtr[6]
+          END = KaElem.NRec
+          LEFT JOIN SpKAU ON CASE
+              WHEN Nachisl.TblExtr[1] = 10062 THEN Nachisl.KauExtr[1]
+              WHEN Nachisl.TblExtr[2] = 10062 THEN Nachisl.KauExtr[2]
+              WHEN Nachisl.TblExtr[3] = 10062 THEN Nachisl.KauExtr[3]
+              WHEN Nachisl.TblExtr[4] = 10062 THEN Nachisl.KauExtr[4]
+              WHEN Nachisl.TblExtr[5] = 10062 THEN Nachisl.KauExtr[5]
+              WHEN Nachisl.TblExtr[6] = 10062 THEN Nachisl.KauExtr[6]
+          END = SpKAU.NRec
+          LEFT JOIN (
+            SELECT
+              NRec,
+              CASE WHEN Appointments.DateEnd <> 0 THEN '+' ELSE '-' END AS IsVr
+            from
+              Appointments
+          ) App on (CASE WHEN Persons.AppointCur <> 0 THEN Persons.AppointCur ELSE Persons.AppointLast END = App.NRec)
+        WHERE
+              :(pYear)  = Nachisl.YearN
+          and :(pMonth) <= Nachisl.MesN
+          and :(pMonthEnd) >= Nachisl.MesN
+          %Filter
+        GROUP BY
+          Nachisl.VidOpl,
+          Nachisl.VidOplS,
+          Nachisl.KATEG, // LSchet.Kateg,
+          LSchet.Sovm,
+          KaElem.Kod,
+          SpKAU.Name,
+          App.IsVr
+      ));
+      var hStrFilter: longint = 0;
+      // Если установлен фильтр по подразделению
+      if (NeedApplyDepFlt)
+        sqlAddStr(hStrFilter, 'and Nachisl.CexOZ in (SELECT NRec FROM TmpSelKatPodr)');
+      else
+        sqlAddStr(hStrFilter, '');
+      if (hStrFilter != 0) {
+        Q.setMacro('Filter', hStrFilter);
+        sqlFreeStr(hStrFilter);
+      }
+    }
+
+    // Выполняем DirectSQL запрос
+    if (Q.Execute.ErrorCode != 0)
+    {
+      IsAborted := true;
+      oGP_Log.Error('Ошибка выполнения DSQL запроса при отборе данных по оплатам (' + To_Char(Q.ErrorCode) + ')');
+    }
+    else
+    {
+      // Копируем результаты DirectSQL запроса в таблицу SOpl
+      //sqlCopyInto(Q.getResultSet, tnSOpl, true);
+      sqlCopyInto(Q.getResultSet, tnSOpl, false);
+    }
+    Q := NullRef;
+  }
+
+  // Заполняет с помощью DirectSQL запроса данные по удержаниям
+  procedure FillSUder;
+  {
+    SetVisualHeader('Получение данных по удержаниям...');
+    #ifdef __DEBUG__
+    oGP_Log.Info('');
+    #end
+    var Q: IQuery new;
+
+    // Если в параметрах выбран прошлый отчётныё период
+    if To_Date(1, pMonth, pYear) < To_Date(1, pMonthRas, pYearRas) then
+    begin
+      // Создаем SQL запрос для отбора данных за прошлый отчётныё период
+      Q := QueryManager.CreateQuery(SQLQuery(
+        // MS SQL запрос
+        SELECT
+          SumVidUd.VidUdP,
+          SumVidUd.VidUd,
+          SumVidUd.KATEG, //LSchet.Kateg,
+          LSchet.Sovm,
+          App.IsVr,
+          Sum(SumVidUd.SumUd)
+        FROM
+          SumVidUd
+          JOIN LSchet ON SumVidUd.cLSch = LSchet.NRec
+          JOIN Persons ON SumVidUd.tPerson = Persons.NRec
+          LEFT JOIN (
+            SELECT
+              NRec,
+              CASE WHEN Appointments.DateEnd <> 0 THEN '+' ELSE '-' END AS IsVr
+            from
+              Appointments
+          ) App on (CASE WHEN Persons.AppointCur <> 0 THEN Persons.AppointCur ELSE Persons.AppointLast END = App.NRec)
+        WHERE
+              :(pYear)  = SumVidUd.YearN
+          and :(pMonth) <= SumVidUd.MesN
+          and :(pMonthEnd) >= SumVidUd.MesN
+          %Filter
+        GROUP BY
+          SumVidUd.VidUdP,
+          SumVidUd.VidUd,
+          SumVidUd.KATEG, // LSchet.Kateg,
+          LSchet.Sovm,
+          App.IsVr
+      ));
+      var hStrFilter: longint = 0;
+      // Если установлен фильтр по подразделению
+      if (NeedApplyDepFlt)
+        sqlAddStr(hStrFilter, 'and SumVidUd.CexOZ in (SELECT NRec FROM TmpSelKatPodr)');
+      else
+        sqlAddStr(hStrFilter, '');
+      if (hStrFilter != 0) {
+        Q.setMacro('Filter', hStrFilter);
+        sqlFreeStr(hStrFilter);
+      }
+    }
+    else
+    {
+      // Создаем SQL запрос для отбора данных за текущий или будущий отчётныё период
+      Q := QueryManager.CreateQuery(SQLQuery(
+        // MS SQL запрос
+        SELECT
+          Uder.VidUd,
+          Uder.VidUdS,
+          Uder.KATEG, // LSchet.Kateg,
+          LSchet.Sovm,
+          App.IsVr,
+          Sum(Uder.SumUd)
+        FROM
+          Uder
+          JOIN LSchet ON Uder.cLSch = LSchet.NRec
+          JOIN Persons ON Uder.tPerson = Persons.NRec
+          LEFT JOIN (
+            SELECT
+              NRec,
+              CASE WHEN Appointments.DateEnd <> 0 THEN '+' ELSE '-' END AS IsVr
+            from
+              Appointments
+          ) App on (CASE WHEN Persons.AppointCur <> 0 THEN Persons.AppointCur ELSE Persons.AppointLast END = App.NRec)
+        WHERE
+              :(pYear)  = Uder.YearN
+          and :(pMonth) <= Uder.MesN
+          and :(pMonthEnd) >= Uder.MesN
+          %Filter
+        GROUP BY
+          Uder.VidUd,
+          Uder.VidUdS,
+          Uder.KATEG, // LSchet.Kateg,
+          LSchet.Sovm,
+          App.IsVr
+      ));
+      var hStrFilter: longint = 0;
+      // Если установлен фильтр по подразделению
+      if (NeedApplyDepFlt)
+        sqlAddStr(hStrFilter, 'and Uder.CexOZ in (SELECT NRec FROM TmpSelKatPodr)');
+      else
+        sqlAddStr(hStrFilter, '');
+      if (hStrFilter != 0) {
+        Q.setMacro('Filter', hStrFilter);
+        sqlFreeStr(hStrFilter);
+      }
+    }
+
+    // Выполняем DirectSQL запрос
+    if (Q.Execute.ErrorCode != 0)
+    {
+      IsAborted := true;
+      oGP_Log.Error('Ошибка выполнения DSQL запроса при отборе данных по удержаниям (' + To_Char(Q.ErrorCode) + ')');
+    }
+    else
+    {
+      // Копируем результаты DirectSQL запроса в таблицу SUder
+      //sqlCopyInto(Q.getResultSet, tnSUder, true);
+      sqlCopyInto(Q.getResultSet, tnSUder, false);
+    }
+    Q := NullRef;
+  }
+
+  // Анализирует данные по оплатам
+  procedure AnalyseOpl;
+  {
+    SetVisualHeader('Анализ данных по оплатам...');
+    #ifdef __DEBUG__
+    oGP_Log.Info('');
+    oGP_Log.Info('SOpl:');
+    #end
+    _loop SOpl
+    {
+      if (not NextVisual)
+      {
+        IsAborted := true;
+        break;
+      }
+      #ifdef __DEBUG__
+      oGP_Log.Info('');
+      oGP_Log.Info('SOpl.VidOplP: ' + To_Char(SOpl.VidOplP));
+      oGP_Log.Info('SOpl.VidOplS: ' + To_Char(SOpl.VidOplS));
+      oGP_Log.Info('SOpl.Kateg: ' + To_Char(SOpl.Kateg));
+      oGP_Log.Info('SOpl.Sovm: ' + To_Char(SOpl.Sovm));
+      oGP_Log.Info('SOpl.KaElemKod: ' + SOpl.KaElemKod);
+      oGP_Log.Info('SOpl.VSH: ' + SOpl.VSH);
+      oGP_Log.Info('SOpl.IsVr: ' + SOpl.IsVr);
+      oGP_Log.Info('SOpl.Sum: ' + To_Char(SOpl.Sum, 0, 2));
+      oGP_Log.Info('KlVidOpl.NVidOpl: ' + KlVidOpl.NVidOpl);
+      oGP_Log.Info('KlVidOpl.VHVO[1]: ' + KlVidOpl.VHVO[1]);
+      oGP_Log.Info('Вх.в страховые взносы в ПФР: ' + if(IsValid(tnKlPerOpl), '+', '-'));
+      #end
+
+      // Если поле категория не заполнено
+      if (SOpl.Kateg = 0)
+      {
+        oGP_Log.Error('Не заполнено поле "Категория" (' + 
+         'Вид.опл.: ' + To_Char(SOpl.VidOplP) + ' Сумма: ' + To_Char(SOpl.Sum, 0, 2) + ')');
+        continue;
+      }
+
+      // Если в поле категория выбрана категория "Ветераны"
+      if (SOpl.Kateg = CAT_CODE_VETERAN)
+      {
+        #ifdef __DEBUG__
+        oGP_Log.Info('Категория "Ветераны" - в отчет не включаем');
+        #end
+        continue;
+      }
+
+      // Вид оплаты 189 (142) "Долг за предприятием"
+      if (SOpl.VidOplS = 142)
+        // Долг за предпр.на конец месяца
+        AddData(BL_DEBT, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum);
+      else
+      {
+        // Начисления
+        if (SubStr(SOpl.KaElemKod, 1, 4) = '4')
+          // Основная зарплата
+          AddData(BL_NACH_OSN_ZP, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum, SOpl.VidOplP);
+        else
+          if (SubStr(SOpl.KaElemKod, 1, 4) = '5')
+            // Дополн.зарплата
+            AddData(BL_NACH_DOP_ZP, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum, SOpl.VidOplP);
+          else
+            // Начисления из других источников
+            AddData(BL_NACH_OTH, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum, SOpl.VidOplP);
+        // Всего начислено
+        AddData(BL_NACH_TOTAL, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum);
+        // Входимость в расчет налога на доходы
+        if (KlVidOpl.VHVO[1] = '+')
+          AddData(BL_FOR_TAXES, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum);
+        // Входимость в налог на ФОТ 5 "Страховые взносы в ПФР"
+        if (IsValid(tnKlPerOpl))
+          AddData(BL_FOR_STRAH, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum);
+        // Внешний атрибут "905 Фонд заработной платы (ОВР)" к записи в классификаторе видов оплат
+        set cSpKAUVhFZP := oExtAttr.coGetAttr(coKlVidOpl, KlVidOpl.NRec, EXT_ATTR_VH_FZP);
+        #ifdef __DEBUG__
+        if (IsValid(tnSpKAUVhFZP))
+        {
+          oGP_Log.Info('SpKAUVhFZP.Code: ' + SpKAUVhFZP.Code + ' SpKAUVhFZP.Name: ' + SpKAUVhFZP.Name);
+        }
+        #end
+        if (IsValid(tnSpKAUVhFZP))
+          // имеет значение с кодом "905"
+          if (SpKAUVhFZP.Code = '905')
+            AddData(BL_FZP, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum);
+        // Внешний атрибут "909 Фонд ЗП с отпусков будущих периодов (ОВР)" к записи в классификаторе видов оплат
+        set cSpKAUVhFZPOtpB := oExtAttr.coGetAttr(coKlVidOpl, KlVidOpl.NRec, EXT_ATTR_VH_FZP_OTP_B);
+        #ifdef __DEBUG__
+        if (IsValid(tnSpKAUVhFZPOtpB))
+        {
+          oGP_Log.Info('SpKAUVhFZPOtpB.Code: ' + SpKAUVhFZPOtpB.Code + ' SpKAUVhFZPOtpB.Name: ' + SpKAUVhFZPOtpB.Name);
+        }
+        #end
+        if (IsValid(tnSpKAUVhFZPOtpB))
+          // имеет значение с кодом "909"
+          if (SpKAUVhFZPOtpB.Code = '909')
+            AddData(BL_FZP_OTP_B, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum);
+
+        // Внешний атрибут "910 Отчет РосКосмос
+        set cSpKau_REPORT_ROSKOSMOS := oExtAttr.coGetAttr(coKlVidOpl, KlVidOpl.NRec, EXT_ATTR_VH_REPORT_ROSKOSMOS);
+        #ifdef __DEBUG__
+        if (IsValid(tnSpKAUVhFZPOtpB))
+        {
+          oGP_Log.Info('SpKAUVhFZPOtpB.Code: ' + SpKAUVhFZPReportRosKosmos.Code + ' SpKAUVhFZPOtpB.Name: ' + SpKAUVhFZPReportRosKosmos.Name);
+        }
+        #end
+        if (IsValid(tnSpKAUVhFZPReportRosKosmos))
+          // имеет значение с кодом "909"
+          if (SpKAUVhFZPReportRosKosmos.Code = '910')
+            AddData(BL_FZP_OTP_RepRoskosmos, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum);
+
+        // В доп.аналитике 10062 "Выплаты социального характера" выбрано значение с наименованием "ВСХ"
+        if (SOpl.VSH = 'ВСХ')
+          // ВСХ для бюджета
+          AddData(BL_VSH, SOpl.Kateg, SOpl.Sovm, SOpl.IsVr, SOpl.Sum);
+      }
+    }
+  }
+
+  // Анализирует данные по удержаниям
+  procedure AnalyseUder;
+  {
+    SetVisualHeader('Анализ данных по удержаниям...');
+    #ifdef __DEBUG__
+    oGP_Log.Info('');
+    oGP_Log.Info('SUder:');
+    #end
+    _loop SUder
+    {
+      if (not NextVisual)
+      {
+        IsAborted := true;
+        break;
+      }
+      #ifdef __DEBUG__
+      oGP_Log.Info('');
+      oGP_Log.Info('SUder.VidUdP: ' + To_Char(SUder.VidUdP));
+      oGP_Log.Info('SUder.VidUdS: ' + To_Char(SUder.VidUdS));
+      oGP_Log.Info('SUder.Kateg: ' + To_Char(SUder.Kateg));
+      oGP_Log.Info('SUder.Sovm: ' + To_Char(SUder.Sovm));
+      oGP_Log.Info('SUder.IsVr: ' + SUder.IsVr);
+      oGP_Log.Info('SUder.Sum: ' + To_Char(SUder.Sum, 0, 2));
+      #end
+      // Если поле категория не заполнено
+      if (SUder.Kateg = 0)
+      {
+        oGP_Log.Error('Не заполнено поле "Категория" (' + 
+         'Вид.удер.: ' + To_Char(SUder.VidUdP) + ' Сумма: ' + To_Char(SUder.Sum, 0, 2) + ')');
+        continue;
+      }
+
+      // Если в поле категория выбрана категория "Ветераны"
+      if (SUder.Kateg = CAT_CODE_VETERAN)
+      {
+        #ifdef __DEBUG__
+        oGP_Log.Info('Категория "Ветераны" - в отчет не включаем');
+        #end
+        continue;
+      }
+
+      // Удержание 500 (220) "К перечислению з/п в банк"
+      if (SUder.VidUdS = 220)
+        // Сумма на руки
+        AddData(BL_ON_HANDS, SUder.Kateg, SUder.Sovm, SUder.IsVr, SUder.Sum);
+      else
+      {
+        // Удержания
+        AddData(BL_UDER, SUder.Kateg, SUder.Sovm, SUder.IsVr, SUder.Sum, SUder.VidUdP);
+      }
+    }
+  }
+
+  procedure PrepareData;
+  {
+    DepFilterTitle := FiltrPodr;
+    // Если установлен фильтр по подразделению
+    if (NeedApplyDepFlt)
+    {
+      PodrMarker := CLSF.LoadFullCurrentDepartmentList;
+      // В случае если помечено одно подразделение, в название фильтра нужно выводить и код подразделения
+      var _cKatPodr: tNRec = 0;
+      if (GetMarkerCount(PodrMarker) = 1)
+        GetMarker(PodrMarker, 0, _cKatPodr);
+      else
+        if (Zar_User.CurCex != 0)
+          _cKatPodr := Zar_User.CurCex;
+      if (_cKatPodr != 0)
+      {
+        if (getFirst KatPodr where((_cKatPodr == KatPodr.NRec)) = tsOk)
+          DepFilterTitle := KatPodr.Kod + ' ' + KatPodr.Name;
+      }
+    }
+
+    StartNewVisual(vtRotateVisual, vfTimer + vfConfirm, ''#3'Анализ данных...'#13, 1);
+
+    if (not IsAborted)
+      FillCols;
+    if (not IsAborted)
+      FillBlocks;
+    if (not IsAborted)
+      FillPodrList;
+    if (not IsAborted)
+      FillSOpl;
+    if (not IsAborted)
+      FillSUder;
+    if (not IsAborted)
+      AnalyseOpl;
+    if (not IsAborted)
+      AnalyseUder;
+    StopVisual('', 0);
+
+    // Если установлен фильтр по подразделению
+    if (NeedApplyDepFlt)
+      DoneMarker(PodrMarker,'');
+  }
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  // Исключение для генерации ошибок, связанных с выводом в Excel файл
+  exception ExOnExecelError;
+
+  // Генерирует ошибку, связанную с выводом в Excel файл
+  procedure ExcelError(ErrCode: Word; AddInfo: string);
+  {
+    var ErrText: string;
+    case ErrCode of
+      XE_BAD_OP:
+        ErrText := 'не удалось выполнить операцию с Excel-файлом';
+      XE_CREATE_FILE:
+        ErrText := 'не удалось создать файл';
+      XE_OPEN_FILE:
+        ErrText := 'не удалось открыть файл';
+      XE_INIT_FILE:
+        ErrText := 'не удалось инициализировать Excel';
+      XE_CREATE_MATRIX:
+        ErrText := 'не удалось создать матрицу';
+      XE_OUT_MATRIX:
+        ErrText := 'не удалось вывести матрицу в отчёт';
+      XE_WRITE_TO_MATRIX:
+        ErrText := 'не удалось записать значение в матрицу';
+      XE_WRONG_TEMPLATE:
+        ErrText := 'в xlt шаблоне не найден лист с именем';
+      XE_FORMAT_CELL:
+        ErrText := 'не удалось отформатировать ячейку';
+      XE_SET_CELL_VALUE:
+        ErrText := 'не удалось записать значение в ячейку';
+      XE_RUN_MACRO:
+        ErrText := 'не удалось запустить макрос';
+      XE_ADD_SHEET:
+        ErrText := 'не удалось добавить вкладку';
+      XE_DEL_SHEET:
+        ErrText := 'не удалось удалить вкладку';
+      XE_RENAME_SHEET:
+        ErrText := 'не удалось переименовать вкладку';
+      XE_FREE_MATRIX:
+        ErrText := 'не удалось освободить матрицу';
+      XE_SET_CELL_FORMULA:
+        ErrText := 'не удалось записать формулу';
+    else
+      ErrText := '';
+    end;
+    oGP_Log.Error(ErrText + ' ' + AddInfo);
+    _raise ExOnExecelError;
+  }
+
+  // Эта Функция делает более удобной проверку результата операции с Excel
+  // Первым параметром передаем функцию, которая работает с Excel, а вторым и третьим - информацию об ошибке,
+  // которая будет выведена, если эта функция вернёт false (т.е. выполнится с ошибкой)
+  procedure xlOp(IsCorrect: Boolean; ErrCode: Word; AddInfo: string);
+  {
+    if (not IsCorrect)
+      ExcelError(ErrCode, AddInfo);
+  }
+
+  // Создаёт Excel файл и создаёт в нём вкладки для вывода отчёта
+  procedure PrepareExcelFile(OutFileName: string);
+  {
+    if (ExistFile(OutFileName))
+      DeleteFile(OutFileName);
+    SetVisualHeader('Создание Excel-файла...');
+    // Создаем файл Excel
+    xlOp(xlCreateExcel(OutFileName, True), XE_CREATE_FILE, OutFileName);
+    xlOp(xlIsExcelValid, XE_INIT_FILE, '');
+    // Переименуем вкладки
+    // Если в отчете меньше вкладок, чем нам нужно добавим недостающие
+    var TabCnt: word = 0;
+    xlOp(xlGetSheetsCount(TabCnt), XE_ADD_SHEET, '');
+    while TabCnt < TAB_CNT do
+    {
+      xlOp(xlAddSheet, 11, '');
+      TabCnt++;
+    }
+    // Если в больше вкладок, чем нам нужно, удалим лишние
+    while TabCnt > TAB_CNT do
+    {
+      xlOp(xlDeleteSheet(1), XE_DEL_SHEET, '');
+      TabCnt--;
+    }
+    // Переименуем вкладки
+    xlOp(xlSetSheetName(1, TAB_TITLE_1), XE_RENAME_SHEET, '');
+  }
+
+  procedure OutTitle(var R: longint);
+  {
+    // Выводим название организации
+    xlOp(xlSetCellStringValue(Trim(sGetTune('MYORG')), R, LastCol, R, LastCol), XE_SET_CELL_VALUE, '');
+    xlOp(xlAlignCellsEx(xlRight, xlTop, R, LastCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Выводим заголовок отчета
+    xlOp(xlSetCellStringValue(REP_TITLE + ' за ' + DateToStr(To_Date(1, pMonth, pYear), 'month YYYY') + ' по ' + DateToStr(To_Date(1, pMonthEnd, pYear), 'month YYYY')+ ' года',
+     R + 1, FirstCol, R + 1, FirstCol), XE_SET_CELL_VALUE, '');
+    xlOp(xlMergeCells(R + 1, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, R + 1, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    // Выводим название фильтра по подразделению
+    xlOp(xlSetCellStringValue(DepFilterTitle, R + 2, FirstCol, R + 2, FirstCol), XE_SET_CELL_VALUE, '');
+    // сделаем все заголовки жирными
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R + 2, LastCol), XE_FORMAT_CELL, '');
+    // изменим размер шрифта
+    xlOp(xlSetFontSize(14, R + 1, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    xlOp(xlSetFontSize(12, R + 2, FirstCol, R + 2, LastCol), XE_FORMAT_CELL, '');
+    R += 3;
+  }
+
+  // Вывод шапки отчёта
+  procedure OutHeader(var R: longint);
+  {
+    SetVisualHeader('Форматирование Excel-файла...');
+    var C: word = FirstCol - 1;
+    // Вид.опл.
+    xlOp(xlSetCellStringValue('Вид.опл.', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(25, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlMergeCells(R, C, R + 1, C), XE_FORMAT_CELL, '');
+    // Колонки с данными
+    var i, j: byte;
+    for (i := 1; i <= DATA_COL_CNT; i++)
+    {
+      var S: string = '';
+      for (j := 1; j <= Cols[i].KategCnt; j++)
+      {
+        if (S != '')
+          S += Chr(13) + Chr(10);
+        S += GetKategColName(Cols[i].Kategs[j]);
+      }
+      xlOp(xlSetCellStringValue(S, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      S := '';
+      for (j := 1; j <= Cols[i].SovmCnt; j++)
+      {
+        if (S != '')
+          S += Chr(13) + Chr(10);
+        S += GetSovmColName(Cols[i].Sovms[j]);
+      }
+      xlOp(xlSetCellStringValue(S, R + 1, C, R + 1, C), XE_SET_CELL_VALUE, '');
+      xlOp(xlSetColumnWidth(15, R, C, R, C), XE_FORMAT_CELL, '');
+    }
+    // ИТОГО
+    xlOp(xlSetCellStringValue('ИТОГО', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(15, R, C, R, C), XE_FORMAT_CELL, '');
+    xlOp(xlMergeCells(R, C, R + 1, C), XE_FORMAT_CELL, '');
+
+    LastCol := C;
+
+    // Выравниваем содержимое ячеек шапки по верхнему краю и по центру
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    // Устанавливаем текстовый формат для всех ячеек шапки
+    xlOp(xlSetNumberFormat('@', R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    // Делаем шрифт шапки жирным
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');;
+    // Изменияе размер шрифта
+    xlOp(xlSetFontSize(10, R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    // Увеличиваем высоту шапки
+    xlOp(xlSetRowHeight(56, R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    // Рисуем границы ячеек для шапки
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0,
+     R, FirstCol, R + 1, LastCol), XE_FORMAT_CELL, '');
+    R += 2;
+  }
+
+  // Вывод текущего блока в отчёт
+  procedure OutBlock(var R: longint);
+  {
+    var FR: longint = R;
+    // Выводим содержимое блока (данные по видам оплат и удержаний)
+    _loop SBlDt where ((SBl.BlNum == SBlDt.BlNum))
+    {
+      var C: word = FirstCol - 1;
+      xlOp(xlSetNumberFormat('@', R, ++C, R, C), XE_FORMAT_CELL, '');
+      //xlOp(xlSetCellStringValue(Chr(39) + Replace(To_Char(SBlDt.VidOplUdP, 3, 0), ' ', '0'), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      xlOp(xlSetCellStringValue(Replace(To_Char(SBlDt.VidOplUdP, 3, 0), ' ', '0'), R, C, R, C), XE_SET_CELL_VALUE, '');
+      xlOp(xlAlignCellsEx(xlRight, xlTop, R, C, R, LastCol), XE_FORMAT_CELL, '');
+      xlOp(xlSetNumberFormat(SumFormat2D, R, C + 1, R, LastCol), XE_FORMAT_CELL, '');
+      var i: byte;
+      for (i := 1; i <= DATA_COL_CNT; i++)
+      {
+        xlOp(xlSetCellNumberValue(SBlDt.ColSum[i], R, C + i, R, C + i), XE_SET_CELL_VALUE, '');
+      }
+      xlOp(xlSetCellNumberValue(SBlDt.Total, R, C + i, R, C + i), XE_SET_CELL_VALUE, '');
+      R++;
+    }
+    if (SBl.ShowTitle)
+    {
+      // Выводим заголовок блока
+      var C: word = FirstCol - 1;
+      xlOp(xlSetCellStringValue(SBl.Title, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+      xlOp(xlSetFontStyle(xlBold, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');;
+      xlOp(xlWrapText(R, C, R, C), XE_FORMAT_CELL, '');
+      xlOp(xlSetNumberFormat(SumFormat2D, R, C + 1, R, LastCol), XE_FORMAT_CELL, '');
+      xlOp(xlAlignCellsEx(xlRight, xlTop, R, C + 1, R, LastCol), XE_FORMAT_CELL, '');
+      var i: byte;
+      for (i := 1; i <= DATA_COL_CNT; i++)
+      {
+        xlOp(xlSetCellNumberValue(SBl.ColSum[i], R, C + i, R, C + i), XE_SET_CELL_VALUE, '');
+      }
+      xlOp(xlSetCellNumberValue(SBl.Total, R, C + i, R, C + i), XE_SET_CELL_VALUE, '');
+      R++;
+    }
+    // Если вывели хоть одну строку
+    if (R > FR)
+      // Рисуем границы
+      xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0,
+       FR, FirstCol, R - 1, LastCol), XE_FORMAT_CELL, '');
+  }
+
+  // Вывод тела отчёта
+  procedure OutBody(var R: longint);
+  {
+    SetVisualHeader('Вывод данных в отчет...');
+    _loop SBl
+    {
+      if (IsAborted)
+        break;
+      NextVisual;
+      OutBlock(R);
+    }
+  }
+
+  // Формирует отчёт
+  procedure CreateReport;
+  {
+    if (IsAborted)
+      exit;
+
+    SumFormat2D := '# ##0' + GetDecimalSeparator + '00';
+
+    FirstCol := 1; // Номер первой колонки отчёта
+    LastCol := FirstCol + DATA_COL_CNT + 1; // Номер последней колонки отчёта
+
+    var OutFileName: string = GetDefaultUserPath + REP_TITLE + ' ' + DateToStr(To_Date(1, pMonth, pYear), 'MM.YYYY') + ' '+DateToStr(To_Date(1, pMonthEnd, pYear), 'MM.YYYY');
+    StartNewVisual(vtRotateVisual, vfTimer + vfConfirm, ''#3'Формирование отчета...'#13, 1);
+    _try
+    {
+      PrepareExcelFile(OutFileName);
+      var R: longint = 1;
+      // Выводим заголовок отчёта
+      OutTitle(R);
+      // Выводим шапку отчёта
+      OutHeader(R);
+      // Выводим тело отчёта
+      OutBody(R);
+    }
+    _except on ExOnExecelError, ExUserBreak:
+    {
+      IsAborted := true;
+    }
+    StopVisual('',0);
+    xlKillExcel;
+  }
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  handleEvent
+    cmInit:
+      {
+        IsAborted := false;
+        if (AskParam)
+        {
+          oGP_Log.Init('#(GPInt).log', true, true, true);
+          if (GetDBPlatformType = dbptMSSQL)
+          {
+            PrepareData;
+            CreateReport;
+          }
+          else
+            oGP_Log.Error('Отчет "#(GPNam)" работает только на платформе MS SQL');
+          oGP_Log.Done(true);
+        }
+        abort;
+      }
+    cmCheckField:
+      PodrPubCheck; // Процедура для фильтров по подразд.
+    cmPick:
+      PodrPubPick; // Процедура для фильтров по подразд.
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_GP_NachFOT implements IUserReport;
+
+interface UserReport_GP_NachFOT;
+
+  procedure Run;
+  {
+    RunInterface('GP_NachFOT');
+  }
+
+  function GetReportName: string;
+  {
+    result := 'Отчет о начисленном фонде ЗП t07';
+  }
+
+  function GetGroupName(Level: word): string;
+  {
+    result := '';
+    case Level of
+      1: result := 'Сводные отчеты по зарплате';
+    end;
+  }
+
+  function GetPriority: integer;
+  {
+    result := 0;
+  }
+
+  function VisibleInModule(Ind: byte): string;
+  {
+    result := '';
+    case Ind of
+      1: result := 'MENUZARP';
+    end;
+  }
+
+end.

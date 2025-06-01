@@ -1,0 +1,1910 @@
+/*************************************************************************************************\
+* Наименование:  Доработка ведения заказов/проектов                                               *
+*                Рабочая корзина                                                                  *
+* Контур/Модуль: Управление персоналом/Заработная плата                                           *
+* Примечание:    Добавление полей, видимость колонок                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#774          |07/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#775          |07/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#1171         |07/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#1183         |22/10/17|Евдокимов М.А.           |НПО Энергомаш                    *
+* Разработка  |#2070         |16/03/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#2189         |31/03/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#219          |07/09/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include GP_VisibleHidden.vih //KBU
+#include GP_PrVidOplHelper.vih
+#include GP_UserFilterManager.vih
+#include GP_UserFilterString.vih
+#include GP_UserFilterDouble.vih
+#include GP_UserFilterPeriod.vih
+#include GP_UserFilterStoreDSK.vih
+#include GP_UserFilterManagerViewActiveFilters.vih
+#include GP_PartDocAccessController.vih
+#include GP_Staff_Func.vih
+
+#include ExtrAnalyticsHelper.vih //Объект для управления дополнительными аналитиками
+#include Marker.vih
+#include PosMarker.vih
+#include oKatKau.vih
+#include Query.vih
+#include macrosch.vpp
+
+#include Mark.inc
+end;
+
+#component "Z_LSCHET"
+#doc
+Интерфейс на работу с рабочей корзиной
+  Доработки системы для учета по заказам.pptx
+#end
+
+Alter Interface BASKET ;
+
+Overload
+#ifndef _2020_09_30_
+  Procedure NewDoplata;
+#else
+  function NewDoplata: boolean;
+#end
+  function SignalName(_Code: word; _bZam: boolean): string;
+  function ProcessChangeAddPayment: boolean;
+  function ProcessZarSignal: boolean;
+  procedure UpdateView;
+  function UpdatePersonalAccount(var _changeDatUv: boolean): boolean;
+  procedure SetupBounds(_CurRecord: comp);
+  procedure DeleteRecords(ProcessedOnly: boolean);
+  procedure SetDoplata(IsNew: boolean);
+end;//Overload
+
+table struct tZarSignal (
+  Nrec          : comp,
+  ParentNrec    : comp,
+  ZarSignalNrec : comp,
+  KatPodrKod    : string[20],
+  KatPodrName   : string[150],
+  TitleDocNrec  : comp,
+  TitleDocNmb   : string[20],
+  TitleDocDate  : date,
+  TitleDocText  : string[100],
+  TitleDocTable : word,
+  IsProcessed   : byte,
+  Sum           : double,
+  Percent       : double,
+  StrTabn       : string[20],
+  Fio           : string[60],
+  OperDate      : date,
+  Date1         : date,
+  MsgCode       : word,
+  IsSubstitution: byte,
+  OrderNrec     : comp,
+  OrderNumber   : string[20],
+  ProjectNrec   : comp,
+  ProjectCode   : string[20],
+  IsLeaf        : byte
+) with index (
+  i00 = Nrec (unique, surrogate),
+  i01 = IsLeaf + TitleDocNrec,
+  i11 = IsLeaf + TitleDocDate + TitleDocNmb,
+  i02 = ParentNrec + TitleDocDate + TitleDocNmb + OperDate,
+  i03 = ZarSignalNrec
+);
+
+//***************************************
+var
+//***************************************
+  EAH            : ExtrAnalyticsHelper;         // Переменная типа интерфейс ExtrAnalyticsHelper
+  pGP_Staff_Func : GP_Staff_Func;
+  //----------------------------------------
+  _visibleHidden   : GP_VisibleHidden;            // скрыть/показать поля
+  _prVidOplHelper  : GP_ZP::GP_PrVidOplHelper;    // поиск и создание sys_mbf, prvidopl
+  _katKau          : oKatKauEdit;
+
+  _attrNamNrecContDocOrder:  comp;
+  _attrNamNrecPartDocOrder:  comp;
+  _attrNamNrecTitleDocOrder: comp;
+
+  _cgKau_ProductionType:       word;
+  _attrNamNrecContDocProject:  comp;
+  _attrNamNrecPartDocProject:  comp;
+  _attrNamNrecTitleDocProject: comp;
+
+  _attrNamNrecPartDocHidden: comp;
+
+  _tZarSignalMarker : IPosMarker(PosMarker) new;
+  _filterManager    : GP_IUserFilterManager noauto;
+  _filterStore      : GP_UserFilterStoreDSK noauto;
+  _filterManagerView: GP_UserFilterManagerViewActiveFilters noauto;
+
+  _hierMode: byte;
+//---- настройки
+//-- #2070 'Заполнять поле "Выплачено(аванс)" в начислениях и выплатах межпериода'
+
+  NPOEM_OWN_ZP_MP_Vipl:boolean;
+//---- #2228
+  //Запретить обработку ранее обработанных записей РК
+  DISABLE_Processed_Rec:boolean;
+  //Разрешать обрабатывать записи РК за прошлые отчетные периоды (кол-во месяцев от тек.периода)
+  Process_month:word;
+  Process_DT   :date;
+  //Предлагать удаление обработанных записей
+  Auto_DEL     :boolean;
+
+//***************************************
+//Основная вьюха из базового интерфейса
+create view First
+var
+  _tZarSignalParentNrec: comp;
+  _buhSchetNrec: comp;
+Select tZarSignal.Nrec
+From
+    tZarSignal,
+    tZarSignal tZarSignalForZS,
+    BuhSchet,
+    X$USERS X$USERS_SH,
+    OtpDop
+Where ((
+      _tZarSignalParentNrec     == tZarSignal.ParentNrec
+  and ZarSignal.Nrec            == tZarSignalForZS.ZarSignalNrec
+  and tZarSignalForZS.OrderNrec == MnPlan.Nrec
+  and DOPLATA.OldcLsch          == OtpDop.Nrec
+
+  //#1171.#16
+  and ZARSIGNAL.ATL_LASTUSER    == X$USERS_SH.Atl_Nrec
+  and _buhSchetNrec             == BuhSchet.Nrec
+))
+bounds ByZarSignalNrec = tZarSignal.ZarSignalNrec == LoadZarSignal.Signal
+;
+
+//Для определения заголовка приказа
+create view vPrik
+as select contdoc.Nrec
+from contdoc, partdoc, titledoc;
+
+//Для построения иерархии tZarSignal
+create view vHier
+as select zs.Nrec
+from tZarSignal zs, tZarSignal zsTitleDoc
+     ,tZarSignal zsChild
+     /*
+     (select count(*) (fieldname=cnt), sum(zsChild.Sum) (fieldname=sum)
+      from tZarSignal zsChild
+      where ((
+        1               == zsChild.IsLeaf and
+        zs.TitleDocDate == zsChild.TitleDocDate and
+        zs.TitleDocNmb  == zsChild.TitleDocNmb
+      ))
+     ) tChildCnt,
+     (select count(*) (fieldname=pcnt)
+      from tZarSignal zsProcessedChild
+      where ((
+        1               == zsProcessedChild.IsLeaf and
+        zs.TitleDocDate == zsProcessedChild.TitleDocDate and
+        zs.TitleDocNmb  == zsProcessedChild.TitleDocNmb and (zsProcessedChild.IsProcessed = 1)
+      ))
+     ) tProcessedChildCnt
+     */
+where ((
+  1               == zs.IsLeaf and (zs.ParentNrec = 0) and
+  1               == zsTitleDoc.IsLeaf and
+  zs.TitleDocDate == zsTitleDoc.TitleDocDate and
+  zs.TitleDocNmb  == zsTitleDoc.TitleDocNmb  and
+  //===========
+  1               == zsChild.IsLeaf and
+  zs.TitleDocDate == zsChild.TitleDocDate and
+  zs.TitleDocNmb  == zsChild.TitleDocNmb
+
+));
+
+//Для синхронизации пометок tZarSignal и LoadZarSignal
+create view vSyncMarker
+var
+  _marker: TPtr;
+as select tZarSignal.Nrec
+from tZarSignal, LoadZarSignal
+where ((
+  root == tZarSignal.Nrec and (FoundMarker(vSyncMarker._marker, vSyncMarker.tZarSignal.Nrec))
+));
+
+
+//******************************************************************************
+//#region Визуальная часть
+
+overloadformats brwZarSignal;
+overloadformats scrLookRaise;
+overloadformats scrLookLsch;
+
+embedded embActiveFilters interface;
+show (,,,3) fixed_y;
+end;
+
+tree 1 trZarSignal 'Иерархическое представление' (,hcBasket,sci18EscIns) ;
+show(,4,,8);
+table tZarSignal;
+recmarker = _tZarSignalMarker { tZarSignal.Nrec };
+fields
+  {font = {color = if(tZarSignal.IsProcessed = 1, ColorSysGray, 0);}};
+  tZarSignal.TitleDocNmb  'Номер приказа'             : [8], protect;
+  tZarSignal.TitleDocDate 'Дата приказа'              : [8], protect;
+  tZarSignal.TitleDocText 'Краткое содержание'        : [8], protect;
+  tZarSignal.OperDate     'Дата операции'             : [10], protect;
+
+  [tZarSignalMsgName]
+    SignalName(tZarSignal.MsgCode, tZarSignal.IsSubstitution = 1)
+    'Операция' ('Операция'): [8], protect;
+
+  tZarSignal.Date1        'Дата начала изменений'     : [10], protect;
+  tZarSignal.Sum          'Сумма'                     : [10,2], protect;
+  tZarSignal.Percent      'Процент'                   : [10,2], protect;
+  tZarSignal.StrTabn      'Таб. №'                    : [10], protect;
+  tZarSignal.Fio          'Сотрудник'                 : [20], protect;
+  tZarSignal.KatPodrKod   'Код подразделения'         : [10], protect;
+  tZarSignal.KatPodrName  'Наименование подразделения': [20], protect;
+  tZarSignal.OrderNumber  'Номер заказа'              : [5], protect;
+  tZarSignal.ProjectCode  'Проект'                    : [5], protect;
+  //#1171.#16
+  [User_Modify] MyGetInitial(X$USERS_SH.XU$FULLNAME,true)  'Изменивший запись' : [20], protect,NoDel;
+end;
+
+handleevent
+  cmTreeTop       : _tZarSignalParentNrec := 0;
+  cmTreeUp        : _tZarSignalParentNrec := tZarSignal.ParentNrec;
+  cmTreeDown      : _tZarSignalParentNrec := tZarSignal.Nrec;
+  cmTreeNodeType  : if (tZarSignal.IsLeaf = 1) TreeSetNodeType(trZarSignal, ntfText);
+  cmTreeNeedOwner : TreeJumpToRecord(trZarSignal, tZarSignal.ParentNrec);
+end;
+
+//********************************
+screen scrLookPrVidOpl (,hcbasketWAll, sci18Esc);
+show at (,9) fixed_y;
+table LOADZARSIGNAL;
+bevel b1 {61, 8, 80, 14, bsLowered, bsFrame};
+fields
+  MsgName: protect;
+
+  PERSONS.FIO: protect;
+  if(isValid(#ZarSignal)
+    ,if(getfirst fastfirstrow KlVidOpl where((ZarSignal.Word3 == KlVidOpl.VidOpl)) = tsOk,
+    KlVidOpl.NVidOpl, ''),'' ) ('Вид оплаты'):
+    {Font = {BackColor = if(isValid(#ZarSignal),if(ZARSIGNAL.COMP1_M = 'И', ColorNeed, 0),'')}}, protect;
+
+  ZARSIGNAL.DATE1 ('Дата начала действия доплаты'):
+    {Font = {BackColor = if(ZARSIGNAL.DATE1_M = 'И', ColorNeed, 0)}}, protect;
+
+  ZARSIGNAL.DATE2 ('Дата окончания действия доплаты'):
+    {Font = {BackColor = if(ZARSIGNAL.DATE2_M = 'И', ColorNeed, 0)}}, protect;
+
+  if(getfirst fastfirstrow KlVidUd where((ZarSignal.Word4 == KlVidUd.VidUd)) = tsOk,
+    KlVidUd.NVidUd, '' ) ('Вид удержания'):
+    {Font = {BackColor = if(ZARSIGNAL.COMP1_M = 'И', ColorNeed, 0)}}, protect;
+
+  FixedAddPaymentSumStr ('Сумма'): [13.2],
+    {Font = {BackColor = if(ZARSIGNAL.DOUBLE1_M = 'И', ColorNeed, 0)}}, protect;
+
+  sPerCent ('Валюта'):
+    {Font = {BackColor = if(ZARSIGNAL.COMP2_M = 'И', ColorNeed, 0)}}, protect;
+
+  FixedAddPaymentPercentStr ('Процент'): [13.2],
+    {Font = {BackColor = if(ZARSIGNAL.DOUBLE1_M = 'И', ColorNeed, 0)}}, protect;
+
+  ZARSIGNAL.DATE10
+    ('Дата утверждения приказа, на основании которого создана запись'): protect;
+
+  ZARSIGNAL.STRING2
+    ('Номер приказа, на основании которого создана запись'): protect;
+  SyncText('Сообщение о синхронизации'):
+    skip,
+    {Font = {Bold = true; Color = 2}}, protect;
+
+<<
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Вид оплаты`                                 `Начало`       `Окончание`
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@@@@@   .@@@@@@@@@@@
+`Вид удержания`
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Сумма`          `Валюта`        `Процент`
+ .@@@@@@@@@@@@@@@ .@@@@@@@@@@@@@  .@@@@@@@@@@
+
+
+                                                              `Дата приказа`
+                                                               .@@@@@@@@@@@
+                                                              `Номер приказа`
+                                                               .@@@@@@@@@@@@@@
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end; // scrLookPrVidOpl
+//------------------------------------------------------------------------------
+// Экран "Изменить лицевой счёт"
+screen scrLookLsch (,hcbasketWAll, sci18Esc);
+show at (,9) fixed_y;
+table LOADZARSIGNAL;
+bevel b1 {61, 10, 80, 16, bsLowered, bsFrame};
+fields
+  MsgName: protect;
+  PERSONS.FIO: protect;
+#IFDEF _GP_
+  NewClockNumber
+#ELSE
+  [NewClockNumber]
+    if(ZARSIGNAL.TABN_M = 'И',
+      // новый табельный номер
+      if (CharacterClockNumbers, ZARSIGNAL.LASTUSER, ZARSIGNAL.TABN),
+      // старый табельный номер
+      OldClockNumberStr)
+    ('Табельный номер'):
+#ENDIF
+    {Font = {BackColor = if(ZARSIGNAL.TABN_M = 'И', ColorNeed, 0)}}, protect;
+
+  KATPODR.NAME ('Подразделение'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.CEX_M = 'И' and Katpodr.Nrec<>Lschet.cex, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.CEX_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  DependantPrivilege ('Льготы на иждивенцев'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.COMP2_M = 'И', ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.COMP2_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.DATE2 ('Дата приема на работу'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.DATE2_M = 'И' and ZARSIGNAL.DATE2<>Lschet.DatPos , ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.DATE2_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.DATE3 ('Дата увольнения'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.DATE3_M = 'И' and ZARSIGNAL.DATE3<>Lschet.DatUv, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.DATE3_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+
+  KLSISOPL_ZARSIGNAL.NASISOPL ('Система оплаты'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.WORD1_M = 'И' and ZarSignal.Word1<>Lschet.sisopl, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.WORD1_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.DOUBLE1 ('Тариф/оклад'): [10.3],
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.DOUBLE1_M = 'И', ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.DOUBLE1_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  KLVAL_LSCHET.SIMVOLV ('Валюта'):
+#IFDEF _GP_
+    {Font = {backcolor = if (ZARSIGNAL.COMP4_M = 'И' and ZARSIGNAL.COMP4<>LSCHET.CFILTER, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {backcolor = if (ZARSIGNAL.COMP4_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.DATE1 ('Дата начала перехода'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.DATE1_M = 'И', ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.DATE1_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.DATE9 ('Дата окончания перехода'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.DATE9_M = 'И', ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.DATE9_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  TARSTAV.NAITAR ('Тарифная сетка'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.WORD2_M = 'И' and TARSTAV.CODTAR<>Lschet.CODTAR, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.WORD2_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.WORD3 ('Разряд'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.WORD3_M = 'И' and ZARSIGNAL.WORD3<>Lschet.razr, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.WORD3_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  fWageRate ('Количество ставок'): [10.3],
+    {Font = {BackColor = if(IsChangeWageRate and LSCHET.TabDop[2]/1000000000<>fWageRate, ColorNeed, 0)}}, protect;
+#IFDEF _GP_
+  CorrectCoef
+#ELSE
+  [CorrectCoef]
+    DoubleToStr(GetNormalizedCorrectKoef, '[|-]3666.888')
+#ENDIF
+    ('Корректирующий коэффициент'):
+#IFDEF _GP_
+    {Font = {BackColor = if(IsChangeCorrectKoef and LSCHET.SUMMA34<>GetNormalizedCorrectKoef, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(IsChangeCorrectKoef, ColorNeed, 0)}}, protect;
+#ENDIF
+
+  ZARSIGNAL.DATE4 ('Дата начала непрерывного стажа для выплаты северных'):
+#IFDEF _GP_
+    {Font = {BackColor = if(Date4_M = 'И' and Lschet.Datn13<>Zarsignal.Date4, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(Date4_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.DATE5 ('Дата начала непрерывного стажа для расчета больничных'):
+#IFDEF _GP_
+    {Font = {BackColor = if(Date5_M = 'И' and Lschet.DatnPs<>Zarsignal.Date5, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(Date5_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  KLREJIM_ZARSIGNAL.NREJIM ('Режим работы'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.WORD4_M = 'И' and ZarSignal.Word4<>Lschet.Rejim, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.WORD4_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.CHAR1 ('Членство в профсоюзе'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.CHAR1_M = 'И' and ZARSIGNAL.CHAR1<>Lschet.Profs, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.CHAR1_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.DATE6 ('Дата начала непрерывного стажа для расчета выслуги лет'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.DATE6_M = 'И' and ZARSIGNAL.DATE6<>LSCHET.DATNVIS , ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.DATE6_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  KLKATEGO_ZARSIGNAL.NAIKAT ('Категория'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.WORD5_M = 'И' and ZarSignal.Word5<>Lschet.Kateg, ColorNeed, 0)}}, protect;
+#ELSE
+  KLKATEGO_ZARSIGNAL.NAIKAT ('Категория'):
+#ENDIF
+  NorthernString ('Северная категория'):
+#IFDEF _GP_
+    {Font = {BackColor = if(NorthernChanged and LSCHET.KATEGS<>KLKategS.Kod, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(NorthernChanged, ColorNeed, 0)}}, protect;
+#ENDIF
+  RCPercent ('Процент районной надбавки'):
+#IFDEF _GP_
+    {Font = {BackColor = if(IsChangeRegionalCoefficient and Zarsignal.STRING3<>Lschet.Pensnal, ColorNeed, 0)}},protect;
+#ELSE
+    {Font = {BackColor = if(IsChangeRegionalCoefficient, ColorNeed, 0)}},protect;
+#ENDIF
+
+  KLSOVM_ZARSIGNAL.NSOVM ('Вид работы'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.WDOP7_M = 'И' and Lschet.Sovm<>KLSOVM_ZARSIGNAL.SOVM, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.WDOP7_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  POST.NAME ('Должность'):
+#IFDEF _GP_
+    {Font = {BackColor = if(ZARSIGNAL.COMP3_M = 'И' and ZarSignal.Comp3<>Lschet.cAppoint, ColorNeed, 0)}}, protect;
+#ELSE
+    {Font = {BackColor = if(ZARSIGNAL.COMP3_M = 'И', ColorNeed, 0)}}, protect;
+#ENDIF
+  ZARSIGNAL.DATE10
+    ('Дата утверждения приказа, на основании которого создана запись'): protect;
+
+  AdvisesStr('Условия труда на рабочем месте'):
+    {Font = {BackColor = if(IsChangeKPS and LSCHET.CEXDOP[10]<>ZARSIGNAL.cAdvises, ColorNeed, 0)}}, protect;
+
+  TerrUslStr('Территориальные условия'):
+    {Font = {BackColor = if(IsChangeKPS and LSCHET.CEXDOP[10]<>ZARSIGNAL.cAdvises, ColorNeed, 0)}}, protect;
+
+  ZARSIGNAL.STRING2
+    ('Номер приказа, на основании которого создана запись'): protect;
+
+  IfString('Источники финансирования', hcbasketWAll, sci138Esc):
+    {Font = {BackColor = if(ZARSIGNAL.WDOP8_M = 'И', ColorNeed, 0)}}, protect;
+
+  SyncText('Сообщение о синхронизации'):
+    skip,
+    {Font = {Bold = true; Color = 2}}, protect;
+
+  buttons
+    cmValue12,[singleline],,,
+     'Составляющие корректирующего коэффициента', hcStaff_complexKK;
+
+<<
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Таб. №`    `Подразделение`                                   `Льготы`
+ .@@@@@@@@@  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@@@@@@@@@@@
+`Принят`    `Уволен`    `Система оплаты`        `Оклад`       `Валюта`
+ .@@@@@@@@@  .@@@@@@@@@  .@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@@@@@@ .@@@@@@@@@@@@@@@@@
+`Начало`    `Окончание` `Тарифная сетка`        `Разряд`      `Ставка`  `КК`<.>>.>
+ .@@@@@@@@@  .@@@@@@@@@  .@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@@@@@@ .@@@@@@@  .@@@@@@@
+`Стаж сев.` `Стаж б/л`  `Режим работы`                      `Профсоюз`
+ .@@@@@@@@@  .@@@@@@@@@  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ .@@
+`Стаж высл.``Категория` `Сев.кат.`              `РК`
+ .@@@@@@@@@  .@@@@@@@@@  .@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@@@@
+`Вид работы`            `Должность`                           `Дата приказа`
+ .@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@   .@@@@@@@@@
+`Условия труда на рабочем месте`          `Терр. усл.`        `Номер приказа`
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@@@@@@@@@@   .@@@@@@@@@@@@@@
+`Источники финансирования`
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end;
+
+//#endregion Визуальная часть
+//******************************************************************************
+
+//******************************************************************************
+//#region Вспомогательные функции
+
+function GetKauAttrNamNrec(wTable: word; sAttrNamName: string; wKodGrKau: word): comp;
+{
+  result := ExtAttr_Id(wTable, sAttrNamName);
+  if result = 0
+    result := ExtAttr_CreateComp(wTable, sAttrNamName, cgAttrType_Comp, 0, wKodGrKau);
+}
+
+procedure AddUserFilterString(lNoField: longint; sSaveName: string; sCaption: string);
+{
+  _filterManager.AddFilter(lNoField,
+                           GP_IUserFilter(new(GP_UserFilterString,
+                                              UserFilterString(lNoField, sSaveName))),
+                           sCaption);
+}
+
+procedure AddUserFilterPeriod(lNoField: longint; sSaveName: string; sCaption: string;
+                              dDateBeg: date = 0; dDateEnd: date = 0;
+                              dDefaultDateBeg: date = 0; dDefaultDateEnd: date = 0);
+{
+  _filterManager.AddFilter(lNoField,
+                           GP_IUserFilter(new(GP_UserFilterPeriod,
+                                              UserFilterPeriod(lNoField, sSaveName, dDateBeg,
+                                              dDateEnd, dDefaultDateBeg, dDefaultDateEnd))),
+                           sCaption);
+}
+
+procedure AddUserFilterDouble(lNoField: longint; sSaveName: string; sCaption: string);
+{
+  _filterManager.AddFilter(lNoField,
+                           GP_IUserFilter(new(GP_UserFilterDouble,
+                                              UserFilterDouble(lNoField, sSaveName))),
+                           sCaption);
+}
+
+Procedure UnsetBoundByZarSignalNrec;
+{
+   // LoGstrToFile('Z_Basket_lap.log','UnsetBoundByZarSignalNrec 1');
+  if BoundActive(tbByZarSignalNrec)
+    SubBounds(tbByZarSignalNrec);
+   // LoGstrToFile('Z_Basket_lap.log','UnsetBoundByZarSignalNrec 2');
+}
+
+Procedure SetBoundByZarSignalNrec;
+{
+  if not BoundActive(tbByZarSignalNrec)
+    AddBounds(tbByZarSignalNrec);
+}
+
+//#region query querySelectZarSignal
+sql query querySelectZarSignal =
+  select *
+  from (select ZarSignal.Nrec                             as ZarSignalNrec,
+               coalesce(KatPodr.Kod, '')                  as KatPodrKod,
+               coalesce(KatPodr.Name, '')                 as KatPodrName,
+
+               coalescen(TitleDoc.Nrec,
+                         StrTitle.Nrec,
+                         #comp(0))                        as TitleDocNrec,
+
+               case when coalesce(TitleDoc.DocNmb, ZarSignal.String2) = ''
+                    then #date(0,0,0)
+                    else coalesce(TitleDoc.DocDate, ZarSignal.Date10)
+               end                                        as TitleDocDate,
+
+               case when coalesce(TitleDoc.DocNmb, ZarSignal.String2) = ''
+                    then '<без приказа>'
+                    else coalesce(TitleDoc.DocNmb, ZarSignal.String2)
+               end                                        as TitleDocNmb,
+
+               coalescen(TitleDoc.DocText,
+                         StrTitle.DocText,
+                         '')                              as TitleDocText,
+
+               case when TitleDoc.Nrec is null and
+                         StrTitle.Nrec is not null
+                    then 25091
+                    else 25043
+               end                                        as TitleDocTable,
+               BitAnd(ZarSignal.FilialNo, 1)              as IsProcessed,
+               case when ZarSignal.SrcTable in (16, 32, 116, 132)
+                     and ZarSignal.Word1 < 2
+                    then ZarSignal.Double1
+                    else 0
+               end                                        as Sum,
+               case when ZarSignal.SrcTable in (16, 32, 116, 132)
+                     and ZarSignal.Word1 = 2
+                    then ZarSignal.Double1
+                    else 0
+               end                                        as Percent,
+               ZarSignal.StrTabn                          as StrTabn,
+               coalesce(Persons.FIO, '')                  as FIO,
+               ZarSignal.MsgCode                          as MsgCode,
+               ZarSignal.LstDate                          as OperDate,
+               ZarSignal.Date1                            as Date1,
+               case when ZarSignal.wDop9 = 9
+                    then 1
+                    else 0
+               end                                        as IsSubstitution,
+               coalesce(MnPlan.Nrec, #comp(0))            as OrderNrec,
+               coalesce(MnPlan.Number, '')                as OrderNumber,
+               coalesce(spkProject.Nrec, #comp(0))        as ProjectNrec,
+               coalesce(spkProject.Code, '')              as ProjectCode,
+               1                                          as IsLeaf
+
+        from tmpLoadZarSignal
+        join ZarSignal on ZarSignal.Nrec = tmpLoadZarSignal.Nrec
+
+        //Приказ, идентифицируемый однозначно в зависимости от типа записи ZarSignal
+        left join ( select distinct ZarSignal.Nrec as ZarSignalNrec,
+                                    PartDoc.cDoc as TitleDocNrec,
+                                    PartDoc.Nrec as PartDocNrec,
+                                    ContDoc.Nrec as ContDocNrec
+                    from ZarSignal
+                    left join Raise on Raise.Nrec = ZarSignal.SrcRec
+                    left join Fortune on Fortune.nrec = ZarSignal.SrcRec
+                    join ContDoc on ContDoc.Nrec = case when BitAnd(ZarSignal.FilialNo, 4) = 4 then Fortune.cFcont else Raise.cRdop end
+                    join PartDoc on PartDoc.Nrec = ContDoc.cPart
+                    where ZarSignal.SrcTable = 16 and ZarSignal.MsgCode not in (114, 115, 214, 215, 212, 213)
+
+                    union all
+
+                    select distinct ZarSignal.Nrec, PartDoc.cDoc, PartDoc.Nrec, ContDoc.Nrec
+                    from ZarSignal
+                    join ContDoc on ContDoc.Nrec = ZarSignal.Comp4
+                    join PartDoc on PartDoc.Nrec = ContDoc.cPart
+                    where ZarSignal.SrcTable = 32 or ZarSignal.MsgCode in (114, 115, 214, 215, 212, 213)
+                  ) tPrikaz on tPrikaz.ZarSignalNrec = ZarSignal.Nrec
+
+        //Приказ по номеру и дате в ZarSignal
+        left join (select TitleDoc.DocDate, TitleDoc.DocNmb, ContDoc.Person,
+                          max(TitleDoc.Nrec) as TitleDocNrec,
+                          max(PartDoc.Nrec) as PartDocNrec,
+                          max(ContDoc.Nrec) as ContDocNrec
+                   from TitleDoc
+                   join PartDoc on PartDoc.cDoc = TitleDoc.Nrec
+                   join ContDoc on ContDoc.cPart = PartDoc.Nrec
+                   group by TitleDoc.DocDate, TitleDoc.DocNmb, ContDoc.Person
+                  ) tPrikaz2 on tPrikaz2.DocDate = ZarSignal.Date10 and
+                                tPrikaz2.DocNmb = ZarSignal.String2 and
+                                tPrikaz2.Person = ZarSignal.tPerson and
+                                ZarSignal.Date10 <> 0 and
+                                ZarSignal.String2 <> ''
+
+        //Приказ по штатке по номеру и дате в ZarSignal
+        left join (select StrTitle.DocDate, StrTitle.DocNmb, max(StrTitle.Nrec) as StrTitleNrec
+                   from StrTitle
+                   group by StrTitle.DocDate, StrTitle.DocNmb
+                  ) tPrikaz3 on tPrikaz3.DocDate = ZarSignal.Date10 and
+                                tPrikaz3.DocNmb = ZarSignal.String2 and
+                                ZarSignal.Date10 <> 0 and
+                                ZarSignal.String2 <> ''
+
+        left join TitleDoc on TitleDoc.Nrec = coalesceN(tPrikaz.TitleDocNrec, tPrikaz2.TitleDocNrec, #comp(0))
+        left join PartDoc  on PartDoc.Nrec  = coalesceN(tPrikaz.PartDocNrec,  tPrikaz2.PartDocNrec , #comp(0))
+        left join ContDoc  on ContDoc.Nrec  = coalesceN(tPrikaz.ContDocNrec,  tPrikaz2.ContDocNrec , #comp(0))
+        left join StrTitle on StrTitle.Nrec = coalesceN(tPrikaz3.StrTitleNrec, #comp(0) )
+
+        left join KatPodr on KatPodr.Nrec = ZarSignal.Cex
+
+        left join Persons on Persons.Nrec = ZarSignal.tPerson
+
+        //Заказ из приказа
+        left join AttrVal avTitleDocOrder on avTitleDocOrder.wTable   = :coTitleDoc and
+                                             avTitleDocOrder.cRec     = TitleDoc.Nrec and
+                                             avTitleDocOrder.cAttrNam = :AttrNamNrecTitleDocOrder
+
+        left join AttrVal avPartDocOrder  on avPartDocOrder.wTable   = :coPartDoc and
+                                             avPartDocOrder.cRec     = PartDoc.Nrec and
+                                             avPartDocOrder.cAttrNam = :AttrNamNrecPartDocOrder
+
+        left join AttrVal avContDocOrder  on avContDocOrder.wTable   = :coContDoc and
+                                             avContDocOrder.cRec     = ContDoc.Nrec and
+                                             avContDocOrder.cAttrNam = :AttrNamNrecContDocOrder
+
+        left join MnPlan on MnPlan.Nrec = /*case when coalesce(avContDocOrder.vComp, #comp(0)) = #comp(0)
+                                             then case when coalesce(avTitleDocOrder.vComp, #comp(0)) = #comp(0)
+                                                         then avContDocOrder.vComp
+                                                         else avTitleDocOrder.vComp
+                                                    end
+                                          end
+                                                    */
+                                            CoalesceN(avContDocOrder.vComp,avPartDocOrder.vComp,avTitleDocOrder.vComp,#comp(0))
+
+        //Проект из приказа
+        left join AttrVal avTitleDocProject on avTitleDocProject.wTable   = :coTitleDoc and
+                                               avTitleDocProject.cRec     = TitleDoc.Nrec and
+                                               avTitleDocProject.cAttrNam = :AttrNamNrecTitleDocProject
+
+        left join AttrVal avPartDocProject  on avPartDocProject.wTable   = :coPartDoc and
+                                               avPartDocProject.cRec     = PartDoc.Nrec and
+                                               avPartDocProject.cAttrNam = :AttrNamNrecPartDocProject
+
+        left join AttrVal avContDocProject  on avContDocProject.wTable   = :coContDoc and
+                                               avContDocProject.cRec     = ContDoc.Nrec and
+                                               avContDocProject.cAttrNam = :AttrNamNrecContDocProject
+
+        left join SpKau spkProject on spkProject.Nrec =/* case when coalesce(avContDocProject.vComp, #comp(0)) = #comp(0)
+                                                             then case when coalesce(avTitleDocProject.vComp, #comp(0)) = #comp(0)
+                                                                       then avContDocProject.vComp
+                                                                       else avTitleDocProject.vComp
+                                                                  end
+                                                             else avContDocProject.vComp
+                                                        end
+                                                       */
+                                             CoalesceN(avContDocProject.vComp,avPartDocProject.vComp,avTitleDocProject.vComp,#comp(0))
+
+        left join AttrVal avHidden on avHidden.wTable   = :coPartDoc and
+                                      avHidden.cRec     = PartDoc.Nrec and
+                                      avHidden.cAttrNam = :AttrNamNrecPartDocHidden
+
+        left join servstav on servstav.wtblcode = partdoc.typeoper and
+                              servstav.cunit    = :cUser and
+                              servstav.filialno = 1
+
+        where coalesce(avHidden.vString, '') = '' or
+              ( avHidden.vString = :AttrValValuePartDocHidden and
+                BITAND(cast(servstav.cserv as longint), :bitEnabledHidden ) = :bitEnabledHidden )
+      ) t
+;
+//#endregion query
+
+procedure SqlAddWhereByString(fldName: string; storeSaveName: string; var s: longint);
+{
+  var match: byte;
+  match := byte(_filterStore.LoadComp(storeSaveName + '_Match'));
+
+  var filterString: string;
+  filterString := _filterStore.LoadString(storeSaveName + '_FilterString');
+
+  case match of
+    GP_UserFilterString_Match_Equal:
+      sqlAddStr(s, 'and ' + fldName + ' = ''' + filterString + '''');
+    GP_UserFilterString_Match_Like:
+      sqlAddStr(s, 'and ' + fldName + ' like ''%' + filterString + '%''');
+  end;
+}
+
+procedure SqlAddWhereByPeriod(fldName: string; storeSaveName: string; var s: longint);
+{
+  var dBeg, dEnd: date;
+  dBeg := _filterStore.LoadDate(storeSaveName + '_DateBeg');
+  dEnd := _filterStore.LoadDate(storeSaveName + '_DateEnd');
+  sqlAddStr(s, 'and ' + fldName + ' between #date(' + DateToStr(dBeg, 'DD, MM, YYYY') +
+               ') and #date(' + DateToStr(dEnd, 'DD, MM, YYYY') + ')');
+}
+
+procedure RebuildHierarchyTable;
+{
+  var zarSignalNrecOld: comp =0 ;
+  if isValidAll(#tZarSignal)
+  {
+    zarSignalNrecOld := tZarSignal.ZarSignalNrec;
+  }
+  if timelog_Status>1  Timelog('Z_LSCHET##BASKET RebuildHierarchyTable zarSignalNrecOld='+string(zarSignalNrecOld));
+
+  //Снимаем ограничения с tZarSignal для очистки и заполнения
+
+  //PopBounds(#LOADZARSIGNAL);
+  //PopAllConditionForLeave(#LOADZARSIGNAL);
+  UnsetBoundByZarSignalNrec;
+  //ResetBounds(#tZarSignal);
+  //delete all tZarSignal;
+  MtClear(#tZarSignal,mfNormal);
+
+  StartNewVisual(vtIndicatorVisual, vfTimer+vfBreak, 'Обновление', recordsintable(tnLoadZarSignal));
+  //Создаем временную sql таблицу tmpLoadZarSignal и заполняем ее записями из LoadZarSignal
+  sqlCreateTmpTable('table tmpLoadZarSignal (nrec: comp);', ctmNormal);
+  var qInsert: IQuery;
+  qInsert := queryManager.createQuery('insert tmpLoadZarSignal (nrec) Values ( :Nrec )');
+  _loop LoadZarSignal
+  {
+    qInsert.setParam('Nrec', LoadZarSignal.Signal).Execute;
+    //sqlExecDirect('insert tmpLoadZarSignal (nrec) Values (#comp(' + LoadZarSignal.Signal + '))');
+    if not NextVisual break;
+  }
+
+  //Генерируем текст запроса отбирающего данные для tZarSignal
+  var s: longint = 0;
+  sqlFreeStr(s);
+  sqlAddStr(s, querySelectZarSignal);
+  sqlAddStr(s, 'where 1=1');
+
+  if _filterManager.FilterForFieldIsActive(#tZarSignal.TitleDocNmb)
+    SqlAddWhereByString('TitleDocNmb', 'TitleDocNmb', s);
+  if _filterManager.FilterForFieldIsActive(#tZarSignal.TitleDocDate)
+    SqlAddWhereByPeriod('TitleDocDate', 'TitleDocDate', s);
+  if _filterManager.FilterForFieldIsActive(#tZarSignal.Date1)
+    SqlAddWhereByPeriod('Date1', 'Date1', s);
+  if _filterManager.FilterForFieldIsActive(#tZarSignal.TitleDocText)
+    SqlAddWhereByString('TitleDocText', 'TitleDocText', s);
+  if _filterManager.FilterForFieldIsActive(#tZarSignal.StrTabn)
+    SqlAddWhereByString('StrTabn', 'TabN', s);
+  if _filterManager.FilterForFieldIsActive(#tZarSignal.Fio)
+    SqlAddWhereByString('Fio', 'FIO', s);
+  if _filterManager.FilterForFieldIsActive(#tZarSignal.KatPodrKod)
+    SqlAddWhereByString('KatPodrKod', 'KatPodrKod', s);
+  if _filterManager.FilterForFieldIsActive(#tZarSignal.OrderNumber)
+    SqlAddWhereByString('OrderNumber', 'OrderNumber', s);
+  if _filterManager.FilterForFieldIsActive(#tZarSignal.ProjectCode)
+    SqlAddWhereByString('ProjectCode', 'ProjectCode', s);
+
+  //Заполняем tZarSignal
+  var q: IQuery;
+  q := queryManager.createQuery(s)
+                   .setParam('coTitleDoc', coTitleDoc)
+                   .setParam('coPartDoc',  coPartDoc)
+                   .setParam('coContDoc',  coContDoc)
+                   .setParam('AttrNamNrecTitleDocOrder', _attrNamNrecTitleDocOrder)
+                   .setParam('AttrNamNrecPartDocOrder',  _attrNamNrecPartDocOrder)
+                   .setParam('AttrNamNrecContDocOrder',  _attrNamNrecContDocOrder)
+                   .setParam('AttrNamNrecTitleDocProject', _attrNamNrecTitleDocProject)
+                   .setParam('AttrNamNrecPartDocProject',  _attrNamNrecPartDocProject)
+                   .setParam('AttrNamNrecContDocProject',  _attrNamNrecContDocProject)
+                   .setParam('AttrNamNrecPartDocHidden', _attrNamNrecPartDocHidden)
+                   .setParam('cUser', UserId)
+                   .setParam('AttrValValuePartDocHidden', GP_ATTRVAL_VALUE_PARTDOC_HIDDEN)
+                   .setParam('bitEnabledHidden', GP_BIT_RPD_ENABLED_HIDDEN)
+                   .Execute;
+  if q.errorCode = tsOk
+    sqlCopyInto(q, tntZarSignal, true);
+
+  //Дропаем временную sql таблицу
+  sqlDropTmpTable('tmpLoadZarSignal');
+
+  StopVisual('', 0);
+  var _cnt  : longint = 0;
+  var _pcnt : longint = 0;
+  var _sum  : double  = 0;
+  if _hierMode = 1
+  {
+    //Строим иерархию
+    StartNewVisual(vtIndicatorVisual, vfTimer+vfBreak, 'Построение иерархии', recordsintable(tntZarSignal));
+    vHier._loop zs
+    {
+      if not NextVisual break;
+
+      //if vHier.tChildCnt.Cnt > 1
+      _cnt  := 0;
+      _pcnt := 0;
+      _sum  := 0;
+      vHier._loop zsChild
+      {
+        _cnt++;
+        if vHier.zsChild.IsProcessed =1
+          _pcnt++;
+        _sum+= vHier.zsChild.Sum;
+      }
+
+      if _cnt>1
+      {
+        var newNrec: comp;
+        newNrec := GetNextNRec(tntZarSignal, 0);
+        vHier.update zsTitleDoc set zsTitleDoc.ParentNrec := newNrec;
+        clearBuffer(tntZarSignal);
+        tZarSignal.Nrec         := newNrec;
+        tZarSignal.IsLeaf       := 0;
+        tZarSignal.TitleDocNrec := vHier.zs.TitleDocNrec;
+        tZarSignal.TitleDocNmb  := vHier.zs.TitleDocNmb;
+        tZarSignal.TitleDocDate := vHier.zs.TitleDocDate;
+        tZarSignal.TitleDocText := vHier.zs.TitleDocText;
+        tZarSignal.TitleDocTable:= vHier.zs.TitleDocTable;
+        //tZarSignal.IsProcessed  := if(vHier.tChildCnt.Cnt = vHier.tProcessedChildCnt.pCnt, 1, 0);
+        //tZarSignal.Sum          := vHier.tChildCnt.Sum;
+        tZarSignal.IsProcessed  := if(_Cnt = _pCnt, 1, 0);
+        tZarSignal.Sum          := _Sum;
+        insert current tZarSignal;
+      }
+    }
+    StopVisual('', 0);
+  }
+
+  //Возвращаем ограничения на tZarSignal
+  //SetBounds(#tZarSignal);
+
+  //перерисовка
+  if timelog_Status>1
+  {
+    Timelog('Z_LSCHET##BASKET отобрали '+string(RecordsInTable(#tZarSignal)));
+    Timelog('Z_LSCHET##BASKET TreeIsTruthTree(trZarSignal) ='+string(TreeIsTruthTree(trZarSignal)) );
+  }
+  //EM-486 - если нет данных то фейс падает.
+  if RecordsInTable(#tZarSignal) = 0
+  {
+    Message('Нет данных, измените фильтр!');
+    clearbuffer(#tZarSignal);
+    tZarSignal.IsProcessed := 1;
+    insert current tZarSignal;
+    zarSignalNrecOld := 0;
+  }
+  if zarSignalNrecOld <> 0
+    if getfirst tZarSignalForZS where ((zarSignalNrecOld == tZarSignalForZS.ZarSignalNrec)) = tsOk
+      TreeJumpToRecord(trZarSignal, zarSignalNrecOld)
+    else
+      zarSignalNrecOld := 0;
+  if zarSignalNrecOld = 0
+  {
+    TreeGetFirstEx(trZarSignal);
+    if not TreeIsTerminal(trZarSignal)
+      TreeOpenNode(trZarSignal);
+  }
+  rereadrecord(#tZarSignal);
+}
+
+Procedure OnExtraFilterChange;
+{
+  _filterManager.Save;
+  RebuildHierarchyTable;
+  SetupBounds(LoadZarSignal.Signal);
+}
+
+Procedure SyncLoadZarSignalMarks;
+{
+  if vSyncMarker._marker = 0
+    vSyncMarker._marker := InitMarker('', 8, 100, 100, true);
+    // LoGstrToFile('Z_Basket_lap.log','SyncLoadZarSignalMarks 1');
+  _tZarSignalMarker.ExportTo(vSyncMarker._marker);
+
+  var m: TPtr;
+  m := InitMarker('', 8, 100, 100, true);
+
+  vSyncMarker._loop tZarSignal
+    if vSyncMarker.tZarSignal.ZarSignalNrec != 0
+      InsertMarker(m, vSyncMarker.tZarSignal.ZarSignalNrec);
+
+  vSyncMarker.update LoadZarSignal
+    set LoadZarSignal.Marked := foundmarker(m, vSyncMarker.LoadZarSignal.Signal);
+
+  DoneMarker(m, '');
+}
+
+//определяет, находится ли дата aDate в будущем периоде
+function IsFuturePeriod(dDate: date): boolean;
+{
+  var d: date;
+  d := dGetTune('UP.DATOTCH');
+  result := dDate > date(Last_Day(d), Month(d), Year(d));
+}
+
+//Возвращает тип документа по сообщению:
+//  0  - межрасчетная выплата
+//  1  - разовое удержание
+//  2  - постоянное удержание
+//  -1 - тип не определен
+function GetDocType(wMsgCode: word): byte;
+{
+  result := case(wMsgCode;
+                 114: 0,
+                 115: 0,
+                 214: 1,
+                 215: 1,
+                 212: 2,
+                 213: 2;
+                 -1);
+}
+
+//определяет sys_mbf.choice в зависимости от типа документа, создаваемого по zarsignal (см. GetDocType)
+//и даты: начисление / удержание, текущий период / будущий период
+function GetChoice(dDate: date; bDocType: byte): word;
+{
+  if IsFuturePeriod(dDate)
+    result := case(bDocType; 0: 99, 1: 89; -1);
+  else
+    result := case(bDocType; 0: 0, 1: 1; -1);
+}
+
+procedure OnTZarSignalMarkUnmark(abMark: Boolean);
+{
+  if abMark and wGetTune('UP.ZAR.MarkFutureRecords') = 1
+      if isValidAll(#ZarSignal)
+        if ZarSignalLogicalChangeDate > DatRas
+          _tZarSignalMarker.MarkUnMarkRec(_tZarSignalMarker.pcRec);
+}
+
+//#endregion Вспомогательные функции
+//******************************************************************************
+
+//******************************************************************************
+//#region Обработчики записей РК
+
+//Обработка сигналов межрасчетных выплат и удержаний
+function GP_ProcessPrVidOpl: boolean;
+{
+  if getfirst fastfirstrow LSchet where ((ZarSignal.cLschetZpl == LSchet.NREC)) = tsOk
+  {
+    Result := false;
+
+    var docType: byte;
+    docType := GetDocType(ZarSignal.MsgCode);
+    if docType = -1
+    {
+      Log('Не определен тип создаваемого документа по сообщению с кодом ' + ZarSignal.MsgCode, mfInformation);
+      exit;
+    }
+
+    var wChoice, wVidOpl, wVidUd: word;
+    wChoice := GetChoice(ZarSignal.Date1, docType);
+    wVidOpl := ZarSignal.Word3;
+    wVidUd  := ZarSignal.Word4;
+
+    var dBeg, dEnd: date;
+    dBeg := ZarSignal.Date1;
+    dEnd := ZarSignal.Date2;
+
+    var dSum: double;
+    dSum := ZarSignal.Double1;
+
+    var cContDoc, cTitleDoc: comp;
+    cContDoc := ZarSignal.Comp4;
+    cTitleDoc:= 0;
+
+    var sNmnem: string;
+    sNmnem := ZarSignal.String4;
+    if sNmnem = ''
+      if vPrik.getfirst ContDoc where ((cContDoc == ContDoc.Nrec)) = tsOk
+        if vPrik.getfirst PartDoc where ((vPrik.ContDoc.cPart == PartDoc.Nrec)) = tsOk
+          if vPrik.getfirst TitleDoc where ((vPrik.PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+          {
+            cTitleDoc := vPrik.TitleDoc.Nrec;
+            if docType = 1
+              sNmnem := 'Межрасчетное удержание (пр. №' + vPrik.TitleDoc.DocNmb + ')';
+            else
+              sNmnem := 'Межрасчетная выплата (пр. №' + vPrik.TitleDoc.DocNmb + ')';
+          }
+
+    var cExistingPrVidOpl: comp;
+    cExistingPrVidOpl := _prVidOplHelper.FindPrVidOpl(LSchet.Nrec, wVidOpl, wVidUd, dBeg, dEnd, cContDoc);
+
+    case ZarSignal.MsgCode of
+
+      114, 214:
+      {
+
+        if cExistingPrVidOpl != 0
+        {
+          if(IsProcessed or boGetTune('UP.ZAR.CONTROLDOPL'))
+          {
+            Log(if(docType = 1, 'Разовое удержание', 'Межрасчетная выплата') + ' уже существует у сотрудника', mfInformation);
+            Log('сотрудник: т.н. ' + GetStrTabn(LSCHET.TABN, LSCHET.STRTABN) + '  ' + PERSONS.FIO, mfTextWithIndent);
+            Log('вид оплаты: ' + string(wVidOpl) + ', вид удержания: ' + string(wVidUd), mfTextWithIndent);
+            exit;
+          }
+        }
+
+        var cSysMbf: comp;
+        cSysMbf := _prVidOplHelper.FindOrCreateSysMbf(wChoice, dBeg, dEnd, sNmnem, ZarSignal.Cex, 0, cTitleDoc);
+        if cSysMbf != 0
+        {
+          var cNewPrVidOpl: comp;
+          cNewPrVidOpl := _prVidOplHelper.CreatePrVidOpl(cSysMbf, Lschet.Nrec, wVidOpl, wVidUd, dSum, cContDoc);
+          if cNewPrVidOpl != 0
+          {
+            //update PrVidOpl where ((cNewPrVidOpl == PrVidOpl.Nrec)) set PrVidOpl.SumUd := 0;
+            Log(if(docType = 1, 'Добавлено разовое удержание', 'Добавлена межрасчетная выплата'), mfInformation);
+            Log('сотрудник: т.н. ' + GetStrTabn(LSCHET.TABN, LSCHET.STRTABN) + '  ' + PERSONS.FIO, mfTextWithIndent);
+            Log('вид оплаты: ' + string(wVidOpl) + ', вид удержания: ' + wVidUd, mfTextWithIndent);
+            Result := true;
+          }
+        }
+      } //114, 214
+
+      115, 215:
+      {
+
+        if cExistingPrVidOpl = 0
+        {
+          Log('Сигнал об удалении доплаты не обработан: ' +
+              if(docType = 1, 'не найдено разовое удержание', 'не найдена межрасчетная выплата'), mfInformation);
+          exit;
+        }
+
+        if _prVidOplHelper.DeletePrVidOpl(cExistingPrVidOpl)
+        {
+          Log(if(docType = 1, 'Удалено разовое удержание', 'Удалена межрасчетная выплата'), mfInformation);
+          Log('сотрудник: т.н. ' + GetStrTabn(LSCHET.TABN, LSCHET.STRTABN) + '  ' + PERSONS.FIO, mfTextWithIndent);
+          Log('вид оплаты: ' + string(wVidOpl) + ', вид удержания: ' + wVidUd, mfTextWithIndent);
+          result := true;
+        }
+
+      }
+
+    end //case
+
+  }
+}
+
+//******************************************************************************
+// Обработка сигналов постоянных удержаний
+// за основу взята обработка стандартной корзины сообщений 12 и 13 - ProcessZarUder
+// и отвязана от punishments. По сути, просто убран в начале getfirst к нему,
+// т.к. никаких привязок в shtraf к puhishments нет.
+//******************************************************************************
+function GP_ProcessUder: boolean;
+{
+  result := false;
+  case ZarSignal.MsgCode of
+    212:
+    {
+      if getfirst fastfirstrow LSCHET where ((ZARSIGNAL.cLschetZPL == LSCHET.Nrec)) = tsok
+      {
+        if (GetFirst KlVidUd = tsOK)
+          if getfirst fastfirstrow Shtraf where ((
+                                        ZarSignal.cLschetZpl    == SHTRAF.CLSCH and
+                                        KlVidUd.VidUd           == Shtraf.VidUd and
+                                        ZarSignal.Date1         == Shtraf.DataN (noindex) and
+                                        ZarSignal.Date2         == Shtraf.Datok (noindex)
+                                    )) = tsOk
+          {
+            displ('[!] Удержание "'+ KlVidUd.NVidUd + '" уже было сформировано ранее.');
+            exit;
+          }
+        ClearBuffer(#Shtraf);
+        Shtraf.Pometka := '+';
+        shtraf.Flag3   := '+';//При расчете удержание не пересчитывается от отработанных дней
+
+        SHTRAF.CLSCH     := LSCHET.NREC;
+        SHTRAF.StrTABN   := LSCHET.StrTABN;
+        SHTRAF.TABN      := LSCHET.TABN;
+        SHTRAF.CEX       := LSCHET.CEX;
+        SHTRAF.TPERSON   := LSCHET.TPERSON;
+
+        if (GetFirst KlVidUd = tsOK)
+          Shtraf.VidUd := KlVidUd.VidUd;
+        //алименты
+        if (((Shtraf.VidUd >= 185) and (Shtraf.VidUd <= 187)) or (Shtraf.VidUd = 191))
+          Shtraf.nomdok := '1';
+
+        if   ((Shtraf.VidUd >= 220)and(Shtraf.VidUd <= 230))
+          or  (Shtraf.VidUd = 219)
+          or ((Shtraf.VidUd >= 206)and(Shtraf.VidUd <= 210))
+            Shtraf.PrPer := 2
+          else
+            Shtraf.PrPer := 1;
+        // ШПЗ
+        #SetDef_Kr(Shtraf);
+
+        if Zarsignal.Word1 = 1
+        {
+          Shtraf.SumUd := Zarsignal.Double1;
+          Shtraf.Proc := 0;
+        }
+        if Zarsignal.Word1 = 2
+        {
+          Shtraf.SumUd :=  0;
+          Shtraf.Proc := Zarsignal.Double1;
+        }
+        Shtraf.DataN := ZarSignal.Date1;
+        //заносим дату окончания взыскания
+        Shtraf.Datok := ZarSignal.Date2;
+
+        if insert current Shtraf = tsOk
+        {
+          result := true;
+          Log('Добавлено удержание: Сотрудник с т.н. '+ GetStrTabn(Lschet.Tabn,Lschet.StrTabn) + ' вид удержания: ' + string(Shtraf.VidUd) , mfInformation);
+          //#219.#25
+          // Управление персоналом \ Управление и учет кадров \ Приказы \ Приказы по персоналу \
+          //РПД-107 (Компенсация стоимости гостиничных услуг) \ Вид удержания"
+          if Shtraf.VidUd=coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_107.VIDUD')
+          { var _pOrg:comp=pGP_Staff_Func.FindOrgByPers(Lschet.tPerson,'',ZeroDate);
+            if _pOrg<>0
+            { EAH.BindExtrAnalytics(coSHTRAF, SHTRAF.OLDCLSCH);
+              update current SHTRAF;
+              if getfirst OtpDop where (( SHTRAF.OLDCLSCH == OTPDOP.NREC ))=tsok
+              { var _jj:word;
+                For(_jj:=1;_jj<=6;_jj++)
+                { if OTPDOP.TBLD[_jj]=0 or OTPDOP.TBLD[_jj]=cgKau_KatOrg
+                  { OTPDOP.TBLD [_jj]:=cgKau_KatOrg;
+                    OTPDOP.CKAUD[_jj]:=_pOrg;
+                    break;
+                  }
+                } //For(_jj:=1;_jj<=6;_jj++)
+                update current OTPDOP;
+              } //if getfirst OtpDop where (( SHTRAF.OLDCLSCH == OTPDOP.NREC ))=tsok
+            } //if _pOrg<>0
+          } //if Shtraf.VidUd=coGetTune('UP.STAFF.PRIKAZ_PERS.RPD_107.VIDUD')
+        } ////if insert current Shtraf = tsOk
+
+      } //if getfirst fastfirstrow LSCHET where ((ZARSIGNAL.cLschetZPL == LSCHET.Nrec)) = tsok
+    }  //212:
+    213:
+    {
+      if getfirst Lschet where ((ZarSignal.cLschetZpl == Lschet.Nrec)) = tsOk
+      {
+        var lVidUd : longint;
+        // вид удержания
+        if (GetFirst KlVidUd = tsOK)
+          lVidUd := KlVidUd.VidUd;
+        if getfirst Shtraf where ((ZarSignal.cLschetZpl == SHTRAF.CLSCH and
+                                   lVidUd               == Shtraf.VidUd and
+                                   ZarSignal.Date1      == Shtraf.DataN (noindex) and
+                                   ZarSignal.Date2      == Shtraf.Datok (noindex))) = tsOk
+          {
+            delete SYS_DOG where ((coShtraf == SYS_DOG.TBLK[1]
+                                  and SHTRAF.NREC == SYS_DOG.CKAUK[1]));
+
+            if delete current Shtraf = tsOk
+            {
+              result := true;
+              Log('Удалено удержание: Сотрудник с т.н. '+ GetStrTabn(Lschet.Tabn,Lschet.StrTabn) + ' вид удержания: ' + string(Shtraf.VidUd) , mfInformation);
+            }
+          }
+      }
+    }
+  end;
+}
+
+//#endregion Обработчики записей РК
+//******************************************************************************
+
+//******************************************************************************
+//#region Перехваченные функции
+//------------------------------------------------------------------------------
+// Удаление записей (ProcessedOnly - только обработанных)
+//------------------------------------------------------------------------------
+procedure DeleteRecords(ProcessedOnly: boolean);
+{ if ProcessedOnly
+  { if not Auto_Del then Exit;
+  }
+  Inherited::DeleteRecords(ProcessedOnly);
+}
+#ifndef _2020_09_30_
+  Procedure NewDoplata;
+#else
+  function NewDoplata: boolean;
+#end
+
+{
+   // LoGstrToFile('Z_Basket_lap.log','NewDoplata 1');
+#ifndef _2020_09_30_
+  Inherited::NewDoplata;
+#else
+  result := Inherited::NewDoplata;
+#end
+
+
+   // LoGstrToFile('Z_Basket_lap.log','NewDoplata 2');
+  var _pZAKAZ: comp = 0;
+  var _pPROJECT: comp = 0;
+  var _NUMBER: string = '';
+  var ii:word;
+
+  case ZarSignal.SrcTable of
+  16, 116://20 RPD
+  {
+   // LoGstrToFile('Z_Basket_lap.log','NewDoplata case ZarSignal.SrcTable of 16, 116');
+    _pZAKAZ := 0;
+    _buhSchetNrec := 0;
+
+    if GetFirst tZarSignalForZS = tsOk
+    {
+   // LoGstrToFile('Z_Basket_lap.log','NewDoplata if GetFirst tZarSignalForZS = tsOk');
+      if GetFirst MnPlan = tsOk
+        _pZakaz := MnPlan.Nrec;
+      _pProject := tZarSignalForZS.ProjectNrec;
+    }
+
+    if _pZakaz > 0
+    {
+   // LoGstrToFile('Z_Basket_lap.log','NewDoplata if _pZakaz > 0');
+      _NUMBER := MnPlan.Number;
+      if MnPlan.wKodGr1 = 5063
+        _buhSchetNrec := MnPlan.cAnVal1;
+      else if MnPlan.wKodGr2 = 5063
+        _buhSchetNrec := MnPlan.cAnVal2;
+    }
+    //-- нашли счет бухучета
+    if getfirst BUHSCHET = tsok
+    {
+   // LoGstrToFile('Z_Basket_lap.log','NewDoplata if getfirst BUHSCHET = tsok');
+      Log('Установлен счет/субсчет по заказу '+_NUMBER+' '+SubStr(BUHSCHET.SCHET,2,20)+'/'+BUHSCHET.SUBSCH, mfTextWithIndent);
+      Doplata.CSCHETD  := SubStr(BUHSCHET.SCHET,2,20);
+      Doplata.CSUBSCHD := BUHSCHET.SUBSCH;
+      For(ii:=1;ii<=6;ii++)
+      {
+        if Doplata.TBLD[ii] <> BUHSCHET.KODTABLE[ii]
+        {
+          Doplata.TBLD[ii]  := BUHSCHET.KODTABLE[ii];
+          Doplata.CKAUD[ii] := 0;
+        }
+
+        if Doplata.TBLD[ii] = cgKau_Zakaz   //7
+          Doplata.CKAUD[ii] := _pZAKAZ;
+        if Doplata.TBLD[ii] =  _cgKau_ProductionType
+          Doplata.CKAUD[ii] := _pPROJECT;
+        if Doplata.TBLD[ii] = cgKau_KatPodr //2
+          if Doplata.CKAUD[ii] = 0
+            Doplata.CKAUD[ii] := Lschet.Cex;
+
+      } //For(ii=1;ii<=6;ii++)
+
+    } //if getfirst BUHSCHET=tsok
+    else
+    {
+
+      For(ii:=1;ii<=6;ii++)
+      {
+        if Doplata.TBLD[ii] =  _cgKau_ProductionType
+        {  Doplata.CKAUD[ii] := _pPROJECT;
+        }
+        if Doplata.TBLD[ii] = cgKau_Zakaz //7
+        {
+          Doplata.CKAUD[ii] := _pZAKAZ;
+          _pZAKAZ:=0; // пока обнулим,
+        }
+      } //else For(ii=1;ii<=6;ii++)
+
+    } //if getfirst BUHSCHET=tsok
+    update current Doplata;
+
+    //--- Есть проект - заполним доп.аналитику
+    if _pPROJECT > 0 or _pZAKAZ > 0
+    {
+      if getfirst OtpDop<>tsok
+      {
+        ClearBuffer(#OtpDop);
+        OTPDOP.Vidopl     := 15013;
+        OTPDOP.CKAUD[1]   := _pPROJECT;
+        OTPDOP.TBLD[1]    := _cgKau_ProductionType;
+        if _pZAKAZ<>0
+        {
+          OTPDOP.CKAUD[2] := _pZAKAZ;
+          OTPDOP.TBLD[2]  := cgKau_Zakaz;
+        }
+        insert current OTPDOP;
+        Doplata.OLDCLSCH  := OTPDOP.Nrec;
+        update current Doplata;
+      }
+      else
+      {
+        OTPDOP.CKAUD[1]   := _pPROJECT;
+        OTPDOP.TBLD[1]    := _cgKau_ProductionType;
+        Update Current OtpDop;
+      }
+    } //if pPROJECT_P>0
+
+  } //16,116://20 RPD
+  end; //case ZarSignal.SrcTable of
+
+}//Procedure NewDoplata;
+
+//------------------------------------------------------------------------------
+Procedure PrVidoplSetSchet;
+{   var _pZAKAZ: comp = 0;
+  var _pPROJECT: comp = 0;
+  var _NUMBER: string = '';
+  var ii:word;
+
+  //case ZarSignal.SrcTable of 16, 116://20 RPD
+    _pZAKAZ := 0;
+    _buhSchetNrec := 0;
+
+    if GetFirst tZarSignalForZS = tsOk
+    {
+      if GetFirst MnPlan = tsOk
+        _pZakaz := MnPlan.Nrec;
+      _pProject := tZarSignalForZS.ProjectNrec;
+    }
+
+    if _pZakaz > 0
+    {
+      _NUMBER := MnPlan.Number;
+      if MnPlan.wKodGr1 = 5063
+        _buhSchetNrec := MnPlan.cAnVal1;
+      else if MnPlan.wKodGr2 = 5063
+        _buhSchetNrec := MnPlan.cAnVal2;
+    }
+    //-- нашли счет бухучета
+    if getfirst BUHSCHET = tsok
+    {
+
+      Log('Установлен счет/субсчет по заказу '+_NUMBER+' '+SubStr(BUHSCHET.SCHET,2,20)+'/'+BUHSCHET.SUBSCH, mfTextWithIndent);
+      PrVidopl.CSCHETD  := SubStr(BUHSCHET.SCHET,2,20);
+      PrVidopl.CSUBSCHD := BUHSCHET.SUBSCH;
+      For(ii:=1;ii<=6;ii++)
+      {
+        if PrVidopl.TBLD[ii] <> BUHSCHET.KODTABLE[ii]
+        {
+          PrVidopl.TBLD[ii]  := BUHSCHET.KODTABLE[ii];
+          PrVidopl.CKAUD[ii] := 0;
+        }
+        if PrVidopl.TBLD[ii] =  _cgKau_ProductionType
+        {  PrVidopl.CKAUD[ii] := _pPROJECT;
+        }
+
+        if PrVidopl.TBLD[ii] = cgKau_Zakaz   //7
+          PrVidopl.CKAUD[ii] := _pZAKAZ;
+
+        if PrVidopl.TBLD[ii] = cgKau_KatPodr //2
+          if PrVidopl.CKAUD[ii] = 0
+            PrVidopl.CKAUD[ii] := PrVidopl.Cexoz;
+
+      } //For(ii=1;ii<=6;ii++)
+
+    } //if getfirst BUHSCHET=tsok
+    else
+    {
+
+      For(ii:=1;ii<=6;ii++)
+      {
+        if PrVidopl.TBLD[ii] = cgKau_Zakaz //7
+        { if _pZAKAZ>0
+          { PrVidopl.CKAUD[ii] := _pZAKAZ;
+            _pZAKAZ:=0; // пока обнулим,
+          }
+          break;
+        }
+      } //else For(ii=1;ii<=6;ii++)
+
+    } //if getfirst BUHSCHET=tsok
+    update current PrVidopl;
+
+    //--- Есть проект - заполним доп.аналитику
+    if _pPROJECT > 0 or _pZAKAZ > 0
+    { /*
+      if getfirst OtpDop<>tsok
+      {
+        ClearBuffer(#OtpDop);
+        OTPDOP.Vidopl     := 15013;
+        OTPDOP.CKAUD[1]   := _pPROJECT;
+        OTPDOP.TBLD[1]    := _cgKau_ProductionType;
+        if _pZAKAZ<>0
+        {
+          OTPDOP.CKAUD[2] := _pZAKAZ;
+          OTPDOP.TBLD[2]  := cgKau_Zakaz;
+        }
+        insert current OTPDOP;
+        Doplata.OLDCLSCH  := OTPDOP.Nrec;
+        update current Doplata;
+      }
+      else
+      {
+        OTPDOP.CKAUD[1]   := _pPROJECT;
+        OTPDOP.TBLD[1]    := _cgKau_ProductionType;
+        Update Current OtpDop;
+      }
+      */
+    } //if pPROJECT_P>0
+
+  //} //16,116://20 RPD
+  //end; //case ZarSignal.SrcTable of
+
+
+} //Procedure PrVidoplSetSchet;
+
+//------------------------------------------------------------------------------
+function ProcessChangeAddPayment: boolean;
+{ Result:=inherited::ProcessChangeAddPayment;
+  if not Result Exit;
+  case ZarSignal.MsgCode of
+  14: // Создание межрасчетной выплаты
+  {
+    PrVidoplSetSchet;//установим если возможно счет/субсчет по заказу
+    if not NPOEM_OWN_ZP_MP_Vipl
+    { if  PRVIDOPL.SUMUD>0
+      { SYS_MBF.SUMMAUD := SYS_MBF.SUMMAUD - PRVIDOPL.SUMUD;
+        update current SYS_MBF;
+        PRVIDOPL.SUMUD:=0;
+        update current PRVIDOPL;
+      }
+    } //if not NPOEM_OWN_ZP_MP_Vipl
+  }
+  end;
+} //function ProcessChangeAddPayment: boolean;
+
+//Текстовое представление сигнала
+function SignalName(_Code: word; _bZam: boolean): string;
+{
+  case _Code of
+    114: result := 'Новая доплата (межпериод)';
+    115: result := 'Удалена доплата (межпериод)';
+    212: result := 'Добавлено удержание';
+    213: result := 'Удалено удержание';
+    214: result := 'Новое удержание (межпериод)';
+    215: result := 'Удалено удержание (межпериод)';
+    else result := inherited::SignalName(_Code, _bZam);
+  end;
+} //function SignalName
+
+//Выбор формата отображения детальной информации в зависимости от типа сигнала
+procedure UpdateView;
+{
+  ReScanPanel(#ZarSignal);
+  if RegByte = 1
+  {
+    case ZarSignal.MsgCode of
+      114, 115, 214, 215: SetFormat(scrLookPrVidOpl);
+      else inherited::UpdateView;
+    end;
+  }
+  else
+  { SetFormat(scrLookAll);
+  }
+  ReScanPanel(#ZarSignal);
+} //procedure UpdateView;
+
+//------------------------------------------------------------------------------
+// Корректировка данных в лицевом счете
+//------------------------------------------------------------------------------
+function UpdatePersonalAccount(var _changeDatUv: boolean): boolean;
+{ Result:=Inherited::UpdatePersonalAccount(_changeDatUv);
+  if (ZARSIGNAL.DATE9_M = 'И')
+  { //если по каким то причинам не проставили
+    if Lschet.DatUv<>ZARSIGNAL.DATE9
+    and (LSCHET.NREC = ZARSIGNAL.CLSCHETZPL) // обрабатываемый сигналом
+    { if (IsValid(tnAPPHIST))//and ZARSIGNAL.CPODRZPL
+      { if AppHist.CodOper=65 //продление контракта
+        { //#2189
+          LSCHET.DATUV := Zarsignal.Date9;
+          update current LSCHET;
+          LogChange('дата увольнения по 65 РПД: ' + string(ZARSIGNAL.DATE9));
+          //wasFired := LSCHET.DATUV <> Date(0, 0, 0); // был именно уволен, а не восстановлен после увольнения
+        }
+      }
+    } //if Lschet.DatUv<>ZARSIGNAL.DATE9
+
+  } //if (ZARSIGNAL.DATE9_M = 'И'
+} //function UpdatePersonalAccount(var _changeDatUv: boolean): boolean;
+
+//----------------------------------------
+//Отобразить сообщение о пропуске записи
+Procedure PrintDisplMes(_sMes:string);
+{ Log('сотрудник: т.н. ' + GetStrTabn(LSCHET.TABN, LSCHET.STRTABN)
+   + ' '+SignalName(ZARSIGNAL.MSGCODE, ZARSIGNAL.WDOP9 = 9)+' от '+DateToStr(ZarSignalLogicalChangeDate,''), mfTextWithIndent);
+  Log(_sMes, mfTextWithIndent);
+} //Procedure PrintDisplMes(_wMes:string);
+
+//Обработка в зависимости от типа сигнала
+function ProcessZarSignal: boolean;
+{
+   // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal 1');
+  var needUpdateLoadZarSignal: boolean;
+  needUpdateLoadZarSignal := false;
+
+  if DISABLE_Processed_Rec
+  { if IsProcessed
+    { PrintDisplMes('Уже обработана, повторная обработка запрещена настройкой');
+      Result:=True;
+      Exit;
+    }
+  }
+  var _wDt:date=ZarSignalLogicalChangeDate;
+  if _wDt<ZarSignal.LstDate//tZARSIGNAL.OPERDATE
+     _wDt:=ZarSignal.LstDate;
+  if _wDt<Process_DT
+  { PrintDisplMes('Дата операции меньше чем '+DateToStr(Process_DT,'')+', обработка запрещена');
+    Result:=True;
+    Exit;
+
+
+  }
+   // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal 2');
+  if (ZARSIGNAL.DATE9_M = 'И')
+  { if (IsValid(tnAPPHIST))//and ZARSIGNAL.CPODRZPL
+    { if AppHist.CodOper=65 //продление контракта
+      { if LSCHET.DATUV <> Zarsignal.Date3
+        { Update Current ZARSIGNAL set ZARSIGNAL.DATE3_M:='И'
+        }
+      }
+    }
+  } //if (ZARSIGNAL.DATE9_M = 'И')
+   // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal 3');
+  case ZARSIGNAL.MSGCODE of
+    114, 115, 214, 215:
+    {
+      // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal case ZARSIGNAL.MSGCODE of 114, 115, 214, 215:   1');
+      result := GP_ProcessPrVidOpl;
+      needUpdateLoadZarSignal := result;
+      // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal case ZARSIGNAL.MSGCODE of 114, 115, 214, 215:    2');
+    }
+    212, 213:
+    {
+      // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal case ZARSIGNAL.MSGCODE of 212, 213: 1');
+      result := GP_ProcessUder;
+      // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal case ZARSIGNAL.MSGCODE of 212, 213: 2');
+      needUpdateLoadZarSignal := result;
+    }
+    else
+      {
+        // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal case ZARSIGNAL.MSGCODE of ELSE 1');
+        result := inherited::ProcessZarSignal;
+        // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal case ZARSIGNAL.MSGCODE of ELSE 2');
+      }
+  end;
+   // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal 3/1');
+  if needUpdateLoadZarSignal
+  {
+   // LoGstrToFile('Z_Basket_lap.log','ProcessZarSignal 4');
+    //установка признака обработанности записи
+    update current ZARSIGNAL
+      set ZARSIGNAL.FILIALNO := ZARSIGNAL.FILIALNO or 1;
+    //обновление LOADZARSIGNAL - при обработке могли измениться какие-то атрибуты сигнала
+    update current LOADZARSIGNAL
+      set LOADZARSIGNAL.PROCESSED := StatusProcessing,
+      LOADZARSIGNAL.LASTDATE := ZARSIGNAL.LSTDATE,
+      LOADZARSIGNAL.LASTTIME := ZARSIGNAL.LSTTIME,
+      LOADZARSIGNAL.TPERSON := ZARSIGNAL.TPERSON,
+      LOADZARSIGNAL.cLschetZpl := ZARSIGNAL.cLschetZpl,
+      LOADZARSIGNAL.USER := ZARSIGNAL.ATL_LASTUSER,
+      LOADZARSIGNAL.TABNZPL := ZARSIGNAL.TABNZPL,
+      LOADZARSIGNAL.STRTABN := ZARSIGNAL.STRTABN;
+  }
+}
+
+procedure SetupBounds(_CurRecord: comp);
+{
+  inherited::SetupBounds(_CurRecord);
+  AddBounds(tbByZarSignalNrec);
+}
+
+//------------------------------------
+procedure SetDoplata(IsNew: boolean);
+{ Inherited::SetDoplata(IsNew);
+  //#1171.#13 При обработке записей корзины "Новая доплата" не заполняется поле Назначена С
+  if IsNew
+  { if DOPLATA.DATANN=ZeroDate
+      DOPLATA.DATANN := Zarsignal.Date1;
+  }
+} //procedure SetDoplata(IsNew: boolean);
+//#endregion Перехваченные функции
+//******************************************************************************
+
+//=======================================================================
+TableEvent  Table tZarSignal;
+//=======================================================================
+cmPositionChanged:   UpdateView;
+end;
+
+//HandleEvent интерфейса
+HandleEvent
+
+cmInit:
+{
+  TimeLog_Init;
+  if False // убираем предупреждения компилятора
+  { NewDoplata; ProcessZarSignal; SignalName(0, false);
+  }
+  if timelog_Status>1  Timelog('Z_LSCHET##BASKET cmInit START');
+  //-- #2070
+  NPOEM_OWN_ZP_MP_Vipl:=boGetTune('NPOEM_OWN.ZP.MP_Vipl');//'Заполнять поле "Выплачено(аванс)" в начислениях и выплатах межпериода'
+  //-- #2228
+  //Запретить обработку ранее обработанных записей РК
+  DISABLE_Processed_Rec:=boGetTune('NPOEM_OWN.ZP.BASKET.DISABLE_Processed_Rec');
+  //Разрешать обрабатывать записи РК за прошлые отчетные периоды (кол-во месяцев от тек.периода)
+  Process_month:=wGetTune('NPOEM_OWN.ZP.BASKET.Process_month');
+  Process_DT:=Sub_Months(dGetTune('UP.DATOTCH'),Process_month);
+  //Предлагать удаление обработанных записей
+  Auto_Del:=boGetTune('NPOEM_OWN.ZP.BASKET.Auto_DEL');
+  //----------------------------------
+  _attrNamNrecContDocOrder  := GetKauAttrNamNrec(coContDoc,  'Заказ', cgKau_Zakaz);
+  _attrNamNrecPartDocOrder  := GetKauAttrNamNrec(coPartDoc,  'Заказ', cgKau_Zakaz);
+  _attrNamNrecTitleDocOrder := GetKauAttrNamNrec(coTitleDoc, 'Заказ', cgKau_Zakaz);
+
+  _tZarSignalMarker.Disable := False;
+  BindEvent(OnTZarSignalMarkUnmark, _tZarSignalMarker.EventMarkUnmark);
+
+  var katKauBuf: TkatKAU_p;
+  ClearAdvRecord(katKauBuf);
+  if not _katKau.IsKAUCode('ВидПр', katKauBuf)
+  {
+    katKauBuf.Attr     := 1;
+    katKauBuf.Code     := 'ВидПр';
+    katKauBuf.KodGroup := _katKau.GetNextKodGroup;
+    katKauBuf.Name     := 'Вид производства';
+    katKauBuf.SysNum   := 1;
+    _katKau.InsertRec(katKauBuf, false);
+  }
+  _cgKau_ProductionType := katKauBuf.KodGroup;
+
+  _attrNamNrecContDocProject  := GetKauAttrNamNrec(coContDoc,  'Проект', _cgKau_ProductionType);
+  _attrNamNrecPartDocProject  := GetKauAttrNamNrec(coPartDoc,  'Проект', _cgKau_ProductionType);
+  _attrNamNrecTitleDocProject := GetKauAttrNamNrec(coTitleDoc, 'Проект', _cgKau_ProductionType);
+
+  _attrNamNrecPartDocHidden := ExtAttr_Id(coPartDoc, GP_ATTRNAM_NAME_PARTDOC_HIDDEN);
+
+  _filterStore := new(GP_UserFilterStoreDSK, InitDSK('GP_BASKET_FILTERS'));
+
+  _filterManager := GP_IUserFilterManager(new(GP_UserFilterManager, UserFilterManager(GP_IUserFilterStore(_filterStore))));
+
+  _filterManagerView := new(GP_UserFilterManagerViewActiveFilters, UserFilterManagerViewActiveFilters(_filterManager));
+  BindEvent(OnExtraFilterChange, _filterManagerView.OnCmDefault);
+
+  AddUserFilterString(#tZarSignal.TitleDocNmb, 'TitleDocNmb', '№ приказа');
+  AddUserFilterPeriod(#tZarSignal.TitleDocDate, 'TitleDocDate', 'Дата прик.');
+  AddUserFilterPeriod(#tZarSignal.Date1, 'Date1', 'Дата нач.');
+  AddUserFilterString(#tZarSignal.TitleDocText, 'TitleDocText', 'Содерж.');
+  AddUserFilterString(#tZarSignal.StrTabn, 'TabN', 'Таб.№');
+  AddUserFilterString(#tZarSignal.Fio, 'FIO', 'Сотрудник');
+  AddUserFilterString(#tZarSignal.KatPodrKod, 'KatPodrKod', 'Код подр.');
+  AddUserFilterString(#tZarSignal.OrderNumber, 'OrderNumber', 'Заказ');
+  AddUserFilterString(#tZarSignal.ProjectCode, 'ProjectCode', 'Проект');
+
+  BindEmbeddedInterface(embActiveFilters, _filterManagerView);
+  _tZarSignalMarker.IsNeedCheckDelete := false;
+
+  if not readmydsk(_hierMode, 'BASKET_HIERMODE', false) _hierMode := 0;
+
+  if timelog_Status>1  Timelog('Z_LSCHET##BASKET cmInit inherited');
+
+  //----------------------
+  if  inherited :: handleEvent (cmInit)=heAbort then
+  {
+    if timelog_Status>1  Timelog('Z_LSCHET##BASKET cmInit inherited abort');
+    ClearAllEvents;
+    Abort;
+  }
+  //----------------------
+  if timelog_Status>1  Timelog('Z_LSCHET##BASKET cmInit RebuildHierarchyTable');
+
+  RebuildHierarchyTable;
+  SetBoundByZarSignalNrec;
+  if timelog_Status>1  Timelog('Z_LSCHET##BASKET cmInit cmValue60');
+  PutCommand(cmValue60);
+
+}
+
+cmValue60:
+{
+  if timelog_Status>1  Timelog('Z_LSCHET##BASKET cmValue60 Start');
+  UpdateView;
+  //----------------------
+
+  //--- скрыть показать колонки
+  _visibleHidden.SetVisibleForField( cfsGetCurrentContainerSelf
+                                      , GetInterfaceComponentName
+                                      , #(__InterfaceName__)
+                                      , 'trZarSignal');
+
+  if timelog_Status>1  Timelog('Z_LSCHET##BASKET cmValue60 Finish');
+}
+cmdone:
+{
+  if timelog_Status>1  Timelog('Z_LSCHET##BASKET cmDone Start');
+  savemydsk(_hierMode, 'BASKET_HIERMODE');
+  inherited::handleevent(cmdone);
+  if timelog_Status>1  Timelog('Z_LSCHET##BASKET cmDone Finish');
+}
+
+cmAlt3:
+{
+  if tZarSignal.TitleDocNrec != 0
+    runinterface(Z_StaffOrders::OrdersList, tZarSignal.TitleDocNrec);
+}
+
+cmHotkeys:
+{
+  var menuId: longint;
+  menuId := LoadMenu('Z_Lschet::BasketPopUp');
+  AddMenuItem(menuId, 'SEPARATOR', 0);
+  ConcatMenu(menuId, LoadMenu('GP_Common::VisibleHidden_Fields'));
+  AddMenuItem(menuId, 'SEPARATOR', 0);
+  if _filterManager.AddMenuItemForField(menuId, curfield)
+    EnableCommand(cmNal)
+  else
+    DisableCommand(cmNal);
+  AddMenuItemWithHlp(menuID, 'Редактировать приказ', '',
+                                 hcNoHelp, cmAlt3, kbAlt3, 'Alt+3', '');
+  AddMenuItemWithHlp(menuID, 'Переключить режим просмотра', '',
+                                 hcNoHelp, cmAccording, kbAltS, 'Alt+S', '');
+  PutHotCommand(RunLoadMenu(menuId));
+}
+
+cmManagerId:
+{
+   if ( RunInterface(GP_VisibleHidden, cfsGetCurrentContainerSelf, GetInterfaceComponentName,
+                     #(__InterfaceName__) , 'trZarSignal' ) = cmDefault )
+   {
+      ReScanPanel(#LOADZARSIGNAL);
+   }
+}
+
+cmAccording: //Alt+S  Переключить режим просмотра
+{
+  _hierMode := if(_hierMode = 0, 1, 0);
+  SyncLoadZarSignalMarks;
+  UnsetBoundByZarSignalNrec;
+  RebuildHierarchyTable;
+  SetBoundByZarSignalNrec;
+  _tZarSignalMarker.UnselectAll;
+}
+
+cmNal: //Alt+F
+{
+  if CurTable = #tZarSignal
+    if _filterManager.EditFilterForField(curfield)
+      OnExtraFilterChange;
+}
+
+cmMarkUnMark:
+{
+  if curtable != tntZarSignal
+    inherited::handleevent(cmMarkUnMark);
+}
+
+cmSelectAll:
+{
+  if curtable != tntZarSignal
+    inherited::handleevent(cmSelectAll);
+}
+
+cmUnSelectAll:
+{
+  if curtable != tntZarSignal
+    inherited::handleevent(cmUnSelectAll);
+}
+
+cmDelete:
+{
+  SyncLoadZarSignalMarks;
+  UnsetBoundByZarSignalNrec;
+  inherited::handleevent(cmDelete);
+  RebuildHierarchyTable;
+  SetBoundByZarSignalNrec;
+  _tZarSignalMarker.UnselectAll;
+}
+
+cmAttrib:   //kbCtrlEnter
+{
+  if tZarSignal.IsLeaf = 0
+  {
+    if not TreeNodeIsOpen(trZarSignal)
+      TreeOpenNode(trZarSignal);
+    RescanPanel(#tZarSignal);
+  }
+  else
+  {
+    // LoGstrToFile('Z_Basket_lap.log','1');
+
+    if _tZarSignalMarker.Count = 0
+    {
+      _tZarSignalMarker.Mark;
+      RereadRecord(#tZarSignal);
+    }
+    // LoGstrToFile('Z_Basket_lap.log','2');
+    SyncLoadZarSignalMarks;
+    // LoGstrToFile('Z_Basket_lap.log','after SyncLoadZarSignalMarks;');
+    UnsetBoundByZarSignalNrec;
+    // LoGstrToFile('Z_Basket_lap.log','after UnsetBoundByZarSignalNrec;');
+    inherited::handleevent(cmAttrib);
+    // LoGstrToFile('Z_Basket_lap.log','after inherited::handleevent(cmAttrib);;');
+    RebuildHierarchyTable;
+    // LoGstrToFile('Z_Basket_lap.log','after RebuildHierarchyTable;');
+    SetBoundByZarSignalNrec;
+    // LoGstrToFile('Z_Basket_lap.log','after SetBoundByZarSignalNrec;');
+    _tZarSignalMarker.UnselectAll;
+  }
+}
+
+cmCompressLevel:  //kbCtrlBack
+{
+  if tZarSignal.IsLeaf = 1 and tZarSignal.ParentNrec != 0
+    TreeJumpToRecord(trZarSignal, tZarSignal.ParentNrec);
+  if TreeNodeIsOpen(trZarSignal)
+    TreeCloseNode(trZarSignal);
+  RescanPanel(#tZarSignal);
+}
+
+cmFilterSave:  //kbAltB
+{
+  SyncLoadZarSignalMarks;
+  UnsetBoundByZarSignalNrec;
+  inherited::handleevent(cmFilterSave);
+  RebuildHierarchyTable;
+  SetBoundByZarSignalNrec;
+  _tZarSignalMarker.UnselectAll;
+}
+
+cmSortMC: //kbAltR
+{
+  UnsetBoundByZarSignalNrec;
+  inherited::HandleEvent(cmSortMC);
+  RebuildHierarchyTable;
+  SetBoundByZarSignalNrec;
+  _tZarSignalMarker.UnselectAll;
+}
+
+end; //handleevent
+
+end.

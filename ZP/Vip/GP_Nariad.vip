@@ -1,0 +1,1609 @@
+/*************************************************************************************************\
+* Наименование: Разработать интерфейс ввода нарядов                                               *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:  Заработная плата -> Операции -> НПО "Энергомаш" -> Ввод нарядов                    *
+*              #2642 - добавление атрибутов "Шифр СМК", "Причина несоответствия", "Причина,       *
+*              указанная в карточке разрешения". Контроль заполнения поля "Причина несоответствия"*
+* 2018-08-16   CheckedDate,CheckedDate2 заменил на Sys_Nar.CheckDate                              *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1920         |19/02/18|Валента А.В.             |НПО Энергомаш                    *
+* Разработка  |#2642         |11/08/18|Евдокимов М.А.           |НПО Энергомаш                    *
+* Разработка  |#3574         |31/10/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+
+
+#include GetKau.Vih
+#include PAFilter.vih
+#include macrosch.vpp
+#include XGetKau.vih  // объектный интерфейс выбора многих КАУ
+#include ExtAttr.vih     // Внешние атрибуты
+#include AttrTablePick.vih
+#include GP_QualityCostsHelper.vih
+
+interface GP_Nariad 'Ввод нарядов "Энергомаш"' escclose;
+  show at (1,2,110,22);
+
+//include ExtAttr.var   // Внешние атрибуты (oExtAttr)
+#include GetKau.Var
+#include GP_Func_ZP.Var
+
+var iXGetKau : XGetKau;
+//var PAF: TraditionalPersonalAccountFilter;
+var PAF: TraditionalPersonalAccountFilterChild; // переменные для фильтра по сотрудникам и подразделениям\\
+var oAttrTablePick:AttrTablePick;
+var CS: IContextSession; // для захвата прикладного контекста табеля
+var _qualityCostsHelper: GP_QualityCostsHelper; //Хэлпер для работы с затратами на качество
+
+
+#include ShowKau.vpp
+
+Create view
+var
+  jobSheetType           : word;
+  currentPeriod          : integer;
+  jobSheetMarker         : TPtr;
+  departmentList         : TPtr;
+  JobMarkers             : TPtr;
+  department             : comp;
+  editMode               : boolean;
+  dNormHour              : double;
+  personalAccount        : comp;
+  CharacterClockNumbers  : boolean;
+  ProtectedCheckedNaryad : boolean;
+  CLSF                   : CurLSFunctions;
+  PAFExtOption           : longint;
+  cexozDate1             : date;
+  cexozDate2             : date;
+  cAttr1                 : comp;
+  cAttr2                 : comp;
+  dimeRounding           : longint;  //округление до копеек
+  isProt                 : boolean;
+  otchPeriod             : date;
+  nRecProtect            : comp;
+ //______________________________________________________________
+    myCurRepNo : comp;            // консолидация баз данных
+    myFilialNo : longint;         // работа с данными филиала
+    myPlansNo  : comp;            // текущий план счетов
+ //______________________________________________________________
+    shpzar:tSchet3;
+
+  (
+    SchetDeb, SubSchDeb, NamKauD
+  )
+as select
+  #CalcField_Deb (PRNARYAD)
+, if (jobSheetMarker <> 0, FoundMarker(jobSheetMarker, SYS_NAR.NREC), false)
+    (fieldname = JobSheetMarked)
+, if (JobSheetMarked, 'V', '')
+    (fieldname = JobSheetMarkedStr)
+/*
+, StrToDate(DateToStr(longint(SYS_NAR.LASTTIME), 'DD/MM/YYYY'), 'DD/MM/YYYY')
+    (fieldname = CheckedDate)
+, StrToDate(DateToStr(longint(SYS_NAR.LASTTIME), 'DD/MM/YYYY'), 'DD/MM/YYYY')
+    (fieldname = CheckedDate2)
+*/
+, if (IsValid(tnKatPodr), Trim(LTrim(KatPodr.Kod + ', ' + KatPodr.Name, ',')), '')
+    (fieldname = DepartmentStr)
+, (SYS_NAR.SUMMANRS * SYS_NAR.RASSAL / 100 - SYS_NAR.SUMMANTM)
+    (fieldname = Fot)
+, if(IsValid(tnPRNARYAD), (if(SYS_NAR.CALCULATED = coJSNo, ' ', '+') + if(SYS_NAR.DISTRIBUTED = coJSNo, ' ', '+')), '')
+    (fieldname = StateFlag)
+, if (FoundMarker(JobMarkers, PRNARYAD.NREC), 'V', '')
+    (fieldname = JobMark)
+, GetSurnameWithInitials(PERSONS.FIO)
+    (fieldname = WorkerName)
+, Time2StrDef(PRNARYAD.NRMTIME)
+    (fieldname = StandardTimeStr)
+, String(KLVIDOPL.VIDOPLP)   + ', ' + KLVIDOPL.NVIDOPL
+    (fieldname = PaymentKindStr)
+, String(KLVIDOPLPR.VIDOPLP) + ', ' + KLVIDOPLPR.NVIDOPL
+    (fieldname = PremiumPaymentKindStr)
+, SYS_NAR.SUMMANAR + SYS_NAR.SUMMAPREM
+    (fieldname = TotalSum)
+
+, SYS_NAR.NREC //*
+
+from
+  SYS_NAR
+, KATPODR
+, KATPODR  KATPODRN
+, PRNARYAD
+, PRNARYAD PRNARYAD1
+, PRNARYAD PRNARYADB
+, x$Users
+, PERSONS  (ReadOnly)
+, KLVIDOPL (ReadOnly)
+, KLVIDOPL KLVIDOPLPR 
+, CATALOGS
+, LSCHET
+, LSCHET LSCHET2
+, PLANSSCH (ReadOnly)
+where
+((
+    SYS_NAR.NREC          == PRNARYAD.MNREC
+AND SYS_NAR.CEX           == KATPODR.NREC
+AND PRNARYAD.ATL_LASTUSER == x$Users.ATL_NREC
+AND PRNARYAD.TPERSON      == PERSONS.NREC
+AND PRNARYAD.VIDOPL       == KLVIDOPL.VIDOPL
+AND PRNARYAD.VIDPREM      == KLVIDOPLPR.VIDOPL
+AND PRNARYAD.CPODR        == CATALOGS.NREC
+AND SYS_NAR.NREC          == PrNaryadB.mNRec
+AND PRNARYAD.CLSCH        == LSCHET.NREC
+AND _cLSchet              == Formarks.Choice
+AND myPlansNo             == PLANSSCH.NREC
+AND prnaryad.CEXOZ        == KATPODRN.NRec
+))
+
+bounds AvailableDepartmentsFilter =
+       jobSheetType == SYS_NAR.CHOICE
+  and (FoundMarker(departmentList, SYS_NAR.CEX))
+//  ordered by SYS_NAR.NMNEM
+  ordered by TableOrder
+;
+
+procedure CalcSys_NarSummaNar(var dSum, dPr, dNorm : double);
+var dSummaNar, dSummaNtm : double;
+{
+  timelog('GP_Nariad->CalcSys_NarSummaNar:start');
+  dSum  := 0;
+  dPr   := 0;
+  dNorm := 0;
+  ReReadRecord(#PrNaryadB);
+  _loop fullcache PrNaryadB
+    {
+      dSum  += PrNaryadB.Summa;
+      dPr   += PrNaryadB.SUMMPREM;
+      dNorm += PrNaryadB.NRMTIME;
+    }
+  timelog('GP_Nariad->CalcSys_NarSummaNar:finish');
+}
+
+procedure RecalcPremia;
+var dSum, dPr, dNorm : double;
+{
+  timelog('GP_Nariad->RecalcPremia:start');
+  dSum  := 0;
+  dPr   := 0;
+  dNorm := 0;
+
+  if (getfirst fastfirstrow PrNaryadB <> tsOk)
+  {
+  }
+  else
+  {
+    CalcSys_NarSummaNar(dSum, dPr, dNorm);
+  }
+  SYS_NAR.SUMMANAR  := dSum;
+  SYS_NAR.SUMMAPREM := dPr;
+  DNORMHOUR         := dNorm;
+  update current SYS_NAR;
+  timelog('GP_Nariad->RecalcPremia:finish');
+}
+
+procedure PickDepartment;
+{
+  var Dummy: double;
+  var tempCex: comp = SYS_NAR.CEX;
+
+  if RunInterface('GetPodaln', 5, tempCex, Dummy) = cmDefault
+    set SYS_NAR.CEX := tempCex;
+}
+
+procedure CalcJobPremium;
+{
+  if (100 - PRNARYAD.SUMMAPR)<>0
+// что здесь не то - не понимаю 100 * (100 - PRNARYAD.SUMMAPR) / 100
+   set PRNARYAD.SUMMPREM := OcrugNaRuk(PRNARYAD.SUMMA * PRNARYAD.PROC / 100 * (100 - PRNARYAD.SUMMAPR) / 100, dimeRounding);
+  //циклит cmUpdateRecord
+// + падает с разными ошибками
+//  set PRNARYAD.SUMMPREM := Round(PRNARYAD.SUMMA * PRNARYAD.PROC /  (100 - PRNARYAD.SUMMAPR),2);
+}
+
+
+procedure UpdateTitle;
+{
+  var TitleStr: string;
+  var PeriodStr: string;
+  PeriodStr := 'неизвестный';
+
+  TitleStr := 'Перечень индивидуальных нарядов с КТУ';
+
+  case currentPeriod of
+    0:  PeriodStr := 'текущий';
+    1:  PeriodStr := 'будущий';
+    2:  PeriodStr := 'архивный';
+  end; //case
+
+  var DepartmentFilterStr: string;
+  DepartmentFilterStr := ', ' + CLSF.GetDepartmentFilterStr;
+
+  SetTitle(TitleStr + ' (' + PeriodStr + ' период' + DepartmentfilterStr + ')');
+}
+
+procedure SetupPeriod(Period: integer);
+{
+  currentPeriod := Period;
+
+  case currentPeriod of
+    0:
+    {
+      set jobSheetType := jsIndividualVsMPF ;
+      DisableCommand(cmPickClass);
+      EnableCommand(cmNal);
+      EnableCommand(cmPickAttr);
+    }
+    1:
+    {
+      set jobSheetType := jsFuturePeriodIndividualVsMPF;
+      EnableCommand(cmPickClass);
+      DisableCommand(cmNal);
+      EnableCommand(cmPickAttr);
+    }
+    2:
+    {
+      set jobSheetType := jsArchivePeriodIndividualVsMPF;
+      EnableCommand(cmPickClass);
+      EnableCommand(cmNal);
+      DisableCommand(cmPickAttr);
+    }
+  end; //case
+
+  ReReadRecord(#SYS_NAR);
+}
+
+function GetDepartmentGroupMembershipValidator: IDepartmentValidator;
+{
+  Result := NullRef;
+}
+
+// настроить фильтр по подразделению
+procedure SetupDepartmentFilter;
+{
+  if (BoundActive(tbAvailableDepartmentsFilter))
+    PopBounds(tbAvailableDepartmentsFilter);
+  // если список инициализирован
+  if departmentList <> 0
+    DoneMarker(departmentList, '');
+
+  departmentList := CLSF.LoadCurrentDepartmentList;
+
+  if not IDepartmentFilterStateDetector(CLSF).IsDepartmentFilterSet //фильтр по подразделениям не установлен
+    InsertMarker(departmentList, 0); //сделать доступными наряды с нулевой ссылкой на подразделение
+
+  IPAFilterExtOption2(PAF).InitPAFilterMode(GetDepartmentGroupMembershipValidator, otchPeriod, otchPeriod, pafoCommon);
+
+
+  PushBounds(tbAvailableDepartmentsFilter); //установить фильтр по всем помеченным подразделениям
+}
+
+procedure SelectPersonalAccount(MultipleSelection: boolean);
+{
+  delete all Formarks;
+
+  var  ModeUv: TModeUv;
+  ModeUv.Mode  := 0;
+  ModeUv.DatUv := otchPeriod;
+
+  PAF.prModeUV := ModeUv;
+  IPAFilterExtOption2(PAF).PickPersonalAccount(pafoCommon, otchPeriod,otchPeriod);
+
+  //PAF.ChangePersonalAccountFilter(0);
+
+  //if (RunInterface('Z_LSchet::getpmeu1Rep', comp(0), SYS_NAR.CEX, 1) <> cmDefault)
+  //  exit;
+  var cnt : word; cnt := 0;
+  _LOOP Formarks
+    {
+      inc(cnt);
+      if (cnt > 1)
+         break;
+    }
+
+  if (cnt = 0)
+    exit;
+
+  if (cnt = 1 and IsValid(#prnaryad))
+    {
+      if (GetFirst Formarks = tsOk)
+        if (GetFirst LSCHET2 where ((ForMarks.cLschet == LSchet2.nRec)) =tsOk)
+          if (LSCHET2.DATPOS < SYS_NAR.DATOK AND (LSCHET2.DATUV > SYS_NAR.DATAN OR LSCHET2.DATUV = ZeroDate))
+          {
+            set prnaryad.CEXOZ    := lschet2.cex;
+            set prnaryad.CPODR    := lschet2.cappoint;//????
+            set prnaryad.SISOPL   := lschet2.sisopl;
+            set prnaryad.TARIF    := lschet2.tarif;
+            set prnaryad.CLSCH    := lschet2.nrec;
+            set prnaryad.TPERSON  := lschet2.tperson;
+            set prnaryad.STRTABN  := lschet2.strtabn;
+            set PRNARYAD.CHASF    := PRNARYAD.NRMTIME;
+            update current prnaryad;
+
+          }
+      exit;
+    }
+
+  _LOOP Formarks
+    if (GetFirst LSCHET2 where ((ForMarks.cLschet == LSchet2.nRec)) =tsOk)
+      if (LSCHET2.DATPOS < SYS_NAR.DATOK AND (LSCHET2.DATUV > SYS_NAR.DATAN OR LSCHET2.DATUV = ZeroDate))
+    {
+      ClearBuffer(#PRNARYAD);
+      prnaryad.nrec     := GetNextNRec(tnPRNARYAD, 0);
+      PRNARYAD.MNREC    := SYS_NAR.NREC;
+      PRNARYAD.DATAN    := SYS_NAR.DATAN;
+      PRNARYAD.DATOK    := SYS_NAR.DATOK;
+      PRNARYAD.MES      := AD_month(SYS_NAR.DATAN);
+      PRNARYAD.CLSCH    := ForMarks.cLschet;
+      prnaryad.CEXOZ    := lschet2.cex;
+      prnaryad.CPODR    := lschet2.cappoint;//????
+      prnaryad.SISOPL   := lschet2.sisopl;
+      prnaryad.TARIF    := lschet2.tarif;
+      prnaryad.CLSCH    := lschet2.nrec;
+      prnaryad.TPERSON  := lschet2.tperson;
+      prnaryad.STRTABN  := lschet2.strtabn;
+      prnaryad.ckaud[6] := prnaryad.nrec;
+      CalcJobPremium;
+      if (insert current PRNARYAD = tsOk)
+        {}
+    }
+
+  RecalcPremia;
+  ReReadRecord(#SYS_NAR);
+  ReReadRecord(#PRNARYAD);
+}
+
+//#2642 Проверка на валидность поля Причина несоответствия.
+//Возвращает False, если поле Причина несоответствия является обязательным и не заполнено
+function IsPrichNesootvValid: boolean;
+{
+  result := true;
+  if _qualityCostsHelper.cPrichNesootv(coSys_Nar, Sys_Nar.Nrec) = 0
+    if _qualityCostsHelper.IsRequiredPrichNesootv(_qualityCostsHelper.cShZK(coSys_Nar, Sys_Nar.Nrec))
+      result := false;
+}
+
+window WinEdit  'Редактирование наряда' escclose;
+  Show at (, , 80, 22);
+
+screen scrEdit ( , , sci1Esc);
+  show at (,,,5) FIXED_Y;
+Table SYS_NAR;
+Fields
+    SYS_NAR.NMNEM        ('Наименование наряда');
+    SYS_NAR.DATAN        ('Дата начала работ по наряду'):
+           {font = {bold = true}}, NoProtect;
+    SYS_NAR.DATOK        ('Дата окончания работ по наряду'):
+           {font = {bold = true}}, NoProtect;
+    //CheckedDate2         ('Дата проверки наряда',, sci13Esc)    : NoProtect;
+    Sys_Nar.CheckDate    ('Дата проверки наряда',, sci13Esc)    : NoProtect;
+    dNormHour            ('Норма времени')                      : [10.2], Protect;
+    SYS_NAR.SUMMANAR     ('Сумма наряда')                       : [10.2], Protect;
+    SYS_NAR.SUMMAPREM    ('Сумма премии')                       : [10.2], Protect;
+    TotalSum             ('Всего')                              : [10.2], Protect;
+
+    [PrichNesootvFld] _qualityCostsHelper.sPrichNesootv(coSys_Nar, Sys_Nar.Nrec)
+                         (,, sci13Esc)                          : Protect,
+                         {Font = {BackColor = if(not IsPrichNesootvValid, ColorNeed, 0)}};
+    [ShZKFld] _qualityCostsHelper.sShZK(coSys_Nar, Sys_Nar.Nrec)
+                         (,, sci13Esc)                          : Protect;
+    [PrichKartRazrFld] _qualityCostsHelper.sPrichKartRazr(coSys_Nar, Sys_Nar.Nrec)
+                         (,, sci13Esc)                          : Protect;
+  <<
+`Наряд`                   `Начало`    `Окончание` `Проверен`
+ .@@@@@@@@@@@@@@@@@@@@@@@@.@@@@@@@@@@ .@@@@@@@@@@ .@@@@@@@@@@
+`Норма времени` `Сумма`    `ТОН`      `Всего`      `Причина несоответствия` `Шифр СМК`   `Причина в карт. разрешения`
+ .@@@@@@@@@@@@@@.@@@@@@@@@@.@@@@@@@@@@.@@@@@@@@@@@@.@@@@@@@@@@@@@@@@@@@@@@@@.@@@@@@@@@@@@.@@@@@@@@@@@@@@@@@@@@
+  >>
+end;
+
+browse brwEdit ( , , sci178Esc);
+  show at (,6,,);
+Table PRNARYAD;
+  fields
+  {font = {color = if (JobMark <> '', ColorMark, 0);}};
+  JobMark                                         ('Признак пометки записи')                       :    [1], Protect;
+  PRNARYAD.TABN     'Таб.'  , 'номер'     ('Табельный номер'          , , sci1378Esc )     :    [9], Protect, QuickChoice;
+  PRNARYAD.STRTABN  'Таб.'  , 'номер'     ('Табельный номер'          , , sci1378Esc)      :   [10], Protect, QuickChoice;
+  WorkerName        'Работник'                ('Работник'                 , , sci1378Esc)      :   [15], Protect, QuickChoice;
+  StandardTimeStr   'Норма' , 'времени'   ('Норма времени')                                :    [8], right,
+      {Font = {BackColor = if((prnaryad.vidopl=1 or prnaryad.vidopl=7) AND PRNARYAD.NRMTIME = 0, ColorNeed, 0)}};
+  PRNARYAD.SUMMA    'Оплата', 'по наряду' ('Сумма заработка по наряду')                    : [10,2];
+  PRNARYAD.PROC     '%'     , 'ТОН.'      ('Процент премии по наряду')                     :  [5,1];
+  PRNARYAD.SUMMPREM 'ТОН'                     ('Сумма премии по наряду')                       : [10,2];
+  PRNARYAD.DATAN    'Начало'                  ('Дата начала работ по наряду')                  :   [10];
+  PRNARYAD.DATOK    'Окончание'               ('Дата окончания работ по наряду')               :   [10];
+  KATPODRN.NAME     'Подразделение ОЗ'        ('Подразделение отнесение затрат', , sci178Esc)  :   [24], Protect;
+  NamKAUD           'Аналитика'               ('Аналитика'                     , , sci1378Esc) :   [30], Protect, QuickChoice,
+    {Font = {BackColor = if(NamKAUD  = '', ColorNeed, 0)}};
+  PaymentKindStr    'Вид оплаты'              ('Наименование вида оплаты'      , , sci1378Esc) :   [25], Protect, QuickChoice,
+    {Font = {BackColor = if(PRNARYAD.VIDOPL  = 0, ColorNeed, 0)}};
+  PremiumPaymentKindStr 'Вид премии'          ('Наименование вида премии'      , , sci178Esc)  :   [25], Protect, QuickChoice;
+  CATALOGS.NAME     'Должность'               ('Должность работника'           , , sci178Esc)  :   [15], Protect, QuickChoice;
+end;               //browse
+
+//*****************************************************************************
+Function CheckPN : boolean;
+{
+  result := true;
+  if ((PrNaryad.VidOpl=1 or PrNaryad.VidOpl=7) AND PrNaryad.NRMTIME = 0)
+    {
+      result := false;
+      Exit;
+    }
+
+  if(NamKAUD  = '')
+    {
+      result := false;
+      Exit;
+    }
+
+  if(PrNaryad.VidOpl  = 0)
+    {
+      result := false;
+      Exit;
+    }     
+}
+
+Function CheckPrNaryad(_boUpdate:boolean=false) : boolean;
+{ if _boUpdate
+// - эта же функция идет в cmUpdateRecord - и сие приводит к зацикливанию
+    UpdateTable;
+  result := true;
+
+  PushPos(#PrNaryad);
+  _LOOP PrNaryad
+    {
+      result := CheckPN;
+      if (NOT result)
+        break;
+    }
+  PopPos(#PrNaryad);
+
+  //#2642 Проверка на заполненность причины несоответствия
+  result := result and IsPrichNesootvValid;
+}
+
+//*****************************************************************************
+
+HandleEvent
+
+cmInit:
+  {
+    var d1, d2 : double;
+    CalcSys_NarSummaNar(d1, d2, DNORMHOUR);
+    set DNORMHOUR := DNORMHOUR;
+
+    if (NOT CheckPrNaryad)
+      nRecProtect := SYS_NAR.NRec;
+    else
+      nRecProtect := 0;
+  }
+
+cmOpenSearch:
+  {
+    if IsProtected(CurTable)
+      {
+        abort;
+        exit;
+      }
+
+    case CurField of
+      #PaymentKindStr,
+      #PremiumPaymentKindStr:
+      {
+        QuickChoiceName := 'qcPaymentUserNumber';
+        ProcessCommand(cmPick);
+      }
+      else
+      {
+       ProcessCommand(cmPick);
+       abort;
+      }
+      end;
+    }
+
+cmHotKeys:
+  {
+    var ComponentName: string; ComponentName := '#__COMPONENT__::';
+
+    if (curTable = #PRNARYAD)
+      PutHotCommand(RunDynMenu(ComponentName + 'GPPrNaryad_HotKeys;'));
+  }
+
+cmValue2:
+  {
+    if (Message('Сдублировать текущую запись?', Confirmation + YesNo) <> cmYes)
+      exit;
+
+    if (not UpdateTable)
+      exit;
+
+    var OldOwner: comp; OldOwner := PRNARYAD.NREC;
+    PRNARYAD.NREC      := GetNextNRec(tnPRNARYAD, 0);
+    PRNARYAD.SUMMA     := 0;
+    PRNARYAD.SUMMPREM  := 0;
+    prnaryad.ckaud[6]  := prnaryad.nrec;
+    insert current prnaryad;
+    RereadRecord(CurTable);
+
+    if CharacterClockNumbers
+      SelectField(#PRNARYAD.STRTABN);
+    else
+      SelectField(#PRNARYAD.TABN);
+  }
+
+cmDone:
+  {
+    if (NOT CheckPrNaryad)
+      {
+        Message('Не все обязательные поля были заполнены!');
+        Abort;
+      }
+  }
+
+end;
+End;
+
+panel pJobSheets;
+  table SYS_NAR;
+
+browse brw ('', hcZar_NaryadObject, sci1478EnIns);
+  show (,,,);
+fields
+      {font = {color = if(JobSheetMarked, ColorMark, if (IsValid(#PRNARYAD), 0, ColorSysGray))}};
+
+    JobSheetMarkedStr                                                                      :    [1], Skip, NoAutosize;
+    StateFlag            'Расч.'  ('"+" - была разноска, "++" - был расчет и разноска',,):    [5], Skip, NoAutosize, Centered;
+    SYS_NAR.NMNEM        'Наименование'                           ('Наименование наряда'):   [30], Protect;
+    SYS_NAR.SUMMANAR     'Сумма'                                      ('Сумма по наряду'): [11,2], NoAutosize, Protect;
+    SYS_NAR.SUMMAPREM    'Премия'                                     ('Премия на наряд'): [11,2], NoAutosize, Protect;
+    TotalSum             'Всего'                                                ('Всего'): [11,2], NoAutosize, Protect;
+    x$Users.XU$FULLNAME  'Создатель'                     ('Пользователь создавший наряд'):   [20], Protect;
+    DepartmentStr        'Подразделение'                 ('Подразделение')               :   [18], Protect;
+    //CheckedDate          'Проверен'               ('Дата проверки наряда')               :   [11], Protect, NoAutosize;
+    Sys_Nar.CheckDate    'Проверен'               ('Дата проверки наряда')               :   [11], Protect, NoAutosize;
+end;
+
+
+function IsProtectedRecord : boolean;
+{
+  //result := ProtectedCheckedNaryad AND CheckedDate <> ZeroDate;
+  result := ProtectedCheckedNaryad AND Sys_Nar.CheckDate <> ZeroDate;
+
+  if (isProt <> result)
+    {
+      if (result)
+        {
+          SetFieldOption(#SYS_NAR.NMNEM, ofProtected);
+          SetFieldOption(#SYS_NAR.DATAN, ofProtected);
+          SetFieldOption(#SYS_NAR.DATOK, ofProtected);
+
+          SetFieldOption(#StandardTimeStr  , ofProtected);
+          SetFieldOption(#PRNARYAD.SUMMA   , ofProtected);
+          SetFieldOption(#PRNARYAD.PROC    , ofProtected);
+          SetFieldOption(#PRNARYAD.SUMMPREM, ofProtected);
+          SetFieldOption(#PRNARYAD.DATAN   , ofProtected);
+          SetFieldOption(#PRNARYAD.DATOK   , ofProtected);
+        }
+       else
+        {
+          ClearFieldOption(#SYS_NAR.NMNEM, ofProtected);
+          ClearFieldOption(#SYS_NAR.DATAN, ofProtected);
+          ClearFieldOption(#SYS_NAR.DATOK, ofProtected);
+
+          ClearFieldOption(#StandardTimeStr  , ofProtected);
+          ClearFieldOption(#PRNARYAD.SUMMA   , ofProtected);
+          ClearFieldOption(#PRNARYAD.PROC    , ofProtected);
+          ClearFieldOption(#PRNARYAD.SUMMPREM, ofProtected);
+          ClearFieldOption(#PRNARYAD.DATAN   , ofProtected);
+          ClearFieldOption(#PRNARYAD.DATOK   , ofProtected);
+        }
+
+      //-1 не надо, тогда уже ''
+      SetHelpAndStatusContext(scrEdit,     -1, if (result, sci17Esc, sci178Esc), hcNoContext);
+      SetHelpAndStatusContext(scrEdit, #PrichNesootvFld , if (result, sci1Esc , sci13Esc ), hcNoContext);
+      SetHelpAndStatusContext(scrEdit, #ShZKFld         , if (result, sci1Esc , sci13Esc ), hcNoContext);
+      SetHelpAndStatusContext(scrEdit, #PrichKartRazrFld, if (result, sci1Esc , sci13Esc ), hcNoContext);
+
+      SetHelpAndStatusContext(brwEdit, -1               , if (result, sci1Esc , sci178Esc) , hcNoContext);
+      SetHelpAndStatusContext(brwEdit, #PRNARYAD.TABN   , if (result, sci1Esc , sci1378Esc), hcNoContext);
+      SetHelpAndStatusContext(brwEdit, #PRNARYAD.STRTABN, if (result, sci1Esc , sci1378Esc), hcNoContext);
+      SetHelpAndStatusContext(brwEdit, #PRNARYAD.DATAN  , if (result, sci1Esc , sci1378Esc), hcNoContext);
+      SetHelpAndStatusContext(brwEdit, #PRNARYAD.DATOK  , if (result, sci1Esc , sci1378Esc), hcNoContext);
+      SetHelpAndStatusContext(brwEdit, #WorkerName      , if (result, sci1Esc , sci1378Esc), hcNoContext);
+      SetHelpAndStatusContext(brwEdit, #NamKAUD         , if (result, sci1Esc , sci1378Esc), hcNoContext);
+      SetHelpAndStatusContext(brwEdit, #PaymentKindStr  , if (result, sci1Esc , sci1378Esc), hcNoContext);
+
+      //ProtectRecord(#SYS_NAR,  result);
+      ProtectRecord(#PRNARYAD, result);
+    }
+
+  isProt := result;
+  result := false;
+}
+
+var pTmp         :comp;
+
+
+Function SetFieldsByMnPlan(_pMnPlan:comp):boolean;
+var ii:word;
+{ Result:=false;
+
+  #FUNC_ZP_Fill_To_SchKauParam(PRNARYAD,cSchetD,cSubSchD,cKaud,Tbld)
+  if pGP_Func_ZP.SetFieldsByMnPlan(_pMnPlan,PSchKauParam)
+  { #FUNC_ZP_Fill_From_SchKauParam(PRNARYAD,cSchetD,cSubSchD,cKaud,Tbld)
+  }
+  Result:=true;
+  SetModified(true);
+  UpdateTable;
+}//Function SetFieldsByMnPlan(_pMnPlan:comp);
+
+Function GetUserTuneParam(var myPlansNo: comp // #docl текущий план счетов
+                         ): boolean;
+var cPlansRab: comp; // рабочее поле
+{
+  result := false;
+  cPlansRab := 0;
+  myPlansNo := coGetTune('Konsolid.cPlansSch'); // План счетов из Консолидации
+
+  if (myPlansNo = 0)
+  {
+    message('Установите текущий план счетов', Information);
+    exit;
+  }
+
+  cPlansRab := coGetTune('Fin.User.cPlansSch');
+
+  if (cPlansRab <> 0)
+    myPlansNo := cPlansRab;
+
+  if (GetFirst PlansSch where (( myPlansNo == PlansSch.NRec )) <> tsOk)
+  {
+    message('Утеряна настройка планов счетов.'#13 +
+            'Проведите настройку.'#13 +
+            'Установите текущий план счетов.', Information);
+    exit;
+  }
+
+  result := true;
+}
+//*****************************************************************************
+Function GetJobSheetDefaultNameNew(Number : longint) : string;
+{
+  if (Number < 10)
+    result := 'Наряд №0' + string(Number);
+  else
+    result := 'Наряд №' + string(Number);
+}
+//*****************************************************************************
+function ShouldDeleteJobs: boolean;
+{
+  var kol: word; kol := GetMarkerCount(JobMarkers);
+  if (kol <> 0)
+    result := Message('Удалить помеченные записи (' + String(kol) + ')?', Confirmation + YesNo) = cmYes
+  else
+    result := Message('Удалить текущую запись?', Confirmation + YesNo) = cmYes;
+}
+//*****************************************************************************
+Function UpdateJob  : boolean;
+{
+  timelog('GP_Nariad->UpdateJob:start');
+  result := false;
+
+  if (IsProtectedRecord)
+    Exit;
+
+  _try
+  {
+    set PRNARYAD.MES   := AD_Month(PRNARYAD.DATAN);
+    set PRNARYAD.CHASF := PRNARYAD.NRMTIME;
+    if update current PRNARYAD=tsok {}
+    RecalcPremia;
+  }
+  _except
+    on ExDatabase:
+    {
+      Message(ExploreException, Error);
+    }
+
+  timelog('GP_Nariad->UpdateJob:finish');
+  result := true;
+} // procedure UpdateJob
+Function DeleteJobs : boolean;
+{
+  result := false;
+
+  if (IsProtectedRecord)
+    Exit;
+
+  var I: integer;
+  ReSetBounds(#PRNARYAD);
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Удаление записей', GetMarkerCount(JobMarkers));
+
+  _try
+  {
+    I := 0;
+    while I < GetMarkerCount(JobMarkers)
+    {
+      var RecNum: comp;
+      GetMarker(JobMarkers, I, RecNum);
+      if (getfirst PRNARYAD where ((RecNum == PRNARYAD.NREC)) <> tsOk)
+      {
+        AtDeleteMarker(JobMarkers, I);
+        continue;
+      }
+      NextVisual;
+
+      if (personalAccount <> 0)
+      {
+        ReSetBounds(#SYS_NAR);
+        if getfirst SYS_NAR where ((PRNARYAD.MNREC == SYS_NAR.NREC)) <> tsOk {}
+      }
+
+      _try
+      {
+        delete current PRNARYAD;
+        AtDeleteMarker(JobMarkers, I);
+      }
+      _finally
+        if (personalAccount <> 0)
+          SetBounds(#SYS_NAR);
+    }
+    RecalcPremia;
+  }
+  _except
+    on ExDatabase:
+    {
+      Message(ExploreException, Error);
+  }
+  _finally
+  {
+    SetBounds(#PRNARYAD);
+    StopVisual('', 0);
+  }
+
+  result := false;
+}
+Function InsertJob  : boolean;
+{
+  result := false;
+
+  _try
+  {
+    if (insert current PRNARYAD = tsOk)
+      {
+        set prnaryad.ckaud[6]:=prnaryad.nrec;
+        if (update current prnaryad = tsOk)
+          {}
+        RecalcPremia;
+      }
+  }
+  _except
+    on ExDatabase:
+    {
+      Message(ExploreException, Error);
+    }
+
+  result := true;
+}
+//*****************************************************************************
+procedure DeleteCurrentJob;
+{
+  var Empty: boolean = (GetMarkerCount(JobMarkers) = 0);
+
+  if Empty
+    InsertMarker(JobMarkers, PRNARYAD.NREC);
+
+  DeleteJobs;
+
+  if Empty
+    ClearMarker(JobMarkers);
+}
+//*****************************************************************************
+Function MyCheckDate : boolean;
+{
+  if (NOT IsValid(#PRNARYAD))
+    result := true;
+  else
+    if (prnaryad.vidopl=1 or prnaryad.vidopl=7)
+      result := PRNARYAD.NRMTIME <> 0 AND NamKauD <> '';
+    else
+       result := NamKauD <> '' AND PRNARYAD.VIDOPL <> 0;
+}
+//*****************************************************************************
+
+TableEvent
+  Table PRNARYAD;
+
+cmSetDefault:
+  {
+    if (IsProtectedRecord)
+      {
+        Abort;
+        Exit;
+      }
+
+    ClearBuffer(#PRNARYAD);
+    PRNARYAD.MNREC    := SYS_NAR.NREC;
+    PRNARYAD.DATAN    := SYS_NAR.DATAN;
+    PRNARYAD.DATOK    := SYS_NAR.DATOK;
+    PRNARYAD.MES      := AD_month(SYS_NAR.DATAN);
+    prnaryad.VIDPREM  := 1;
+    prnaryad.CEX      := SYS_NAR.CEX;
+    prnaryad.KTY      := 1;
+    prnaryad.ckaud[6] := prnaryad.nrec;
+
+    if CharacterClockNumbers
+      SelectField(#PRNARYAD.STRTABN);
+    else
+      SelectField(#PRNARYAD.TABN);
+  }
+
+cmCheckRecord:
+  { timelog('GP_Nariad->cmCheckRecord:Start');
+
+    if (PRNARYAD.CLSCH = 0)
+      {
+        Message('Выберите лицевой счет работника', Warning + OkButton);
+        abort;
+        if CharacterclockNumbers
+          Selectfield(#PRNARYAD.STRTABN);
+        else
+          SelectField(#PRNARYAD.TABN);
+        exit;
+      }
+     timelog('GP_Nariad->cmCheckRecord:finish');
+  }
+/*
+cmSetCurField:
+  {
+    case Target of
+      #PRNARYAD.TABN,
+      #PRNARYAD.STRTABN:
+        if (PRNARYAD.CLSCH = 0)
+          PutCommand(cmPick);
+    end;
+  }
+*/
+cmDeleterecord:
+  {
+    if (IsProtectedRecord)
+    {
+      Message('Запись защищена от редактирования', Warning + OkButton);
+      stop;
+      Exit;
+    }
+
+    if ShouldDeleteJobs
+      DeleteCurrentJob;
+
+    RedRawPanel(#PrNaryad);
+    ReReadRecord(#SYS_NAR);
+
+    if (CurWindow = WinEdit)
+      {
+        nRecProtect := 0;
+
+        if (NOT CheckPN)
+          nRecProtect := SYS_NAR.NRec;
+        else 
+          if (NOT CheckPrNaryad)
+            nRecProtect := SYS_NAR.NRec;
+      }
+  }
+
+cmInsertRecord:
+  {
+    if (NOT InsertJob)
+      Abort;
+
+    ReReadRecord(#SYS_NAR);
+
+    if (CurWindow = WinEdit)
+      {
+        nRecProtect := 0;
+
+        if (NOT CheckPN)
+          nRecProtect := SYS_NAR.NRec;
+        else 
+          if (NOT CheckPrNaryad)
+            nRecProtect := SYS_NAR.NRec;
+      }
+  }
+
+cmUpdateRecord:
+  {
+    timelog('GP_Nariad->cmUpdateRecord PRNARYAD:start');
+    if (NOT UpdateJob)      {}
+
+    timelog('GP_Nariad->cmUpdateRecord PRNARYAD:001');
+    //ReReadRecord(#SYS_NAR);
+    ReScanPanel(#SYS_NAR);
+    timelog('GP_Nariad->cmUpdateRecord PRNARYAD:002');
+    if (CurWindow = WinEdit)
+      {
+        nRecProtect := 0;
+
+        if (NOT CheckPN)
+          nRecProtect := SYS_NAR.NRec;
+        else 
+          if (NOT CheckPrNaryad)
+            nRecProtect := SYS_NAR.NRec;
+      }
+    timelog('GP_Nariad->cmUpdateRecord PRNARYAD:finish');
+  }
+
+cmExprFieldChanged:
+  {
+    case CurField of
+      #StandardTimeStr:
+      {
+        SetModified(true);
+        var Value: double;
+        _try
+        {
+          Value := Str2Time(ExprFieldValue);
+
+          if (Value < 0)
+          {
+            Message('Введено недопустимое количество часов', Error + OkButton);
+            //abort;
+            exit;
+          }
+
+          set PRNARYAD.CHASF   := Value;
+          set PRNARYAD.NRMTIME := Value;
+        }
+        _except
+          on ExNumberConvert:
+          {
+            Message('Введена недопустимая величина', Error + OkButton);
+            //abort;
+          }
+      }
+    end; //case
+  }
+
+cmDelOnProtect:
+  {
+    if (IsProtectedRecord)
+      {
+        Abort;
+        Exit;
+      }
+
+    case CurField of
+      #PaymentKindStr:        set PRNARYAD.VIDOPL := 0;
+      #PremiumPaymentKindStr: set PRNARYAD.VIDPREM := 0;
+      #Catalogs.Name:         set PRNARYAD.CPODR    := 0;     // обнулим должность
+      #NamKAUD:
+      {
+        #DelonProtect_Deb (PrNaryad, #Schetdeb, #SubSchdeb, #NamKAUD);
+      }
+    end; //case
+  }
+
+cmPick:
+  {
+    if (IsProtectedRecord)
+      {
+        Abort;
+        Exit;
+      }
+
+    case CurField of
+      #PRNARYAD.TABN,
+      #PRNARYAD.STRTABN,
+      #WorkerName:
+      {
+         SelectPersonalAccount(true);
+      }
+      #NamKaud:
+      {
+        if (QuickChoiceName <> '')
+          QuickChoiceName := 'qcKau_Needed' ;
+
+        pTmp:=0;
+        if (iGetKau.GetCodeKau(cgiPick, cgKau_Zakaz, pTmp) <> 0)  //cmCancel
+          if (SetFieldsByMnPlan(pTmp))
+            {}
+      }
+      #PaymentKindStr:
+      {
+        RunInterface('Z_Zar::PICKOPL', PRNARYAD.VIDOPL);
+        set PRNARYAD.VIDPREM := PRNARYAD.VIDOPL;
+      }
+      #PremiumPaymentKindStr: RunInterface('Z_Zar::PICKOPL', PRNARYAD.VIDPREM);
+    end; //case
+  }
+
+cmCheckField:
+  {
+    timelog('GP_Nariad->cmCheckField:start');
+    case CurField of
+      #PRNARYAD.PROC,
+      #PRNARYAD.SUMMAPR,
+      #PRNARYAD.SUMMA:
+        CalcJobPremium;
+      #PRNARYAD.DATAN
+    , #PRNARYAD.DATOK:
+         if (PRNARYAD.DATOK <> ZeroDate AND PRNARYAD.DATAN > PRNARYAD.DATOK)
+           {
+             Message('Дата окончания меньше чем дата начала.');
+             Abort;
+             Exit;
+           }
+    end;
+    timelog('GP_Nariad->cmCheckField:finish');
+  }
+end;
+//*****************************************************************************
+TableEvent 
+  Table SYS_NAR;
+
+cmSetDefault:
+  {
+    if (IsProtectedRecord)
+      {
+        Abort;
+        Exit;
+      }
+
+    if currentPeriod = 2
+      Exit;
+
+    SYS_NAR.CHOICE  := jobSheetType;
+    SYS_NAR.MNREC   := Longint(GetLastNumD(2003));
+    SYS_NAR.NMNEM   := GetJobSheetDefaultNameNew(SYS_NAR.MNREC);
+    sys_nar.DATAN   := date(1,Month(otchPeriod),Year(otchPeriod));
+		sys_nar.DATOK   := date(Last_Day(otchPeriod),Month(otchPeriod),Year(otchPeriod));
+    sys_nar.PRKAUOT := 3;
+
+    if BoundActive(tbAvailableDepartmentsFilter)
+    {
+      GetMarker(departmentList, 0, SYS_NAR.CEX);
+    }
+    PickDepartment;
+
+    if (sys_nar.cex = comp(0))
+      {
+        Abort;
+        Exit;
+      }
+
+  }
+
+cmCheckField:
+  {
+    timelog('GP_Nariad->cmCheckField:start sys_nar');
+    case CurField of
+    //  #CheckedDate
+    //, #CheckedDate2:
+    #Sys_Nar.CheckDate:
+        if ((NOT MyCheckDate)
+          //AND (SYS_NAR.LASTTIME <> time(0,0,0,0)))
+          and Sys_Nar.CheckDate<>ZeroDate)
+          {
+            //set SYS_NAR.LASTTIME := longint(0);
+            set Sys_Nar.CheckDate:=ZeroDate;
+            Message('Не возможно установить дату, так как не все значения заданы!');
+          }
+      #SYS_NAR.DATAN
+    , #SYS_NAR.DATOK:
+         if (SYS_NAR.DATOK <> ZeroDate AND SYS_NAR.DATAN > SYS_NAR.DATOK)
+           {
+             Message('Дата окончания меньше чем дата начала.');
+             Abort;
+             Exit;
+           }
+    end
+    timelog('GP_Nariad->cmCheckField sys_nar:finish');
+  }
+
+cmCheckRecord:
+  {
+    timelog('GP_Nariad->cmCheckRecord sys_nar:start');
+    if (NOT FoundMarker(departmentList, SYS_NAR.CEX))
+      {
+        SelectField(#DepartmentStr);
+
+        if Message('При заданном фильтре по подразделениям, текущий наряд станет недоступен для просмотра.'#13 +
+          'Изменить подразделение наряда?'#13#13 +
+          '"Да" - выбрать другое подразделение.'#13 +
+          '"Нет" - наряд будет скрыт так как не удовлетворяет условиям фильтра.', Warning + YesNo) <> cmNo
+        {
+          SelectField(#DepartmentStr);
+          PickDepartment;
+        }
+      }
+
+    timelog('GP_Nariad->cmCheckRecord sys_nar:finish');
+  }
+
+cmPick:
+  {
+    if (IsProtectedRecord)
+      {
+        Abort;
+        Exit;
+      }
+
+    case CurField of
+      #PrichNesootvFld:
+      {
+        var c: comp = _qualityCostsHelper.cPrichNesootv(coSys_Nar, Sys_Nar.Nrec);
+        if _qualityCostsHelper.PickPrichNesootv(c)
+        {
+          _qualityCostsHelper.SetPrichNesootv(coSys_Nar, Sys_Nar.Nrec, c);
+          set PrichNesootvFld;
+          nRecProtect := if(IsPrichNesootvValid, 0, Sys_Nar.Nrec);
+        }
+      }
+      #ShZKFld:
+      {
+        var c: comp = _qualityCostsHelper.cShZK(coSys_Nar, Sys_Nar.Nrec);
+        if _qualityCostsHelper.PickShZK(c)
+        {
+          _qualityCostsHelper.SetShZK(coSys_Nar, Sys_Nar.Nrec, c);
+          set ShZKFld;
+          nRecProtect := if(IsPrichNesootvValid, 0, Sys_Nar.Nrec);
+        }
+      }
+      #PrichKartRazrFld:
+      {
+        var c: comp = _qualityCostsHelper.cPrichKartRazr(coSys_Nar, Sys_Nar.Nrec);
+        if _qualityCostsHelper.PickPrichKartRazr(c)
+        {
+          _qualityCostsHelper.SetPrichKartRazr(coSys_Nar, Sys_Nar.Nrec, c);
+          set PrichKartRazrFld;
+        }
+      }
+    end; //case
+  }
+
+cmDelOnProtect:
+  {
+    if (IsProtectedRecord)
+      {
+        Abort;
+        Exit;
+      }
+
+    case CurField of
+      #PrichNesootvFld:
+      {
+        _qualityCostsHelper.SetPrichNesootv(coSys_Nar, Sys_Nar.Nrec, 0);
+        set PrichNesootvFld;
+        nRecProtect := if(IsPrichNesootvValid, 0, Sys_Nar.Nrec);
+      }
+      #ShZKFld:
+      {
+        _qualityCostsHelper.SetShZK(coSys_Nar, Sys_Nar.Nrec, 0);
+        set ShZKFld;
+        nRecProtect := if(IsPrichNesootvValid, 0, Sys_Nar.Nrec);
+      }
+      #PrichKartRazrFld:
+      {
+        _qualityCostsHelper.SetPrichKartRazr(coSys_Nar, Sys_Nar.Nrec, 0);
+        set PrichKartRazrFld;
+      }
+    end; //case
+  }
+
+cmInsertRecord:
+  {
+    if (IsProtectedRecord)
+      {
+        Abort;
+        Exit;
+      }
+
+    insert current SYS_NAR;
+  }
+
+cmUpdateRecord:
+  {
+    if (IsProtectedRecord)
+      {
+        Abort;
+        Exit;
+      }
+
+    update current SYS_NAR;
+  }
+
+cmDeleteRecord:
+  {
+
+    if (IsProtectedRecord)
+      {
+        Abort;
+        Exit;
+      }
+
+    var cnt: longint = GetMarkercount(jobSheetMarker);
+
+    if cnt = 0
+    {
+      if (Message('Удалить наряд?', Confirmation + YesNo) = cmYes)
+      {
+        delete all PRNARYAD;
+        delete current SYS_NAR;
+      }
+    }
+    else
+    {
+      if Message('Удалить помеченные наряды (' + String(cnt)+ ')?', Confirmation + YesNo) <> cmYes
+      {
+        abort;
+        exit;
+      }
+      var I: longint;
+      I := 0;
+      while I < GetMarkerCount(jobSheetMarker) do
+      {
+        var JobSheet: comp;
+        GetMarker(jobSheetMarker, I, JobSheet);
+        if getfirst SYS_NAR where ((JobSheet == SYS_NAR.NREC)) = tsOk
+        {
+          delete all PRNARYAD;
+          delete current SYS_NAR;
+          DeleteMarker(jobSheetMarker, JobSheet);
+        }
+      }
+    }
+  }
+
+cmPositionChanged:
+  { 
+    if (CurWindow = WinEdit)
+      {  
+        if (nRecProtect <> comp(0) AND nRecProtect <> SYS_NAR.NRec)
+          {                        
+            if (GetFirst SYS_NAR where ((nRecProtect == SYS_NAR.NRec)) = tsOk)
+              {}  
+
+            ReReadRecord(#SYS_NAR);
+            Message('Не все обязательные поля были заполнены!');
+          }
+
+        if (NOT CheckPrNaryad)
+          nRecProtect := SYS_NAR.NRec;
+        else
+          nRecProtect := 0;
+      }
+
+    IsProtectedRecord;
+  }
+
+end;
+
+end;
+
+HandleEvent
+cmInit:
+  { timelog_init;
+    timelog('GP_Nariad->cmInit');
+    otchPeriod := dGetTune('UP.DATOTCH');
+    set jobSheetType := jsIndividualVsMPF;
+    set isProt := false;
+    var CL: ContextList;
+    if (not CL.Add(CS, 'IntInit'))
+    {
+    }
+    if (not PrVidInit(25, 1))
+    {
+      //ExitProc;
+      abort;
+      exit;
+    }
+
+    if (not GetUserTuneParam(myPlansNo))
+      exit;
+
+    ProtectedCheckedNaryad := boGetTune('UP.ZAR.JS.PROTECTCHECKEDNARYAD'); // защищены наряды или нет от переформирования
+    CharacterClockNumbers  := wGetTune('FormatClockNumber') = 1;
+    dimeRounding           := lGetTune('UP.ZAR.RoundNa');  //округление до копеек
+
+    if CharacterClockNumbers
+      ClearFieldState(#PRNARYAD.TABN, sfVisible);
+    else
+      ClearFieldState(#PRNARYAD.STRTABN, sfVisible);
+
+    JobMarkers     := InitMarker('', 8, 100, 100);
+    jobSheetMarker := InitMarker('', 8, 50, 50);
+
+    SetupPeriod(integer(coGetTune('UP.TEKBUD')));
+    SetupDepartmentFilter;
+
+    if (getfirst sys_nar <> tsOk)
+      {}
+    UpdateTitle;
+
+    if (IsProtectedRecord)
+    {}
+  }
+
+cmCancel:
+  {
+    if (NOT IsProtectedRecord)
+      UpdateTable;
+  }
+
+cmDone:
+  {
+    DoneMarker(departmentList, '');
+    DoneMarker(jobSheetMarker, '');
+    DoneMarker(JobMarkers    , '');
+    FreeVipInterface(PAF);
+    CS       := NullRef;
+    DoneVx(25);
+    //ExitProc;
+
+  }
+
+cmExprFieldChanged:
+  { /*
+    case CurField of
+      #CheckedDate,
+      #CheckedDate2:
+      {
+        var dd : longint; dd := longint(StrToDate(ExprFieldValue, 'DD/MM/YYYY'));
+        SetModified(true);
+        set SYS_NAR.LASTTIME := dd;
+      }
+    end; //case
+    */
+  }
+
+cmDefault:
+  {
+    if ((currentPeriod= 2) and (getfirst PRNARYAD1 where ((SYS_NAR.NREC == PRNARYAD1.MNREC)) <> tsOk))
+    {
+      Message('Архивный наряд без спецификаций, поэтому редактирование запрещено', Information);
+      Abort;
+      Exit;
+    }
+
+    if (NOT IsProtectedRecord)
+      UpdateTable;
+
+    if IsValid(#SYS_NAR)
+    {
+      if (GetFirst PRNARYAD <> tsOk)
+        {
+          SelectPersonalAccount(true);
+        }
+
+      RunWindowModal(WinEdit);
+
+
+      if (NOT IsProtectedRecord)
+        UpdateTable;
+
+      RereadRecord(#SYS_NAR);
+      abort;
+    }
+  }
+
+cmAddNewRec:
+  {
+    PutCommand(cmInsert);
+  }
+
+cmEdit:
+  {
+    PutCommand(cmDefault);
+  }
+/*
+cmQuit:
+  {
+    if (NOT IsProtectedRecord)
+      UpdateTable;
+
+    if IsModalWindow
+    {
+      CloseInterface(cmCancel);
+      PutCommand(cmQuit);
+    }
+  }
+
+cmMenu:
+  {
+    if (NOT IsProtectedRecord)
+      UpdateTable;
+
+    if IsModalWindow
+    {
+      CloseInterface(cmCancel);
+      PutCommand(cmMenu);
+    }
+  }
+*/
+
+cmNal:
+  {
+    SetupPeriod(1);
+
+    if (NOT IsProtectedRecord)
+      UpdateTitle;
+
+    RereadRecord(#SYS_NAR);
+  }
+
+cmPickClass:
+  {
+    SetupPeriod(0);
+
+    if (NOT IsProtectedRecord)
+      UpdateTitle;
+
+    RereadRecord(#SYS_NAR);
+  }
+
+cmPickAttr:
+  {
+    SetupPeriod(2);
+
+    if (NOT IsProtectedRecord)
+      UpdateTitle;
+
+    RereadRecord(#SYS_NAR);
+  }
+
+cmHotKeys:
+  {
+    var ComponentName: string; ComponentName := '#__COMPONENT__::';
+    PutHotCommand(RunDynMenu(ComponentName + 'GPSys_NarPopup;SEPARATOR;' + ComponentName + 'GPJobSheetListPeriodPopup'));
+  }
+
+cmMarkUnmark:
+  {
+    if (NOT IsProtectedRecord)
+      UpdateTable;
+
+    InvertMarker(jobSheetMarker, SYS_NAR.NREC);
+    ReDrawPanel(#SYS_NAR);
+    RedrawCurrentAndGo (GetCurrentFormat,true);
+  }
+
+cmSelectAll:
+  {
+    if (NOT IsProtectedRecord)
+      UpdateTable;
+
+    PushPos(#SYS_NAR);
+
+    _loop SYS_NAR
+      InsertMarker(jobSheetMarker, SYS_NAR.NREC);
+
+    PopPos(#SYS_NAR);
+    RereadRecord(#SYS_NAR);
+  }
+
+cmUnSelectAll:
+  {
+    ClearMarker(jobSheetMarker);
+    RereadRecord(#SYS_NAR);
+  }
+
+cmFilterSave:
+  {
+    if (NOT IsProtectedRecord)
+      UpdateTable;
+
+    var Dummy: double;
+    if RunInterface(GetPodaln, 11, department, Dummy) = cmDefault
+    {
+      SetupDepartmentFilter;
+      RereadRecord(#SYS_NAR);
+    }
+  }
+
+cmProtectedInput:
+  {
+    Message('Поле защищено от редактирования. Возможно, заполнено поле'+
+            ' "Проверен" и настройка "Защитить наряды от редактирования" находится в значении "Да"', Warning + OkButton);
+    Stop;
+  }
+
+cmValue1:
+  {
+    var dd : date; dd := otchPeriod;
+    if (RunDialog(GPGetDate, dd) <> cmCancel)
+      {
+        var cnt: longint = GetMarkercount(jobSheetMarker);
+
+        if cnt = 0
+          {
+            if (IsValid(#SYS_NAR) AND MyCheckDate)
+              {
+                set SYS_NAR.CHECKDATE := longint(dd);
+                if (update current SYS_NAR = tsOk)
+                  {}
+              }
+          }
+        else
+          {
+            if Message('Установить дату проверки для помеченных нарядов?', Confirmation + YesNo) <> cmYes
+              {
+                abort;
+                exit;
+              }
+            var I: longint; I := 0;
+            var bBlock : boolean; bBlock := false;
+            while I < GetMarkerCount(jobSheetMarker) do
+            {
+               var JobSheet: comp;
+               GetMarker(jobSheetMarker, I, JobSheet);
+               if (getfirst SYS_NAR where ((JobSheet == SYS_NAR.NREC)) = tsOk)
+                 if (NOT MyCheckDate)
+                   {
+                     bBlock := true;
+                     DeleteMarker(jobSheetMarker, JobSheet);
+                     continue;
+                   }
+                 else
+                  {
+                    set SYS_NAR.CHECKDATE := longint(dd);
+                    if (update current SYS_NAR != tsOk)
+                      {  }
+                  }
+              DeleteMarker(jobSheetMarker, JobSheet);
+            }
+
+            if (bBlock)
+              Message('По некоторым нарядам не проставлена дата проверки, т.к. не все поля заданны!');
+          }
+
+        ReReadRecord(#SYS_NAR);
+      }
+  }
+
+cmValue2:
+  RunInterface('Attribute', coSYS_NAR, SYS_NAR.nRec, false);
+
+end;   //handleevent
+end.
+
+
+GPSys_NarPopup menu
+{
+  - 'Установка даты проверки', cmValue1, 'Установка даты проверки' ,hcNoContext, '', , sci1Esc;
+  - 'Фильтр по подразделению', cmFilterSave,
+    'Установить фильтр по подразделению',hcNoContext, 'Alt+B', kbAltB, sci1Esc;
+  //- 'Внешние а~т~рибуты', cmValue2, 'Заполнение внешних атрибутов по данной позиции', hcGkatalM1Attr, 'Alt+A', kbAltA, sci1Esc,,,,bmpAttribute;
+}
+
+GPPrNaryad_HotKeys Menu
+{
+  - 'Продублировать запись', cmValue2, 'Продублировать текущую запись',hcPrNaryad,'',,sci1Esc;
+}
+
+
+GPJobSheetListPeriodPopup menu
+{
+  = 'Период', 'Период', hcNoContext, sci1Esc;
+  {
+    - 'Будущий', cmNal, 'Просмотр нарядов будущего периода', hcPrNaryad, 'Alt+F', kbAltF, sci1Esc;
+    - 'Текущий', cmPickClass, 'Просмотр нарядов текущего периода', hcPrNaryad, 'Alt+C', kbAltC, sci1Esc;
+    - 'Архивный',cmPickAttr,'Просмотр нарядов архивного периода',hcPrNaryad,'Alt+A',kbAltA,sci1Esc;
+  }
+
+}
+
+
+GPGetDate DIALOG
+Fields
+  myd ('Введите дату',hcD_GetFormNa,scGalDial): date [,'DD/MM/YYYY'];
+Buttons
+  cmOk,Default, , 'Ввод' ,hcD_GetFormNa,scGalDial;
+  cmCancel,,,'Отмена',hcD_GetFormNa,scGalDial;
+
+<<'Введите дату проверки'
+
+           .@@@@@@@@@@@
+
+  <.~П~родолжить.> <. ~О~тмена .>
+>>

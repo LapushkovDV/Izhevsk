@@ -1,0 +1,200 @@
+/*************************************************************************************************\
+* Наименование: Расширение интерфейса редактирования списка распорядительных действий в приказе   *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание: Добавлена колонка с создателем PartDoc                                              *
+*             Добавлена колонка с признаком скрытости                                             *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#000          |07/11/17|Евдокимов М.А.           |НПО Энергомаш                    *
+* Разработка  |#776          |17/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include ExtAttr.vih
+#include GP_PartDocAccessController.vih
+#include GP_MenuDynamic.vih
+#component "Z_STAFFORDERS"
+
+alter interface ContainerOfOrders;
+OverLoad
+Function CheckAbilityPrint(PTO: word): boolean;
+end;
+extendformats brPart;
+
+function GetUserCreatorFIO: string; forward;
+function GetIsHidden: string; forward;
+
+var
+  //_extAttr: iExtAttr; - есть Static
+  _partDocAccessController: GP_PartDocAccessController;
+  _attrNamNrecPartDocHidden: comp; //nrec вн.атр. Скрытый
+
+create view
+  (UserCreatorFIO,
+   IsHidden)
+as select
+  GetUserCreatorFIO(),
+  GetIsHidden()
+from x$users UserCreator
+where ((
+  PartDoc.cRef2 == UserCreator.Atl_Nrec
+));
+
+create view vUser
+var
+  _nrec: comp;
+  _loginName: string;
+as select UserByNrec.Atl_Nrec
+from x$users UserByNrec, x$users UserByLoginName
+where ((
+  _nrec      == UserByNrec.Atl_Nrec and
+  _loginName == UserByLoginName.xu$LoginName
+));
+
+//******************************************************************************
+// Функция проверяем можно ли печатать групповую форму или нужно обыкновенный
+// CommonRep грузить
+//******************************************************************************
+
+Function CheckAbilityPrint(PTO: word): boolean;
+{ result := True; // можно вызывать методы реализации
+  case PTO of
+  13,21:
+  { //776 Для них по стандарту нет фаста? , в 13 уже заложена печать 9, в 21 добавим печать 20.
+  }
+  else
+  {  Result:=Inherited::CheckAbilityPrint(PTO)
+
+  }
+  end;
+
+} //Function CheckAbilityPrint(PTO: word): boolean;
+
+
+function GetUserCreatorFIO: string;
+{
+  result := '';
+  if IsValidAll(tnUserCreator)
+  {
+    var s: string;
+    s := sGetTuneEx('USER.FIO', UserCreator.xu$UserOffice, UserCreator.Atl_Nrec);
+    result := if(s = '',
+                 if(UserCreator.xu$FullName = '',
+                    UserCreator.xu$LoginName + ' (учетная запись пользователя)',
+                    UserCreator.xu$FullName),
+                 s);
+  }
+}
+
+function GetIsHidden: string;
+{
+  result := trim(sGetAttrId(coPartDoc, PartDoc.Nrec, _attrNamNrecPartDocHidden));
+}
+
+browse brPart 'Разделы' (, hcStaffWinPr);
+  show at (,,, 5) fixed_y;
+  table PartDoc;
+  fields
+    UserCreatorFIO 'Создатель': [20], protect, pickbutton;
+    IsHidden 'Скрытое': [3], noautosize, protect, pickbutton;
+end;
+
+handleevent
+
+cmvalue66:
+{
+ RunInterface('Z_STAFFORDERS::ALLOWANCESORDER', Titledoc.Nrec, PartDoc.nrec);
+}
+
+
+cmPick:
+{
+  case curfield of
+    #UserCreatorFIO:
+    {
+      case wGetTune('DOC.CHANGEDESCRINDOC') of
+        1: message(''#3'Установлен запрет на изменение дескриптора в документах', Error);
+        2: if message(''#3'Изменить создателя на своего пользователя?', YesNo) = cmYes
+             Set PartDoc.cRef2 := UserId;
+        0:
+        {
+          vUser._nrec := UserId;
+          if vUser.getfirst UserByNrec = tsOk
+            vUser._loginName := vUser.UserByNrec.xu$LoginName;
+          if RunInterface(C_COMMON::GetUser, vUser._loginName) = cmDefault
+            if vUser.getfirst UserByLoginName = tsOk
+              Set PartDoc.cRef2 := vUser.UserByLoginName.Atl_Nrec;
+        }
+      end;
+      RedrawPanel(#PartDoc);
+    }
+    #IsHidden:
+    {
+      if (_partDocAccessController.GetUsersAccessFlag(UserId, PartDoc.TypeOper) and
+          GP_BIT_RPD_ENABLED_HIDDEN) = GP_BIT_RPD_ENABLED_HIDDEN
+      {
+        if GetIsHidden = ''
+          sSetAttrID(coPartDoc, PartDoc.Nrec, _attrNamNrecPartDocHidden,
+                              GP_ATTRVAL_VALUE_PARTDOC_HIDDEN)
+        else
+          ExtAttr_DeleteValueID(coPartDoc, PartDoc.Nrec, _attrNamNrecPartDocHidden);
+        RedrawPanel(#PartDoc);
+      }
+      else
+        Message('Установлен запрет на изменение признака "Скрытое"', error);
+    }
+    else
+      inherited::handleevent(cmPick);
+  end;
+}
+
+cmOnVipLoad:
+{
+  inherited::handleevent(cmOnVipLoad);
+
+  _attrNamNrecPartDocHidden := ExtAttr_Id(coPartDoc, GP_ATTRNAM_NAME_PARTDOC_HIDDEN);
+  if _attrNamNrecPartDocHidden = 0
+    _attrNamNrecPartDocHidden := ExtAttr_Create(coPartDoc, GP_ATTRNAM_NAME_PARTDOC_HIDDEN, cgAttrType_Str);
+}
+
+end;
+
+end.
+
+
+//Добавление пунктов контекстного меню в интерфейсе списка приказов по персоналу
+handler with replace GP_MenuDynamic_AddItems_CONTAINEROFORDERS on ExtensionPoint GP_MenuDynamic_AddItems
+action
+{
+  result := true;
+  timelog('GP_MenuDynamic_AddItems_CONTAINEROFORDERS_MENU:start');
+  DeleteMenuHowDynamics('Z_STAFFORDERS::CONTAINEROFORDERS_MENU');
+
+  var MenuID, NewMenuId: longint = 0;
+  _try
+  {
+    MenuID := LoadMenu('Z_STAFFORDERS::CONTAINEROFORDERS_MENU', false);
+    if (not ConcatMenu(MenuId, LoadMenu('Z_StaffOrders::mnuAllowancesorder', false)))
+    {
+      timelog('ошибка добавления Z_StaffOrders::mnuAllowancesorder ');
+      _raise ExAddMenuItemError;
+    }
+    if (not StoreMenuHowDynamics(MenuID,'Z_STAFFORDERS::CONTAINEROFORDERS_MENU'))
+    {
+      timelog('ошибка сохранения Z_STAFFORDERS::CONTAINEROFORDERS_MENU');
+      _raise ExAddMenuItemError;
+    }
+  }
+  _except
+    on ExVip:
+      message('Ошибка регистрации контекстного меню в списке приказов по персоналу'#13 + ExploreException, error);
+  _finally
+    if (MenuID<>0) DisposeLoadMenu(MenuID);
+  timelog('Z_STAFFORDERS::CONTAINEROFORDERS_MENU :finish');
+}
+
+
+
+mnuAllowancesorder menu
+{
+  - 'Загрузить Excel файл', cmvalue66 ;
+}

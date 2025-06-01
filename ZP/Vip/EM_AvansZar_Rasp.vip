@@ -1,0 +1,1763 @@
+/*************************************************************************************************\
+  Наименование:  Распределение аванса
+  Контур/Модуль: ЗП
+  Примечание:    Серкова и ПЕУ
+  Вид работы  |Номер           |Дата    |Исполнитель              |Проект
+  -----------------------------------------------------------------------------------------------
+  Разработка  |SR00035183      |17/04/21|Kurennykh                |НПО Энергомаш
+                                        |Lapushkov                |НПО Энергомаш
+  Доработка   |89372           |20/01/25|Dmitrii.Lapygin          |НПО Энергомаш
+\************************************************************************************************/
+//003889
+#include IGK_Dog.vih
+#include Query.vih
+#include GetKau.vih
+#include GetKau.var
+
+#doc
+    1.  Один и тот же сотрудник может выполнять основную тематическую работу и в этом же месяце работы накладного характера, поэтому  исправление в пункт 1.
+        <Основные тематические работники, заработная плата которых учитывается на 20  счете бухгалтерского учета по темам ГОЗ и любым другим темам, в т. ч. коммерческим,
+        может попадать в категорию персонала накладного характера при распределении зарплаты по темам ГОЗ и коммерческим, при этом тематический (прямой) заказ
+        и заказы накладного характера проставляются в наряде или табеле>.
+    2.  Распределение заработной платы накладного характера основывается на шифре заказа, все заказы на счетах 25, 26 являются признаком накладного персонала
+        (70:,71:,72:,73:,74:,75:,76:).
+    3.  Основные тематические работники, заработная плата которых учитывается на 23  счете бухгалтерского учета по темам ГОЗ и любым другим темам, в т. ч. коммерческим,
+        также может попадать в категорию персонала накладного характера при распределении зарплаты по темам ГОЗ и коммерческим, при этом тематический (прямой) заказ
+        и заказы накладного характера проставляются  также в наряде или табеле.
+    4.  Кроме указанных в п. 2 заказов накладного характера для выплаты заработной платы со счетов ГОЗ также включаются работники, зарплата которых отражается на заказах 48:,
+        239000000120, 239000300120.
+    5.  Необходимо учитывать представленный перечень исключаемых подразделений для выплаты по ГОЗ.
+#end
+const
+ coDecimalPoint = 2; //до какого округляем проценты в БД
+// coDecimalPointNDFL = 0;   не будем по НДФЛ до рубля округлоять, это только портит общшие суммы и не имеет отнощшения к реальности в данном контексте.
+ coVirtualcVPlan = 999999999;
+ coVirtualcVPlan2 = 888888888;
+end;
+
+VipInterface EM_AvansZar_Rasp Licensed(free);
+
+Interface EM_AvansZar_Rasp 'Распределение аванса и ЗП' EscClose;
+
+Procedure Fill_tmpItog; Forward;
+Procedure Fill_tmpRaspr; Forward;
+Function Get_Sum_vplan_WO_Excl(bFlag : boolean) : double; Forward;
+Function Get_Total_perc_Goz(_cLscht : comp) : double; Forward;
+Function Get_Total_Straight_Goz(_cLscht : comp) : double; Forward;
+Function CheckLSchet(_cLs : comp) : boolean; Forward;
+
+Const
+  AnBankSch = 'Банковские счета';
+  AnArch    = 'Архив';
+  KL_code   = 35183;
+  KL_on     = 'SR00035183';
+  IndGroup  = 000A00000000000Fh;
+End;
+
+table struct tmpItog
+(
+  cVPlan        : comp
+, cBankSch      : comp
+, dSumRaspPlan  : double
+, dSumRaspFactS : double
+, dSumRaspFactO : double
+, dPercent      : double
+)
+with index
+(
+  i01 = cVPlan
+);
+
+table struct tmpRaspr
+(
+  cLSchet       : comp
+, cPerson       : comp
+, cVPlan        : comp
+, sPerson       : string
+, sTabN         : string
+, dSum          : double
+, dNdfl         : double
+, dPercent      : double
+, dSumGoz       : double
+, wType         : word
+, cBankS        : comp
+, dPercentOld   : double
+)
+with index
+(
+  i01 = cLSchet
+, i02 = cVPlan + wType
+, i03 = cVPlan + cLSchet
+);
+
+table struct tmpExcludedRecs
+(
+  wType : word
+, cRec  : comp
+)
+with index
+(
+  i01 = wType + cRec
+);
+
+Table Struct TmpIndPsn
+(
+    cPers : comp
+)
+With Index
+(
+    i01 = cPers
+);
+
+
+Create View rView
+
+var
+  _log         : string = '';
+  _TypeFot     : longint = 0;
+  oIGK_Dog     : iIGK_Dog;
+  dBeg         : date;
+  dEnd         : date;
+  curTypeExcl  : word;
+  wSpKau       : word;
+  cSpKau       : comp;
+  _strWarning1 : string = '';
+  _strWarning2 : string = '';
+  SumAll : double = 0.0;
+  pOrderGrp: tNRec;
+
+As
+
+select
+  if( tmpRaspr.wType = 0, 'Накладные', if (tmpRaspr.wType = 1, 'Прямые', if(tmpRaspr.wType = 2, 'Прямые не ГОЗ', if(tmpRaspr.wType = 3, 'Прочее не ГОЗ', '???')) )) (FieldName = TypePer)
+, if( tmpItog.cVPlan = comp(coVirtualcVPlan),'Прямые, не ГОЗ', if (tmpItog.cVPlan = comp(coVirtualcVPlan2),'Прочее не ГОЗ',vPlanItog.Name) )        (FieldName = svPlanItog)
+from
+  vPlan vPlanItog
+, vPlan vPlanRasp
+, vPlan vPlanIskl
+, tmpItog
+, tmpItog tmpItogLoop
+, tmpRaspr
+
+, tmpRaspr tmpRasprLoop
+, tmpRaspr tmpRasprLoop2
+, tmpRaspr tmpRasprIns
+, tmpRaspr tmpRasprLoop_Fn_GOZ
+, tmpRaspr tmpRasprLoop_Straight_Goz
+, gp_raspavans
+, gp_raspavans gp_raspavansLoop
+, Lschet LschetCheck
+, KatPodr
+, KatLink KatLinkPsn
+, KatLink KatLinkPodr
+
+, em_unidoc_head unidoc_vplan
+
+, KatKau
+, SpKau
+
+, TmpIndPsn
+where ((
+                       root == tmpRaspr.cVPlan
+        and (tmpRaspr.cVPlan <> 0 /*and tmpRaspr.cVPlan <> comp(coVirtualcVPlan)*/)
+and      tmpRaspr.cVPlan == vPlanRasp.nrec
+and       tmpItog.cVPlan == vPlanItog.nrec
+
+and     tmpRaspr.clSchet == lSchet.nRec
+and           lSchet.cex == katpodr.nrec
+
+and tmpRasprLoop.clschet == gp_raspavansLoop.clschet
+
+and                    0 == gp_raspavansLoop.isarh
+and                 dBeg == gp_raspavansLoop.datan
+and                 dEnd == gp_raspavansLoop.dataok (noIndex)
+
+and            coPersons == KatLinkPsn.codeTable
+and              KL_code == KatLinkPsn.code
+and                KL_on == KatLinkPsn.ownname
+
+and            coKatPodr == KatLinkPodr.codeTable
+and              KL_code == KatLinkPodr.code
+and                KL_on == KatLinkPodr.ownname
+
+and            31015 == unidoc_vplan.wtype
+and            unidoc_vplan.ADDCOMP[1] == vPlanIskl.NRec
+))
+;
+
+Screen scRasp (,,sci1Esc);
+Show at (,,,2);
+Table tmpItog; //NoTableNavigation;
+Fields
+    _TypeFot                    ('Тип: Аванс / ЗП')               : noProtect, NoFrame;
+    DateToStr(dGetTune('UP.DATOTCH'),'Month YYYY')      ('Текущий период ЗП') : SKIP, {Font = {Color = ColorMark}};
+    _strWarning1                 ('предупреждение, что данные в интерфейсе могут отличаться от тех, что в БД')   : SKIP, {Font = {BackColor = if(length(_strWarning1) = 0,0,ColorSysRed)}};
+    SumAll + Get_Sum_vplan_WO_Excl(true)         ('Сумма НР без исключений')       : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+    _strWarning2                 ('предупреждение, что данные в интерфейсе могут отличаться от тех, что в БД')   : SKIP, {Font = {BackColor = if(length(_strWarning2) = 0,0,ColorSysRed)}};
+    Get_Sum_vplan_WO_Excl(true) ('Сумма НР с исключениями')       : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+Buttons
+    cmValue11, [singleLine],,, 'Исключенные подразделения',, sci1Esc;
+    cmValue12, [singleLine],,, 'Исключенные сотрудники',, sci1Esc;
+    cmValue14, [singleLine],,, 'Исключенные темы',, sci1Esc;
+    cmValue13, [singleLine],,, 'Сохранить',, sci1Esc;
+<<
+  `Выполнять распределение для` (.) Аванса`             <. Исключенные подразделения .>   Период обработки: .@@@@@@@@@@@@@@@@@
+                                (.) Зар. платы`         <. Исключенные сотрудники    .> .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   Общая сумма ЗП накладных       .@@@@@@@@@@@@@@@@@    <. Исключенные темы          .> .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   Общая сумма ЗП накл. с искл.   .@@@@@@@@@@@@@@@@@    <. Сохранить расчет          .>
+>>
+End; //scRasp
+
+Browse brItog 'Итоги распределения аванса и ЗП' (,,Sci1Esc);
+Show At (,3,,10);
+
+Table tmpItog;
+Fields
+  svPlanItog /*vPlanItog.name*/                  'Тема'                                ('Наименование темы'               ,,sci1Esc)  : [50], Protect;
+  tmpItog.dSumRaspFactS + tmpItog.dSumRaspFactO  'Итоговая сумма выплаты'              ('Итоговая сумма выплаты'          ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpItog.dSumRaspPlan                           'Плановая сумма распределения'        ('Плановая сумма распределения'    ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], noProtect;
+  tmpItog.dSumRaspFactS                          'Факт. сумма распределения прямых'    ('Фактическая сумма распределения' ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpItog.dSumRaspFactO                          'Факт. сумма распределения накладных' ('Фактическая сумма распределения' ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect,
+                                                  {Font = {BackColor = if(tmpItog.cVPlan <> comp(coVirtualcVPlan), if(tmpItog.dSumRaspFactO > tmpItog.dSumRaspPlan, ColorError, 0), 0)}};
+  tmpItog.dPercent                               'Процент распределения'               ('Процент распределения'           ,,sci1Esc)  : [10, '\7p[|-]36`666`666`666`666`666.8899999'], noProtect;
+
+End; //brItog
+//  нижний брауз интерфейса. Собран из уникальных lschet
+Browse brPers 'Распределения аванса и ЗП по людям' (,,Sci18Esc);
+Show At (,11,,);
+
+Table tmpRaspr;
+Fields
+  TypePer               'Прямые/Накладные'        ('Прямые/Накладные'         ,,sci18Esc) : [10], Protect, {Font = {BackColor = if(tmpRaspr.wtype = 1,7,0)}};
+  KatPodr.Kod           'Подразделение'           ('Подразделение'            ,,sci18Esc) : [10], Protect;
+  tmpRaspr.sPerson      'ФИО'                     ('ФИО'                      ,,sci18Esc) : [70], Protect;
+  tmpRaspr.sTabN        'Табельный номер'         ('Табельный номер'          ,,sci18Esc) : [20], Protect;
+  vPlanRasp.name        'Тема'                    ('Тема'                     ,,sci1Esc)  : [30], Protect;
+//  tmpRaspr.dSum         'Сумма выплаты'           ('Сумма выплаты'            ,,sci1Esc)  : [20, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+//  tmpRaspr.dNdfl        'НДФЛ'                    ('НДФЛ'                     ,,sci1Esc)  : [20, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpRaspr.dPercent     'Процент распределения'   ('Процент распределения'    ,,sci1Esc)  : [20, '\7p[|-]36`666`666`666`666`666.8899999'], Protect;
+  tmpRaspr.dPercentOld  'Процент в базе (старый)' ('Процент в базе (старый)'  ,,sci1Esc)  : [20, '\7p[|-]36`666`666`666`666`666.8899999'], Protect;
+//  tmpRaspr.dSumGoz      'Сумма с гос. заказа'     ('Сумма с гос. заказа'      ,,sci1Esc)  : [20, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+End; //brPers
+
+
+Procedure MyLog(_str: string);
+{
+ timelog(ShortStrToWin('EM_AvansZar_Rasp -> '+_str));
+}
+
+Procedure MysqlAddStr(var query_handle: longInt; add_query_str: string);
+{
+  sqlAddStr(query_handle, add_query_str);
+  MyLog('sql: ' + add_query_str);
+}
+
+#declare WinExcludedRecs (TypeRecs, label, cgKau, coTable)
+Window winPickExcluded#TypeRecs #label, DoAccept;
+  Browse brPickExcluded#TypeRecs #label (#label,,sci178Esc);
+    Table KatLink#TypeRecs;
+  fields
+      ShowKau(#cgKau, KatLink#TypeRecs.crec) #label (#label         ,,sci178Esc) : [100], Protect;
+
+  end;
+
+HandleEvent
+cmInsert:
+{
+  if ( iGetKau.GetCodeKau(cgiMulti, #cgKau, 0h) <> 0 )
+  {
+    var _markerKau: tPtr = InitMarker(iGetKau.GetMarkerName(#cgKau), 8, 10, 10);
+    var _i : longint = 0;
+    var _crec : comp = 0h;
+    if GetMarker(_markerKau, _i, _crec)
+    do
+    {
+      if (RecordExists KatLink#TypeRecs where ((  #coTable == KatLink#TypeRecs.codetable
+                                            and KL_code   == KatLink#TypeRecs.code
+                                            and KL_on     == KatLink#TypeRecs.ownName
+                                            and _crec     == KatLink#TypeRecs.crec (noIndex) )) <> tsOk)
+      insert KatLink#TypeRecs
+       set  KatLink#TypeRecs.codetable := #coTable
+          , KatLink#TypeRecs.code      := KL_code
+          , KatLink#TypeRecs.ownName   := KL_on
+          , KatLink#TypeRecs.crec      := _crec
+          ;
+       _i++;
+    } while GetMarker(_markerKau, _i, _crec)
+    donemarker(_markerKau, iGetKau.GetMarkerName(#cgKau));
+  }
+  ReReadRecord;
+}
+cmDelete:
+{
+  Delete current KatLink#TypeRecs;
+  ReReadRecord;
+}
+end;
+End; //winPickExcludedPsn
+#end
+
+#WinExcludedRecs (Psn,  'Исключаемые сотрудники',    cgKau_Persons, coPersons)
+#WinExcludedRecs (Podr, 'Исключаемые подразделения', cgKau_KatPodr, coKatPodr)
+
+
+Window winPickExcludedVplan 'Исключаемые темы', DoAccept;
+  Browse brPickExcludedVplan 'Исключаемые темы'('Исключаемые темы',,sci178Esc);
+    Table unidoc_vplan;
+  fields
+      vPlanIskl.CODE 'Код' : [10], Protect;
+      vPlanIskl.NAME 'Наименование' : [20], Protect;
+  end;
+
+HandleEvent
+cmInsert:
+{
+   var _cVPlan: tNRec;
+             _cVPlan := pOrderGrp;
+             if (RunInterFace('GrvPlan', _cVPlan, 0, 17) != cmCancel)
+             {
+                set pOrderGrp := _cVPlan;
+                insert unidoc_vplan
+                set unidoc_vplan.wtype:=31015
+                , unidoc_vplan.cpodr:=pOrderGrp
+                , unidoc_vplan.ADDCOMP[1]:=pOrderGrp
+                ;
+             }
+
+  ReReadRecord;
+}
+
+cmDelete:
+{
+  Delete current unidoc_vplan;
+  ReReadRecord;
+}
+end;  //HandleEvent winPickExcludedVplan
+
+End;   //winPickExcludedVplan
+
+function Set_strPrefix : string;
+{
+ result := if (_TypeFot=0,'АВАНС',' ЗП');
+}
+procedure FillSpkau_period;
+{
+  //создаем в spkau папки год - месяц для хранения плановых сумм распределения
+  var dUv : date = dGetTune('UP.DATOTCH');
+
+  cSpKau := 0h;
+  if (getFirst FastFirstRow SpKau where ((                  wSpKau == SpKau.KodGrKau
+                                             and String(Year(dUv)) == SpKau.Code
+                                            and String(Month(dUv)) == SpKau.Name (noIndex)
+                                               and Set_strPrefix() == SpKau.LevelCode (noIndex)
+                                        )) <> tsOk) then
+  {
+    ClearBuffer(#SpKau);
+      SpKau.nRec      := 0h;
+      SpKau.Code      := String(Year(dUv));
+      SpKau.Name      := String(Month(dUv));
+      SpKau.KodGrKau  := wSpKau;
+      SpKau.LevelCode := Set_strPrefix();
+    Insert Current SpKau;
+  }
+ set cSpKau := SpKau.nRec;
+}
+
+//  верхний брауз интерфейса. Собран из уникальных vplan
+//  при условии наличия у них ссылки на счет, который имеет ИГК
+Procedure Fill_tmpItog;
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Сбор тем гос. заказов', 0);
+  delete all tmpItog;
+
+  var qStr : longint = 0;
+
+  sqlFreeStr(qStr);
+
+  MysqlAddStr(qStr, ' select distinct                                                                                                    ');
+  MysqlAddStr(qStr, '   vplan.nrec    as cVPlan                                                                                          ');
+  MysqlAddStr(qStr, ' , av.vcomp      as cBankSch                                                                                        ');
+  //MysqlAddStr(qStr, ' , vplan.name    as sVPlan                                                                                        ');
+  MysqlAddStr(qStr, ' , 0.0           as dSumRaspPlan                                                                                    ');
+  MysqlAddStr(qStr, ' , 0.0           as dSumRaspFactS                                                                                   ');
+  MysqlAddStr(qStr, ' , 0.0           as dSumRaspFactO                                                                                   ');
+  MysqlAddStr(qStr, ' , 0.0           as sPercent                                                                                        ');
+  MysqlAddStr(qStr, ' from vplan                                                                                                         ');
+  MysqlAddStr(qStr, ' inner join attrnam an on ' + word(coVPlan) + ' = an.wtable and ''' + string(AnBankSch) + ''' = an.name             ');
+  MysqlAddStr(qStr, ' inner join attrval av on ' + word(coVPlan) + ' = av.wtable and an.nrec = av.cattrnam and vplan.nrec = av.crec      ');
+  MysqlAddStr(qStr, ' inner join attrnam an1 on ' + word(coVPlan) + ' = an1.wtable and ''' + string(AnArch) + ''' = an1.name             ');
+  MysqlAddStr(qStr, '  left join attrval av1 on ' + word(coVPlan) + ' = av1.wtable and an1.nrec = av1.cattrnam and vplan.nrec = av1.crec ');
+  MysqlAddStr(qStr, ' where coalesce(av1.vlongint, 0) <> 1                                                                               ');
+  MysqlAddStr(qStr, ' union all                                                                                                          ');
+  MysqlAddStr(qStr, ' select                                                                                                             ');
+  MysqlAddStr(qStr, '   #comp('+string(coVirtualcVPlan)+')    as cVPlan                                                                  ');
+  MysqlAddStr(qStr, ' , #comp(0h)     as cBankSch                                                                                        ');
+  MysqlAddStr(qStr, ' , 0.0           as dSumRaspPlan                                                                                    ');
+  MysqlAddStr(qStr, ' , 0.0           as dSumRaspFactS                                                                                   ');
+  MysqlAddStr(qStr, ' , 0.0           as dSumRaspFactO                                                                                   ');
+  MysqlAddStr(qStr, ' , 0.0           as sPercent                                                                                        ');
+   MysqlAddStr(qStr, ' union all                                                                                                          ');
+  MysqlAddStr(qStr, ' select                                                                                                             ');
+  MysqlAddStr(qStr, '   #comp('+string(coVirtualcVPlan2)+')    as cVPlan                                                                  ');
+  MysqlAddStr(qStr, ' , #comp(0h)     as cBankSch                                                                                        ');
+  MysqlAddStr(qStr, ' , 0.0           as dSumRaspPlan                                                                                    ');
+  MysqlAddStr(qStr, ' , 0.0           as dSumRaspFactS                                                                                   ');
+  MysqlAddStr(qStr, ' , 0.0           as dSumRaspFactO                                                                                   ');
+  MysqlAddStr(qStr, ' , 0.0           as sPercent                                                                                        ');
+
+  var objQuery: iQuery;
+      objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка поиска гос. заказов (Fill_tmpItog) '+ objQuery.errorCode, Error);
+    sqlFreeStr(qStr);
+    StopVisual;
+    Exit;
+  }
+  else
+  {
+    sqlCopyInto(objQuery, tntmpItog, true);
+  }
+
+  _Loop tmpItog
+  {
+    if (tmpItog.cVPlan = comp(coVirtualcVPlan) or tmpItog.cVPlan = comp(coVirtualcVPlan2)) then
+    {
+      continue;
+    }
+    if ( oIGK_Dog.GetFullIGKByBank(tmpItog.cBankSch) = '' ) then
+    {
+      Delete Current tmpItog;
+    }
+  }
+  StopVisual;
+}
+
+Procedure UpdateItogsByVPlan;
+{
+  SetVisualHeader('Подсчет итогов по темам');
+  PushPos(tntmpItog);
+  _Loop tmpItog
+  {
+    tmpItog.dSumRaspFactO := 0;
+    tmpItog.dSumRaspFactS := 0;
+
+    _Loop tmpRasprLoop where ((tmpItog.cVplan == tmpRasprLoop.cVplan))
+    {
+      if (tmpRasprLoop.wType > 0) then
+      {
+        tmpItog.dSumRaspFactS := tmpItog.dSumRaspFactS  + tmpRasprLoop.dSumGoz;
+      }
+      //распределенные накладные
+      if (tmpRasprLoop.wType = 0 and tmpRasprLoop.cVplan <> 0h) then
+      {
+        tmpItog.dSumRaspFactO := tmpItog.dSumRaspFactO  + tmpRasprLoop.dSumGoz;
+      }
+    }
+    var x : double = Get_Sum_vplan_WO_Excl(true);
+    //Mylog(vplan.name + '|' + tmpItog.dSumRaspFactO + '|' + x);
+    tmpItog.dPercent := Round(tmpItog.dSumRaspFactO / x * 100, coDecimalPoint);
+    Update current tmpItog;
+  }
+  if (getFirst tmpItog = tsOk) then {ReScanPanel(tntmpItog);}
+  PopPos(tntmpItog);
+}
+Procedure LoadPlanSum;
+{
+FillSpkau_period;
+    mylog('Procedure LoadPlanSum;');
+    mylog('    wSpKau ='+ wSpKau);
+    mylog('    cSpKau ='+ cSpKau);
+
+  _Loop tmpItogLoop
+  {
+    Set tmpItogLoop.dSumRaspPlan := 0;
+    mylog('     tmpItogLoop.cVPlan =  ' + tmpItogLoop.cVPlan) ;
+    if ( getFirst FastFirstRow SpKau where ((     wSpKau == SpKau.KodGrKau
+                                              and cSpKau == SpKau.cNode
+                                              and string(tmpItogLoop.cVPlan) == SpKau.LevelCode
+                                           )) = tsOk) then
+    {
+      mylog('     getFirst FastFirstRow SpKau where ((     wSpKau == SpKau.KodGrKau) Double(SpKau.Code) = ' + Double(SpKau.Code));
+      Set tmpItogLoop.dSumRaspPlan := Double(SpKau.Code);
+    }
+    Update Current tmpItogLoop;
+  }
+  if (getFirst tmpItog = tsOk) then {ReScanPanel(tntmpItog);}
+}
+
+Procedure Fill_tmpRaspr;
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Сбор сумм распределения по людям', 0);
+  LoadPlanSum;
+  delete all tmpRasprLoop;
+
+  var qStr : longint = 0;
+  ClearFuncCache;
+  sqlFreeStr(qStr);
+
+  var dUv : date = dGetTune('UP.DATOTCH');
+
+  //аванс
+  if (_TypeFot = 0) then
+  {
+    SetVisualHeader('Сбор сумм распределения аванса по людям');
+
+    MysqlAddStr(qStr, ' select                                                                                                                                          ');
+    MysqlAddStr(qStr, '   t.cLSchet                               as cLSchet                                                                                            ');
+    MysqlAddStr(qStr, ' , t.cPerson                               as cPerson                                                                                            ');
+    MysqlAddStr(qStr, ' , t.cVPlan                                as cVPlan                                                                                             ');
+    MysqlAddStr(qStr, ' , t.sPerson                               as sPerson                                                                                            ');
+    MysqlAddStr(qStr, ' , t.sTabN                                 as sTabN                                                                                              ');
+    MysqlAddStr(qStr, ' , t.dSum                                  as dSum                                                                                               ');
+    MysqlAddStr(qStr, ' , t.dNdfl                                 as dNdfl                                                                                              ');
+    MysqlAddStr(qStr, ' , t.dPercent                              as dPercent                                                                                           ');
+    MysqlAddStr(qStr, ' , t.dPercent                              as dPercentOld                                                                                        ');
+    MysqlAddStr(qStr, ' , Round(t.dSum * t.dPercent / 100.0, 2)   as dSumGoz                                                                                            ');
+    MysqlAddStr(qStr, ' , t.wType                                 as wType                                                                                              ');
+    MysqlAddStr(qStr, ' from (                                                                                                                                          ');
+    MysqlAddStr(qStr, ' select                                                                                                                                          ');
+    MysqlAddStr(qStr, '   lschet.nrec                         as cLSchet                                                                                                ');
+    MysqlAddStr(qStr, ' , persons.nrec                        as cPerson                                                                                                ');
+    MysqlAddStr(qStr, ' , t_rasp.cVPlan                       as cVPlan                                                                                                 ');
+    MysqlAddStr(qStr, ' , persons.fio                         as sPerson                                                                                                ');
+    MysqlAddStr(qStr, ' , persons.strtabn                     as sTabN                                                                                                  ');
+    MysqlAddStr(qStr, ' , sum(nach226.sumAV)                  as dSum                                                                                          ');
+    //MysqlAddStr(qStr, ' , sum(lschet.avfakt)                           as dSum                                                                                          ');
+    MysqlAddStr(qStr, ' , 0.0                                 as dNdfl                                                                                                  ');
+    MysqlAddStr(qStr, ' , t_rasp.dPercent                     as dPercent                                                                                               ');
+    MysqlAddStr(qStr, ' , t_rasp.wType                        as wType                                                                                                  ');
+    MysqlAddStr(qStr, ' from  lschet                                                                                                                                    ');
+    MysqlAddStr(qStr, ' inner join persons on lschet.tperson = persons.nrec                                                                                             ');
+    MysqlAddStr(qStr, ' inner join katpodr on lschet.cex = katpodr.nrec                                                                                                 ');
+    MysqlAddStr(qStr, ' outer apply (                                                                                                                                   ');
+    MysqlAddStr(qStr, ' select sum(uder.sumud) sumAV from uder                                                                                                          ');
+    MysqlAddStr(qStr, ' where mesn='+string(Month(dUv))+' and yearn='+string(Year(dUv))+' and VIDUDS=141                                                                ');
+    MysqlAddStr(qStr, ' and uder.clsch=lschet.nrec                                                                                                                      ');
+    MysqlAddStr(qStr, ' ) nach226                                                                                                                                       ');
+    MysqlAddStr(qStr, ' outer apply (                                                                                                                                   ');
+    MysqlAddStr(qStr, '                 select                                                                                                                          ');
+    MysqlAddStr(qStr, '                   vplan.nrec            as cVplan                                                                                               ');
+    MysqlAddStr(qStr, '                 , vplan.name            as sVplan                                                                                               ');
+    MysqlAddStr(qStr, '                 , gp_raspavans.procent  as dPercent                                                                                             ');
+    MysqlAddStr(qStr, '                 , gp_raspavans.wtype    as wtype                                                                                                ');
+    MysqlAddStr(qStr, '                 from gp_raspavans                                                                                                               ');
+    MysqlAddStr(qStr, '                 left join vplan on gp_raspavans.cvplan = vplan.nrec                                                                             ');
+    MysqlAddStr(qStr, '                 where     lschet.nrec = gp_raspavans.clschet                                                                                    ');
+    MysqlAddStr(qStr, '                       and persons.nrec = gp_raspavans.cpersons                                                                                  ');
+    MysqlAddStr(qStr, '                       and gp_raspavans.isarh = 0                                                                                                ');
+    MysqlAddStr(qStr, '                       and gp_raspavans.datan = #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                   ');
+    MysqlAddStr(qStr, '                       and gp_raspavans.dataok = #date(' + Day(15) + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                   ');
+    MysqlAddStr(qStr, ' ) t_rasp                                                                                                                                        ');
+    MysqlAddStr(qStr, ' where     nach226.sumAV > 0.01                                                                                                                  ');
+    MysqlAddStr(qStr, '       and lschet.summa27 <> 0                                                                                                                   ');
+    MysqlAddStr(qStr, '       and katpodr.kod not in (  ''446'', ''Вет''                                                                                       ');
+    MysqlAddStr(qStr, '                               , ''_Профком'', ''_Студенты'', ''_ФИЗ ЛИЦ'', '''')                                                                ');
+    MysqlAddStr(qStr, '       and ( lschet.datuv = #date(0, 0, 0) or lschet.datuv >= #date(' + Day(dUv) + ', ' + Month(dUv) + ', ' + Year(dUv) + ') )                   ');
+    MysqlAddStr(qStr, ' group by    lschet.nrec                                                                                                                         ');
+    MysqlAddStr(qStr, '           , persons.nrec                                                                                                                        ');
+    MysqlAddStr(qStr, '           , t_rasp.cVPlan                                                                                                                       ');
+    MysqlAddStr(qStr, '           , persons.fio                                                                                                                         ');
+    MysqlAddStr(qStr, '           , persons.strtabn                                                                                                                     ');
+    MysqlAddStr(qStr, '           , t_rasp.dPercent                                                                                                                     ');
+    MysqlAddStr(qStr, '           , t_rasp.wType                                                                                                                        ');
+    MysqlAddStr(qStr, ' ) t                                                                                                                                             ');
+
+    var objQuery: iQuery;
+      objQuery := queryManager.createQuery(qStr);
+    if (objQuery.execute.errorCode != tsOk) then
+    {
+      Message('Ошибка сбора сумм аванса (Fill_tmpRaspr) '+ objQuery.errorCode, Error);
+      sqlFreeStr(qStr);
+      StopVisual;
+      Exit;
+    }
+    else
+    {
+      sqlCopyInto(objQuery, tntmpRasprLoop, true);
+      //RecalcItog;
+    }
+
+  }
+  //ЗП
+  if (_TypeFot = 1) then
+  {
+    SetVisualHeader('Сбор сумм распределения зар. платы по людям');
+    /*
+    ПЕУ разродилось на ТЗ, заменяем алгоритм сбора часов, разноски по темам
+    MysqlAddStr(qStr, ' select                                                                                                                                                   ');
+    MysqlAddStr(qStr, '   lschet.nrec                                         as cLSchet                                                                                         ');
+    MysqlAddStr(qStr, ' , persons.nrec                                        as cPerson                                                                                         ');
+    MysqlAddStr(qStr, ' , t_rasp.cVPlan                                       as cVPlan                                                                                          ');
+    MysqlAddStr(qStr, ' , persons.fio                                         as sPerson                                                                                         ');
+    MysqlAddStr(qStr, ' , lschet.strtabn                                      as sTabN                                                                                           ');
+    MysqlAddStr(qStr, ' , coalesce(t_ls_sum.dSum  , 0)                        as dSum                                                                                            ');
+    MysqlAddStr(qStr, ' , coalesce(t_ls_ndfl.dSum , 0)                        as dNdfl                                                                                           ');
+    MysqlAddStr(qStr, ' , case when (t_SumH.dSum_vPlan = 0) then 0 else Round(t_rasp.dSumH_ls / t_SumH.dSum_vPlan, '+string(coDecimalPoint)+') end * 100 as dPercent                                      ');
+    MysqlAddStr(qStr, ' , case when (t_SumH.dSum_vPlan = 0) then 0 else Round(t_rasp.dSumH_ls / t_SumH.dSum_vPlan, '+string(coDecimalPoint)+') end * 100 as dPercentOld                                   ');
+    MysqlAddStr(qStr, ' , case when (t_SumH.dSum_vPlan = 0) then 0 else Round(t_ls_sum.dSum * t_rasp.dSumH_ls / t_SumH.dSum_vPlan, 2) end as dSumGoz                             ');
+    MysqlAddStr(qStr, ' , case when (    coalesce(substring(t_prnaryad.ssch, 2, 2), substring(t_prvidopl.ssch, 2, 2)) in (''25'', ''26'')                                                                                    ');
+    MysqlAddStr(qStr, '               or coalesce(substring(t_prnaryad.smnp, 2, 2), substring(t_prvidopl.smnp, 2, 2)) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')                                    ');
+    MysqlAddStr(qStr, '               or coalesce(t_prnaryad.smnp, t_prvidopl.smnp) in (''239000000120'', ''239000300120'')                                                                                 ');
+    MysqlAddStr(qStr, '             ) then 0                                                                                                                                     ');
+    MysqlAddStr(qStr, '        else t_rasp.wType                                                                                                                                 ');
+    MysqlAddStr(qStr, '   end                                                as wType                                                                                            ');
+    MysqlAddStr(qStr, ' , t_rasp.cBankS                                       as cBankS                                                                                          ');
+    MysqlAddStr(qStr, ' from lschet                                                                                                                                              ');
+    MysqlAddStr(qStr, ' inner join persons on lschet.tperson = persons.nrec                                                                                                      ');
+    MysqlAddStr(qStr, '  left join katpodr on lschet.cex = katpodr.nrec                                                                                                          ');
+    MysqlAddStr(qStr, ' outer apply (                                                                                                                                            ');
+    MysqlAddStr(qStr, '                 select                                                                                                                                   ');
+    MysqlAddStr(qStr, '                   sum(uder.sumud) as dSum                                                                                                                ');
+    MysqlAddStr(qStr, '                 from uder                                                                                                                                ');
+    MysqlAddStr(qStr, '                 where     lschet.nrec = uder.clsch                                                                                                       ');
+    MysqlAddStr(qStr, '                       and uder.mesv = ' + Month(dUv) + '                                                                                                 ');
+    MysqlAddStr(qStr, '                       and uder.yearv = ' + Year(dUv) + '                                                                                                 ');
+    MysqlAddStr(qStr, '                       and uder.vidud = 500 having sum(uder.sumud) >= 0.01                                                                                ');
+    MysqlAddStr(qStr, ' ) t_ls_sum                                                                                                                                               ');
+    MysqlAddStr(qStr, ' outer apply (                                                                                                                                            ');
+    MysqlAddStr(qStr, '                 select                                                                                                                                   ');
+    MysqlAddStr(qStr, '                   sum(uder.sumud) as dSum                                                                                                                ');
+    MysqlAddStr(qStr, '                 from uder                                                                                                                                ');
+    MysqlAddStr(qStr, '                 where     lschet.nrec = uder.clsch                                                                                                       ');
+    MysqlAddStr(qStr, '                       and uder.mesv = ' + Month(dUv) + '                                                                                                 ');
+    MysqlAddStr(qStr, '                       and uder.yearv = ' + Year(dUv) + '                                                                                                 ');
+    MysqlAddStr(qStr, '                       and uder.vidud = 213 having sum(uder.sumud) >= 0.01                                                                                ');
+    MysqlAddStr(qStr, ' ) t_ls_ndfl                                                                                                                                              ');
+    MysqlAddStr(qStr, ' outer apply (                                                                                                                                            ');
+    MysqlAddStr(qStr, '                 select                                                                                                                                   ');
+    MysqlAddStr(qStr, '                   mnplan.cvplan         as cVplan                                                                                                        ');
+    MysqlAddStr(qStr, '                 , ''''                  as sVplan                                                                                                        ');
+    MysqlAddStr(qStr, '                 , sum(prnaryad.chasf)   as dSumH_ls                                                                                                      ');
+    MysqlAddStr(qStr, '                 , case when (av.vcomp is null) then 2 else 1 end  as wtype                                                                                                         ');
+    MysqlAddStr(qStr, '                 , lschet.nrec           as clschet                                                                                                       ');
+    MysqlAddStr(qStr, '                 , av.vcomp as cBankS                                                                                                                     ');
+    MysqlAddStr(qStr, '                 from prnaryad                                                                                                                            ');
+    MysqlAddStr(qStr, '                 left join sys_nar on prnaryad.mnrec = sys_nar.nrec                                                                                       ');
+    MysqlAddStr(qStr, '                 left join mnplan on case when prnaryad.tbld[1] = 7 then prnaryad.ckaud[1]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[2] = 7 then prnaryad.ckaud[2]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[3] = 7 then prnaryad.ckaud[3]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[4] = 7 then prnaryad.ckaud[4]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[5] = 7 then prnaryad.ckaud[5]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[6] = 7 then prnaryad.ckaud[6]                                                       ');
+    MysqlAddStr(qStr, '                                          else #comp(0h)                                                                                         ');
+    MysqlAddStr(qStr, '                                     end = mnplan.nrec                                                                                           ');
+    MysqlAddStr(qStr, '                 inner join attrnam an on ' + word(coVPlan) + ' = an.wtable and ''' + string(AnBankSch) + ''' = an.name                                   ');
+    MysqlAddStr(qStr, '                  left join attrval av on ' + word(coVPlan) + ' = av.wtable and an.nrec = av.cattrnam and mnplan.cvplan = av.crec                         ');
+    MysqlAddStr(qStr, '                 where     lschet.nrec = prnaryad.clsch                                                                                                   ');
+    MysqlAddStr(qStr, '                       and sys_nar.choice < 900                                                                                                           ');
+    MysqlAddStr(qStr, '                       and prnaryad.datan >= #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                               ');
+    MysqlAddStr(qStr, '                       and (#date(' + Day(dUv)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ') <= prnaryad.DatOk or prnaryad.DatOk = #date(0, 0, 0))        ');
+    //добавляем доп ограничения 22/04/2021
+    //MysqlAddStr(qStr, '                       and prnaryad.cschetd not in (''20'')                                                                                               ');
+
+    MysqlAddStr(qStr, '                 group by mnplan.cvplan, av.vcomp                                                                                                         ');
+    MysqlAddStr(qStr, ' ) t_rasp                                                                                                                                                 ');
+    MysqlAddStr(qStr, ' left join (                                                                                                                                              ');
+    MysqlAddStr(qStr, '                 select                                                                                                                                   ');
+    MysqlAddStr(qStr, '                   sum(prnaryad.chasf) as dSum_vPlan, prnaryad.clsch as clsch                                                                             ');
+    MysqlAddStr(qStr, '                 from prnaryad                                                                                                                            ');
+    MysqlAddStr(qStr, '                 left join sys_nar on prnaryad.mnrec = sys_nar.nrec                                                                                       ');
+    MysqlAddStr(qStr, '                 where     sys_nar.choice < 900                                                                                                           ');
+    MysqlAddStr(qStr, '                       and prnaryad.datan >= #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                               ');
+    MysqlAddStr(qStr, '                       and (#date(' + Day(dUv)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ') <= prnaryad.DatOk or prnaryad.DatOk = #date(0, 0, 0))        ');
+    //добавляем доп ограничения 22/04/2021
+    //MysqlAddStr(qStr, '                       and prnaryad.cschetd not in (''20'')                                                                                               ');
+
+    MysqlAddStr(qStr, '                 group by prnaryad.clsch                                                                                                                  ');
+    MysqlAddStr(qStr, ' ) t_sumH on t_sumH.clsch = lschet.nrec                                                                                                                   ');
+
+    //добавляем доп ограничения 22/04/2021
+    MysqlAddStr(qStr, ' outer apply (                                                                                                                                   ');
+    MysqlAddStr(qStr, '                 select top 1                                                                                                                    ');
+    MysqlAddStr(qStr, '                   coalesce(mnplan.number, '''') as smnp                                                                                         ');
+    MysqlAddStr(qStr, '                 , buhschet.schet as ssch                                                                                                        ');
+    MysqlAddStr(qStr, '                 from prvidopl                                                                                                                   ');
+    MysqlAddStr(qStr, '                 left join mnplan on case when prvidopl.tbld[1] = 7 then prvidopl.ckaud[1]                                                       ');
+    MysqlAddStr(qStr, '                                          when prvidopl.tbld[2] = 7 then prvidopl.ckaud[2]                                                       ');
+    MysqlAddStr(qStr, '                                          when prvidopl.tbld[3] = 7 then prvidopl.ckaud[3]                                                       ');
+    MysqlAddStr(qStr, '                                          when prvidopl.tbld[4] = 7 then prvidopl.ckaud[4]                                                       ');
+    MysqlAddStr(qStr, '                                          when prvidopl.tbld[5] = 7 then prvidopl.ckaud[5]                                                       ');
+    MysqlAddStr(qStr, '                                          when prvidopl.tbld[6] = 7 then prvidopl.ckaud[6]                                                       ');
+    MysqlAddStr(qStr, '                                          else #comp(0h)                                                                                         ');
+    MysqlAddStr(qStr, '                                     end = mnplan.nrec                                                                                           ');
+    MysqlAddStr(qStr, '                 left join buhschet on mnplan.canval2 = buhschet.nrec                                                                            ');
+    MysqlAddStr(qStr, '                 where LSchet.nrec = prvidopl.clsch                                                                                              ');
+    MysqlAddStr(qStr, '                       and prvidopl.datan >= #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                      ');
+    MysqlAddStr(qStr, '                       and prvidopl.datok <= #date(' + Last_Day(dUv) + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                 ');
+    MysqlAddStr(qStr, ' ) t_prvidopl                                                                                                                                    ');
+    MysqlAddStr(qStr, '                                                                                                                                                 ');
+    MysqlAddStr(qStr, ' outer apply (                                                                                                                                   ');
+    MysqlAddStr(qStr, '                 select top 1                                                                                                                    ');
+    MysqlAddStr(qStr, '                   coalesce(mnplan.number, '''') as smnp                                                                                         ');
+    MysqlAddStr(qStr, '                 , buhschet.schet as ssch                                                                                                        ');
+    MysqlAddStr(qStr, '                 from prnaryad                                                                                                                   ');
+    MysqlAddStr(qStr, '                 left join sys_nar on prnaryad.mnrec = sys_nar.nrec                                                                              ');
+    MysqlAddStr(qStr, '                 left join mnplan on case when prnaryad.tbld[1] = 7 then prnaryad.ckaud[1]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[2] = 7 then prnaryad.ckaud[2]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[3] = 7 then prnaryad.ckaud[3]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[4] = 7 then prnaryad.ckaud[4]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[5] = 7 then prnaryad.ckaud[5]                                                       ');
+    MysqlAddStr(qStr, '                                          when prnaryad.tbld[6] = 7 then prnaryad.ckaud[6]                                                       ');
+    MysqlAddStr(qStr, '                                          else #comp(0h)                                                                                         ');
+    MysqlAddStr(qStr, '                                     end = mnplan.nrec                                                                                           ');
+    MysqlAddStr(qStr, '                 left join buhschet on mnplan.canval2 = buhschet.nrec                                                                            ');
+    MysqlAddStr(qStr, '                 where LSchet.nrec = prnaryad.clsch                                                                                              ');
+    MysqlAddStr(qStr, '                       and prnaryad.datan = #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                       ');
+    MysqlAddStr(qStr, '                       and prnaryad.datok = #date(' + Last_Day(dUv) + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                  ');
+    MysqlAddStr(qStr, '                       and sys_nar.choice < 900                                                                                                  ');
+    MysqlAddStr(qStr, ' ) t_prnaryad                                                                                                                                    ');
+    // конец доп ограничений 22/04/2021
+    MysqlAddStr(qStr, ' where (    t_ls_ndfl.dsum is not null                                                                                                           ');
+    MysqlAddStr(qStr, '         or t_ls_sum.dSum is not null )                                                                                                          ');
+    MysqlAddStr(qStr, '        and katpodr.kod not in (  ''446'', ''999'', ''Вет''                                                                                      ');
+    MysqlAddStr(qStr, '                                , ''_Профком'', ''_Студенты'', ''_ФИЗ ЛИЦ'', '''')                                                               ');
+    MysqlAddStr(qStr, '        and ( lschet.datuv = #date(0, 0, 0) or lschet.datuv >= #date(' + Day(dUv) + ', ' + Month(dUv) + ', ' + Year(dUv) + ') )                  ');
+    MysqlAddStr(qStr, '        and lschet.summa27 <> 0                                                                                                                  ');
+    //MysqlAddStr(qStr, '        and t_prvidopl.cprvidopl is null                                                                                                         ');
+    //MysqlAddStr(qStr, '        and t_prnaryad.cprnaryad is null                                                                                                         ');
+    */
+
+
+
+    MysqlAddStr(qStr, '  select                                                                                                                                                         ');
+    MysqlAddStr(qStr, '    lschet.nrec                                         as cLSchet                                                                                               ');
+    MysqlAddStr(qStr, '  , persons.nrec                                        as cPerson                                                                                               ');
+    MysqlAddStr(qStr, '  , coalesce(t_rasp.cVPlan, t_rasp2.cVPlan)             as cVPlan                                                                                                ');
+    MysqlAddStr(qStr, '  , persons.fio                                         as sPerson                                                                                               ');
+    MysqlAddStr(qStr, '  , lschet.strtabn                                      as sTabN                                                                                                 ');
+    MysqlAddStr(qStr, '  , coalesce(t_ls_sum.dSum  , 0)                        as dSum                                                                                                  ');
+    MysqlAddStr(qStr, '  , coalesce(t_ls_ndfl.dSum , 0)                        as dNdfl                                                                                                 ');
+    MysqlAddStr(qStr, '  , case when (coalesce(t_SumH.dSum_vPlan, t_SumH2.dSum_vPlan) = 0) then 0                                                                                       ');
+    MysqlAddStr(qStr, '         else Round(coalesce(t_rasp.dSumH_ls, t_rasp2.dSumH_ls) * 100 / coalesce(t_SumH.dSum_vPlan, t_SumH2.dSum_vPlan), 2)                                      ');
+    MysqlAddStr(qStr, '    end                                           as dPercent                                                                                                    ');
+    MysqlAddStr(qStr, '  , case when (coalesce(t_SumH.dSum_vPlan, t_SumH2.dSum_vPlan) = 0) then 0                                                                                       ');
+    MysqlAddStr(qStr, '         else Round(coalesce(t_rasp.dSumH_ls, t_rasp2.dSumH_ls) * 100 / coalesce(t_SumH.dSum_vPlan, t_SumH2.dSum_vPlan), 2)                                      ');
+    MysqlAddStr(qStr, '    end                                           as dPercentOld                                                                                                 ');
+    MysqlAddStr(qStr, '  , case when (coalesce(t_SumH.dSum_vPlan, t_SumH2.dSum_vPlan) = 0) then 0                                                                                       ');
+    MysqlAddStr(qStr, '         else Round(coalesce(t_ls_sum.dSum, 0) * coalesce(t_rasp.dSumH_ls, t_rasp2.dSumH_ls) / coalesce(t_SumH.dSum_vPlan, t_SumH2.dSum_vPlan), 2)                            ');
+    MysqlAddStr(qStr, '            + Round(coalesce(t_ls_ndfl.dSum, 0) * coalesce(t_rasp.dSumH_ls, t_rasp2.dSumH_ls) / coalesce(t_SumH.dSum_vPlan, t_SumH2.dSum_vPlan), 0)                           ');
+    MysqlAddStr(qStr, '    end                                                 as dSumGoz                                                                                               ');
+    MysqlAddStr(qStr, '  , coalesce(t_rasp.wType, t_rasp2.wType)               as wType                                                                                                 ');
+    MysqlAddStr(qStr, '  , coalesce(t_rasp.cBankS, t_rasp2.cBankS)             as cBankS                                                                                                ');
+    MysqlAddStr(qStr, '  from lschet                                                                                                                                                    ');
+    MysqlAddStr(qStr, '  inner join persons on lschet.tperson = persons.nrec                                                                                                            ');
+    MysqlAddStr(qStr, '   left join katpodr on lschet.cex = katpodr.nrec                                                                                                                ');
+    MysqlAddStr(qStr, '  outer apply (                                                                                                                                                  ');
+    MysqlAddStr(qStr, '                  select                                                                                                                                         ');
+    MysqlAddStr(qStr, '                    sum(uder.sumud) as dSum                                                                                                                      ');
+    MysqlAddStr(qStr, '                  from uder                                                                                                                                      ');
+    MysqlAddStr(qStr, '                  where     lschet.nrec = uder.clsch                                                                                                             ');
+    MysqlAddStr(qStr, '                        and uder.mesv = ' + Month(dUv) + '                                                                                                       ');
+    MysqlAddStr(qStr, '                        and uder.yearv = ' + Year(dUv) + '                                                                                                       ');
+    MysqlAddStr(qStr, '                        and uder.vidud = 500 having sum(uder.sumud) >= 0.01                                                                                      ');
+    MysqlAddStr(qStr, '  ) t_ls_sum                                                                                                                                                     ');
+    MysqlAddStr(qStr, '  outer apply (                                                                                                                                                  ');
+    MysqlAddStr(qStr, '                  select                                                                                                                                         ');
+    MysqlAddStr(qStr, '                    sum(uder.sumud) as dSum                                                                                                                      ');
+    MysqlAddStr(qStr, '                  from uder                                                                                                                                      ');
+    MysqlAddStr(qStr, '                  where     lschet.nrec = uder.clsch                                                                                                             ');
+    MysqlAddStr(qStr, '                        and uder.mesv = ' + Month(dUv) + '                                                                                                       ');
+    MysqlAddStr(qStr, '                        and uder.yearv = ' + Year(dUv) + '                                                                                                       ');
+    MysqlAddStr(qStr, '                        and uder.vidud = 213 having sum(uder.sumud) >= 0.01                                                                                      ');
+    MysqlAddStr(qStr, '  ) t_ls_ndfl                                                                                                                                                    ');
+    MysqlAddStr(qStr, '  outer apply (                                                                                                                                                  ');
+    MysqlAddStr(qStr, '                  select                                                                                                                                         ');
+    MysqlAddStr(qStr, '                    case when (      (av.vcomp is null or av.vcomp = #comp(0h))                                                                                  ');
+    MysqlAddStr(qStr, '                                 and substring(buhschet.schet, 2, 2) not in (''25'', ''26'')                                                                     ');
+    MysqlAddStr(qStr, '                                 and substring(mnplan.number, 1, 2) not in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')                      ');
+    MysqlAddStr(qStr, '                                 and mnplan.number not in (''239000000120'', ''239000300120'')) then #comp('+string(coVirtualcVPlan)+')                          ');
+    MysqlAddStr(qStr, '                         else case when (     substring(buhschet.schet, 2, 2) in (''25'', ''26'')                                                                ');
+    MysqlAddStr(qStr, '                                           or substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')                 ');
+    MysqlAddStr(qStr, '                                           or mnplan.number in (''239000000120'', ''239000300120'')) then #comp(0h)                                              ');
+    MysqlAddStr(qStr, '                                   else mnplan.cvplan                                                                                                            ');
+    MysqlAddStr(qStr, '                              end                                                                                                                                ');
+    MysqlAddStr(qStr, '                    end as cVplan                                                                                                                                ');
+    MysqlAddStr(qStr, '                  , ''''                  as sVplan                                                                                                              ');
+    MysqlAddStr(qStr, '                  , sum(prnaryad.chasf)   as dSumH_ls                                                                                                            ');
+    MysqlAddStr(qStr, '                  , case when (      (av.vcomp is null or av.vcomp = #comp(0h))                                                                                  ');
+    MysqlAddStr(qStr, '                                 and substring(buhschet.schet, 2, 2) not in (''25'', ''26'')                                                                     ');
+    MysqlAddStr(qStr, '                                 and substring(mnplan.number, 1, 2) not in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')                      ');
+    MysqlAddStr(qStr, '                                 and mnplan.number not in (''239000000120'', ''239000300120'')) then 2                                                           ');
+    MysqlAddStr(qStr, '                         else case when (     substring(buhschet.schet, 2, 2) in (''25'', ''26'')                                                                ');
+    MysqlAddStr(qStr, '                                           or substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')                 ');
+    MysqlAddStr(qStr, '                                           or mnplan.number in (''239000000120'', ''239000300120'')) then 0                                                      ');
+    MysqlAddStr(qStr, '                                   else 1                                                                                                                        ');
+    MysqlAddStr(qStr, '                              end                                                                                                                                ');
+    MysqlAddStr(qStr, '                    end                   as wtype                                                                                                               ');
+    MysqlAddStr(qStr, '                  , lschet.nrec           as clschet                                                                                                             ');
+    MysqlAddStr(qStr, '                  , av.vcomp as cBankS                                                                                                                           ');
+    MysqlAddStr(qStr, '                  from prnaryad                                                                                                                                  ');
+    MysqlAddStr(qStr, '                  left join sys_nar on prnaryad.mnrec = sys_nar.nrec                                                                                             ');
+    MysqlAddStr(qStr, '                  left join mnplan on case when prnaryad.tbld[1] = 7 then prnaryad.ckaud[1]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prnaryad.tbld[2] = 7 then prnaryad.ckaud[2]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prnaryad.tbld[3] = 7 then prnaryad.ckaud[3]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prnaryad.tbld[4] = 7 then prnaryad.ckaud[4]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prnaryad.tbld[5] = 7 then prnaryad.ckaud[5]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prnaryad.tbld[6] = 7 then prnaryad.ckaud[6]                                                                      ');
+    MysqlAddStr(qStr, '                                           else #comp(0h)                                                                                                        ');
+    MysqlAddStr(qStr, '                                      end = mnplan.nrec                                                                                                          ');
+    MysqlAddStr(qStr, '                  inner join attrnam an on ' + word(coVPlan) + ' = an.wtable and ''Банковские счета'' = an.name                                                  ');
+    MysqlAddStr(qStr, '                   left join attrval av on ' + word(coVPlan) + ' = av.wtable and an.nrec = av.cattrnam and mnplan.cvplan = av.crec                               ');
+    MysqlAddStr(qStr, '                   left join buhschet on mnplan.canval2 = buhschet.nrec                                                                                          ');
+    MysqlAddStr(qStr, '                  where     lschet.nrec = prnaryad.clsch                                                                                                         ');
+    MysqlAddStr(qStr, '                        and sys_nar.choice < 900                                                                                                                 ');
+    MysqlAddStr(qStr, '                        and prnaryad.datan >= #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                                     ');
+    MysqlAddStr(qStr, '                        and (#date(' + Day(dUv)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ') <= prnaryad.DatOk or prnaryad.DatOk = #date(0, 0, 0))              ');
+    MysqlAddStr(qStr, '                        and mnplan.nrec is not null                                                                                                              ');
+    MysqlAddStr(qStr, '                  group by case when (      (av.vcomp is null or av.vcomp = #comp(0h))                                                                           ');
+    MysqlAddStr(qStr, '                                        and substring(buhschet.schet, 2, 2) not in (''25'', ''26'')                                                              ');
+    MysqlAddStr(qStr, '                                        and substring(mnplan.number, 1, 2) not in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')               ');
+    MysqlAddStr(qStr, '                                        and mnplan.number not in (''239000000120'', ''239000300120'')) then #comp('+string(coVirtualcVPlan)+')                   ');
+    MysqlAddStr(qStr, '                                else case when (     substring(buhschet.schet, 2, 2) in (''25'', ''26'')                                                         ');
+    MysqlAddStr(qStr, '                                                  or substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')          ');
+    MysqlAddStr(qStr, '                                                  or mnplan.number in (''239000000120'', ''239000300120'')) then #comp(0h)                                       ');
+    MysqlAddStr(qStr, '                                          else mnplan.cvplan                                                                                                     ');
+    MysqlAddStr(qStr, '                                     end                                                                                                                         ');
+    MysqlAddStr(qStr, '                           end                                                                                                                                   ');
+    MysqlAddStr(qStr, '                         , av.vcomp                                                                                                                              ');
+    MysqlAddStr(qStr, '                         , case when (      (av.vcomp is null or av.vcomp = #comp(0h))                                                                           ');
+    MysqlAddStr(qStr, '                                        and substring(buhschet.schet, 2, 2) not in (''25'', ''26'')                                                              ');
+    MysqlAddStr(qStr, '                                        and substring(mnplan.number, 1, 2) not in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')               ');
+    MysqlAddStr(qStr, '                                        and mnplan.number not in (''239000000120'', ''239000300120'')) then 2                                                    ');
+    MysqlAddStr(qStr, '                                else case when (     substring(buhschet.schet, 2, 2) in (''25'', ''26'')                                                         ');
+    MysqlAddStr(qStr, '                                                  or substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')          ');
+    MysqlAddStr(qStr, '                                                  or mnplan.number in (''239000000120'', ''239000300120'')) then 0                                               ');
+    MysqlAddStr(qStr, '                                          else 1                                                                                                                 ');
+    MysqlAddStr(qStr, '                                     end                                                                                                                         ');
+    MysqlAddStr(qStr, '                           end                                                                                                                                   ');
+    MysqlAddStr(qStr, '  ) t_rasp                                                                                                                                                       ');
+    MysqlAddStr(qStr, '                                                                                                                                                                 ');
+    MysqlAddStr(qStr, '  outer apply (                                                                                                                                                  ');
+    MysqlAddStr(qStr, '                  select                                                                                                                                         ');
+    MysqlAddStr(qStr, '                    case when (      (av.vcomp is null or av.vcomp = #comp(0h))                                                                                  ');
+    MysqlAddStr(qStr, '                                 and substring(buhschet.schet, 2, 2) not in (''25'', ''26'')                                                                     ');
+    MysqlAddStr(qStr, '                                 and substring(mnplan.number, 1, 2) not in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')                      ');
+    MysqlAddStr(qStr, '                                 and mnplan.number not in (''239000000120'', ''239000300120'')) then #comp('+string(coVirtualcVPlan)+')                          ');
+    MysqlAddStr(qStr, '                         else case when (     substring(buhschet.schet, 2, 2) in (''25'', ''26'')                                                                ');
+    MysqlAddStr(qStr, '                                           or substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')                 ');
+    MysqlAddStr(qStr, '                                           or mnplan.number in (''239000000120'', ''239000300120'')) then #comp(0h)                                              ');
+    MysqlAddStr(qStr, '                                   else mnplan.cvplan                                                                                                            ');
+    MysqlAddStr(qStr, '                              end                                                                                                                                ');
+    MysqlAddStr(qStr, '                    end as cVplan                                                                                                                                ');
+    MysqlAddStr(qStr, '                  , ''''                    as sVplan                                                                                                            ');
+    MysqlAddStr(qStr, '                  , sum(prvidopl.chasf)   as dSumH_ls                                                                                                            ');
+    MysqlAddStr(qStr, '                  , case when (      (av.vcomp is null or av.vcomp = #comp(0h))                                                                                  ');
+    MysqlAddStr(qStr, '                                 and substring(buhschet.schet, 2, 2) not in (''25'', ''26'')                                                                     ');
+    MysqlAddStr(qStr, '                                 and substring(mnplan.number, 1, 2) not in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')                      ');
+    MysqlAddStr(qStr, '                                 and mnplan.number not in (''239000000120'', ''239000300120'')) then 2                                                           ');
+    MysqlAddStr(qStr, '                         else case when (     substring(buhschet.schet, 2, 2) in (''25'', ''26'')                                                                ');
+    MysqlAddStr(qStr, '                                           or substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')                 ');
+    MysqlAddStr(qStr, '                                           or mnplan.number in (''239000000120'', ''239000300120'')) then 0                                                      ');
+    MysqlAddStr(qStr, '                                   else 1                                                                                                                        ');
+    MysqlAddStr(qStr, '                              end                                                                                                                                ');
+    MysqlAddStr(qStr, '                    end                   as wtype                                                                                                               ');
+    MysqlAddStr(qStr, '                  , lschet.nrec           as clschet                                                                                                             ');
+    MysqlAddStr(qStr, '                  , av.vcomp as cBankS                                                                                                                           ');
+    MysqlAddStr(qStr, '                  from prvidopl                                                                                                                                  ');
+    MysqlAddStr(qStr, '                  left join mnplan on case when prvidopl.tbld[1] = 7 then prvidopl.ckaud[1]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prvidopl.tbld[2] = 7 then prvidopl.ckaud[2]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prvidopl.tbld[3] = 7 then prvidopl.ckaud[3]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prvidopl.tbld[4] = 7 then prvidopl.ckaud[4]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prvidopl.tbld[5] = 7 then prvidopl.ckaud[5]                                                                      ');
+    MysqlAddStr(qStr, '                                           when prvidopl.tbld[6] = 7 then prvidopl.ckaud[6]                                                                      ');
+    MysqlAddStr(qStr, '                                           else #comp(0h)                                                                                                        ');
+    MysqlAddStr(qStr, '                                      end = mnplan.nrec                                                                                                          ');
+    MysqlAddStr(qStr, '                  inner join attrnam an on ' + word(coVPlan) + ' = an.wtable and ''Банковские счета'' = an.name                                                  ');
+    MysqlAddStr(qStr, '                   left join attrval av on ' + word(coVPlan) + ' = av.wtable and an.nrec = av.cattrnam and mnplan.cvplan = av.crec                               ');
+    MysqlAddStr(qStr, '                   left join buhschet on mnplan.canval2 = buhschet.nrec                                                                                          ');
+    MysqlAddStr(qStr, '                  where LSchet.nrec = prvidopl.clsch                                                                                                             ');
+    MysqlAddStr(qStr, '                        and prvidopl.datan between #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                                ');
+    MysqlAddStr(qStr, '                                               and #date(' + Last_Day(dUv)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                         ');
+    MysqlAddStr(qStr, '                        and prvidopl.datok between #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                                ');
+    MysqlAddStr(qStr, '                                               and #date(' + Last_Day(dUv)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                         ');
+    MysqlAddStr(qStr, '                        and t_rasp.clschet is null                                                                                                               ');
+    MysqlAddStr(qStr, '                        and mnplan.nrec is not null                                                                                                              ');
+    MysqlAddStr(qStr, '                  group by case when (      (av.vcomp is null or av.vcomp = #comp(0h))                                                                           ');
+    MysqlAddStr(qStr, '                                        and substring(buhschet.schet, 2, 2) not in (''25'', ''26'')                                                              ');
+    MysqlAddStr(qStr, '                                        and substring(mnplan.number, 1, 2) not in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')               ');
+    MysqlAddStr(qStr, '                                        and mnplan.number not in (''239000000120'', ''239000300120'')) then #comp('+string(coVirtualcVPlan)+')                   ');
+    MysqlAddStr(qStr, '                                else case when (     substring(buhschet.schet, 2, 2) in (''25'', ''26'')                                                         ');
+    MysqlAddStr(qStr, '                                                  or substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')          ');
+    MysqlAddStr(qStr, '                                                  or mnplan.number in (''239000000120'', ''239000300120'')) then #comp(0h)                                       ');
+    MysqlAddStr(qStr, '                                          else mnplan.cvplan                                                                                                     ');
+    MysqlAddStr(qStr, '                                     end                                                                                                                         ');
+    MysqlAddStr(qStr, '                           end                                                                                                                                   ');
+    MysqlAddStr(qStr, '                         , av.vcomp                                                                                                                              ');
+    MysqlAddStr(qStr, '                         , case when (      (av.vcomp is null or av.vcomp = #comp(0h))                                                                           ');
+    MysqlAddStr(qStr, '                                        and substring(buhschet.schet, 2, 2) not in (''25'', ''26'')                                                              ');
+    MysqlAddStr(qStr, '                                        and substring(mnplan.number, 1, 2) not in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')               ');
+    MysqlAddStr(qStr, '                                        and mnplan.number not in (''239000000120'', ''239000300120'')) then 2                                                    ');
+    MysqlAddStr(qStr, '                                else case when (     substring(buhschet.schet, 2, 2) in (''25'', ''26'')                                                         ');
+    MysqlAddStr(qStr, '                                                  or substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'')          ');
+    MysqlAddStr(qStr, '                                                  or mnplan.number in (''239000000120'', ''239000300120'')) then 0                                               ');
+    MysqlAddStr(qStr, '                                          else 1                                                                                                                 ');
+    MysqlAddStr(qStr, '                                     end                                                                                                                         ');
+    MysqlAddStr(qStr, '                           end                                                                                                                                   ');
+    MysqlAddStr(qStr, '  ) t_rasp2                                                                                                                                                      ');
+    MysqlAddStr(qStr, '                                                                                                                                                                 ');
+    MysqlAddStr(qStr, '  left join (                                                                                                                                                    ');
+    MysqlAddStr(qStr, '                  select                                                                                                                                         ');
+    MysqlAddStr(qStr, '                    sum(prnaryad.chasf) as dSum_vPlan, prnaryad.clsch as clsch                                                                                   ');
+    MysqlAddStr(qStr, '                  from prnaryad                                                                                                                                  ');
+    MysqlAddStr(qStr, '                  left join sys_nar on prnaryad.mnrec = sys_nar.nrec                                                                                             ');
+    MysqlAddStr(qStr, '                  where     sys_nar.choice < 900                                                                                                                 ');
+    MysqlAddStr(qStr, '                        and prnaryad.datan >= #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                                     ');
+    MysqlAddStr(qStr, '                        and (#date(' + Day(dUv)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ') <= prnaryad.DatOk or prnaryad.DatOk = #date(0, 0, 0))              ');
+    MysqlAddStr(qStr, '                  group by prnaryad.clsch                                                                                                                        ');
+    MysqlAddStr(qStr, '  ) t_sumH on t_sumH.clsch = lschet.nrec                                                                                                                         ');
+    MysqlAddStr(qStr, '                                                                                                                                                                 ');
+    MysqlAddStr(qStr, '  left join (                                                                                                                                                    ');
+    MysqlAddStr(qStr, '                  select                                                                                                                                         ');
+    MysqlAddStr(qStr, '                    sum(prvidopl.chasf) as dSum_vPlan, prvidopl.clsch as clsch                                                                                   ');
+    MysqlAddStr(qStr, '                  from prvidopl                                                                                                                                  ');
+    MysqlAddStr(qStr, '                  where     prvidopl.datan >= #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                                     ');
+    MysqlAddStr(qStr, '                        and (#date(' + Day(dUv)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ') <= prvidopl.DatOk or prvidopl.DatOk = #date(0, 0, 0))              ');
+    MysqlAddStr(qStr, '                  group by prvidopl.clsch                                                                                                                        ');
+    MysqlAddStr(qStr, '  ) t_sumH2 on t_sumH2.clsch = lschet.nrec and t_sumH.clsch is null                                                                                              ');
+    MysqlAddStr(qStr, '                                                                                                                                                                 ');
+    MysqlAddStr(qStr, '  where (    t_ls_ndfl.dsum is not null                                                                                                                          ');
+    MysqlAddStr(qStr, '          or t_ls_sum.dSum is not null )                                                                                                                         ');
+    MysqlAddStr(qStr, '         and katpodr.kod not in (  ''446'', ''Вет''                                                                                                     ');
+    MysqlAddStr(qStr, '                                 , ''_Профком'', ''_Студенты'', ''_ФИЗ ЛИЦ'', '''')                                                                              ');
+    MysqlAddStr(qStr, '         and ( lschet.datuv = #date(0, 0, 0) or lschet.datuv >= #date(' + Day(1)   + ', ' + Month(dUv) + ', ' + Year(dUv) + ') )                                 ');
+    MysqlAddStr(qStr, '         and lschet.summa27 <> 0                                                                                                                                 ');
+
+
+
+
+    var objQuery: iQuery;
+      objQuery := queryManager.createQuery(qStr);
+    if (objQuery.execute.errorCode != tsOk) then
+    {
+      Message('Ошибка сбора сумм заработной платы (Fill_tmpRaspr) '+ objQuery.errorCode, Error);
+      sqlFreeStr(qStr);
+      StopVisual;
+      Exit;
+    }
+    else
+    {
+      sqlCopyInto(objQuery, tntmpRasprLoop, true);
+      /*
+      _Loop tmpRasprLoop
+      {
+        if ( oIGK_Dog.GetFullIGKByBank(tmpRasprLoop.cBankS) = '' ) then
+        {
+          Update Current tmpRasprLoop set tmpRasprLoop.wtype := 0, tmpRasprLoop.cvplan := 0h;
+
+        }
+      }
+       */
+      //RecalcItog;
+
+    }
+
+
+
+
+  }
+    SumAll := 0.0;
+    _Loop tmpRasprLoop
+    {
+      if (not CheckLSchet(tmpRasprLoop.cLSchet)) then
+      {
+        mylog('Delete Current tmpRasprLoop ' + tmpRasprLoop.sTabN);
+        var perc_goz : double = Get_Total_Straight_Goz(tmpRasprLoop.clschet);
+        SumAll := SumAll + (tmpRasprLoop.dSum ) * if ((100.0 - perc_goz) > 0.0, Round((100.0 - perc_goz) / 100, coDecimalPoint+2), 0);
+        SumAll := SumAll + (tmpRasprLoop.dNdfl) * if ((100.0 - perc_goz) > 0.0, Round((100.0 - perc_goz) / 100, coDecimalPoint+2), 0);
+        Delete Current tmpRasprLoop;
+      }
+    }
+
+    set dBeg := To_Date(if(_TypeFot = 0, 1, 16), Month(dUv), Year(dUv));
+    set dEnd :=  To_Date(if(_TypeFot = 0, 15, Last_Day(dUv)), Month(dUv) ,Year(dUv));
+
+    SetVisualHeader('Корректировка суммы на чистый ГОЗ');
+
+    _Loop tmpRasprLoop where ((0h << tmpRasprLoop.cVplan))
+    {
+
+
+
+      if (getFirst fastfirstrow tmpRasprLoop2 where ((0h == tmpRasprLoop2.cVplan
+                                                      and tmpRasprLoop.clschet == tmpRasprLoop2.clschet)) <> tsOk)
+      {
+
+
+         tmpRasprLoop2.buffer        := tmpRasprLoop.buffer;
+            tmpRasprLoop2.cvplan      := 0h;
+            tmpRasprLoop2.dPercent    := 0.0  ;
+            tmpRasprLoop2.dPercentOld := 0.0  ;
+            tmpRasprLoop2.dSumGoz     := 0.0  ;
+            tmpRasprLoop2.wType       := 0    ;
+            //tmpRasprLoop2.dSum        := if ((100.0 - perc_goz) > 0.0, Round(Round((100.0 - perc_goz) / 100, 4)* tmpRasprLoop.dSum, 2), 0)  ;
+            //tmpRasprLoop2.dNdfl       := if ((100.0 - perc_goz) > 0.0, Round(Round((100.0 - perc_goz) / 100, 4)* tmpRasprLoop.dNdfl, 2), 0)  ;
+         Insert current tmpRasprLoop2;
+         MyLog('Fill_tmpRaspr Insert current tmpRasprLoop2');
+      }
+      /*
+        var perc_goz : double = Get_Total_Straight_Goz(tmpRasprLoop.clschet);
+      MyLog('Fill_tmpRaspr stabn = : ' + tmpRasprLoop.sTabN);
+      MyLog('Fill_tmpRaspr perc_goz = : ' + perc_goz);
+      if (tmpRasprLoop.wType = 0) then
+      {
+        tmpRasprLoop.dSum        := if ((100.0 - perc_goz) > 0.0, Round(Round((100.0 - perc_goz) / 100, 4)* tmpRasprLoop.dSum, 2), 0)  ;
+        tmpRasprLoop.dNdfl       := if ((100.0 - perc_goz) > 0.0, Round(Round((100.0 - perc_goz) / 100, 4)* tmpRasprLoop.dNdfl, 2), 0)  ;
+        update current tmpRasprLoop;
+      }
+      */
+    }
+
+    _Loop tmpRasprLoop where ((0h == tmpRasprLoop.cVplan))
+    {
+      SetVisualHeader('Просмотр текущего распределения (GP_AvansRaspr)'#13 +
+                       tmpRasprLoop.sPerson);
+      //MyLog('debug_tmpRasprLoop.sPerson = ' + tmpRasprLoop.sPerson);
+      //MyLog('debug_tmpRasprLoop.clschet = ' + tmpRasprLoop.clschet);
+      //MyLog('debug_dBeg = ' + dBeg);
+      //MyLog('debug_dEnd = ' + dEnd);
+
+
+
+
+        _Loop gp_raspavansLoop
+        {
+          //MyLog('debug_gp_raspavans.nrec = ' + gp_raspavans.nrec);
+
+          if (getFirst tmpRasprIns where ((tmpRasprLoop.clschet == tmpRasprIns.clschet
+                                           and gp_raspavansLoop.cvplan == tmpRasprIns.cVplan (noIndex)
+                                           and gp_raspavansLoop.wtype == tmpRasprIns.wtype   (noIndex)
+                                           )) <> tsOk)
+          {
+            tmpRasprIns.Buffer := tmpRasprLoop.Buffer;
+
+            tmpRasprIns.dSumGoz := Round((tmpRasprLoop.dSum +tmpRasprLoop.dNdfl )* gp_raspavansLoop.procent / 100.0, coDecimalPoint);
+            tmpRasprIns.dPercent := gp_raspavansLoop.procent;
+            tmpRasprIns.cvPlan := gp_raspavansLoop.cVplan;
+            tmpRasprIns.wType := gp_raspavansLoop.wType;
+            Insert Current tmpRasprIns;
+            MyLog('Fill_tmpRaspr tmpRasprIns.stabn = ' + tmpRasprIns.stabn);
+            MyLog('Fill_tmpRaspr tmpRasprIns.dSumGoz = ' + tmpRasprIns.dSumGoz);
+            MyLog('Fill_tmpRaspr tmpRasprIns.dPercent = ' + tmpRasprIns.dPercent);
+          }
+          Update current tmpRasprIns set tmpRasprIns.dPercentOld := gp_raspavansLoop.procent;
+
+        }
+        //MyLog('debug__Loop gp_raspavans     end');
+
+
+    }
+
+
+   _Loop tmpRasprLoop
+    {
+      if getfirst unidoc_vplan where (( word(31015)==unidoc_vplan.wtype
+                                        and tmpRasprLoop.cVPlan==unidoc_vplan.cpodr))=tsOk
+      {
+        tmpRasprLoop.wtype:=word(3);
+        tmpRasprLoop.cvplan:=comp(coVirtualcVPlan2);
+        update current tmpRasprLoop;
+      }
+    }
+
+
+  UpdateItogsByVPlan;
+  //delete tmpRasprIns where ((2 >> tmpRasprIns.dPercent(noindex)));
+  //delete from tmpRasprIns where tmpRasprIns.dPercent < 0.02;
+  /*_Loop tmpRasprIns
+  {
+    logstrtofile('666-6.log', 'sTabN = ' + tmpRasprIns.sTabN + ' | ' + tmpRasprIns.dPercent + ' | ' + boolean(2 > tmpRasprIns.dPercent));
+  }*/
+
+
+  if (getFirst tmpRaspr = tsOk) then {ReScanPanel(tntmpRaspr);}
+  sqlFreeStr(qStr);
+  StopVisual;
+}
+
+Function CheckPodr(_cPodr: comp) : boolean; Cacheable;
+{
+  result := false;
+    if(getfirst fastfirstrow  KatLinkPodr where ((     coKatPodr == KatLinkPodr.codeTable
+                                                     and KL_code == KatLinkPodr.code
+                                                       and KL_on == KatLinkPodr.ownname
+                                                      and _cPodr == KatLinkPodr.cRec (noIndex)
+                                                ))
+      ) = tsOK then exit;
+  result := true;
+}
+
+Function CheckLSchet(_cLs : comp) : boolean;
+{
+  result := false;
+  if (getfirst fastfirstrow LschetCheck where ((_cLs == LschetCheck.nrec)) = tsOK)
+  {
+
+    if not CheckPodr(LschetCheck.cex) then exit;
+
+    if(getfirst fastfirstrow  KatLinkPsn  where ((               coPersons == KatLinkPsn.codeTable
+                                                   and             KL_code == KatLinkPsn.code
+                                                   and               KL_on == KatLinkPsn.ownname
+                                                   and LschetCheck.tPerson == KatLinkPsn.cRec (noIndex)
+                                                ))
+      ) = tsOK then exit;
+     result := true;
+  }
+}
+
+//сумма аванса/зп всех накладных - сумма по исключаемым подразделениям и людям
+Function Get_Sum_vplan_WO_Excl(bFlag : boolean) : double; Cacheable;
+{
+  #__UNUSED__(bFlag)
+  StartNewVisual(vtRotateVisual, vfTimer, 'Подсчет итогов с исключениями', 0);
+  var _Sum  : double= 0.0;
+  var _SumNDFL :double= 0.0;
+
+  _Loop tmpRasprLoop_Fn_GOZ where ((0h == tmpRasprLoop_Fn_GOZ.cVPlan))
+  {
+    //if (CheckLSchet(tmpRasprLoop_Fn_GOZ.cLSchet)) then
+    //{
+    //      mylog(tmpRasprLoop.sPerson +'|'+tmpRasprLoop.sTabN+'|'+tmpRasprLoop.dSum+'|'+tmpRasprLoop.dNdfl);
+    var perc_goz : double = Get_Total_Straight_Goz(tmpRasprLoop_Fn_GOZ.clschet);
+
+    if 100.0 <= perc_goz then continue ;
+
+    _Sum     := _Sum     + Round(tmpRasprLoop_Fn_GOZ.dSum  * (100.0 - perc_goz) / 100, coDecimalPoint);
+    _SumNDFL := _SumNDFL + Round(tmpRasprLoop_Fn_GOZ.dNdfl * (100.0 - perc_goz) / 100, coDecimalPoint);
+
+    mylog('Get_Sum_vplan_WO_Excl-> '+tmpRasprLoop_Fn_GOZ.sPerson +'|'+tmpRasprLoop_Fn_GOZ.sTabN+'|'+tmpRasprLoop_Fn_GOZ.dSum+'|'+tmpRasprLoop_Fn_GOZ.dNdfl+'|'+perc_goz+'|'+_Sum + '|'+_SumNDFL);
+    //}
+  }
+  result := _Sum + _SumNDFL;
+  StopVisual;
+}
+
+//вся тематика
+Function Get_Total_Straight_Goz(_cLscht : comp) : double; Cacheable;
+{
+  result := 0.0;
+  _loop tmpRasprLoop_Straight_Goz where ((  _cLscht == tmpRasprLoop_Straight_Goz.clschet
+                             )) //and tmpRasprLoop_Straight_Goz.cVPlan <> 0h
+                                and tmpRasprLoop_Straight_Goz.wType > 0
+  {
+    result += tmpRasprLoop_Straight_Goz.dPercent
+  }
+//  mylog('Get_Total_Straight_Goz-> '+tmpRasprLoop_Straight_Goz.sPerson +'|'+tmpRasprLoop_Straight_Goz.sTabN+'|'+tmpRasprLoop_Straight_Goz.dSum+'|'+tmpRasprLoop_Straight_Goz.dNdfl+'|'+result);
+}
+
+Function Get_Total_perc_Goz(_cLscht : comp) : double;
+{
+  result := 0.0;
+  _loop tmpRasprLoop_Fn_GOZ where ((  _cLscht == tmpRasprLoop_Fn_GOZ.clschet
+                             )) and tmpRasprLoop_Fn_GOZ.cVPlan <> 0h
+//                                and tmpRasprLoop_Straight_Goz.wType <> 2
+  {
+    MyLog('Get_Total_perc_Goz tmpRasprLoop_Fn_GOZ.dPercent = ' + tmpRasprLoop_Fn_GOZ.dPercent);
+    result += tmpRasprLoop_Fn_GOZ.dPercent
+  }
+
+}
+
+//wAlg = 0 : считаем от суммы, wAlg = 1 : от процента
+Procedure DistrPlanSum(wAlg : word);
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Распределение суммы по накладным', 0);
+  delete tmpRasprIns where (( tmpItog.cVplan == tmpRasprIns.cvPlan and 0 == tmpRasprIns.wType));
+ // update current tmpItog set tmpItog.dSumRaspFactO := 0;
+
+  if (tmpItog.dSumRaspPlan <= 0.0 and wAlg = 0)
+    or (tmpItog.dPercent <= 0.0 and wAlg = 1)   then
+  {
+    UpdateItogsByVPlan;
+    StopVisual;
+    Exit;
+  }
+  var sItogZp : double = Get_Sum_vplan_WO_Excl(true);
+
+  var dPerc : double = 0.0;
+  if (wAlg = 0) then
+  {
+    dPerc := Round(tmpItog.dSumRaspPlan / sItogZp, coDecimalPoint+2) ;
+    MyLog('DistrPlanSum wAlg = 0');
+    MyLog('DistrPlanSum dPerc = ' + dPerc);
+//    update current tmpItog set tmpItog.dPercent := dPerc * 100.0;
+  }
+  if (wAlg = 1) then
+  {
+    dPerc := tmpItog.dPercent / 100.0;
+    MyLog('DistrPlanSum wAlg = 1');
+    MyLog('DistrPlanSum dPerc = ' + dPerc);
+  }
+
+  /*
+  _Loop tmpRasprLoop
+  {
+    MyLog('DistrPlanSum debug stabn --------------------------------- ');
+    MyLog('DistrPlanSum debug stabn = ' + tmpRasprLoop.stabn);
+    MyLog('DistrPlanSum debug cvplan = ' + tmpRasprLoop.cvplan);
+    MyLog('DistrPlanSum debug stabn --------------------------------- ');
+  }
+  */
+
+  _Loop tmpRasprLoop where ((0h == tmpRasprLoop.cVPlan))
+  {
+    MyLog('DistrPlanSum tmpRasprLoop.stabn = ' + tmpRasprLoop.stabn);
+    /*if (not CheckLSchet(tmpRasprLoop.clschet)) then
+    {
+      MyLog('DistrPlanSum пропускаем');
+      continue;
+    }*/
+/* варивант 1,0 beta
+    var _curPerc : double = Get_Total_perc_Goz(tmpRasprLoop.clschet);  // прямые и накладные по гоз в сумме
+
+    var _PercPersonal : double = Round(dPerc * 100, 2); // ввели/расчитали в интерыейс
+
+    if _curPerc >= 100  then continue;   // если по ГОЗ уже 100 или даже большлше
+
+//если ввели/расчитали процнт+уже проценты по всем ГОЗ больше 100 то перпсональный процент равен 100 - уже рспраделенное, т.е. мы
+// будем рспраделеять не ввведнный процент, а остаток до 100
+    if _PercPersonal + _curPerc > 100  then _PercPersonal := 100 - _curPerc;  // реальный проуцент который будем ставить на сумму для ркспределдения
+
+    _PercPersonal := round(_PercPersonal / 100, 4);
+
+    //tmpRasprIns.dSumGoz := Round((tmpRasprLoop.dSum + tmpRasprLoop.dNdfl) * _PercPersonal, 2);
+    tmpRasprIns.Buffer := tmpRasprLoop.Buffer;
+
+    var perc_goz : double = Get_Total_Straight_Goz(tmpRasprLoop.clschet); // сумма по прямым процентам ГОЗ
+
+    var _perc_wo_goz : double = if ((100.0 - perc_goz) > 0.0, Round((100.0 - perc_goz) / 100, 4), 0); // остаток проуцента без ГОЗ
+
+
+    tmpRasprIns.dSumGoz := Round(tmpRasprLoop.dSum * _perc_wo_goz * _PercPersonal, 2) + Round(tmpRasprLoop.dNdfl * _perc_wo_goz * _PercPersonal, 2);
+*/
+
+/* вариант 2... математику все-таки не наеб*шь
+
+    var _curPercGOZ : double = Get_Total_perc_Goz(tmpRasprLoop.clschet);  // прямые и накладные по гоз в сумме
+    MyLog('DistrPlanSum _curPercGOZ = ' + _curPercGOZ);
+    if _curPercGOZ >= 100  then continue;   // если по ГОЗ уже 100 или даже большлше
+
+    var _PercPersonal : double = Round(dPerc * 100, coDecimalPoint); // ввели/расчитали в интерыейс
+    MyLog('DistrPlanSum _PercPersonal 1 = ' + _PercPersonal);
+
+    //если ввели/расчитали процнт+уже проценты по всем ГОЗ больше 100 то перпсональный процент равен 100 - уже рспраделенное, т.е. мы
+    // будем рспраделеять не ввведнный процент, а остаток до 100
+
+    if _PercPersonal + _curPercGOZ > 100  then _PercPersonal := 100 - _curPercGOZ;  // реальный проуцент который будем ставить на сумму для ркспределдения
+    MyLog('DistrPlanSum _PercPersonal 2 = ' + _PercPersonal);
+    _PercPersonal := round(_PercPersonal / 100, coDecimalPoint+2);
+    MyLog('DistrPlanSum _PercPersonal 3 = ' + _PercPersonal);
+
+
+
+    //tmpRasprIns.dSumGoz := Round((tmpRasprLoop.dSum + tmpRasprLoop.dNdfl) * _PercPersonal, 2);
+    tmpRasprIns.Buffer := tmpRasprLoop.Buffer;
+
+
+    tmpRasprIns.dSumGoz := Round(tmpRasprLoop.dSum  * _PercPersonal, coDecimalPoint) + Round(tmpRasprLoop.dNdfl * _PercPersonal, coDecimalPointNDFL);
+    MyLog('DistrPlanSum tmpRasprIns.dSum = ' + tmpRasprIns.dSum);
+    MyLog('DistrPlanSum tmpRasprIns.dNdfl = ' + tmpRasprIns.dNdfl);
+    MyLog('DistrPlanSum tmpRasprIns.dSumGoz = ' + tmpRasprIns.dSumGoz);
+    tmpRasprIns.dPercent := Round(tmpRasprIns.dSumGoz / (tmpRasprLoop.dSum + tmpRasprLoop.dNdfl) * 100.0, coDecimalPoint);
+    MyLog('DistrPlanSum tmpRasprIns.dPercent = ' + tmpRasprIns.dPercent);
+*/
+
+
+// а делать то надо вот так ....  математику все-таки не наеб*шь
+
+  var _curPercGOZ : double = Get_Total_Straight_Goz(tmpRasprLoop.clschet);  // прямые и накладные по гоз в сумме
+    if _curPercGOZ >= 100  then continue;   // если по ГОЗ уже 100 или даже большлше
+
+    var _PercPersonal : double = Round((100 - _curPercGOZ )*dPerc , coDecimalPoint); // ввели/расчитали в интерыейс
+    MyLog('DistrPlanSum _PercPersonal 1 = ' + _PercPersonal);
+
+    //если ввели/расчитали процнт+уже проценты по всем ГОЗ больше 100 то перпсональный процент равен 100 - уже рспраделенное, т.е. мы
+    // будем рспраделеять не ввведнный процент, а остаток до 100
+
+    var _sumAlreadyRaspr : double = Get_Total_perc_Goz(tmpRasprLoop.clschet);
+
+    if _PercPersonal + _sumAlreadyRaspr > 100  then _PercPersonal := 100 - _sumAlreadyRaspr;  // реальный проуцент который будем ставить на сумму для ркспределдения
+
+    MyLog('DistrPlanSum _PercPersonal 2 = ' + _PercPersonal);
+    _PercPersonal := round(_PercPersonal / 100, coDecimalPoint+2);
+    MyLog('DistrPlanSum _PercPersonal 3 = ' + _PercPersonal);
+
+
+
+    //tmpRasprIns.dSumGoz := Round((tmpRasprLoop.dSum + tmpRasprLoop.dNdfl) * _PercPersonal, 2);
+    tmpRasprIns.Buffer := tmpRasprLoop.Buffer;
+
+
+    tmpRasprIns.dSumGoz := Round((tmpRasprLoop.dSum  + tmpRasprLoop.dNdfl )* _PercPersonal, coDecimalPoint);
+    MyLog('DistrPlanSum tmpRasprIns.dSum = ' + tmpRasprIns.dSum);
+    MyLog('DistrPlanSum tmpRasprIns.dNdfl = ' + tmpRasprIns.dNdfl);
+    MyLog('DistrPlanSum tmpRasprIns.dSumGoz = ' + tmpRasprIns.dSumGoz);
+    tmpRasprIns.dPercent := Round(tmpRasprIns.dSumGoz / (tmpRasprLoop.dSum + tmpRasprLoop.dNdfl) * 100.0, coDecimalPoint);
+    MyLog('DistrPlanSum tmpRasprIns.dPercent = ' + tmpRasprIns.dPercent);
+
+    tmpRasprIns.wType := 0;
+    tmpRasprIns.cvPlan := tmpItog.cVplan;
+    if (getFirst gp_raspavansLoop where ((     tmpRasprIns.clschet == gp_raspavansLoop.clschet
+                                          and 0 == gp_raspavansLoop.isarh
+                                          and dBeg == gp_raspavansLoop.datan
+                                          and dEnd == gp_raspavansLoop.dataok (noIndex)
+                                          and tmpRasprIns.cvplan == gp_raspavansLoop.cvplan (noIndex)
+                                          and tmpRasprIns.wtype == gp_raspavansLoop.wtype (noIndex)
+                                          )) = tsOk ) then
+    {
+      tmpRasprIns.dPercentOld := gp_raspavansLoop.Procent;
+      MyLog('DistrPlanSum tmpRasprIns.dPercentOld = ' + tmpRasprIns.dPercentOld);
+    }
+    Insert Current tmpRasprIns;
+
+
+   // tmpItog.dSumRaspFactO := tmpItog.dSumRaspFactO  + tmpRasprIns.dSumGoz;
+  }
+//  Update current tmpItog;
+  UpdateItogsByVPlan;
+    if (getFirst tmpRaspr = tsOk) then {ReScanPanel(tntmpRaspr);}
+
+      set _strWarning1 := 'ВНИМАНИЕ! Внесены изменения' ;
+      set _strWarning2 := 'Данные в интерфейсе могут отличаться от хранимых';
+
+  StopVisual;
+}
+
+Procedure DeleteFromGpRaspAvans;
+{
+  SetVisualHeader('Удаление записей распределения из базы');
+  Delete From Gp_RaspAvans where ((       0 == Gp_RaspAvans.isarh
+                                   and dBeg == Gp_RaspAvans.datan  (noIndex)
+                                   and dEnd == Gp_RaspAvans.dataok (noIndex)
+                                   //and    0 == Gp_RaspAvans.wtype (noIndex)
+                                 ))
+  ;
+}
+
+Procedure CopyToGpRaspAvansFromTRasp;
+{
+  SetVisualHeader('Сохранение записей распределения в базу');
+  _Loop tmpRaspr
+  {
+    if tmpRaspr.dpercent < 2 or tmpRaspr.wtype = 2 or tmpRaspr.wtype = 3 or tmpRaspr.cvplan = 0h then continue; // это точно не надо сохранять
+
+    //if (tmpRaspr.wtype = 1) then { continue; }
+    Insert Gp_RaspAvans set
+       gp_raspavans.isarh    := 0
+     , gp_raspavans.datan    := dBeg
+     , gp_raspavans.dataok   := dEnd
+     , gp_raspavans.procent  := tmpRaspr.dpercent
+     , gp_raspavans.wtype    := tmpRaspr.wtype
+     , gp_raspavans.cvplan   := tmpRaspr.cvplan
+     , gp_raspavans.cpersons := tmpRaspr.cperson
+     , gp_raspavans.clschet  := tmpRaspr.clschet
+     , gp_raspavans.TABN     := 0
+     , gp_raspavans.STRTABN  := tmpRaspr.sTabN
+     , gp_raspavans.CKATPODR := Lschet.cex
+     , gp_raspavans.CMNPLAN  := 0h
+     , gp_raspavans.CUSER    := UserID
+     , gp_raspavans.DINPUT   := Cur_Date()
+
+    ;
+  }
+}
+
+Function CheckFactSum : boolean;
+{
+  _Loop tmpItog
+  {
+    if (tmpItog.cVPlan = comp(coVirtualcVPlan)) then
+    {
+      continue;
+    }
+    if ( tmpItog.dSumRaspPlan < tmpItog.dSumRaspFactO) then
+    {
+      result := false;
+      Exit;
+    }
+  }
+  result := true;
+}
+
+Procedure SavePlanSum;
+{
+  //сохраняем плановую сумму к распределению в spkau
+  //записываем vplan.name и vplan.nrec
+  if (getFirst FastFirstRow SpKau where ((      wSpKau == SpKau.KodGrKau
+                                            and cSpKau == SpKau.cNode
+//                                            and vPlanItog.Name == SpKau.Name
+                                            and string(vPlanItog.nRec) == SpKau.LevelCode (noIndex)
+                                        )) <> tsOk) then
+  {
+    ClearBuffer(#SpKau);
+      SpKau.nRec      := 0h;
+      SpKau.Name      := vPlanItog.Name;
+      SpKau.LevelCode := string(vPlanItog.nRec);
+      SpKau.cNode     := cSpKau;
+      SpKau.KodGrKau  := wSpKau;
+    Insert Current SpKau;
+  }
+   SpKau.Code := String(tmpItog.dSumRaspPlan);
+  Update Current SpKau;
+}
+
+Procedure DeleteUnusedPlanSum;
+{
+  _Loop tmpItogLoop where tmpItogLoop.dSumRaspPlan = 0.0
+  {
+    if ( getFirst FastFirstRow SpKau where ((     wSpKau == SpKau.KodGrKau
+                                              and cSpKau == SpKau.cNode
+                                              and string(tmpItogLoop.cVPlan) == SpKau.LevelCode
+                                           )) = tsOk) then
+    {
+      Delete Current SpKau;
+    }
+  }
+}
+
+Procedure ReFill_ExclPsn(_w : word);
+{
+  Delete All TmpIndPsn;
+
+  Delete From KatLinkPsn where ((      coPersons == KatLinkPsn.codetable
+                                   and KL_code   == KatLinkPsn.code
+                                   and KL_on     == KatLinkPsn.ownName
+                                   and 666       == KatLinkPsn.Tune1     (noIndex) ));
+
+  var dUv : date = dGetTune('UP.DATOTCH');
+  //чтобы не поломать текущее распределение
+  if (dUv < date(01, 07, 2022)) then
+  {
+    Message('не прошли по дате');
+    Exit;
+  }
+  else
+  {
+    var qStr : longint = 0;
+
+    StartNewVisual(vtRotateVisual, vfTimer, 'Обработка списка сотрудников', 0);
+    sqlFreeStr(qStr);
+
+    if (_w = 0) then
+    {
+      MysqlAddStr(qStr, ' select distinct                                                                                                                          ');
+      MysqlAddStr(qStr, '   persons.nrec as cpers                                                                                                                  ');
+      MysqlAddStr(qStr, ' from persons                                                                                                                             ');
+      MysqlAddStr(qStr, ' inner join attrnam an on 25001 = an.wtable and ''Физическое лицо (контрагент)'' = an.name                                                ');
+      MysqlAddStr(qStr, ' inner join attrval av on 25001 = av.wtable and an.nrec = av.cattrnam and persons.nrec = av.crec                                          ');
+      MysqlAddStr(qStr, ' inner join katorgdescr on av.vcomp = katorgdescr.crec                                                                                    ');
+      MysqlAddStr(qStr, ' where    (persons.disdate = #date(0, 0, 0)                                                                                               ');
+      MysqlAddStr(qStr, '        or persons.disdate > #date(' + Day(1) + ', ' + Month(dUv) + ', ' + Year(dUv) + '))                                                ');
+      MysqlAddStr(qStr, '        and katorgdescr.cgroup = #comp(' + string(IndGroup) + ')                                                                          ');
+      MysqlAddStr(qStr, '        and persons.nrec not in (                                                                                                         ');
+      MysqlAddStr(qStr, '                                    select distinct                                                                                       ');
+      MysqlAddStr(qStr, '                                      gp_raspavans.cpersons as cPers                                                                      ');
+      MysqlAddStr(qStr, '                                    from gp_raspavans                                                                                     ');
+      MysqlAddStr(qStr, '                                    where     gp_raspavans.isarh = 0                                                                      ');
+      MysqlAddStr(qStr, '                                          and gp_raspavans.wtype <> 0                                                                     ');
+      MysqlAddStr(qStr, '                                          and gp_raspavans.datan  >= #date(' + Day(1)        + ', ' + Month(dUv) + ', ' + Year(dUv) + ')  ');
+      MysqlAddStr(qStr, '                                          and gp_raspavans.dataok <= #date(' + Last_Day(dUv) + ', ' + Month(dUv) + ', ' + Year(dUv) + ')  ');
+      MysqlAddStr(qStr, '        )                                                                                                                                 ');
+    }
+    if (_w = 1) then
+    {
+      MysqlAddStr(qStr, ' select distinct                                                                                                                          ');
+      MysqlAddStr(qStr, '   t.cPers as cPers                                                                                                                       ');
+      MysqlAddStr(qStr, ' from (                                                                                                                                   ');
+      MysqlAddStr(qStr, '         select                                                                                                                           ');
+      MysqlAddStr(qStr, '           lschet.tperson as cPers                                                                                                        ');
+      MysqlAddStr(qStr, '         from prnaryad                                                                                                                    ');
+      MysqlAddStr(qStr, '         left join lschet on prnaryad.clsch = lschet.nrec                                                                                 ');
+      MysqlAddStr(qStr, '         left join sys_nar on prnaryad.mnrec = sys_nar.nrec                                                                               ');
+      MysqlAddStr(qStr, '         left join mnplan on case when prnaryad.tbld[1] = 7 then prnaryad.ckaud[1]                                                        ');
+      MysqlAddStr(qStr, '                                  when prnaryad.tbld[2] = 7 then prnaryad.ckaud[2]                                                        ');
+      MysqlAddStr(qStr, '                                  when prnaryad.tbld[3] = 7 then prnaryad.ckaud[3]                                                        ');
+      MysqlAddStr(qStr, '                                  when prnaryad.tbld[4] = 7 then prnaryad.ckaud[4]                                                        ');
+      MysqlAddStr(qStr, '                                  when prnaryad.tbld[5] = 7 then prnaryad.ckaud[5]                                                        ');
+      MysqlAddStr(qStr, '                                  when prnaryad.tbld[6] = 7 then prnaryad.ckaud[6]                                                        ');
+      MysqlAddStr(qStr, '                                  else #comp(0h)                                                                                          ');
+      MysqlAddStr(qStr, '                             end = mnplan.nrec                                                                                            ');
+      MysqlAddStr(qStr, '         left join buhschet on mnplan.canval2 = buhschet.nrec                                                                             ');
+      MysqlAddStr(qStr, '         left join attrnam an on 25001 = an.wtable and ''Физическое лицо (контрагент)'' = an.name                                         ');
+      MysqlAddStr(qStr, '         left join attrval av on 25001 = av.wtable and an.nrec = av.cattrnam and lschet.tperson = av.crec                                 ');
+      MysqlAddStr(qStr, '         left join katorgdescr on av.vcomp = katorgdescr.crec                                                                             ');
+      MysqlAddStr(qStr, '         where     sys_nar.choice < 900                                                                                                   ');
+      MysqlAddStr(qStr, '               and prnaryad.datan >= #date(' + Day(1) + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                                         ');
+      MysqlAddStr(qStr, '               and (#date(' + Day(1)        + ', ' + Month(dUv) + ', ' + Year(dUv) + ') <= prnaryad.DatOk or                              ');
+      MysqlAddStr(qStr, '                    prnaryad.DatOk = #date(0, 0, 0))                                                                                      ');
+      MysqlAddStr(qStr, '               and mnplan.nrec is not null                                                                                                ');
+      MysqlAddStr(qStr, '               and lschet.summa27 <> 0                                                                                                    ');
+      MysqlAddStr(qStr, '               and katorgdescr.cgroup = #comp(' + string(IndGroup) + ')                                                                   ');
+      MysqlAddStr(qStr, '               and ( lschet.datuv = #date(0, 0, 0) or                                                                                     ');
+      MysqlAddStr(qStr, '                     lschet.datuv >= #date(' + Day(1) + ', ' + Month(dUv) + ', ' + Year(dUv) + ') )                                       ');
+      MysqlAddStr(qStr, '               and (substring(buhschet.schet, 2, 2) in (''25'', ''26'') or                                                                ');
+      MysqlAddStr(qStr, '                    substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'') or                 ');
+      MysqlAddStr(qStr, '                    mnplan.number in (''239000000120'', ''239000300120'')                                                                 ');
+      MysqlAddStr(qStr, '               )                                                                                                                          ');
+      MysqlAddStr(qStr, '         union all                                                                                                                        ');
+      MysqlAddStr(qStr, '         select                                                                                                                           ');
+      MysqlAddStr(qStr, '           lschet.tperson as cPers                                                                                                        ');
+      MysqlAddStr(qStr, '         from prvidopl                                                                                                                    ');
+      MysqlAddStr(qStr, '         left join lschet on prvidopl.clsch = lschet.nrec                                                                                 ');
+      MysqlAddStr(qStr, '         left join mnplan on case when prvidopl.tbld[1] = 7 then prvidopl.ckaud[1]                                                        ');
+      MysqlAddStr(qStr, '                                  when prvidopl.tbld[2] = 7 then prvidopl.ckaud[2]                                                        ');
+      MysqlAddStr(qStr, '                                  when prvidopl.tbld[3] = 7 then prvidopl.ckaud[3]                                                        ');
+      MysqlAddStr(qStr, '                                  when prvidopl.tbld[4] = 7 then prvidopl.ckaud[4]                                                        ');
+      MysqlAddStr(qStr, '                                  when prvidopl.tbld[5] = 7 then prvidopl.ckaud[5]                                                        ');
+      MysqlAddStr(qStr, '                                  when prvidopl.tbld[6] = 7 then prvidopl.ckaud[6]                                                        ');
+      MysqlAddStr(qStr, '                                  else #comp(0h)                                                                                          ');
+      MysqlAddStr(qStr, '                             end = mnplan.nrec                                                                                            ');
+      MysqlAddStr(qStr, '         left join buhschet on mnplan.canval2 = buhschet.nrec                                                                             ');
+      MysqlAddStr(qStr, '         left join attrnam an on 25001 = an.wtable and ''Физическое лицо (контрагент)'' = an.name                                         ');
+      MysqlAddStr(qStr, '         left join attrval av on 25001 = av.wtable and an.nrec = av.cattrnam and lschet.tperson = av.crec                                 ');
+      MysqlAddStr(qStr, '         left join katorgdescr on av.vcomp = katorgdescr.crec                                                                             ');
+      MysqlAddStr(qStr, '         where     prvidopl.datan between #date(' + Day(1)        + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                             ');
+      MysqlAddStr(qStr, '                                      and #date(' + Last_Day(dUv) + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                             ');
+      MysqlAddStr(qStr, '               and prvidopl.datok between #date(' + Day(1)        + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                             ');
+      MysqlAddStr(qStr, '                                      and #date(' + Last_Day(dUv) + ', ' + Month(dUv) + ', ' + Year(dUv) + ')                             ');
+      MysqlAddStr(qStr, '               and mnplan.nrec is not null                                                                                                ');
+      MysqlAddStr(qStr, '               and lschet.summa27 <> 0                                                                                                    ');
+      MysqlAddStr(qStr, '               and katorgdescr.cgroup = #comp(' + string(IndGroup) + ')                                                                   ');
+      MysqlAddStr(qStr, '               and ( lschet.datuv = #date(0, 0, 0) or                                                                                     ');
+      MysqlAddStr(qStr, '                     lschet.datuv >= #date(' + Day(1) + ', ' + Month(dUv) + ', ' + Year(dUv) + ') )                                       ');
+      MysqlAddStr(qStr, '               and (substring(buhschet.schet, 2, 2) in (''25'', ''26'') or                                                                ');
+      MysqlAddStr(qStr, '                    substring(mnplan.number, 1, 2) in (''70'', ''71'', ''72'', ''73'', ''74'', ''75'', ''76'', ''48'') or                 ');
+      MysqlAddStr(qStr, '                    mnplan.number in (''239000000120'', ''239000300120''))                                                                ');
+      MysqlAddStr(qStr, ' ) t                                                                                                                                      ');
+    }
+
+
+    var objQuery: iQuery;
+        objQuery := queryManager.createQuery(qStr);
+
+    if (objQuery.execute.errorCode != tsOk) then
+    {
+      Message('Ошибка обработки списка сотрудников (ReFill_ExclPsn) ' + objQuery.errorCode, Error);
+    }
+    else
+    {
+      sqlCopyInto(objQuery, tnTmpIndPsn, true);
+//      message(RecordsInTable(tnTmpIndPsn));
+    }
+    sqlFreeStr(qStr);
+
+    _Loop TmpIndPsn
+    {
+      if (RecordExists KatLinkPsn where ((     coPersons       == KatLinkPsn.codetable
+                                           and KL_code         == KatLinkPsn.code
+                                           and KL_on           == KatLinkPsn.ownName
+                                           and TmpIndPsn.cPers == KatLinkPsn.crec (noIndex) )) <> tsOk)
+      Insert KatLinkPsn
+      Set    KatLinkPsn.codetable := coPersons
+           , KatLinkPsn.code      := KL_code
+           , KatLinkPsn.ownName   := KL_on
+           , KatLinkPsn.crec      := TmpIndPsn.cPers
+           , KatLinkPsn.Tune1     := 666;               //признак того, что добавлено автоматом
+    }
+
+    StopVisual;
+  }
+}
+
+HandleEvent
+cmInit:
+{
+  set _log := 'em_avans_zar_' + DateToStr(Cur_Date(),'_YYYYMMDD')+ TimeToStr(Cur_Time(),'_HHMMSS') + '.log';
+
+  if( getFirst KatKau where (( wGetTune('NPOEM_OWN.ZP.PLAN_DISTR_SPKAU') == KatKau.KodGroup )) <> tsOk ) then
+  {
+     Message('Не указана настройка ' + GetTuneName('NPOEM_OWN.ZP.PLAN_DISTR_SPKAU') + ''#13 +
+             'Интерфейс работать не будет.', Error );
+     Abort; Exit;
+  }
+  else
+  {
+    set wSpKau := KatKau.KodGroup;
+  }
+
+  /*
+    чтобы по индивидуальным не формировались платежки по 2 рубля, убираем их автоматом
+    из перечня сотрудников в список исключений
+  */
+  ReFill_ExclPsn(_TypeFot);
+
+  _strWarning1 := _strWarning2 := '';
+//  FillSpkau_period;
+  Fill_tmpItog;
+  Fill_tmpRaspr;
+}
+
+cmCheckField:
+{
+  case CurField of
+    #_TypeFot :
+    {
+      /*
+        чтобы по индивидуальным не формировались платежки по 2 рубля, убираем их автоматом
+        из перечня сотрудников в список исключений
+      */
+      ReFill_ExclPsn(_TypeFot);
+      Fill_tmpRaspr;
+    }
+    #tmpItog.dSumRaspPlan :
+    {
+      if (tmpItog.cVPlan = comp(coVirtualcVPlan)) then
+      {
+         tmpItog.dSumRaspPlan := 0.0;
+      }
+      if (tmpItog.dSumRaspPlan = 0.0) then
+      {
+        tmpItog.dPercent := 0.0;
+      }
+      Update current tmpItog;
+      SavePlanSum;
+      DistrPlanSum(0);
+    }
+    #tmpItog.dPercent :
+    {
+      tmpItog.dPercent := Round(tmpItog.dPercent, coDecimalPoint);
+      if (tmpItog.dPercent = 0.0) then
+      {
+        tmpItog.dSumRaspPlan := 0.0;
+      }
+      Update current tmpItog;
+      DistrPlanSum(1);
+    }
+  end;
+  ReReadRecord;
+}
+
+cmValue1:
+{
+  Message('В работе');
+}
+
+cmHotKeys:
+{
+  PutHotCommand(RunDynMenu('GP_ZP::EmRaspAvansZar_HotKeys'));
+}
+
+
+
+
+cmValue11:
+{
+ set curTypeExcl := cgKau_KatPodr;
+  Runwindowmodal(winPickExcludedPodr);
+  ClearFuncCache;
+  Message('Необходимо перераспределить суммы по сотрудникам',warning)
+}
+
+cmValue12:
+{
+ set curTypeExcl := cgKau_Persons;
+  Runwindowmodal(winPickExcludedPsn);
+  ClearFuncCache;
+  Message('Необходимо перераспределить суммы по сотрудникам',warning)
+
+}
+cmValue14:
+{
+  Runwindowmodal(winPickExcludedVplan);
+  ClearFuncCache;
+  Message('Необходимо перераспределить суммы по сотрудникам',warning)
+
+}
+
+cmValue13:
+{
+/*
+  Удаляем все из гп_распаванс, где
+  and 0 == gp_raspavansLoop.isarh
+  and dBeg == gp_raspavansLoop.datan
+  and dEnd == gp_raspavansLoop.dataok (noIndex)
+*/
+
+  if (not CheckFactSum) then
+  {
+    Message('Фактическая сумма распределения превышает плановую'#13 +
+            'Сохранение результата невозможно', Error);
+    stop; abort; exit;
+  }
+
+  if (_TypeFot = 1) then
+  {
+    if (message('Вы сохраняете зар. плату за ' + datetostr(dBeg,'month YYYY') + ''#13 +
+                'записи по распределению аванса по ГОЗ будут переведены в архив.'#13 +
+                'Продолжить?', YesNo) <> cmYes) then
+    {
+       stop; abort; exit;
+    }
+  }
+  StartNewVisual(vtRotateVisual, vfTimer, 'Распределение суммы по накладным', 0);
+  update GP_RaspAvans where
+         (( 0 == GP_RaspAvans.IsArh
+         and ZeroDate <<GP_RaspAvans.DataOk(noindex)
+         and dBeg >>GP_RaspAvans.DataOk(noindex)
+           ))
+  set GP_RaspAvans.IsArh:=1;
+
+
+  DeleteFromGpRaspAvans;
+  CopyToGpRaspAvansFromTRasp;
+  DeleteUnusedPlanSum;
+  //Fill_tmpItog;
+  Fill_tmpRaspr;
+
+  StopVisual;
+}
+
+end; //HandleEvent
+
+End.
+
+#include UserReport.vih
+
+VipInterface UserReport_EM_AvansZar_Rasp Implements IUserReport Licensed(free);
+Interface UserReport_EM_AvansZar_Rasp;
+
+Procedure Run;
+Begin
+  if (wGetTune('NPOEM_OWN.ZP.DISTR_FAKT_AVANS_TO_GOZ') = 0) then
+  {
+    Message('У Вас нет прав для работы с данным интерфейсом'#13 +
+            GetTuneName('NPOEM_OWN.ZP.DISTR_FAKT_AVANS_TO_GOZ'), Error );
+  }
+  else
+  {
+    runinterface(EM_AvansZar_Rasp);
+  }
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Распределение заработной платы накладных по ГОЗ';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := '';
+  End;
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'MENUZARP';
+  end;
+end;
+
+End.
+
+EmRaspAvansZar_HotKeys Menu
+{
+  - 'Печать отчета', cmValue1, ,hcBankLMIntAnRep, 'Ctrl+P', kbCtrlP, sci1Esc;
+}

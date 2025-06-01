@@ -1,0 +1,343 @@
+/*************************************************************************************************\
+* Наименование: Выработка по табелям/нарядам                                                      *
+* Контур/Модуль: Табельный учет                                                                   *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |--            |06/10/19|Плинда Н.А.              |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include UserReport.vih
+
+VipInterface UserReport_Gp_Vyr Implements IUserReport;
+
+Interface UserReport_Gp_Vyr 'Выработка по табелям/нарядам' gray dialog;
+  show (, , 161, 32);
+
+table struct NarEM
+(
+clsch:comp,
+chasf:double,
+mesn:integer
+)
+with index (n01=clsch+mesn);
+
+
+  const
+    stPlanned = 0;
+    stActual = 1;
+    hkWorking = 1;
+    cfDisregardPeriod = 64;
+  end;
+
+var
+ _log : string;
+  Counter : longint;
+  i, chasfNar, Otrab:double;
+  ExcelPath:string;
+var wMBeg , wMEnd ,wYear : word;
+create view createdView
+  as
+select NarEM.*
+  from
+    lstab
+  , persons
+  , katpodr
+  , narem // , lschet
+  , sys_nar
+  , prnaryad
+//  , Appointments
+  , Catalogs
+where ((  lstab.cex == katpodr.nrec
+ and lstab.cappoint == catalogs.nrec
+  and lstab.tperson == persons.nrec
+  and          900 >>= sys_nar.choice // and lstab.clschet==lschet.nrec
+  and  sys_nar.nrec == prnaryad.mnrec
+))
+;
+
+Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
+{
+ Result:=sqlAddStr(query_handle, add_query_str);
+ LogStrToFile(_log,add_query_str);
+
+} //Function MysqlAddStr(var query_handle: longInt; add_query_str: string):
+
+function CreateExcel (FExcelName : string) : boolean;
+{
+  StartNewVisual(vtRotateVisual, vfBreak+vfTimer, 'Инициализация EXCEL', 1);
+    result := true;
+
+    DeleteFile(FExcelName);
+
+    if (not xlCreateExcel(FExcelName, true))
+    {
+      message('ОШИБКА! Не удалось инициализировать сессию Excel', Error);
+      xlKillExcel;
+      result := false;
+      exit;
+    }
+
+    if (not xlIsExcelValid)
+    {
+      message('ОШИБКА! Не удалось инициализировать сессию Excel', Error);
+      xlKillExcel;
+      result := false;
+      exit
+    }
+  var xlCount : word;
+  xlCount := 0;
+   Do
+   {
+    xlGetSheetsCount(xlCount);
+    xlDeleteSheet(xlCount);
+   } while xlCount > 1
+
+    xlSetActiveSheet(1);
+    xlSetSheetName(1, 'NaryadVirabotka_'+UserName);
+
+   StopVisual('',0);
+}
+
+Procedure MyPrintMatrixToExcel(var nrow, nrowReal : longint);
+{
+ if nrow = 100 then
+  {
+   xlWritematrixToExcel(nrowReal,1);
+   xlclearMatrix;
+   nrowReal := nrowReal + nrow;
+   nrow := 0;
+  }
+}
+window winRepParam 'Выработка по табелям/нарядам ' doAccept, escClose;
+screen scrRepParam (,,sci13Esc);
+    fields
+      wMBeg ('Месяц начала'): noProtect ,NoPickButton;
+      wMEnd ('Месяц окончания'): noProtect ,NoPickButton,NoDel;
+      wYear ('Год',): noProtect ,NoPickButton,NoDel;
+    buttons
+      cmOK,default,,'Запуск',,;
+      cmCancel,,,'Выход',,;
+<<
+
+ Месяц С.@@@ по.@@@ за Год.@@@@@@@@
+
+   <.~С~формировать.>   <.~О~тмена.>
+>>
+end; // screen scrRepParam
+HandleEvent
+
+cmInit: {
+  wMBeg := 1;
+  wMEnd := 12;
+  wYear := Year(Cur_Date);
+}
+
+cmOK:{
+    StartNewVisual(vtRotateVisual,vfTimer,'Обработка нарядов', 1);
+    InitWorkingTable;
+  _log := GetStringParameter('Files', 'OutputFilesDirectory', 0) + 'NaklReportsWithAkt_'+datetostr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS')+'.log';
+  deletefile(_log);
+i:=wMBeg;
+
+  delete all narEm;
+  var hstr : longint = 0;
+
+    MysqlAddStr(hstr, 'select                        ');
+    MysqlAddStr(hstr, '  pn.clsch as clsch           ');
+    MysqlAddStr(hstr, '  ,d_month(pn.datan) as mesn   ');
+    MysqlAddStr(hstr, '  ,Sum(pn.chasf) as chasf     ');
+    MysqlAddStr(hstr, 'FROM  sys_nar sn              ');
+    MysqlAddStr(hstr, 'join prnaryad pn on (sn.nrec = pn.mnrec)');
+    MysqlAddStr(hstr, 'where                                   ');
+    MysqlAddStr(hstr, '      (sn.choice = 3 or sn.choice = 203)');
+    MysqlAddStr(hstr, 'and   pn.datan >= #date(01,'+String(wMBeg)+','+string(wYear)+')');
+    MysqlAddStr(hstr, 'and   pn.datok <= #date(31,'+String(wMEnd)+','+string(wYear)+')');
+    MysqlAddStr(hstr, 'group by   pn.clsch  ');
+    MysqlAddStr(hstr, '  ,d_month(pn.datan) ');
+
+  var objQuery: iQuery;
+    objQuery := queryManager.createQuery(hstr);
+
+  if objQuery.execute.errorCode != tsOk
+   then {
+      logstrtofile(_log,'Ошибка выполнения запроса '+ objQuery.errorCode);
+      }
+  else
+  {
+    sqlCopyInto(objQuery, tnnarEm, true);
+  }
+
+/*
+_loop sys_nar //  where ((900 >>= sys_nar.choice ))
+  {
+    if sys_nar.choice>900 continue;
+
+    _loop prnaryad //  where ((sys_nar.nrec==prnaryad.mnrec))
+    {
+      nextvisual;
+      if prnaryad.vidopl<>1 continue;
+      if year(prnaryad.datan)<>wYear continue;
+
+      clearbuffer(#narEm);
+         narEm.clsch := prnaryad.clsch;
+         narEm.mesn  := month(prnaryad.datan);
+         narEm.chasf := prnaryad.chasf;
+       insert current narEm;
+    }
+
+  }
+*/
+  StopVisual('',0);
+
+/*
+ ExcelPath := Ltrim(StartPathName)+'\xls_ЭМ\staff\';
+ ExcelPath := if(substr(ExcelPath,1,2) = '\\','\','') + Replace(ExcelPath,'\\','\');
+
+    xlCreateExcelWithTemplate(ExcelPath+'gP_vyr.xlsx',true);
+!    xlCreateExcelWithTemplate('\\dep968-terminal\User_disk\Galaktika\WorkFolder\ERPDB\Nikolai.Plinda\1.xls',true)
+    if (xlIsExcelValid) xlSetActiveWorkBookByName('1');
+
+Counter:=2;
+*/
+
+  var _excelFile :string = GetStringParameter('Files','TmpFilesDirectory',0)+'NaryadVirabotka_'+UserName+'_'+DateToStr(Cur_Date,'YYYYMMDD')+'_'+TimeToStr(Cur_Time,'HHMMSS')+'.xlsx';
+  if not CreateExcel(_excelFile)
+    then {Stop; Abort; exit;}
+
+  xlCreateMatrix(100,17);
+
+  StartNewVisual(vtNumericVisual,vfTimer,'Обработка табелей', 1);
+  var Nrow0,Nrow, column, nrowreal : longint;
+  Nrow := 1;
+    Column := 1;
+    xlstWriteToMatrix(Nrow,Column,'Табельный номер'); Column++;
+    xlStWriteToMatrix(Nrow,Column,'Тариф'); Column++;
+    xlstWriteToMatrix(Nrow,Column,'ФИО'); Column++;
+    xlstWriteToMatrix(Nrow,Column,'Подразделение'); Column++;
+    xlstWriteToMatrix(Nrow,Column,'Должность'); Column++;
+    xlstWriteToMatrix(Nrow,Column,'Месяц'); Column++;
+    xlstWriteToMatrix(Nrow,Column,'Год'); Column++;
+    xlStWriteToMatrix(Nrow,Column,'Отработано по табелю'); Column++;
+    xlStWriteToMatrix(Nrow,Column,'Часы нарядов');
+    MyPrintMatrixToExcel(Nrow,NrowReal);
+
+do
+{
+_loop lstab where ((wYear==lstab.yearn and i==lstab.mesn))
+ {
+   nextvisual;
+   if lstab.sisopl<>20 continue;
+   otrab:=0;
+	if LoadWorkingTable(Lstab.clschet, i, wYear) = 0
+	{
+    Otrab :=WT_GHBD(hkWorking, 0, 0, stActual, date(1,i,wYear), date(last_day(date(1,i,wYear)),i,wYear));
+	}
+
+   ChasfNar := 0;
+!	_loop prnaryad where ((lstab.clschet==prnaryad.clsch)) and month(prnaryad.datan)=i and year(prnaryad.datan)=wYear and prnaryad.vidopl=1
+/*
+	_loop NarEm where ((lstab.clschet==narEm.clsch and i==NarEm.mesn))
+	{
+		ChasfNar := ChasfNar + NarEm.chasf;
+	}
+*/
+	if getfirst NarEm where ((lstab.clschet==narEm.clsch and i==NarEm.mesn)) = tsOK
+	{
+		ChasfNar := NarEm.chasf;
+	}
+
+  if otrab>0 or ChasfNar>0
+  {
+/*
+    xlsetcellStringValue(chr(39)+lstab.strtabn,Counter,1,Counter,1);
+    xlsetcellNumberValue(lstab.tarif          ,Counter,2,Counter,2);
+    xlsetcellStringValue(persons.fio          ,Counter,3,Counter,3);
+    xlsetcellStringValue(katpodr.kod          ,Counter,4,Counter,4);
+    xlsetcellNumberValue(          i          ,Counter,5,Counter,5);
+    xlsetcellNumberValue(      wYear          ,Counter,6,Counter,6);
+    xlsetcellNumberValue(      Otrab          ,Counter,7,Counter,7);
+    xlsetcellNumberValue(   ChasfNar          ,Counter,8,Counter,8);
+//    xlsetcellNumberValue(ChasfNar/Otrab      ,Counter,9,Counter,9);
+Counter++;
+*/
+    Nrow++;
+    Column := 1;
+    xlstWriteToMatrix(Nrow,Column,chr(39)+lstab.strtabn); Column++;
+    xlDOWriteToMatrix(Nrow,Column,lstab.tarif); Column++;
+    xlstWriteToMatrix(Nrow,Column,persons.fio); Column++;
+    xlstWriteToMatrix(Nrow,Column,katpodr.kod); Column++;
+      if(getfirst Catalogs = tsOK){
+         xlstWriteToMatrix(Nrow,Column,catalogs.name);
+       }
+    Column++;
+    xlstWriteToMatrix(Nrow,Column,          i); Column++;
+    xlstWriteToMatrix(Nrow,Column,      wYear); Column++;
+    xlDoWriteToMatrix(Nrow,Column,      Otrab); Column++;
+    xlDoWriteToMatrix(Nrow,Column,   ChasfNar);
+    MyPrintMatrixToExcel(Nrow,NrowReal);
+  }
+ }
+i:=i+1;
+}
+while i<=wMEnd
+
+ xlFrameCells(xlBorderL + xlBorderR + xlBorderT + xlBorderB, xlMedium, xlContinuous, 0, 2, 1, nrow+nrowreal-1, Column);
+ xlWriteMatrixToExcel(NrowReal,1);
+ xlSaveWorkBookByName(_excelFile);
+
+xlkillExcel;
+  stopVisual('', 0);
+CloseWindowEx(winRepParam, cmDefault);
+
+}
+end; // Window
+HandleEvent // interface
+end;
+end; //he
+!-------------------------------------------------------------------------------
+// Запуск отчета на выполнение при выборе его из списка отчетов
+procedure Run;
+begin
+  RunWindow(winRepParam);
+end;
+!-------------------------------------------------------------------------------
+// Наименование отчета в списке
+function GetReportName: String;
+begin
+  GetReportName := 'Сводная информация по выработке (наряды, табеля)';
+end;
+!-------------------------------------------------------------------------------
+// Наименования групп, в которые входит отчет
+// Группа n+1 делается подчиненной группе n
+// В данном случае будет иерархия:
+// [+] Группа 1
+//     [+] Группа 2
+//         Отчет 1
+function GetGroupName (Level : Word) : String;
+begin
+  GetGroupName := '';
+  case Level of
+    1 : GetGroupName := 'Отчеты по табелям';
+  end;
+end;
+!-------------------------------------------------------------------------------
+// Приоритет отчета - сортировка внутри группы выполняется сначала
+// по приоритету, а затем по наименованию
+function GetPriority : Integer;
+begin
+  GetPriority := 0;
+end;
+!-------------------------------------------------------------------------------
+// ModuleID модулей, в которых будет виден отчет
+// '*' - отчет будет виден в любом модуле
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+end;
+!-------------------------------------------------------------------------------
+end.

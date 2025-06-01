@@ -1,0 +1,348 @@
+/*************************************************************************************************\
+* Наименование: Построитель запроса для DSQL                                                      *
+* Контур/Модуль: *                                                                                *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |              |15/08/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_QueryBuilder.vih
+
+interface GP_QueryBuilder;
+
+var CurRowNum,ParentRowNum,hStr:longint;
+    DebugeMode:boolean;
+    LogFileName:string;
+    IsTmpListVal:boolean;
+
+table struct Rows(
+  Tip:word,Num:longint,Parent:longint,str:string
+)
+with index (i=Tip+Parent+Num);
+
+table struct TmpListVal(ListNum:longint,Val:comp) with index (i=ListNum);
+
+create view
+var CurListNum:longint;
+from
+  Rows,Rows Rows2,Rows Rows3,
+  TmpListVal
+where((
+  CurListNum==TmpListVal.ListNum
+));
+
+procedure AddRow(t:word;p:longint;s:string);
+{
+  if (trim(s)='') exit;
+
+  Rows.Tip:=t;
+  Rows.Parent:=p;
+  Rows.Num:=++CurRowNum;
+  Rows.str:=s;
+  insert current Rows;
+}
+
+function MakeCondition(s:string;val:variant):string;
+var d:date;
+    ss:string;
+{
+  ss:=trim(s);
+  if (ss<>'') ss:=ss[length(ss)];
+  if (ss='=' or ss='>' or ss='<') {
+    case VType(val) of
+      VT_DATE:{//date
+        d:=StrToDate(string(val),'DD/MM/YYYY');
+        s:=s+'#date('+string(day(d))+','+string(month(d))+','+string(year(d))+')';
+      }
+      VT_I8:s:=s+'#comp('+string(val)+')';//comp
+      VT_I2,VT_I4,VT_UI1,VT_UI2:s:=s+string(val);//integer,longint,byte,word
+      VT_BSTR:s:=s+''''+string(val)+'''';//string
+      VT_R4,VT_R8:s:=s+string(val,35,10);//double
+      VT_EMPTY,VT_NULL:exit;
+    end;
+  };
+
+  result:=s;
+}
+
+procedure AddStr(s:string);
+{
+  sqlAddStr(hStr,s);
+  if (DebugeMode and LogFileName<>'')
+    LogStrToFile(LogFileName,s);
+}
+
+constructor Init;
+{
+  CurRowNum:=0;
+  ParentRowNum:=0;
+  LogFileName:='';
+  hStr:=0;
+  DebugeMode:=false;
+  IsTmpListVal:=false;
+  delete all Rows;
+
+  result:=true;
+}
+
+destructor Done;
+{
+  DropTmpTables;
+}
+
+procedure AddText(s:string);
+{
+  AddRow(0,0,s);
+}
+
+procedure AddToSelect(s:string);
+{
+  AddRow(1,0,s);
+}
+
+procedure AddToFrom(s:string);
+{
+  AddRow(2,0,s);
+  ParentRowNum:=CurRowNum;
+}
+
+procedure AddCondition(s:string;val:variant='');
+{
+  if (ParentRowNum=0) exit;
+
+  AddRow(2,ParentRowNum,MakeCondition(s,val));
+}
+
+procedure AddConditionMarker(s:string;m:longint);
+var i,k,CurParentRowNum:longint;
+    cRec:comp;
+{
+  if (trim(s)='') exit;
+  if (ParentRowNum=0) exit;
+  CurParentRowNum:=ParentRowNum;
+
+  k:=GetMarkerCount(m);
+  case k of
+    0:AddRow(2,ParentRowNum,s+'=#comp(0)');
+    1:{
+      GetMarker(m,0,cRec);
+      AddRow(2,ParentRowNum,s+'=#comp('+string(cRec)+')');
+    }
+    else {
+      AddRow(2,ParentRowNum,s+' in (');
+      ParentRowNum:=CurRowNum;
+      for(i:=0;i<k;i++) {
+        GetMarker(m,i,cRec);
+        AddRow(2,ParentRowNum,if(i=0,' ',',')+'#comp('+string(cRec)+')');
+      };
+      AddRow(2,ParentRowNum,')');
+      ParentRowNum:=CurParentRowNum;
+    }
+  end;
+}
+
+procedure AddToWhere(s:string;val:variant='');
+{
+  AddRow(3,0,MakeCondition(s,val));
+}
+
+procedure AddToWhereMarker(s:string;m:longint);
+var i,k,CurParentRowNum:longint;
+    cRec:comp;
+{
+  if (trim(s)='') exit;
+  CurParentRowNum:=ParentRowNum;
+
+  k:=GetMarkerCount(m);
+  case k of
+    0:AddRow(3,0,s+'=#comp(0)');
+    1:{
+      GetMarker(m,0,cRec);
+      AddRow(3,0,s+'=#comp('+string(cRec)+')');
+    }
+    else {
+      AddRow(3,0,s+' in (');
+      ParentRowNum:=CurRowNum;
+      for(i:=0;i<k;i++) {
+        GetMarker(m,i,cRec);
+        AddRow(3,ParentRowNum,if(i=0,' ',',')+'#comp('+string(cRec)+')');
+      };
+      AddRow(3,ParentRowNum,')');
+      ParentRowNum:=CurParentRowNum;
+    }
+  end;
+}
+
+procedure AddToGroupBy(s:string);
+{
+  AddRow(4,0,s);
+}
+
+function Make(hStr:longint=0;DebugeMode:boolean=false):longint;
+var First:boolean;
+    s:string;
+{
+  private::hStr:=hStr;
+  private::DebugeMode:=DebugeMode;
+
+  if (DebugeMode) LogFileName:=CreateTmpFileName;
+
+  _loop Rows where((0==Rows.Tip)) AddStr(Rows.str);
+
+  //Select
+  if (getfirst fastfirstrow Rows where((1==Rows.Tip))=tsok) {
+    AddStr('Select');
+    First:=true;
+    _loop Rows where((1==Rows.Tip)) {
+      AddStr('  '+if(First,'',', ')+Rows.str);
+      First:=false;
+    }//_loop Rows
+  }
+
+  //From
+  if (getfirst fastfirstrow Rows where((2==Rows.Tip))=tsok) {
+    AddStr('From');
+    _loop Rows where((2==Rows.Tip and 0==Rows.Parent and
+                      Rows.Tip==Rows2.Tip and Rows.Num==Rows2.Parent)) {
+      AddStr('  '+Rows.str);
+      if (IsValidAll(tnRows2)) {
+        AddStr('  on (');
+        First:=true;
+        _loop Rows2 where((Rows.Tip==Rows2.Tip and Rows.Num==Rows2.Parent)) {
+          if (First or LoCase(SubStr(Rows2.str,1,2))='or' or LoCase(SubStr(Rows2.str,1,3))='and') s:=''
+          else s:='and ';
+          AddStr('        '+s+Rows2.str);
+
+          _loop Rows3 where((Rows2.Tip==Rows3.Tip and Rows2.Num==Rows3.Parent))
+            AddStr('          '+Rows3.str);
+
+          First:=false;
+        }//_loop Rows2
+        AddStr('     )');
+      }
+    }//_loop Rows
+  }
+
+  //Where
+  if (getfirst fastfirstrow Rows where((3==Rows.Tip))=tsok) {
+    AddStr('Where(');
+    First:=true;
+    _loop Rows where((3==Rows.Tip and 0==Rows.Parent)) {
+      if (First or LoCase(SubStr(Rows.str,1,2))='or' or LoCase(SubStr(Rows.str,1,3))='and') s:=''
+      else s:='and ';
+      AddStr('  '+s+Rows.str);
+
+      _loop Rows2 where((Rows.Tip==Rows2.Tip and Rows.Num==Rows2.Parent))
+        AddStr('    '+Rows2.str);
+
+      First:=false;
+    }//_loop Rows
+    AddStr(')');
+  }
+
+  //Group By
+  if (getfirst fastfirstrow Rows where((4==Rows.Tip))=tsok) {
+    AddStr('Group By');
+    First:=true;
+    _loop Rows where((4==Rows.Tip)) {
+      AddStr('  '+if(First,'',', ')+Rows.str);
+      First:=false;
+    }//_loop Rows
+  }
+
+  result:=private::hStr;
+  if (DebugeMode)
+    ProcessText(LogFileName,vfRunModal+vfNewTitle+vfToErase+vfMacroSize,'GP_QueryBuilder - Текст запроса');
+  Init;
+}
+
+function MakeCriteriaFromMarker(s:string;m:TPtr):longint;//Сгенерировать текст ограничения из маркера
+{
+  result:=0;
+
+  AddCriteriaFromMarker(result,s,m);
+}
+
+function PutMarkerToTmpList(m:TPtr):boolean;
+var i,k:longint;
+    cRec:comp;
+    res:integer;
+{
+  result:=false;
+
+  if (not IsTmpListVal) {
+    sqlDropTmpTable('TmpListVal');
+    res:=sqlCreateTmpTable('table TmpListVal(ListNum:longint,Val:comp) with index (i=ListNum);',ctmNormal);
+    if (res<>tsok) {
+      message('Ошибка создания временной таблицы ('+string(res)+').',error);
+      exit;
+    }
+
+    IsTmpListVal:=true;
+  }
+
+  CurListNum:=longint(m);
+  if (getfirst TmpListVal <> tsok) {
+    k:=GetMarkerCount(m);
+    for(i:=0;i<k;i++)
+      if (GetMarker(m,i,cRec))
+        insert TmpListVal set ListNum:=CurListNum ,Val:=cRec;
+
+    //sqlFlushIntoTmp - Atlantis 5.5.29 не работает при включенном протекте
+#if(#__TOOLVERSION__ >= 5005.030)
+    res:=sqlFlushIntoTmp(tnTmpListVal,'TmpListVal',0);
+    if (res<>tsok) {
+      message('Ошибка выполнения sqlFlushIntoTmp ('+string(res)+').',error);
+      exit;
+    }
+#else
+    _loop TmpListVal {
+      NextVisual;
+
+      sqlExecDirect('INSERT INTO TmpListVal (ListNum,Val) values('+string(TmpListVal.ListNum)+', #comp('+string(TmpListVal.Val)+'))');
+    }
+#end
+  }
+  result:=true;
+}
+
+procedure AddCriteriaFromMarker(var hStr:longint;s:string;m:TPtr);
+var i,k:longint;
+    cRec:comp;
+{
+  if (trim(s)='' and hStr=0) exit;
+
+  k:=GetMarkerCount(m);
+  case k of
+    0:sqlAddStr(hStr,s+'=#comp(0)');
+    1:{
+      GetMarker(m,0,cRec);
+      sqlAddStr(hStr,s+'=#comp('+string(cRec)+')');
+    }
+    2..100:{
+      sqlAddStr(hStr,s+' in (');
+      for(i:=0;i<k;i++) {
+        GetMarker(m,i,cRec);
+        sqlAddStr(hStr,if(i=0,' ',',')+'#comp('+string(cRec)+')');
+      }
+      sqlAddStr(hStr,')');
+    }
+    else {
+      if (PutMarkerToTmpList(m))
+        sqlAddStr(hStr,s+' in (select Val from TmpListVal where ListNum='+string(longint(m))+')');
+    }
+  end;
+}
+
+procedure DropTmpTables;
+{
+  if (IsTmpListVal) {
+    sqlDropTmpTable('TmpListVal');
+    delete TmpListVal where((0<<=TmpListVal.ListNum));
+    IsTmpListVal:=false;
+  }
+}
+
+end.

@@ -1,0 +1,298 @@
+/*************************************************************************************************\
+* Наименование: Права доступа к лицевым счетам по подразделениям                                  *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: необходимо разработать отдельный функционал по разграничению прав доступа           *
+* по подразделениям аналогичному в модуле ЗП                                                      *
+* GP_UserRights ->  GP_GP_UserRights                                                                    *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1754         |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#doc
+Интерфейс "Выбор доступных подразделений"
+#end
+interface GP_SelPodr (, hcSelPodr, scViewMarkTree) EscClose, doAccept, cyan;
+  show at (,, 77, 23);
+#IFDEF _GP_
+var
+  IsCurrTree: boolean; // дерево или список
+#ENDIF
+create view Kast
+  Var
+    node    : comp;
+    prCPodr : comp;
+    Xar_SklaFlag,
+    PrOt    : boolean;
+    TSFlag  : integer;
+    prNamP  : string;
+    p2      : double;
+    prUserName : string;
+    DepartmentMarkers: TPtr;
+    wModule:word;
+as select
+  (FoundMarker(DepartmentMarkers, KatPodr.Nrec))
+  (fieldname = Marked)
+from
+  katPodr(readonly),
+  zar_user,
+  GP_UserRights,
+  synonym KatPodr SubKatPodr
+ where
+((
+  prUserName == Zar_User.OwnName
+  and KatPodr.nRec == SubKatPodr.CPodr
+  and Node == KatPodr.CPodr
+))
+order by KatPodr.CPodr, KatPodr.Name
+
+bounds PrCpodr =
+    Node == KatPodr.CPodr
+    and 0 == KatPodr.sklad
+    ordered by KatPodr.CPodr, KatPodr.Sklad, KatPodr.Name;
+
+Parameters
+  prUserName,wModule; // имя пользователя
+
+Tree 1 trPodr;
+  Table KatPodr;
+Fields
+  {font = {color = if (Marked, ColorMark, 0 )}};
+  [MarkedStr] if(Marked, 'V', '') 'V' ('Пометка подразделения'): [1], protect, noAutoSize;
+  KatPodr.Name 'Наименование' ('Наименование подразделения'): [50], protect;
+  KatPodr.Kod  'Код' ('Код подразделения'): [20], protect;
+End;
+
+#IFDEF _GP_
+browse brPodr;
+  Table KatPodr;
+Fields
+  {font = {color = if (Marked, ColorMark, 0 )}};
+  MarkedStr  'V' ('Пометка подразделения'): [1], protect, noAutoSize;
+  KatPodr.Name 'Наименование' ('Наименование подразделения'): [50], protect;
+  KatPodr.Kod  'Код' ('Код подразделения'): [20], protect;
+End;
+#ENDIF
+
+procedure CheckShare;
+{
+#IFDEF _GP_
+#ELSe
+  //update current Zar_User set Zar_User.PodrShare := if (GetMarkerCount(DepartmentMarkers) > 0, '+', '-');
+#ENDIF
+}
+
+// пометить ветвь подразделений с корнем в текущей вершине
+procedure EnableCurrentBranch(Enable: boolean);
+{
+  PushPos(#KatPodr);
+  var Queue: TPtr;
+  Queue := InitMarker('', 8, 10, 20, false);
+  InsertMarker(Queue, KatPodr.NRec);
+  var I: integer;
+
+  for(I := 0; I < GetMarkerCount(Queue); Inc(I))
+  {
+    var CurrentDepartment: comp;
+    GetMarker(Queue, I, CurrentDepartment);
+    if Enable
+      InsertMarker(DepartmentMarkers, CurrentDepartment);
+    else
+      DeleteMarker(DepartmentMarkers, CurrentDepartment);
+    _loop KatPodr where ((CurrentDepartment == KatPodr.CPodr))
+    {
+      // если склады не показываем
+      if not Xar_SklaFlag
+        // если подразделение с признаком склада
+        if KatPodr.Sklad <> 0
+          continue;
+
+      InsertMarker(Queue, KatPodr.Nrec);
+    }
+  }
+  DoneMarker(Queue, '');
+  PopPos(#KatPodr);
+}
+
+procedure MarkUnmark;
+{
+  if Marked
+  {
+    // удаляем пометки у всех нижестоящих
+    EnableCurrentBranch(false);
+  }
+  else
+  {
+    // пометить всю ветвь
+    EnableCurrentBranch(true);
+  }
+
+  RedrawCurrentAndGo(trPodr, true);
+  CheckShare;
+  SaveMyDsk(-1, riLastCurrentDepartment);
+}
+
+
+TableEvent
+  Table KatPodr;
+
+cmTreeTop:
+  Node := 0;
+
+cmTreeUp:
+  Node := KatPodr.CPodr;
+
+cmTreeDown:
+  Node := KatPodr.NRec;
+
+cmTreeNodeType:
+  if not IsValid(#SubKatPodr)
+    TreeSetNodeType(trPodr, 2);
+
+cmTreeNeedOwner:
+  TreeJumpToRecord(trPodr, KATPODR.CPODR);
+
+end;
+
+HandleEvent
+
+cmInit:
+{
+#IFDEF _GP_
+  IsCurrTree := true;
+#ENDIF
+  SetTitle('Подразделения, доступные пользователю "' + PrUserName + '"');
+  Xar_SklaFlag := boGetTune('UP.ZAR.XP.SKLAFLAG');
+  if not Xar_SklaFlag
+    pushbounds(tbprcpodr);
+
+  if (GetFirst KatPodr <> tsOk)
+    if (message('Нет подразделений', OkCancel) = Cancel)
+      abort;
+    else
+      if (RunInterface('KatPodr', integer(-1), comp(0)) = cmCancel)
+        abort;
+
+  DepartmentMarkers := InitMarker('', 8, RecordsInTable(#KatPodr), 100);
+  // загрузить текущие права в маркер
+  _loop GP_UserRights where ((prUserName == GP_UserRights.OwnName
+    and wModule == GP_UserRights.wType
+   ))
+    InsertMarker(DepartmentMarkers, GP_UserRights.CRecDs);
+}
+
+cmDone:
+{
+  // загрузить текущие права из маркера
+  delete GP_UserRights where ((prUserName == GP_UserRights.OwnName
+   and wModule == GP_UserRights.wType
+   ));
+  var I: integer;
+  for(I := 0; I < GetMarkerCount(DepartmentMarkers); Inc(I))
+  {
+    var CurrentDepartment: comp;
+    GetMarker(DepartmentMarkers, I, CurrentDepartment);
+    if getfirst fastfirstrow KatPodr where ((CurrentDepartment == KatPodr.NRec)) = tsOk
+    {
+      ClearBuffer(#GP_UserRights);
+      GP_UserRights.OwnName:= PrUserName;
+      GP_UserRights.Marked := '+';
+      GP_UserRights.cRecDs := KatPodr.NRec;
+      GP_UserRights.cGroup := KatPodr.cPodr;
+      GP_UserRights.Name   := KatPodr.Name;
+      GP_UserRights.Kod    := KatPodr.Kod;
+      GP_UserRights.wType  := wModule;
+      insert current GP_UserRights;
+    }
+  }
+
+  _loop GP_UserRights where ((prUserName == GP_UserRights.OwnName
+   and wModule == GP_UserRights.wType(noindex)
+   ))
+  {
+    var CurrentParent: comp;
+    CurrentParent := GP_UserRights.CRecDs;
+    if recordexists GP_UserRights where ((
+           PrUserName == GP_UserRights.OwnName
+           and CurrentParent == GP_UserRights.CGroup
+           and wModule == GP_UserRights.wType(noindex)
+           )) <> tsOk
+      update current GP_UserRights set GP_UserRights.IsLeaf := 1;
+  }
+  DoneMarker(DepartmentMarkers, '');
+}
+
+cmDefault:
+{
+  if GetMarkerCount(DepartmentMarkers) = 0
+    MarkUnmark;
+}
+
+cmAddNewRec:
+{ RunInterface('KatPodr', integer(-1), comp(0));
+  ReReadRecord;
+}
+
+cmEdit:
+{ RunInterface('KatPodr', integer(0), KatPodr.NRec);
+  ReReadRecord;
+}
+
+cmMarkUnMark:
+{
+  MarkUnmark;
+  ReScanPanel(#KATPODR);
+}
+
+cmSelectAll:
+{
+  TreePushPos(trPodr);
+  if TreeGetFirstEx(trPodr)
+    do
+      InsertMarker(DepartmentMarkers, KatPodr.NRec);
+    while TreeGetNextEx(trPodr);
+  TreePopPos(trPodr);
+  CheckShare;
+  ReScanPanel(#KATPODR);
+  SaveMyDsk(-1, riLastCurrentDepartment);
+}
+
+cmUnSelectAll:
+{
+  ClearMarker(DepartmentMarkers);
+  ReScanPanel(#KatPodr);
+  CheckShare;
+}
+#IFDEF _GP_
+cmAccording :
+{ var _pNrec:comp;
+  _pNrec:=KATPODR.Nrec;
+  if IsCurrTree  // из дерева в список
+  { IsCurrTree := false;
+    ResetBounds(tnKatPodr);
+    if getfirst KatPodr where (( _pNrec == KatPodr.Nrec ))=tsok {}
+    SetFormat(brPodr);
+    ReScanPanel(tnKatPodr);
+  }
+  else  // из списка в дерево
+  { IsCurrTree := true;
+    PushBounds(tnKatPodr);
+    SetFormat(trPodr);
+    ReScanPanel(tnKatPodr);
+    TreeJumpToRecord(trPodr, _pNrec);
+    ReScanPanel(tnKatPodr);
+  }
+}
+cmHotKeys:
+{  PutHotCommand(RunMenu('mnuGP_SELPODR_HoyKey'));
+}
+#ENDIF
+end; // HandleEvent
+end.
+//-----------------
+#IFDEF _GP_
+mnuGP_SELPODR_HoyKey Menu
+{
+ - 'Режим представления: линейный/иерархический',cmAccording,'Режим представления: линейный/иерархический',hcNoContext,'Alt+S',kbAltS, sci1Esc;
+}
+#ENDIF

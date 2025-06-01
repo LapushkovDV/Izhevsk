@@ -1,0 +1,1453 @@
+/*************************************************************************************************\
+* Наименование: Сводка о потерях рабочего времени в разрезе категорий работающих                  *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#824          |29/12/17|Шунин А.Г.               |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+// (Issue #824) Сводка о потерях рабочего времени в разрезе категорий работающих 
+// (Issue #824) Макет расчета с выводом результата в текстовый файл
+// (Issue #824) Вывод в Excel
+// (Issue #824) 26/02/2018 Код. Причина: справочник <Вид Производства> в таблице DEPFUNC.
+// (Issue #824) 28/03/2018 Добавил запуск из "Отчеты пользователя" Код. Причина: справочник <Вид Производства> в таблице DEPFUNC.
+#include Marker.vih
+
+interface GP_MissTime  'Сводка о потерях рабочего времени в разрезе категорий работающих' Cyan;
+show(10,5,180,30);
+
+
+const
+  KatCount = 8;   // Количество категорий от 1 до 7   +1: 8 Ветераны
+
+  cUse          =        1b ;  // Есть коды, которые к неявкам не относятся у них этот флаг 0
+  cTip          =       10b ;  // Признак целого дня 0 - целодневная, 1 - не целодневная считать часы за каждый день
+  c1Otchet      =      100b ;  // коды под параметр 2.    Вид неявки  <Вид неявки>
+  c2WorkNeed    =     1000b ;  // коды под параметр 3.    Неявки служебные
+  c3Vacation    =    10000b ;  // коды под параметр 4.    Неявки по отпускам
+  c4Sick        =   100000b ;  // коды под параметр 5.    Неявки по нетрудоспособности
+  c5AdmVacation =  1000000b ;  // коды под параметр 6.    Неявки по административным отпускам
+  c6Other       = 10000000b ;  // коды под параметр 7.    Прочие неявки
+
+  cFontBold = cUse + c1Otchet;
+
+end;
+
+//среднесписочная численность по текущему цеху
+table struct mtStat // выбрка для средней численности
+(
+  wKateg:  word
+, fSumS:    double
+)
+with index
+(
+  mtStat001 = wKateg
+);
+
+// Временная для фильтров "Подразделение"
+table struct tSelPodr
+(
+  nRec: comp,
+  KOD:  string[20],
+  NAME: string,
+  Mark: boolean,
+  ItogLine: longint, // Первая строка вывода итога.
+
+  WorkingDays : array[1..KatCount] of double // Всего по табелю - общее количество дней, отработанных по табелю данного подразделения
+)
+with index (p01=NAME (desc ), pRpt = Mark + KOD, p3 = nRec);
+
+/*
+// Промежуточные Итоги по подразделению
+table struct tRptRes
+(
+   cRec: comp,       // ссылка на подразделение
+   KOD:  string[20], // Код подразделения
+   NAME: string      // наименование подразделения
+  ,dOtchet      : array[1..KatCount] of double //
+  ,dWorkNeed    : array[1..KatCount] of double //
+  ,dVacation    : array[1..KatCount] of double //
+  ,dSick        : array[1..KatCount] of double //
+  ,dAdmVacation : array[1..KatCount] of double //
+  ,dOther       : array[1..KatCount] of double //
+)
+with index (p01=cRec);
+*/
+
+// Настройка по неявкам
+table struct tNastr
+(
+  nRec   : comp,  // по порядку внутри
+  cParent: comp,
+  npp    : longint,  // сортировка
+  NUM: string,
+  NAME: string,
+  kod:longint // код назначения неявки в отчете побитовая
+//  tip: boolean // Признак целого дня false - целодневная, true - не целодневная считать часы за каждый день
+)
+with index (p01=nRec (Unique,autoinc), p02= cParent + npp);
+
+
+// Результат расчета по неявкам для подразделения
+table struct tRptRes
+(
+  cPodr  : comp, // nRec подразделения
+  cRec   : comp, // nRec неявки
+  DD     : array[1..KatCount] of double // Дней по категориям
+)
+with index (p01=cPodr + cRec);
+
+ type tRec_Itog = record
+        dOtchet      : array[1..KatCount] of double; //
+        dWorkNeed    : array[1..KatCount] of double; //
+        dVacation    : array[1..KatCount] of double; //
+        dSick        : array[1..KatCount] of double; //
+        dAdmVacation : array[1..KatCount] of double; //
+        dOther       : array[1..KatCount] of double; //
+
+      WorkingOthers  : array[1..KatCount] of double; // Отработано дней - количество дней явок, все дни по табелю НЕ перечисленные во входном параметре <Вид неявки>
+end;
+
+var
+  pMarker:IMarker(Marker) new;
+  pMarkerPodr:IMarker(Marker) new;
+  cList, cItog:comp;
+
+  Filtr_cMNF, LastFiltr_cMNF:longInt ;
+  Filtr_KatMNF: string;
+
+  Filtr_cKatPODR:comp;
+  Filtr_Katpodr: string;
+  Marker_Count :longint;
+
+  cRptDep: comp;
+
+  sDskPrefix: string;
+  bPauseBeforOutExcel: boolean;
+
+  Counter, HeadRow: longInt;
+
+create view vM
+var
+   cRootNode, cNode:comp;
+   wFilter,   wFilter_A:word;
+   DTB,  DTE  :date;
+   dNeedSave: boolean;
+//   filtr_KatPodr : String;
+as select DepCat.NRec, tSelPodr.nRec
+
+// Вспомогательные настройки
+ ,if((DepCat.kod and cUse         ) >0,'V','') (fieldname=fUSE         )  // Есть коды, которые к неявкам не относятся у них этот флаг пустой
+ ,if((DepCat.kod and cTip         ) >0,'ч','') (fieldname=fTip         )  // Признак целого дня 0 - целодневная, 1 - не целодневная считать часы за каждый день
+
+// Настройки по ТЗ отчета
+ ,if((DepCat.kod and c1Otchet     ) >0,'V','') (fieldname=f1Otchet     )  // коды под параметр 2.       Вид неявки  <Вид неявки>
+ ,if((DepCat.kod and c2WorkNeed   ) >0,'V','') (fieldname=f2WorkNeed   )  // коды под параметр 3.       Неявки служебные
+ ,if((DepCat.kod and c3Vacation   ) >0,'V','') (fieldname=f3Vacation   )  // коды под параметр 4.       Неявки по отпускам
+ ,if((DepCat.kod and c4Sick       ) >0,'V','') (fieldname=f4Sick       )  // коды под параметр 5.       Неявки по нетрудоспособности
+ ,if((DepCat.kod and c5AdmVacation) >0,'V','') (fieldname=f5AdmVacation)  // коды под параметр 6.       Неявки по административным отпускам
+ ,if((DepCat.kod and c6Other      ) >0,'V','') (fieldname=f6Other      )  // коды под параметр 7.       Прочие неявки
+//  ,if((DepCat.tip),'ч','') (fieldname=fTip)         // ч - считать по часам
+
+
+from
+   tNastr DepCat    // пока не знаю как это лучше назвать оставил DepCat (UOKOD,UOCAT,Neyav,)
+  ,tNastr DepCat_Sub
+  ,tNastr tNastrMark
+  ,tNastr
+
+ , tSelPodr
+ , tSelPodr RptPodr // (pRpt) Mark + KOD
+ , Lschet , Persons
+ , tRptRes
+ , tRptRes RptRes
+ , DEPFUNC KatMNF
+ , mtStat
+ where
+((
+          cNode == DepCat.cParent
+and DepCat.NRec == DepCat_Sub.cParent
+
+
+and pMarker.pNRec == tNastrMark.nRec
+
+and   true == RptPodr.Mark   // для вывода с сортировкой по КОДУ Подразделения
+          and RptPodr.nRec == Lschet.CEX
+                          and LSchet.tPerson == Persons.nrec
+
+          and RptPodr.nRec == RptRes.cPodr
+          and  DepCat.nRec == RptRes.cRec
+
+   and Filtr_cMNF == KatMNF.CFUNC
+
+   and root == mtStat.wKateg
+
+))
+;
+
+
+
+//----------------------------------------
+//
+//     Выбор подразделений
+//
+window wnSelPodr 'Подразделения' doAccept, EscClose;
+Show at (5,5,100,25);
+Browse brSelPodr '' (,,sci14Esc);
+Table tSelPodr;
+recMarker=pMarkerPodr;
+Fields
+tSelPodr.KOD  'Код':[10],Protect,NoDel;
+tSelPodr.NAME 'Наименование подразделения':[100],Protect,NoDel;
+end;//Browse brSelPodr
+end;//wnSelPodr
+
+
+
+//--------------------------------------------------------------
+//
+//      Фильтры.
+//
+Screen sc1(,,sci1Esc);
+show(,,60,);
+Table RptPodr ;
+Fields
+  wFilter :NoProtect;
+  DTB : NoProtect;
+  DTE : NoProtect;
+  Filtr_KatMNF   : PickButton,Protect;
+  Filtr_Katpodr  : PickButton,Protect;
+  bPauseBeforOutExcel: NoProtect;
+ buttons
+   cmCalc;
+   cmCancel,,, 'Отмена', hcAllBCancel, scGalDial;
+
+<<
+  `Фильтр по`
+ [.] периоду      ` .@@@@@@@@@@@@@-.@@@@@@@@@@@@@
+ [.] производство`  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ [.] подразделению` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ [.] Пауза перед выводов в Excel`
+
+   <.Сформировать.>    <.   Отмена   .>
+
+     ТЕСТИРОВАНИЕ 25/04/2018
+     REPxFIO.log - расшифровка по сотрудникам
+
+>>
+end;
+
+
+//---------------------------------------
+// Установка наименований фильтров
+//---------------------------------------
+Procedure SetFilterNM(_Field:longint=0);
+{
+
+       if (_Field = 0) or (_Field = #Filtr_Katpodr)
+       if pMarkerPodr.count = 0
+       {
+         wFilter := (wFilter or 100b) xor 100b; // выключить фильтр по подразделениям
+       }
+       else  // pMarkerPodr.count > 0
+       {
+
+              if pMarkerPodr.count > 1
+              {
+                Filtr_cKatPODR := pMarkerPodr.pnRec;
+                Filtr_KatPODR := 'Выбрано '+ pMarkerPodr.count;
+              }
+              else //  pMarkerPodr.count = 1
+              {
+                   // ставим позицию на единственное помеченое подразделение
+                    SubBounds(tbRmtSelPodr1);
+                    AddBounds(tbRmtSelPodr2);
+
+                    _Loop pMarkerPodr
+                    _Loop tSelPodr
+                    {
+                      Filtr_cKatPODR := tSelPodr.nrec;
+                      Filtr_KatPODR  := tSelPodr.Name;
+                    }
+
+                    SubBounds(tbRmtSelPodr2);
+                    AddBounds(tbRmtSelPodr1);
+              }
+
+              wFilter := wFilter or 100b;
+
+       } // if = #Filtr_Katpodr
+   RescanPanel(#RptPodr);
+} // Procedure SetFilterNM
+
+//---------------------------------------
+//       Загрузка справочника подразделений по Виду производства
+//---------------------------------------
+Procedure LoadPodr;
+{
+  if ( LastFiltr_cMNF = 0 ) or ( LastFiltr_cMNF <> Filtr_cMNF )
+  {
+    delete all tSelPodr;
+    sql
+    select distinct KATPODR.nRec, KATPODR.KOD, KATPODR.NAME
+    from  KATPODR
+    inner join DEPFUNC on KATPODR.CFUNC = DEPFUNC.CFUNC
+    where DEPFUNC.CFUNC = :(Filtr_cMNF)
+    into tSelPodr ByName;
+
+    LastFiltr_cMNF := Filtr_cMNF;
+
+    pMarkerPodr.StoreName := sDskPrefix+'KATPODR'+Filtr_KatMNF;
+
+    if pMarkerPodr.StoreName <> ''  //pMarkerPodr.ImportFromName(pMarker.StoreName); не работатет.
+    {
+            var tmpMark: longint;
+            tmpMark:= InitMarker(pMarkerPodr.StoreName, 8, 1, 1);
+            pMarkerPodr.ImportFrom(tmpMark);
+            DoneMarker(tmpMark,'');
+    }
+
+  }
+}
+
+
+//---------------------------------------
+//       Сохранение настроек
+//---------------------------------------
+
+Procedure SaveParam;
+{
+  dNeedSave := false;
+
+    SaveMyDsk(wFilter  ,sDskPrefix+'wFilter');
+    SaveMyDsk(Filtr_cMNF,sDskPrefix+'Filtr_cMNF');
+    SaveMyDsk(bPauseBeforOutExcel,sDskPrefix+'bPauseBeforOutExcel');
+
+
+     _Loop tNastr where (( cList == tNastr.cParent))
+     {
+       SaveMyDsk(tNastr.kod,sDskPrefix+'KOD'+string(tNastr.nRec,0,0));
+       SaveMyDsk(tNastr.npp,sDskPrefix+'npp'+string(tNastr.nRec,0,0));
+     }
+   /*
+     _Loop tNastr where (( cITOG== tNastr.cParent))
+     {
+       SaveMyDsk(tNastr.kod,sDskPrefix+'KOD'+string(tNastr.NUM,0,0));
+       SaveMyDsk(tNastr.npp,sDskPrefix+'npp'+string(tNastr.NUM,0,0));
+     }
+   */
+
+  if pMarkerPodr.StoreName <> ''  //pMarkerPodr.StoreToDsk; // не работатет.
+  {
+          var tmpMark: longint;
+          tmpMark:= InitMarker('', 8, pMarkerPodr.Count, 1);
+          pMarkerPodr.ExportTo(tmpMark);
+          DoneMarker(tmpMark, pMarkerPodr.StoreName);
+  }
+
+} //Procedure SaveParam;
+
+
+
+//------------------------------------------------------
+//    Чтение настроек из DSK
+//------------------------------------------------------
+Procedure LoadParam;
+{
+  var i: longint;
+  i:=0;
+  sDskPrefix := GetInterfaceName+'_';
+  if not ReadMyDsk(bPauseBeforOutExcel,sDskPrefix+'bPauseBeforOutExcel',false) bPauseBeforOutExcel:=False;
+  if not ReadMyDsk(wFilter,sDskPrefix+'wFilter',false) wFilter:=11b;
+
+
+  LastFiltr_cMNF := 0;
+  if not ReadMyDsk(Filtr_cMNF,sDskPrefix+'Filtr_cMNF',false) Filtr_cMNF := 1;
+
+    if getfirst KatMNF = tsok  Filtr_KatMNF := KatMNF.NMFUNC;
+
+    if Filtr_KatMNF <> ''  LoadPodr;
+
+
+  SetFilterNM(0);
+
+  DTB  := dGetTune('DAT_M_OT');
+  if DTB = Date(0,0,0)  DTB := Cur_Date;
+  DTB := Date(            1, Month(DTB), Year(DTB));
+  DTE := Date(Last_Day(DTB), Month(DTB), Year(DTB));
+
+  delete all tNastr;
+
+  sql select max(nrec) from UOWRKTABEL into (cList) ;
+  cList := cList + 1;
+
+
+  tNastr.cParent:= 0;
+  tNastr.npp := i++;
+  tNastr.nRec := cList;  insert current tNastr set NUM:='Вид неявки'; // , Name:='Виды рабочего времени, по которым должны собираться общие данные в отчетную форму';
+ sql select nRec, :(cList) cParent, NUM, NAME from UOWRKTABEL into tNastr BYNAME;
+
+
+
+ update tNastr where (( cList == tNastr.cParent))
+ set  tNastr.npp := i++
+    , tNastr.kod := if(ReadMyDsk(tNastr.kod,sDskPrefix+'KOD'+string(tNastr.nRec,0,0),false),tNastr.kod,0)
+    , tNastr.npp := if(ReadMyDsk(tNastr.npp,sDskPrefix+'npp'+string(tNastr.nRec,0,0),false),tNastr.npp,tNastr.npp)
+    ;
+
+
+/*
+  tNastr.npp := i++;
+  tNastr.nRec := cList++;
+  tNastr.NUM:='Неявки служебные';
+  tNastr.Name:='Виды рабочего времени, в связи со служебной необходимостью (командировка, обучение)';
+  insert current tNastr;
+*/
+
+/*
+  tNastr.cParent:= 0;
+  tNastr.Name  := '';
+  tNastr.npp := i++;
+  tNastr.nRec := 0; insert current tNastr set NUM:='Итоги';
+  cItog := tNastr.nRec;
+
+  tNastr.cParent:= cItog;
+
+  tNastr.nRec := 0;  insert current tNastr set NUM:='Всего неявок'              ;
+  tNastr.nRec := 0;  insert current tNastr set NUM:='Отработано дней'           ;
+  tNastr.nRec := 0;  insert current tNastr set NUM:='Всего по табелю'           ;
+  tNastr.nRec := 0;  insert current tNastr set NUM:='Расчетная численность'     ;
+  tNastr.nRec := 0;  insert current tNastr set NUM:='Процент потерь'            ;
+  tNastr.nRec := 0;  insert current tNastr set NUM:='Потери 09, 10, 11, 12, 45' ;
+  tNastr.nRec := 0;  insert current tNastr set NUM:='Потери 19,20'              ;
+  tNastr.nRec := 0;  insert current tNastr set NUM:='Потери 16, 17, 18'         ;
+  tNastr.nRec := 0;  insert current tNastr set NUM:='Прочие потери'             ;
+
+  update tNastr where (( cItog == tNastr.cParent))
+  set  tNastr.npp := i++
+     , tNastr.kod := if(ReadMyDsk(tNastr.kod,sDskPrefix+'KOD'+string(tNastr.NUM),false),tNastr.kod,1)
+     , tNastr.npp := if(ReadMyDsk(tNastr.npp,sDskPrefix+'npp'+string(tNastr.NUM),false),tNastr.npp,tNastr.npp)
+     ;
+*/
+
+} //Procedure LoadParam;
+
+// формирует выборку для средней численности
+// Позаимствовал из ...\RedMine\em_dev\Vip\Staff\gp_rkstat7k.vip
+// Автор Потапов А.В.
+function isGetStat(__dBeg, __dEnd: date; _cex: comp): boolean;
+{
+  var iYear:   integer = Year(__dEnd);
+  var wMesBeg: word = Month(__dBeg);
+  var wMesEnd: word = Month(__dEnd);
+
+  result := false;
+
+  delete all from mtStat;
+
+/* // оригинал у Автора:  Потапов А.В.
+   //
+    case
+      when Statis.Kateg = 5 and ( Statis.Sovm = 0 or Statis.Sovm = 1 or Statis.Sovm = 5 ) then 1
+      when ( Statis.Kateg = 6 or Statis.Kateg = 7 ) and ( Statis.Sovm = 0 or Statis.Sovm = 1 or Statis.Sovm = 5 ) then 2
+      when Statis.Kateg < 5 and ( Statis.Sovm = 0 or Statis.Sovm = 1 or Statis.Sovm = 5 ) then 3
+      when Statis.Sovm  = 2 then 4
+      else 0
+    end,
+*/
+
+  sql
+  select
+    Statis.Kateg,
+    sum(ROUND(Statis.SredKol + 0.0005,3))
+  from Statis
+  where
+        Statis.YEARN = :(iYear)
+  and ( Statis.MESN >= :(wMesBeg) and Statis.MESN <= :(wMesEnd) )
+  and ( Statis.CEX = :(_cex) )
+  group by Statis.Kateg
+  into mtStat
+  ;
+
+
+  vM.PutTableToDBF (#mtStat,'mtStat_'+RptPodr.KOD+'.XLS',0);
+  result := isValidAll(#mtStat);
+
+} // function isGetStat
+
+
+tree trNastr (,,sci14Esc); // (,,sci1Tree);
+show(61,,,);
+table DepCat;
+recMarker=pMarker;
+
+fields { font = { bold = (DepCat.kod and cFontBold ) = cFontBold  ; italic = (DepCat.kod and cUSE) = 0 } };
+  DepCat.NUM 'Раздел':[10],Protect;
+  DepCat.NAME  'Описание':[50],Protect;
+  fTip   'Тип','неявки' ('ч - если неявка (например, сокращенный рабочий день) не целодневная, то высчитывается пропорция Часы неявки в день / Часы по графику в день')  :[6],Protect,centered ;
+  fUse   'Неявка' ('V-включать в расчет неявок или полностью игнорировать') :[10],Protect,centered ;
+  f1Otchet  'В отчет' ('-виды рабочего времени, по которым должны собираться общие данные в отчетную форму') :[10],Protect,centered ;
+
+  f2WorkNeed     'Неявки','служебные' ('-виды рабочего времени, в связи со служебной необходимостью (командировка, обучение)') :[10],Protect,centered ;
+  f3Vacation     'Неявки','по отпускам' ('-виды рабочего времени, по потерям по отпускам') :[10],Protect,centered ;
+  f4Sick         'Неявки по','нетрудоспособности ' ('- виды рабочего времени, по потерям по больничным') :[10],Protect,centered ;
+  f5AdmVacation  'Неявки по','административным отпускам ' ('- виды рабочего времени, по потерям по отпускам без сохранения заработной платы') :[10],Protect,centered ;
+  f6Other        'Прочие неявки' ('-виды рабочего времени, по прочим потерям по уважительным причинам') :[10],Protect,centered ;
+end;
+
+
+TableEvent table DepCat;
+cmTreeNodeType:{
+  if (TreeIsTerminal(trNastr))
+    TreeSetNodeType(trNastr, ntfText)
+}
+cmTreeTop:{
+  cNode:=cRootNode;
+}
+cmTreeUp:{
+  cNode:=DepCat.cParent;
+}
+cmTreeDown:{
+  cNode:=DepCat.NRec;
+}
+cmTreeNeedOwner:{
+  if (DepCat.cParent<>cRootNode)
+    TreeJumpToRecord(trNastr,DepCat.cParent)
+  else
+    TreeJumpToRecord(trNastr,0);
+}
+end;
+
+procedure xlOut1(pCol:longint;pStr: string);
+{
+  xlSetCellStringValue(pStr,Counter,pCol,Counter,pCol);
+}
+
+HandleEvent
+cmInit:{
+  ClusterDisabledField(#wFilter,11b);
+  cRootNode := 0;
+  cNode:=cRootNode;
+ LoadParam;
+ if getfirst DepCat = tsok
+ {
+   TreeOpenNode(trNastr);
+   rescanpanel(#DepCat);
+ }
+}
+cmCheckField:
+{
+  case CurField of
+   #wFilter:
+   {
+     var wOld : word;
+     wOld := Word(OldFieldValue);
+     if CurField > wOld // бит установили
+     if (CurField and 10b ) > 0  //
+     {
+       if Filtr_KatMNF = ''
+       {
+         SelectField(#Filtr_KatMNF);
+         ProcessCommand(cmPick);
+       }
+     }
+     else
+     if (CurField and 100b ) > 0  //
+     {
+       if Filtr_KatPodr = ''
+       {
+         SelectField(#Filtr_KatPodr);
+         ProcessCommand(cmPick);
+       }
+     }
+   }
+   #DTB:
+   {
+      DTB := Date(            1, Month(DTB), Year(DTB));
+      DTE := Date(Last_Day(DTB), Month(DTB), Year(DTB));
+   }
+   #DTE:
+   {
+      DTB := Date(            1, Month(DTE), Year(DTE));
+      DTE := Date(Last_Day(DTB), Month(DTB), Year(DTB));
+   }
+  end;
+}
+cmPick:
+{
+      case CurField of
+
+      #DepCat.NUM,#DepCat.NAME:
+      {
+        if cList = DepCat.cParent  Update current DepCat set DepCat.kod := -DepCat.Kod;
+      }
+
+      #Filtr_KatMNF:
+      {
+          // Выбор вида производства
+          // хранятся в таблице DEPFUNC - Производственные функции подразделений
+          // DEPFUNC.NMFUNC // Наименование
+          // KATPODR.CFUNC = DEPFUNC.CFUNC // LongInt
+
+        var l_cMNF: longint = Filtr_cMNF;
+
+          if RunInterface(M_CONTROL::SELDEPFN, l_cMNF, 0)<>cmCancel
+          {
+            Filtr_cMNF := l_cMNF;
+            if getfirst KatMNF = tsok
+            {
+              Filtr_KatMNF := KatMNF.NMFUNC;
+              wFilter := wFilter or 10b;
+
+              if LastFiltr_cMNF <> Filtr_cMNF
+              {
+
+                 dNeedSave := true;
+
+                 pMarkerPodr.UnselectAll;
+                 Filtr_cKatPODR := 0;
+                 Filtr_KatPODR  := '';
+                 LoadPodr;
+
+
+              }
+            }
+          }
+          SetFilterNM(0);
+
+      }// #Filtr_KatMNF
+      #Filtr_Katpodr:
+      {
+        if Filtr_KatMNF = ''
+        {
+          message('Сначала нужно выбрать Вид производства');
+          SelectField(#Filtr_KatMNF);
+          ProcessCommand(cmPick);
+        }
+        else
+        {
+
+          LoadPodr;
+
+          // маркер для хранения помеченых подразделенй
+          // на случай выхода из выбора подразделений по Esc
+          var tmpMark: longint;
+          tmpMark:= InitMarker('', 8, pMarkerPodr.Count, 1);
+          pMarkerPodr.ExportTo(tmpMark);
+
+          if Filtr_cKatPODR > comp(0)
+          if getfirst tSelPodr where (( Filtr_cKatPODR == tSelPodr.nRec ))  =tsOK {}
+
+            if RunWindowModal(wnSelPODR)=cmDefault
+            {
+                dNeedSave := true;
+                if pMarkerPodr.count = 0
+                {
+                  pMarkerPodr.Mark; // пометить текушую
+                  //    Filtr_cKatPODR := tSelPodr.nrec;
+                  //    Filtr_KatPODR  := tSelPodr.Name;
+                  rescanpanel(#tSelPodr);
+                }
+
+            }
+            else
+            {
+              pMarkerPodr.ImportFrom(tmpMark);
+            }
+
+          DoneMarker(tmpMark,'');
+
+          SetFilterNM(#Filtr_Katpodr);
+
+        }
+      }
+      end;
+} //cmPick
+
+
+cmSelectAll: dNeedSave := true;
+cmMarkUnMark: dNeedSave := true;
+cmUnSelectAll: dNeedSave := true;
+
+
+cmDefault:
+{
+    case CurField of
+         #fUSE
+        ,#fTip
+        ,#f1Otchet
+        ,#f2WorkNeed
+        ,#f3Vacation
+        ,#f4Sick
+        ,#f5AdmVacation
+        ,#f6Other:
+        {
+          dNeedSave := true;
+
+          var bitMask: longint;
+          bitMask := longint(1) shl (CurField - #fUSE); // #f1Otchet);
+
+          if pMarker.Count > 0
+          {
+
+            PushPos(#DepCat);
+
+            SubBounds(tbRmDepCat1);
+            AddBounds(tbRmDepCat2);
+
+            _Loop pMarker
+            _Loop DepCat
+            Update current DepCat set DepCat.kod := DepCat.kod xor bitMask;
+
+            SubBounds(tbRmDepCat2);
+            AddBounds(tbRmDepCat1);
+            PopPos(#DepCat);
+          }
+          else
+            Update current DepCat set DepCat.kod := DepCat.kod xor bitMask;
+
+
+          rescanPanel(#DepCat);
+        }
+
+    end;
+}
+cmDelOnProtect:
+{
+     if CurField = #Filtr_Katpodr
+     {
+       wFilter := (wFilter and 11011b) ;// выключить фильтр по подразделениям
+       RescanPanel(#RptPodr);
+     }
+
+}
+
+cmDone:
+if dNeedSave
+if Yes=Message('Сохранить настройки?',YesNO)
+SaveParam;
+
+cmCalc:
+{
+  SaveParam;
+
+  delete all tRptRes;
+
+  PushPos(#DepCat);
+
+  var i, Hcount: longint = 0;
+  var icnt: longint = 0;
+  var bSSPOk, bGSSPOk: boolean;
+  bGSSPOk := False; // Ни разу не выводились данные по среднесписочной численности
+
+  if Filtr_KatMNF = ''
+  {
+    message('Укажите Вид производства');
+    exit;
+  }
+
+  cNode := cList;
+  _Loop DepCat
+  {
+    icnt++;
+    if (DepCat.kod and cFontBold) = cFontBold
+    i++;
+  }
+  Hcount := i;
+
+  if i = 0
+  {
+    message('Укажите виды рабочего времени для расчета');
+    exit;
+  }
+
+  var SFio: string;
+  #define _Log1(pStr) LogStrToFile('REPxFIO.log',#(pStr));
+
+DeleteFile('REPxFIO.log');
+
+#_Log1('')
+#_Log1('======================================================')
+#_Log1(_CurDateTime )
+#_Log1('Производство: ' +Filtr_KatMNF)
+#_Log1(' c' + DTB + ' по ' + DTE);
+#_Log1('======================================================')
+
+
+//---------------------------
+// Начало расчета
+
+    //---------------------------
+    // фильтр по подразделениям
+    Update tSelPodr set Mark := false;
+
+      if (wFilter and  100b ) > 0 // фильтр по подразделениям есть
+      {
+
+          if pMarkerPodr.Count > 0
+          {
+              SubBounds(tbRmtSelPodr1);
+              AddBounds(tbRmtSelPodr2);
+
+              _Loop pMarkerPodr
+              _Loop tSelPodr
+              Update current tSelPodr set tSelPodr.Mark := True;
+
+              SubBounds(tbRmtSelPodr2);
+              AddBounds(tbRmtSelPodr1);
+          }
+          else
+            Update tSelPodr where ((Filtr_cKatPODR == tSelPodr.nRec ))set tSelPodr.Mark := True;
+      }
+      else  // фильтр по подразделениям нет - все подразделения
+        Update all tSelPodr set tSelPodr.Mark := True;
+
+
+var bBreak: boolean;
+bBreak := False;
+
+ StartNewVisual(vtRotateVisual,  vfTimer + vfBreak + vfConfirm, 'Пожалуйста, подождите...', 100);
+
+if InitWorkingTable
+{
+while true // для break
+do
+{
+
+    var wKateg: word;
+    var KeyNewData: longint;
+    var Itog1: array [1..KatCount] of Double;
+    var sOut: string;
+
+
+
+_Loop RptPodr
+{
+
+  // обнуляем массив
+  for(i := 1; i <= KatCount; i++)
+  {
+    RptPodr.WorkingDays[i] := 0;
+  }
+
+
+    #_Log1('  ---------------- '+ _CurDateTime + ' ------------------');
+    #_Log1(RptPodr.KOD + ' ' + RptPodr.Name)
+
+    _Loop LSchet
+    {
+      if getfirst Persons = tsOK
+      SetVisualHeader( 'расчет по ' + Persons.FIO);
+
+
+          SFio := RptPodr.kod + '  '+ Persons.FIO;
+          SFio := Pad(SFio,60);
+          KeyNewData :=0;
+
+
+      bBreak := not nextvisual;
+      if bBreak  break;
+
+       if LoadWorkingTable(LSchet.Nrec, month(DTB), year(DTB)) = 0
+       {
+         wKateg := LSchet.Kateg;
+
+         if wKateg > 1000 wKateg := wKateg - 1000;
+         if wKateg >  100 wKateg := wKateg -  100;
+         if wKateg = 0 wKateg := KatCount;
+         if wKateg > KatCount  wKateg := KatCount;
+         // Отработано дней
+         RptPodr.WorkingDays[wKateg] := RptPodr.WorkingDays[wKateg] + WT_GHBD(hkWorking, 0, 0, stActual, DTB, DTE);
+
+         _Loop DepCat
+         if (DepCat.kod and cUse) > 0
+         {
+
+            if getfirst RptRes <> tsOK
+            {
+               ClearBuffer(#RptRes);
+
+               RptRes.cPodr  := RptPodr.nRec; // nRec подразделения
+               RptRes.cRec   := DepCat.nRec ; // nRec неявки
+               Insert current RptRes;
+            }
+
+           // Расчет по табелю
+           KeyNewData := 0;
+
+           var dHH, dDD, dHHW: double; var wDD :LongInt;
+           var iD: word;
+
+//           if not DepCat.tip //  целодневная
+           if (DepCat.kod and cTip) = 0 //  целодневная
+           {
+               wDD := WT_GetAbsencesDays (stActual, DepCat.NUM , DTB, DTE);
+               RptRes.DD[wKateg] := RptRes.DD[wKateg] + wDD;
+
+               if wDD > 0 KeyNewData++;
+
+           }
+           else // не целодневная считаем как доля дня от графика по дням
+           {
+
+var s5: string = '';
+               for(iD:=1; iD <= Day(DTE); iD++)
+               {
+
+                 Var DDay: Date;
+                 DDay := Date(iD, month(DTB), year(DTB));
+
+
+                  dHH  := WT_GetAbsencesHours(stActual, DepCat.NUM , DDay, DDay);
+
+
+                  if dHH > 0
+                  {
+                    KeyNewData++;
+
+                    dHHW := WT_GHBD(hkWorking or cfDisregardPeriod, 0, 0, stPlanned, DDay, DDay);
+
+                    s5 := 'dHHW=' + dHHW;
+                    if dHHW < dHH  s5 := s5 + '    ---  dHHW < dHH';
+
+
+                    if dHHW > 0
+                    {
+              #_Log1( SFio + '  ' +  DepCat.NUM  + ' dHH = '  + dHH + ' ' + s5  );
+
+
+                       dDD := dHH / dHHW;
+                       RptRes.DD[wKateg] := RptRes.DD[wKateg] + dDD;
+                    }
+
+                  } // if dHH > 0
+
+
+               } //for(iD:=1; iD <= Day(DTE); iD++)
+
+           } // else if DepCat.tip //  целодневная
+
+
+           Update current RptRes;
+
+           if KeyNewData > 0
+           {
+              #_Log1( sFio +' '+ DepCat.NUM +' ' +   RptRes.DD[wKateg] );
+           }
+
+         } // _Loop DepCat
+
+         /*  Заготовка-пример. К этой задаче не относится
+           PersAv.PlanCh := WT_GHBD(hkWorking or cfDisregardPeriod, 0, 0, stPlanned, datNach1, DatNach2) -
+
+
+           PersAv.Otrab  := WT_GHBD(hkWorking, 0, 0, stActual, datNach1, DatNach2);
+
+           PersAv.Night  := WT_GHBD(hkNight  , 0, 0, stActual, datNach1, DatNach2);
+           PersAv.Holiday:= WT_GHBD(hkHoliday, 0, 0, stActual, datNach1, DatNach2);
+
+         */
+       }else
+       {
+        #_Log1( sFio +'  ошибка  LoadWorkingTable');
+
+       }
+
+
+    } // _Loop LSchet
+
+    UpDate current RptPodr;
+
+    #define _Log(pStr) LogStrToFile('REPxxx.log',#(pStr));
+    #_Log('-----------------------------------------------------');
+    #_Log(RptPodr.KOD + ' ' + RptPodr.Name)
+    #_Log('---- c' + DTB + ' по ' + DTE);
+
+    var sOut, sOut2: string;
+    sOut := ''; sOut2 := '';
+        _Loop DepCat
+         if (DepCat.kod and cUse) > 0
+        _Loop RptRes
+        {
+              sOut := DepCat.NUM ;
+              sOut := Pad(sOut,4);
+              sOut :=  sOut  + ' ' + DepCat.NAME + ' ';
+              sOut := Pad(sOut,60);
+          for(i := 1; i <= KatCount; i++)
+          {
+            Itog1[i] := Itog1[i] + RptRes.DD[i];
+
+            sOut := sOut + RptRes.DD[i] + '   ';
+
+          }
+          #_Log(sOut);
+        }
+
+        sOut := '        Итог ';
+        sOut := Pad(sOut,57);
+        sOut2 := Pad(sOut2,57);
+        for(i := 1; i <= KatCount; i++)
+        {
+          sOut := sOut + Itog1[i] + '   ';
+          sOut2 := sOut2 + i + '   ';
+        }
+
+        #_Log(sOut);
+        #_Log(sOut2);
+
+    if bBreak
+    {
+     #_Log1('  Прервано пользователем '+ _CurDateTime );
+     break;
+    }
+
+}//_Loop RptPodr
+
+
+  stopVisual('', 0);
+
+  if bPauseBeforOutExcel
+  Message('Пауза перед выводом в Еxcel'#13'Закройте Еxcel для вывода отчета');
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Вывод данных в Excel ...', 100 div 5);
+
+var ExcelFileName: string = 'Сводка о потерях рабочего времени в разрезе категорий';
+var FirstLine: longint;
+
+var Itog: tRec_Itog;
+
+
+  if bBreak Break;
+
+
+  if (not xlCreateExcel(ExcelFileName,true))
+  { message('Ошибка создания нового файла в Excel"'+ExcelFileName+'".',error);
+    exit;
+  }
+
+Counter := 1;
+// ++ Шапка в Excel
+//
+
+ xlOut1( 3,'СВОДКА О ПОТЕРЯХ РАБОЧЕГО ВРЕМЕНИ В РАЗРЕЗЕ КАТЕГОРИЙ РАБОТАЮЩИХ');
+Counter++;
+ xlOut1( 3,'Предприятие '  + Filtr_KatMNF + DateToStr(DTB,'  за Month YYYY года') );
+Counter++;
+ xlOut1( 1,'Цех Отдел'  );
+ xlOut1( 2,'Код'#10'неявки');
+ xlOut1( 3,'Краткое наименование'#10'причин неявок');
+ xlOut1( 4,'Всего'#10'неявок'#10'(дни)');
+ xlOut1( 5,'1');
+ xlOut1( 6,'2');
+ xlOut1( 7,'3');
+ xlOut1( 8,'4');
+ xlOut1( 9,'5');
+ xlOut1(10,'6');
+ xlOut1(11,'7');
+
+ HeadRow := Counter;
+
+ xlSetRowHeight(55,Counter,1,Counter,1);
+ xlAlignCellsEx(xlCenter,xlCenter ,Counter,1,Counter, 4+KatCount );
+ xlWrapText(Counter,1,Counter, 4+KatCount );
+ xlSetFontStyle(xlBold, Counter, 1, Counter, 4+KatCount );
+ xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlMedium, 0, 0, Counter, 1, Counter, 4+KatCount );
+
+
+  _Loop RptPodr
+  {
+    SetVisualHeader('Вывод данных в Excel'#13+RptPodr.kod + ' ' + RptPodr.Name);
+
+    ClearAdvRecord(Itog);
+    FirstLine := Counter;
+
+    _Loop DepCat
+    if (DepCat.kod and cUse) > 0
+    {
+
+      bBreak := not nextvisual;
+      if bBreak  break;
+
+
+      //  Вывод в Excel RptPodr.KOD DepCat.NUM DepCat.NAME
+      //    только коды для отчета
+      if (DepCat.kod and c1Otchet) > 0
+      {
+         Counter++;
+         xlOut1( 1,RptPodr.KOD  ); // Цех Отдел
+         xlOut1( 2,DepCat.NUM);    // Код неявки
+         xlOut1( 3,DepCat.NAME);   // Краткое наименование причин неявок
+         xlSetCellFormula('=СУММ(RC[+1]:RC[+'+KatCount+'])', Counter, 4, Counter, 4 );
+      }
+
+      _Loop RptRes
+      {
+
+        for(i := 1; i <= KatCount; i++) // по Категориям
+        {
+          // Здесь допущение, что одна неявка
+          // может иметь несколько включенных бит == входить в несколько настроек
+          // время выполнения от этого увеличивается незначительно
+          // Например, её нужно выводить (c1Otchet) и, при этом, это c4Sick
+
+
+          if (DepCat.kod and c1Otchet) > 0
+          {
+            Itog.dOtchet[i] := Itog.dOtchet[i] + RptRes.DD[i];
+
+            // Вывод в Excel
+            xlSetCellNumberValue( RptRes.DD[i] , Counter, i+4, Counter, i+4 );
+
+          }else
+            Itog.WorkingOthers[i] := Itog.WorkingOthers[i] + RptRes.DD[i];
+
+
+          if (DepCat.kod and c2WorkNeed) > 0
+          Itog.dWorkNeed[i] := Itog.dWorkNeed[i] + RptRes.DD[i];
+
+
+          if (DepCat.kod and c3Vacation) > 0
+          Itog.dVacation[i] := Itog.dVacation[i] + RptRes.DD[i];
+
+
+          if (DepCat.kod and c4Sick) > 0
+          Itog.dSick[i] := Itog.dSick[i] + RptRes.DD[i];
+
+
+          if (DepCat.kod and c5AdmVacation) > 0
+          Itog.dAdmVacation[i] := Itog.dAdmVacation[i] + RptRes.DD[i];
+
+
+          if (DepCat.kod and c6Other) > 0
+          Itog.dOther[i] := Itog.dOther[i] + RptRes.DD[i];
+
+
+        }// по Категориям for(i := 1; i <= KatCount
+
+      } // _Loop RptRes
+
+    } // _Loop DepCat
+
+
+  // Формат таблицы с кодами неявок
+//   xlAlignCellsEx(xlRight,xlCenter ,Counter - Hcount,1,Counter , 4+KatCount );
+   xlFrameCells(xlInsideV or xlInsideH or xlBorderB, xlThin,   0, 0, Counter-Hcount+1, 1, Counter, 4+KatCount );
+//   xlFrameCells(xlBorderL or xlBorderR or xlBorderT, xlMedium, 0, 0, Counter-Hcount+1, 1, Counter, 4+KatCount );
+
+
+    RptPodr.ItogLine := counter++;
+    UpDate current RptPodr;
+
+
+ //  Формат таблицы итогов
+//   xlFrameCells(xlBorderL or xlBorderB , xlMedium, 0, 0, Counter, 1, Counter, 2 );
+   xlFrameCells(xlInsideV, xlThin, 0, 0, Counter, 3, Counter, 4+KatCount );
+
+   xlFrameCells(xlBorderL or xlBorderR or xlBorderB , xlThin, 0, 0, Counter, 1, Counter, 3 ); // xlBorderT
+
+   xlAlignCellsEx(xlRight,xlCenter ,Counter+1, 3, Counter +10, 3);
+   xlFrameCells(xlInsideV or xlInsideH or xlBorderT, xlThin, 0, 0, Counter+1, 3, Counter+9, 4+KatCount );
+   xlFrameCells(             xlInsideH, xlThin, 0, 0, Counter+1, 1, Counter+9,       2    );
+
+   xlFrameCells(xlBorderL or xlBorderR or xlBorderB or xlBorderT, xlMedium, 0, 0, Counter-Hcount, 1, Counter+9, 4+KatCount );
+
+ //
+ //   Наименования строк итогов
+ //
+
+    xlOut1( 1,'Итого по цеху ' + RptPodr.KOD + ' ' + RptPodr.NAME  );
+    xlSetFontStyle(xlBold, Counter, 1, Counter, 1);
+
+    sOut := 'Всего неявок';
+    xlSetCellStringValue( sOut, Counter+1, 3, Counter+1 , 3 );
+    xlSetCellFormula('=СУММ(R['+(FirstLine-counter)+']C:R[-2]C)', Counter+1, 5, Counter+1, 5+KatCount-1);
+
+    xlSetCellFormula('=СУММ(RC[+1]:RC[+'+KatCount+'])', Counter+1, 4, Counter+9, 4 );
+
+    sOut := 'Отработано дней';
+    xlSetCellStringValue( sOut, Counter+2, 3, Counter+2 , 3 );
+
+    sOut := 'Всего по табелю';
+    xlSetCellStringValue( sOut, Counter+3, 3, Counter+3 , 3 );
+    xlSetCellFormula('=R[-1]C+R[-2]C)', Counter+3, 3+1, Counter+3, 3+8 );
+
+    sOut := 'Расчетная численность(*)';
+    xlSetCellStringValue( sOut, Counter+4, 3, Counter+4 , 3 );
+
+    bSSPOk := isGetStat(DTB,  DTE, RptPodr.nRec);
+    if not bSSPOk
+    {
+      sOut := 'Статистические данные не найдены';
+      xlSetCellStringValue( sOut, Counter+4, 5, Counter+4 , 5 );
+    }
+    else bGSSPOk := true;
+
+
+
+    sOut := 'Прочие потери';
+    xlSetCellStringValue( sOut, Counter+9, 3, Counter+9 , 3 );
+
+    sOut := 'Потери по административным отпускам (Потери 16, 17, 18)';
+    xlSetCellStringValue( sOut, Counter+8, 3, Counter+8 , 3 );
+
+    sOut := 'Потери по нетрудоспособности';
+    xlSetCellStringValue( sOut, Counter+7, 3, Counter+7 , 3);
+
+    sOut := 'Потери по отпускам - Потери 09, 10, 11, 12, 35';
+    xlSetCellStringValue( sOut, Counter+6, 3, Counter+6 , 3);
+
+    sOut := 'Процент потерь';
+    xlSetCellStringValue( sOut, Counter+5, 3, Counter+5 , 3);
+
+
+      Var Dbl, Sum1, Sum2: double;
+    //
+    //     Вывод в Excel значения ИТОГОВ из Itog.*
+    //
+      for(i := 1; i <= KatCount; i++)
+      {
+//
+//         Отработано дней
+//
+         Dbl := RptPodr.WorkingDays[i];
+         xlSetCellNumberValue( Dbl , Counter+3, i+4, Counter+3 , i+4 );
+
+//
+//         Прочие потери
+//
+
+         Sum2 := Itog.WorkingOthers[i]+ Itog.dWorkNeed[i];
+
+         Sum1 := Itog.dOther[i];
+         Dbl  := Sum1 / (Sum1 +  Sum2) * 100;
+         xlSetCellNumberValue( Dbl ,Counter+9, i+4, Counter+9 , i+4);
+
+
+//
+//         Потери по административным отпускам (Потери 16, 17, 18)
+//
+
+         Sum1 := Itog.dAdmVacation[i];
+         Dbl := Sum1 / (Sum1 +  Sum2) * 100;
+         xlSetCellNumberValue( Dbl , Counter+8, i+4, Counter+8 , i+4 );
+
+//
+//         Потери по нетрудоспособности (Потери 19, 20 )
+//
+
+         Sum1 := Itog.dSick[i];
+         Dbl := Sum1 / (Sum1 +  Sum2) * 100;
+         xlSetCellNumberValue( Dbl , Counter+7, i+4, Counter+7 , i+4);
+
+
+//
+//         Потери по отпускам - Потери 09, 10, 11, 12, 45
+//
+
+         Sum1 := Itog.dVacation[i];
+         Dbl := Sum1 / (Sum1 +  Sum2) * 100;
+         xlSetCellNumberValue( Dbl, Counter+6, i+4, Counter+6 , i+4);
+
+//
+//         Процент потерь
+//
+         Sum1 := Itog.dOther[i]+Itog.dAdmVacation[i]+Itog.dSick[i]+Itog.dVacation[i];
+         Dbl := Sum1 / (Sum1 +  Sum2) * 100;
+         xlSetCellNumberValue( Dbl, Counter+5, i+4, Counter+5 , i+4);
+
+//
+//         Расчетная численность
+//
+       if bSSPOk
+       {
+
+         if Getfirst mtStat where (( word(i) == mtStat.wKateg)) = tsok
+           Dbl := mtStat.fSumS
+         else
+           Dbl := 0;
+
+         xlSetCellNumberValue( Dbl, Counter+4, i+4, Counter+4 , i+4);
+       }
+
+
+
+      } // for(i := 1; i <= KatCount; i++)
+
+    counter := counter + 10;
+    if bBreak Break;
+
+  }// _Loop RptPodr
+
+if bBreak
+xlSetCellStringValue( 'Прервано пользавателем', Counter+1, 3, Counter+1 , 3 );
+
+if bGSSPOk
+{
+sOut := '(*) Примечание. Итоговая средняя численность может не совпадать со значением средней численности в форме П-4, т.к. в отладочной информации итог - это арифметическая сумма,';
+xlSetCellStringValue( sOut, Counter+2, 3, Counter+2 , 3 );
+sOut := 'а в форме П-4 происходит округление итоговых сумм средней численности до целых единиц всегда в большую сторону.';
+xlSetCellStringValue( sOut, Counter+3, 3, Counter+3 , 3 );
+xlSetFontSize(9,Counter+2, 3, Counter+3 , 3 );
+
+
+
+}
+
+
+  counter := counter - 10;
+
+  xlSetColumnWidth(8 ,HeadRow,1,HeadRow,2);
+  xlSetColumnWidth(52,HeadRow,3,HeadRow,3);
+  xlSetNumberFormat('@', HeadRow, 1, Counter, 3);
+
+
+  xlSetColumnWidth(8, HeadRow+1, 4, Counter, 4+KatCount );
+  xlSetNumberFormat('# ##0' + xlGetDecimalSeparator + '00', HeadRow+1, 4, Counter, 4+KatCount );
+
+
+
+  xlkillExcel;
+  break;
+} // while true // для break
+}
+else
+{
+Message('Не могу обратится к табелям системы.');
+
+}
+  DoneWorkingTable;
+
+  StopVisual('', 0);
+
+
+  PopPos(#DepCat);
+  RescanPanel(#DepCat);
+
+}
+end;
+end.
+
+
+/*
+       Вопрос как перевести часы в дни.
+       В ТЗ написано:
+                     Примечание: если неявка (например, сокращенный рабочий день) не целодневная,
+                     то высчитывается пропорция Часы неявки в день / Часы по графику в день
+
+
+       Идея 1
+           Часы по неявке / средние часы за день
+           где
+           средние часы за день : если взять всего часы за месяц и поделить на кол-во рабочих дней
+           быстро, но не точно
+
+       Идея 2
+        считать в цикле по дням за каждый день
+        точно, но долго
+
+//          if Признак целого дня
+           wDD := WT_GetAbsencesDays (stActual, DepCat.NUM , DTB, DTE);
+//           else
+
+*/
+
+
+/*
+// ПРО ИТОГИ:
+
+WorkingDays    Всего по табелю - общее количество дней, отработанных по табелю данного подразделения
+WorkingOthers  Отработано дней - количество дней явок, все дни по табелю НЕ перечисленные во входном параметре <Вид неявки> ( f1Otchet )
+
+
+// Прочие потери
+OtherLost  := Sum1 / (Sum1 +  Sum2) * 100
+Sum1 := f6Other
+Sum2 := WorkingOthers+ f2WorkNeed
+
+//
+//    Потери по административным отпускам
+//
+// AdmVacationLost  := Sum1 / (Sum1 +  Sum2) * 100
+// Sum1 := f5AdmVacation
+// Sum2 := WorkingOthers+ f2WorkNeed
+
+
+// Потери по нетрудоспособности
+SickLost  := Sum1 / (Sum1 +  Sum2) * 100
+Sum1 := f4Sick
+Sum2 := WorkingOthers+ f2WorkNeed
+
+
+// Потери по отпускам - Потери 09, 10, 11, 12, 45
+VacationLost := Sum1 / (Sum1 +  Sum2) * 100
+Sum1 := f3Vacation
+Sum2 := WorkingOthers+ f2WorkNeed
+
+
+// Процент потерь
+// Можно не считать Sum2- знаменатель у всех один
+// поэтому
+PercentLost := VacationLost+ SickLost+ AdmVacationLost+ OtherLost
+// по ТЗ считать так:
+PercentLost := Sum1 / (Sum1 +  Sum2) * 100
+Sum1 := f3Vacation + f4Sick + f5AdmVacation + f6Other
+Sum2 := WorkingOthers+ f2WorkNeed
+
+
+*/
+
+
+#include UserReport.vih
+
+VipInterface UserReport_Run_GP_MissTime Implements IUserReport;
+
+Interface UserReport_Run_GP_MissTime;
+
+!-------------------------------------------------------------------------------
+// Запуск отчета на выполнение при выборе его из списка отчетов
+procedure Run;
+begin
+  RunInterfaceNoModal('GP_MissTime');
+end;
+!-------------------------------------------------------------------------------
+// Наименование отчета в списке
+function GetReportName: String;
+begin
+  GetReportName := 'Сводка о потерях рабочего времени в разрезе категорий работающих';
+end;
+!-------------------------------------------------------------------------------
+// Наименования групп, в которые входит отчет
+// Группа n+1 делается подчиненной группе n
+// В данном случае будет иерархия:
+// [+] Группа 1
+//     [+] Группа 2
+//         Отчет 1
+function GetGroupName (Level : Word) : String;
+begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Отчеты по зарплате ПУ';
+  End;
+end;
+!-------------------------------------------------------------------------------
+// Приоритет отчета - сортировка внутри группы выполняется сначала
+// по приоритету, а затем по наименованию
+function GetPriority : Integer;
+begin
+  GetPriority := 0;
+end;
+!-------------------------------------------------------------------------------
+// ModuleID модулей, в которых будет виден отчет
+// '*' - отчет будет виден в любом модуле
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'MENUZARP';
+  end;
+end;
+!-------------------------------------------------------------------------------
+end.

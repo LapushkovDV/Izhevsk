@@ -1,0 +1,1922 @@
+/*************************************************************************************************\
+* Наименование: Список людей в СКУД                                                               *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+* Нужен индекс GP_SCUD_PERS_IZM CGP_SCUD_PERS +DTIZM                                                                                                *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#175          |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include marker.vih // описание объекта и объявление интерфейса
+                    // marker c реализацией по умолчанию
+#include FRRecordDefinition.vih
+#include ChoiseYourPersons.vih
+#include CatFunc.Vih
+#include GetKau.Vih
+#include GP_StatusAccessEdit.vih
+//---------------------------------
+#include CLSFUNCS.VIH // ф-ии пересканирования текущих л/с
+//---------------------------------
+#include GP_Protector.Vih
+#include Protector.Vih
+#include GP_UserAccessService.vih
+#include GP_SCUD_KategEdit.Vih
+#include GP_SCUD_GrupEdit.Vih
+#include GP_SCUD_EventsEdit.Vih
+
+#include GP_SCUD_PersEdit.Vih
+#include AdrFunc.vih         // Функции работы с адресами
+/*
+создание роли администратора
+SQL insert into GP_UserRoles (cRoleGroup,cUser,cRole)
+  select
+   GP_ROLEGROUPS.Nrec
+  ,#COMP(2814749767106651)          //cUser:=UserId,
+  ,GP_Roles.Nrec
+From GP_ROLEGROUPS
+inner join GP_Roles on GP_Roles.CROLEGROUP = GP_ROLEGROUPS.Nrec and GP_Roles.IsAdmin=GP_Roles.IsAdmin
+where ('СКУД' = GP_ROLEGROUPS.NAME)
+*/
+/*
+--- исправление первой записи
+SQL update GP_SCUD_PERS_HIST Set GP_SCUD_PERS_HIST.DTIZM=Persons.AppDate,GP_SCUD_PERS_HIST.wType=1
+FROm GP_SCUD_PERS_HIST inner join GP_SCUD_PERS on GP_SCUD_PERS.Nrec = GP_SCUD_PERS_Hist.cGP_SCUD_PERS
+inner join Persons on Persons.Nrec =GP_SCUD_PERS.cPersons
+where GP_SCUD_PERS_HIST.wType=0;
+*/
+#doc
+Список людей в СКУД
+История
+1-999 - РПД
+1001  - Пропуска из СКУД
+1002  - Ручное изменение
+#end
+const
+ coCommunMobilePhone = 000A000000039960h ;// мобильный телефон
+ coAccesHistType  = 113; // константа для UNIDIC, тут историю храним доступа для 1 карточки
+end;
+//Интерфейс GP_Staff::SCUD_PersEdit не найден
+Interface GP_SCUD_PersEdit 'Список людей в СКУД' , EscClose;
+Show At (,,120,25);
+//------------------------------------
+// декларация сложного фильтра
+//------------------------------------
+function isFilterAnCorrect(ww_nrec:comp): boolean; forward;
+//------------------------------------
+#include GetKau.var
+#include GP_SCUD_GrupEdit.Var
+#include GP_SCUD_KategEdit.Var
+//--------------------------------------------
+var
+//-------------------
+  iGP_SCUD_EventsEdit :GP_SCUD_EventsEdit New;
+  viCYPersons         : ChoiseYourPersons;
+  iCatFunc            : CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+  pMarker:IMarker(Marker) new;
+//-----------------------------------------
+  NPOEM_OWN_SCUD_Pers_Other :boolean;//'Отображать сторонних лиц
+//-----------------------------------------
+
+  cRec    :Comp   ; // ссылка на группу
+  Marker:longint;
+  //-- пометка подразделения
+//-----------------------------------------
+// Фильтры
+//-----------------------------------------
+   wFilter, wFilter_A:word;
+   Marker_Count :longint;
+    wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   KauMarkerName:string;
+   Marker_Tmp :longint;
+
+   #mrkfld_(KatPodr)
+   #mrkfld_(KatOrg)
+   #mrkfld_(Persons)
+   #mrkfld_(Kateg)
+
+
+   sPassPorts_Flt,sPassPorts_Flt_A : string;
+   sFio_Flt      ,sFio_Flt_A       : string;
+   sPropusk_Flt  ,sPropusk_Flt_A   : string;
+   wType_Flt     ,wType_Flt_A      : word;
+   DTB,DTE:date;
+   dDATOTCH   :date;// Дата начала расчетного периода в зарплате
+   dDUvBeg,dDUvBeg_A :date;// 'Уволен после'
+   dDUvEnd,dDUvEnd_A :date;// 'Уволен до'
+   dDPRBeg,dDPRBeg_A :date;// 'Пропуск после'
+   dDPREnd,dDPREnd_A :date;// 'Пропуск до'
+//----------------------------------------
+  iAdrFunc   : AddressFunc;           // Переменная типа интерфейс AddressFunc
+
+  DataProtectorCard
+  ,DataProtectorCardTel     :IGP_Protector2;//защита полей карточки от модификации
+  boDataProtectorCard     :boolean = false; // признак загрузки DataProtector
+
+
+Create View
+var
+   pPersons :comp;
+   pKatPodr :comp;
+   pKatOrg  :comp;
+   pGP_SCUD_KATEG   :comp;
+as select GP_SCUD_Pers.Nrec,GP_SCUD_Pers.cGP_SCUD_KATEG,
+   if(isValidAll(tnAv_ALCO),if(Av_ALCO.vDouble = 1 , '+',''),'') (Fieldname = IsAlko)
+ , if(isValidAll(tnAv_ALCO),Av_ALCO.vDouble  ,0) (Fieldname = IsAlkoDouble)
+// , iAdrFunc.GetFullAddressInd(Persons.BornAddr ) (Fieldname =BornName); // адрес рождения
+ , iAdrFunc.GetFullAddressInd(Persons.LiveAddr) (Fieldname = LivName ) // адрес проживания
+// , iAdrFunc.GetFullAddressInd(Persons.PasspAddr ) (Fieldname =PasName ); // Адрес регистрации
+
+From
+  GP_SCUD_Pers(GP_SCUD_PERS02)
+, GP_SCUD_Pers_Hist(GP_SCUD_Pers_Hist08) // cGP_SCUD_Pers+Fio+DTIZM+wType,GP_SCUD_Pers_Hist02
+, Persons
+, KatOrg
+, Katpodr
+, KLREJIM
+, KatPodr KatPodr_Hist
+, KatOrg  KatOrg_Hist
+, TYPEPR
+, Appendix
+, GP_SCUD_KATEG
+, Appointments
+, Catalogs CatPost
+//------- фильтры
+ , KatPodr    KatPodr_Flt
+ , KatOrg     KatOrg_Flt
+ , Persons    Persons_Flt
+ , GP_SCUD_KATEG GP_SCUD_KATEG_Flt
+ , AttrNam AN_Alco
+ , AttrVal AV_Alco
+ //sindetskiy_aa
+ ,Communications          // Телефоны
+// ,em_unidic accessHistory
+
+where ((
+    GP_SCUD_Pers.cPersons == Persons.Nrec
+and GP_SCUD_Pers.cKatPodr == Katpodr.Nrec
+and GP_SCUD_Pers.cKatOrg  == KatOrg.Nrec
+and GP_SCUD_Pers.CKLREJIM == KLREJIM.NRec
+and GP_SCUD_Pers.CGP_SCUD_KATEG == GP_SCUD_KATEG.Nrec
+and GP_SCUD_Pers.Nrec     == GP_SCUD_Pers_Hist.cGP_SCUD_Pers
+and GP_SCUD_Pers_Hist.cKatPodr == KatPodr_Hist.Nrec
+and GP_SCUD_Pers_Hist.cKatOrg  == KatOrg_Hist.Nrec
+and GP_SCUD_Pers_Hist.wType    == TYPEPR.CodOper //тип приказа
+and 31557 == AN_Alco.wTable
+and 'Продуваться на алкорамке' == AN_Alco.name
+and AN_Alco.wTable == Av_ALCO.wTable
+and GP_SCUD_Pers.Nrec == Av_ALCO.cRec
+and AN_Alco.Nrec == Av_ALCO.cattrNam
+
+
+//---------------- Данные из картотеки сотрудников
+and if(Persons.AppointCur=0,Persons.AppointLast,Persons.AppointCur) == Appointments.Nrec
+and Appointments.Post == CatPost.Nrec
+//---------------- Фотография
+and 1               == Appendix.ObjBlock
+and Persons.Nrec    == Appendix.Person
+and    200          == Appendix.ObjType
+//------- фильтры
+and wc_nrec == KatPodr_Flt.Nrec
+and wc_nrec == KatOrg_Flt.Nrec
+and wc_nrec == Persons_Flt.Nrec
+and wc_nrec == GP_SCUD_KATEG_Flt.Nrec
+
+//sindetskiy
+and    Persons.nrec        == Communications.Person // Телефоны
+and coCommunMobilePhone == Communications.ComType // мобильный телефон
+//and               coAccesHistType  == accessHistory.wtype (noindex) //Таблица истории
+//and GP_SCUD_Pers.nrec == accessHistory.addcomp[1] (noindex)
+))
+Bounds BySCUD_Kateg pGP_SCUD_KATEG == GP_SCUD_Pers.cGP_SCUD_KATEG(noindex) ordered by TableOrder
+Bounds byPersons pPersons == GP_SCUD_Pers.cPersons(noindex) ordered by TableOrder
+Bounds byKatOrg  pKatOrg  == GP_SCUD_Pers.cKatOrg (noindex) ordered by TableOrder
+Bounds byKatPodr pKatPodr == GP_SCUD_Pers.cKatPodr(noindex) ordered by TableOrder
+Bounds byType    wType_Flt== GP_SCUD_Pers.wType   (noindex) ordered by TableOrder
+Bounds byDPRBeg  dDPRBeg_A <<=GP_SCUD_Pers.Propusk_To(NoIndex)  ordered by TableOrder
+Bounds byDPREND  dDPREnd_A >>=GP_SCUD_Pers.Propusk_To(NoIndex)
+             and ZeroDate  << GP_SCUD_Pers.Propusk_To(NoIndex)  ordered by TableOrder
+
+condition FilterAn = // использование сложного фильтра
+  (isFilterAnCorrect(GP_SCUD_Pers.Nrec))
+;
+Parameters
+  wIntMode
+#doc
+#end
+,  cRec
+#doc
+ возвращаемый параметр
+#end
+,  Marker
+#doc
+ маркер пометки
+#end
+, pKatPodr
+#doc
+ фильтр по подразделению
+#end
+;
+//*************************************************8
+create view vSpr
+var
+  pPersons:comp;
+  pAppoint:comp;
+  pContDoc:comp;
+as select Persons.Nrec
+From Persons,Passports,ContDoc,PartDoc
+where ((
+     pPersons == Persons.Nrec
+and  Persons.PasspRus == Passports.nrec
+and  pAppoint      == Appointments.Nrec
+and  pContDoc      == ContDoc.nrec
+and  ContDoc.cPart == PartDoc.Nrec
+));
+//*************************************************8
+QuickChoice qcByCode
+{
+  AcceptField = GP_SCUD_Pers.Nrec;
+  ViewField = GP_SCUD_Pers.Code;
+  ViewField = GP_SCUD_Pers.Fio;
+  // только текстовый поля!
+  SearchField = GP_SCUD_Pers.Code;
+  OnOpen : {
+  }
+  OnClose : {
+    cRec := GP_SCUD_Pers.Nrec;
+    if Marker<>0
+    { InsertMarker(Marker,crec);
+    }
+  }
+} //QuickChoice qcByCode
+QuickChoice qcByName
+{
+  AcceptField = GP_SCUD_Pers.Nrec;
+  ViewField = GP_SCUD_Pers.Fio;
+  ViewField = GP_SCUD_Pers.Code;
+  // только текстовый поля!
+  SearchField = GP_SCUD_Pers.Fio;
+  OnOpen : {
+  }
+  OnClose : {
+    cRec := GP_SCUD_Pers.Nrec;
+    if Marker<>0
+    { InsertMarker(Marker,crec);
+    }
+  }
+}//QuickChoice qcByName
+
+//******************************************************************************
+// Функции
+//******************************************************************************
+  //------------------------------------
+  // сохранить параметры
+  //------------------------------------
+Procedure EnableDisableInsert(_Enable:boolean);
+{ if _Enable
+  {
+//    EnableCommand(cmInsert);
+    EnableCommand(cmEdit);
+//    EnableCommand(cmAddNewRec);
+//    EnableCommand(cmInsertRecord);
+//    EnableCommand(cmSetDefault);
+
+
+  }
+  else
+  {
+//    DisableCommand(cmInsert);
+    DisableCommand(cmEdit);
+//    DisableCommand(cmAddNewRec);
+//    DisableCommand(cmInsertRecord);
+//    DisableCommand(cmSetDefault);
+  }
+
+}//Function EnableDisableInsert(_Enable:boolean);
+
+
+  Procedure SaveParam;
+  { if (boVisibleRun)
+    {
+      SaveMyDsk(wFilter  ,GetInterfaceName+'_wFilter');
+      SaveMyDsk(DTB      ,GetInterfaceName+'_DTB');
+      SaveMyDsk(DTE      ,GetInterfaceName+'_DTE');
+      SaveMyDsk(dDUvBeg  ,GetInterfaceName+'_dDUvBeg');
+      SaveMyDsk(dDUvEnd  ,GetInterfaceName+'_dDUvEnd');
+      SaveMyDsk(dDPRBeg  ,GetInterfaceName+'_dDPRBeg');
+      SaveMyDsk(dDPREnd  ,GetInterfaceName+'_dDPREnd');
+      SaveMyDsk(wType_Flt,GetInterfaceName+'_wType_Flt');
+      SaveMyDsk(sPassPorts_Flt,GetInterfaceName+'_sPassPorts_Flt');
+      SaveMyDsk(sFio_Flt      ,GetInterfaceName+'_sFio_Flt'      );
+      SaveMyDsk(sPropusk_Flt  ,GetInterfaceName+'_sPropusk_Flt'  );
+    }
+    //-----------------------
+    DoneMarker(Marker_Persons_A, '' );
+    DoneMarker(Marker_KatPodr_A, '' );
+    DoneMarker(Marker_KatOrg_A , '' );
+    DoneMarker(Marker_Kateg_A  , '' );
+    //-----------------------
+    DoneMarker(Marker_Persons,if(not boVisibleRun,'', GetInterfaceName+'_Persons') );
+    DoneMarker(Marker_KatOrg ,if(not boVisibleRun,'', GetInterfaceName+'_KatOrg' ) );
+    DoneMarker(Marker_KatPodr,if(not boVisibleRun,'', GetInterfaceName+'_KatPodr') );
+    DoneMarker(Marker_Kateg  ,if(not boVisibleRun,'', GetInterfaceName+'_Kateg'  ) );
+  } //Procedure SaveParam;
+
+  //------------------------------------
+  // восстановить параметры
+  //------------------------------------
+  Procedure ReadParam;
+  { if (boVisibleRun)
+    {
+      if not ReadMyDsk(wFilter  ,GetInterfaceName+'_wFilter',false) { wFilter:=0; BitOnW(wFilter,11);}
+      if not ReadMyDsk(DTB      ,GetInterfaceName+'_DTB'    ,false) DTB:=ZeroDate;
+      if not ReadMyDsk(DTE      ,GetInterfaceName+'_DTE'    ,false) DTE:=ZeroDate;
+      if not ReadMyDsk(dDUvBeg  ,GetInterfaceName+'_dDUvBeg',false) dDUvBeg:=ZeroDate;
+      if not ReadMyDsk(dDUvEnd  ,GetInterfaceName+'_dDUvEnd',false) dDUvEnd:=ZeroDate;
+      if not ReadMyDsk(dDPRBeg  ,GetInterfaceName+'_dDPRBeg',false) dDPRBeg:=ZeroDate;
+      if not ReadMyDsk(dDPREnd  ,GetInterfaceName+'_dDPREnd',false) dDPREnd:=ZeroDate;
+      if not ReadMyDsk(wType_Flt,GetInterfaceName+'_wType_Flt',false) wType_Flt:=0;
+      if not ReadMyDsk(sPassPorts_Flt,GetInterfaceName+'_sPassPorts_Flt',false) sPassPorts_Flt:='';
+      if not ReadMyDsk(sFio_Flt      ,GetInterfaceName+'_sFio_Flt'      ,false) sFio_Flt      :='';
+      if not ReadMyDsk(sPropusk_Flt  ,GetInterfaceName+'_sPropusk_Flt'  ,false) sPropusk_Flt  :='';
+    }
+    Marker_Persons  :=InitMarker(if(not boVisibleRun,'',GetInterfaceName+'_Persons') , 8, 50, 10, True);
+    Marker_KatOrg   :=InitMarker(if(not boVisibleRun,'',GetInterfaceName+'_KatOrg' ) , 8, 50, 10, True);
+    Marker_KatPodr  :=InitMarker(if(not boVisibleRun,'',GetInterfaceName+'_KatPodr') , 8, 50, 10, True);
+    Marker_Kateg    :=InitMarker(if(not boVisibleRun,'',GetInterfaceName+'_Kateg'  ) , 8, 50, 10, True);
+
+    Marker_Persons_A  :=InitMarker('' , 8, 50, 10, True);
+    Marker_KatOrg_A   :=InitMarker('' , 8, 50, 10, True);
+    Marker_KatPodr_A  :=InitMarker('' , 8, 50, 10, True);
+    Marker_Kateg_A    :=InitMarker('' , 8, 50, 10, True);
+
+  } //  Procedure ReadParam;
+
+
+  //------------------------------------
+  // декларация сложного фильтра
+  //------------------------------------
+  function isFilterAnCorrect(ww_nrec:comp): boolean; cacheable;
+  { #__UNUSED__(ww_nrec)
+    Result:=true;
+    if  isPodrShare
+    and bogettune('NPOEM_OWN.SCUD.CanEditFirstKartocha') = false // для тех. кто может редактировать 1 карточку надо снять ограничения по подразделениям
+    { if GP_SCUD_Pers.wType=0
+       if not EnablePodr(GP_SCUD_Pers.cKatPodr)
+        { Result:=false; Exit;
+        }
+    }
+    if IsBitCTW(wFilter,1)
+    { if Count_KatPodr>1
+      { If not FoundMarker(Marker_KatPodr,GP_SCUD_Pers.cKatPodr)
+        { Result:=false; Exit;
+        }
+      }
+    }
+    if IsBitCTW(wFilter,2)
+    { if Count_KatOrg>1
+      { If not FoundMarker(Marker_KatOrg,GP_SCUD_Pers.cKatOrg)
+        { Result:=false; Exit;
+        }
+      }
+    }
+    if IsBitCTW(wFilter,3)
+    { if Count_Persons>1
+      { If not FoundMarker(Marker_Persons,GP_SCUD_Pers.cPersons)
+        { Result:=false; Exit;
+        }
+      }
+    }
+    if IsBitCTW(wFilter,4)
+    { if Pos(UpCase(sFio_Flt),UpCase(GP_SCUD_Pers.Fio) )=0
+      { Result:=false;  Exit;
+      }
+    }
+    if IsBitCTW(wFilter,5)
+    { if Pos(UpCase(sPassports_Flt),UpCase(GP_SCUD_Pers.Passp_NMB) )=0
+      { Result:=false; Exit;
+      }
+    }
+    if IsBitCTW(wFilter,6)
+    { if Pos(UpCase(sPropusk_Flt),UpCase(GP_SCUD_Pers.Propusk_NMB) )=0
+      { Result:=false; Exit;
+      }
+    }
+    if IsBitCTW(wFilter,8)
+    { if GP_SCUD_Pers.wType<>0
+      { Result:=False;  exit;
+      }
+      if not isValidAll(#Persons)
+      { Result:=False; exit;
+      }
+      if dDUvBeg<>ZeroDate
+      { //if Persons.DisDate<>ZeroDate
+        if Persons.DisDate<dDUvBeg
+        { Result:=false; Exit;
+        }
+      }
+      if dDUvEnd<>ZeroDate
+      { if Persons.DisDate>dDUvEnd
+        or Persons.DisDate=ZeroDate
+        { Result:=false; Exit;
+        }
+      }
+    } //if IsBitCTW(wFilter,8)
+    if IsBitCTW(wFilter,10)
+    { if Count_Kateg>0
+      { If not FoundMarker(Marker_Kateg,GP_SCUD_Pers.cGP_SCUD_KAteg)
+        { Result:=false; Exit;
+        }
+      }
+    }
+    if IsBitCTW(wFilter,11)
+    { if dDATOTCH<>ZeroDate
+      { if not isValidAll(#Persons)
+        { Result:=False; exit;
+        }
+        if Persons.DisDate<>ZeroDate
+        if Persons.DisDate<dDATOTCH
+        { Result:=False; exit;
+        }
+      }
+    } //if IsBitCTW(wFilter,11)
+  }//function isFilterAnCorrect(ww_nrec:comp): boolean;
+
+    //-------------------------------------------
+  // скопировать фильтры в данные для отборв
+  //-------------------------------------------
+  Procedure CopyToA;
+  { CopyMarker(Marker_Persons_A ,Marker_Persons);
+    CopyMarker(Marker_KatOrg_A  ,Marker_KatOrg );
+    CopyMarker(Marker_KatPodr_A ,Marker_KatPodr);
+    CopyMarker(Marker_Kateg_A   ,Marker_Kateg  );
+    sPassPorts_Flt_A:=sPassPorts_Flt;
+    wFilter_A       :=wFilter       ;
+    sFio_Flt_A      :=sFio_Flt      ;
+    sPropusk_Flt_A  :=sPropusk_Flt  ;
+    wType_Flt_A     :=wType_Flt     ;
+    dDUvBeg_A       :=dDUvBeg;
+    dDUvEnd_A       :=dDUvEnd;
+    dDPRBeg_A       :=dDPRBeg;
+    dDPREnd_A       :=dDPREnd;
+  } //Procedure CopyToA;
+
+  //-------------------------------------------
+  // восстановить данные для задания фильтрации
+  // из данных для отбора
+  //-------------------------------------------
+  Procedure RestFromA;
+  { CopyMarker(Marker_Persons ,Marker_Persons_A);
+    CopyMarker(Marker_KatOrg  ,Marker_KatOrg_A );
+    CopyMarker(Marker_KatPodr ,Marker_KatPodr_A);
+    CopyMarker(Marker_Kateg   ,Marker_Kateg_A  );
+
+    sPassPorts_Flt:=sPassPorts_Flt_A;
+    sFio_Flt      :=sFio_Flt_A      ;
+    sPropusk_Flt  :=sPropusk_Flt_A  ;
+    wType_Flt     :=wType_Flt_A     ;
+    dDUvBeg       :=dDUvBeg_A;
+    dDUvEnd       :=dDUvEnd_A;
+    dDPRBeg       :=dDPRBeg_A;
+    dDPREnd       :=dDPREnd_A;
+    set wFilter       :=wFilter_A       ;
+
+  } //Procedure RestFromA;
+
+  //-------------------------------------------
+  #doc
+    Установить ограничения
+  #end
+  Function SetFilterBounds(_IsArch:word) : boolean;
+  { Result:=false;
+    isFilterRun:=True;
+    if ConditionActiveInLeave(tcFilterAn, #GP_SCUD_Pers)
+    { PopConditionForLeave(tcFilterAn, #GP_SCUD_Pers);
+    }
+    If BoundActive(tbbyDPRBeg ) SubBounds(tbbyDPRBeg);
+    If BoundActive(tbbyDPREnd ) SubBounds(tbbyDPREnd);
+    If BoundActive(tbByPersons) SubBounds(tbByPersons);
+    If BoundActive(tbByKatPodr) SubBounds(tbByKatPodr);
+    If BoundActive(tbByKatOrg ) SubBounds(tbByKatOrg );
+    If BoundActive(tbByType   ) SubBounds(tbByType   );
+    If BoundActive(tbBySCUD_Kateg  ) SubBounds(tbBySCUD_Kateg  );
+    //-----------------------
+    wCount_Filter:=0;
+    sTitle_Filter:='';
+    //-----------------------
+    var need_FilterAn:boolean=false;
+    if IsBitCTW(wFilter,1)
+    {  Count_KatPodr:=GetMarkerCount(Marker_KatPodr);
+       GetMarker(Marker_KatPodr,0,pKatPodr);
+
+       if Count_KatPodr=1
+       { AddBounds(tbByKatPodr);
+       }
+       else need_FilterAn:=true;
+       wCount_Filter++;
+       if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'по подразделению';
+    }
+    if IsBitCTW(wFilter,2)
+    {  Count_KatOrg:=GetMarkerCount(Marker_KatOrg);
+       GetMarker(Marker_KatOrg,0,pKatOrg);
+
+       if Count_KatOrg=1
+       { AddBounds(tbByKatOrg);
+       }
+       else need_FilterAn:=true;
+       wCount_Filter++;
+       if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'по организации';
+    }
+    if IsBitCTW(wFilter,3)
+    {  Count_Persons:=GetMarkerCount(Marker_Persons);
+       GetMarker(Marker_Persons,0,pPersons);
+       if Count_Persons=1
+       {
+         AddBounds(tbByPersons);
+       }
+       else need_FilterAn:=true;
+       wCount_Filter++;
+       if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'по сотруднику';
+    }
+    if IsBitCTW(wFilter,4) or IsBitCTW(wFilter,5) or IsBitCTW(wFilter,6)
+    {  need_FilterAn:=true;
+       if IsBitCTW(wFilter,4)
+       { wCount_Filter++;
+         if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'по части фио';
+       }
+       if IsBitCTW(wFilter,5)
+       { wCount_Filter++;
+         if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'номер паспорта';
+       }
+       if IsBitCTW(wFilter,6)
+       { wCount_Filter++;
+         if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'номер пропуска';
+       }
+    }
+    if not NPOEM_OWN_SCUD_Pers_Other
+    { BitOnW(wFilter,7);
+      wType_Flt:=0;
+    }
+
+    if IsBitCTW(wFilter,7)
+    { AddBounds(tbByType);
+      wCount_Filter++;
+      if NPOEM_OWN_SCUD_Pers_Other
+      if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'тип записи';
+
+    }
+    if IsBitCtW(wFilter,8)
+    { if dDUvBeg<>ZeroDate
+      or dDUvEnd<>ZeroDate
+        need_FilterAn:=true;
+      wCount_Filter++;
+      if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'дата увольнения';
+    }
+    if IsBitCtW(wFilter,9)
+    { if dDPRBeg<>ZeroDate AddBounds(tbbyDPRBeg);
+      if dDPREnd<>ZeroDate AddBounds(tbbyDPREnd);
+      wCount_Filter++;
+      if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'срок действ.пропуска';
+    }
+
+    if IsBitCTW(wFilter,10)
+    {  Count_Kateg:=GetMarkerCount(Marker_Kateg);
+       pGP_SCUD_KATEG:=0;
+
+       GetMarker(Marker_Kateg,0,pGP_SCUD_KATEG);
+       if False // не пашет почему то Count_Kateg=1
+       { AddBounds(tbBySCUD_Kateg);
+         timelog('GP_SCUD_PERS->SetFilterBounds:pGP_SCUD_KATEG='+string(pGP_SCUD_KATEG,0,0) );
+       }
+       else
+       { need_FilterAn:=true;
+       }
+       wCount_Filter++;
+       if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+'по категории';
+    }
+    if IsBitCtW(wFilter,11)
+    { need_FilterAn:=true;
+      wCount_Filter++;
+      if wCount_Filter<4 sTitle_Filter:=sTitle_Filter+if(length(sTitle_Filter)>0,',','')+' работающие';
+    }
+
+    if isPodrShare need_FilterAn:=true;
+    ClearFuncCache;
+    // использование сложного фильтра
+    if need_FilterAn
+    { PushConditionForLeave(tcFilterAn, #GP_SCUD_Pers);
+    }
+    ReReadRecord(#GP_SCUD_Pers);
+    if wCount_Filter>3 sTitle_Filter:=sTitle_Filter+' и еще '+string(wCount_Filter-3)+' фильтров';
+    MySetTitle;
+    timelog('GP_SCUD_PERS->SetFilterBounds:=need_FilterAn='+string(need_FilterAn) );
+    if getfirst GP_Scud_Pers<>tsok
+    { case  _IsArch of
+      0:
+      { if wfilter<>0
+        { message('Данных по условиям фильтра не обнаружено');
+          RestFromA;
+          SetFilterBounds(1);
+        }
+      }
+      1:{
+        if wfilter<>0
+        { set wfilter:=wfilter_A:=0;
+          SetFilterBounds(2);
+        }
+      }
+      end;
+    }
+    else
+    { //сохраняем фильтр
+      CopyToA;
+    }
+    Result:=true;
+    isFilterRun:=False;
+
+  } //Function SetFilterBounds : boolean;
+
+  //---------------------------------------
+  // Установка наименований фильтров
+  //---------------------------------------
+  Procedure SetFilterNM(_Field:longint=0);
+  { if _Field=0 or _Field=#Filtr_Katpodr
+    { #mrkfiltr_(Katpodr_Flt,Katpodr,Nrec,wc_nrec,Katpodr_Flt.Kod+','+Katpodr_Flt.Name)
+    }
+    if _Field=0 or _Field=#Filtr_Katorg
+    { #mrkfiltr_(KatOrg_Flt,KatOrg,Nrec,wc_nrec,KatOrg_Flt.Name)
+    }
+    if _Field=0 or _Field=#Filtr_Persons
+    { #mrkfiltr_(Persons_Flt,Persons,Nrec,wc_nrec,Persons_Flt.Fio)
+    }
+    if _Field=0 or _Field=#Filtr_Kateg
+    { #mrkfiltr_(GP_SCUD_KATEG_Flt,Kateg,Nrec,wc_nrec,GP_SCUD_KATEG_Flt.Name)
+    }
+    ReScanPanel(#KatPodr_Flt);
+  } //Procedure SetFilterNM(_Field:longint)
+
+
+
+//-----------------------------------------
+// Получить наименование
+//-----------------------------------------
+Function GetPersName(_pNrec:comp)   :string; cacheable;
+{ Result:='';
+  if getfirst fastfirstrow GP_SCUD_Pers where
+          (( _pNrec == GP_SCUD_Pers.nrec ))<>tsok exit;
+  Result:=GP_SCUD_Pers.Fio;
+} //Function GetPersName(_pNrec:comp)   :string; cacheable;
+
+//-----------------------------------------
+// Получить код
+//-----------------------------------------
+Function GetPersCode(_pNrec:comp)   :string;cacheable;
+{ Result:='';
+  if getfirst fastfirstrow GP_SCUD_Pers where
+          (( _pNrec == GP_SCUD_Pers.nrec ))<>tsok exit;
+  Result:=GP_SCUD_Pers.Code;
+} //Function GetPersCode(_pNrec:comp)   :string;cacheable;
+
+//-----------------------------------------
+// Получить тип
+//-----------------------------------------
+Function GetPersType(_pNrec:comp)   :word;cacheable;
+{ GetPersType:=0;
+  if getfirst fastfirstrow GP_SCUD_Pers where
+          (( _pNrec == GP_SCUD_Pers.nrec ))<>tsok exit;
+  Result:=GP_SCUD_Pers.wType;
+
+} //Function GetPersType(_pNrec:comp)   :string;cacheable;
+
+//-----------------------------------------
+// Получить наименования типа по коду
+//-----------------------------------------
+Function GetPersTypeName(_wType:word)   :string;cacheable;
+{ Result:='';
+  case _wType of
+  0: Result:='сотрудники предприятия ';
+  1: Result:='внешние подрядчики';
+  2: Result:='прочие';
+  end;
+} //Function GetPersTypeName(_wType:word)   :string;cacheable;
+
+//-----------------------------------------
+// Получить наименование типа изменения данных
+//-----------------------------------------
+Function GetTypeHistName(_wType:word) :string; cacheable;
+{ Result:='';
+  case _wType of
+  0: Result:='Создание записи';
+  1..1000:
+  { Result:='Кадры,приказ ';
+    if getfirst TYPEPR=tsok
+     Result:=Result+TYPEPR.NOPER
+
+  }
+  1001:  Result:='СКУД';
+  1002:  Result:='Изменение';
+  end;
+} //Function GetTypeHistName(_wType:string) :string;
+
+//-----------------------------------------
+// Вставить значения в историю
+//-----------------------------------------
+Function Ins_GP_SCUD_Pers_SP(_wType_Hist:word;_cTitleDoc:comp=0;_cContDoc:comp=0;_Dt:date=ZeroDate) :boolean;
+{
+  var isNeedIns:boolean=false;
+  if _Dt=ZeroDate then _Dt:=Cur_Date;
+  isNeedIns:=getfirst GP_SCUD_Pers_Hist where
+        ((GP_SCUD_Pers.Nrec == GP_SCUD_Pers_Hist.cGP_SCUD_Pers
+
+       and _Dt == GP_SCUD_Pers_Hist.DTIZM(noindex)
+       and _wType_Hist == GP_SCUD_Pers_Hist.wType(noindex)
+       ))<>tsok;
+  do
+  {
+    if not isNeedIns
+    { if GP_SCUD_Pers_Hist.Fio            <> GP_SCUD_Pers.Fio// "Фио"
+      or GP_SCUD_Pers_Hist.wType          <> _wType_Hist//"0 - собственные, 1 - сторонние "
+      or GP_SCUD_Pers_Hist.cKatPodr       <> GP_SCUD_Pers.cKatPodr// "Подразделение"
+      or GP_SCUD_Pers_Hist.cKatOrg        <> GP_SCUD_Pers.cKatOrg//  "Организация"
+      //or GP_SCUD_Pers_Hist.cDocument      <> GP_SCUD_Pers.cDocument// "Документ"
+      or GP_SCUD_Pers_Hist.Propusk_NMB    <> GP_SCUD_Pers.Propusk_NMB//    "Пропуск, номер"
+      or GP_SCUD_Pers_Hist.Propusk_From   <> GP_SCUD_Pers.Propusk_From//       "Пропуск, действует с"
+      or GP_SCUD_Pers_Hist.Propusk_To     <> GP_SCUD_Pers.Propusk_To//   "Пропуск, действует по"
+      or GP_SCUD_Pers_Hist.Propusk_TB     <> GP_SCUD_Pers.Propusk_TB//   "Техника безопасности"
+      or GP_SCUD_Pers_Hist.cKlRejim       <> GP_SCUD_Pers.cKlRejim//  "Режим"
+      or GP_SCUD_Pers_Hist.cGP_SCUD_Kateg <> GP_SCUD_Pers.cGP_SCUD_Kateg//) "Категории сотрудников"
+      or GP_SCUD_Pers_Hist.CGP_SCUD_GRUP  <> GP_SCUD_Pers.CGP_SCUD_GRUP// "Группа сотрудников"
+      {} else break; //все совпало - прервем
+    }
+    if isNeedIns ClearBuffer(#GP_SCUD_Pers_Hist);
+
+    GP_SCUD_Pers_Hist.Fio            := GP_SCUD_Pers.Fio;// "Фио"
+    GP_SCUD_Pers_Hist.wType          := _wType_Hist;//"0 создание, 1- 1000 - приказы, 1001 Скуд"
+    GP_SCUD_Pers_Hist.cKatPodr       := GP_SCUD_Pers.cKatPodr;// "Подразделение"
+    GP_SCUD_Pers_Hist.cKatOrg        := GP_SCUD_Pers.cKatOrg;//  "Организация"
+    GP_SCUD_Pers_Hist.cKlRejim       := GP_SCUD_Pers.cKlRejim;//  "Режим"
+    GP_SCUD_Pers_Hist.DTIZM          := _Dt; //"Дата изменения"
+    //GP_SCUD_Pers_Hist.cDocument      := GP_SCUD_Pers.cDocument;// "Документ"
+    GP_SCUD_Pers_Hist.Propusk_NMB    := GP_SCUD_Pers.Propusk_NMB;//    "Пропуск, номер"
+    GP_SCUD_Pers_Hist.Propusk_From   := GP_SCUD_Pers.Propusk_From;//       "Пропуск, действует с"
+    GP_SCUD_Pers_Hist.Propusk_To     := GP_SCUD_Pers.Propusk_To;//   "Пропуск, действует по"
+    GP_SCUD_Pers_Hist.Propusk_TB     := GP_SCUD_Pers.Propusk_TB;//   "Техника безопасности"
+    GP_SCUD_Pers_Hist.cGP_SCUD_Kateg := GP_SCUD_Pers.cGP_SCUD_Kateg;//) "Категории сотрудников"
+    GP_SCUD_Pers_Hist.CGP_SCUD_GRUP  := GP_SCUD_Pers.CGP_SCUD_GRUP;// "Группа сотрудников"
+    if _cTitleDoc<>0
+    { GP_SCUD_Pers_Hist.cTitleDoc:=_cTitleDoc;
+      GP_SCUD_Pers_Hist.cContdoc :=_cContdoc;
+      vSpr.pContDoc:=_cContdoc;
+      // Закрываем пропуск
+    }
+    if isNeedIns
+     insert current GP_SCUD_Pers_Hist
+    else
+     update current GP_SCUD_Pers_Hist;
+  } while false;
+  result:=true;
+} //Function Ins_GP_SCUD_Pers_SP(_wType_Hist:word) :boolean;
+
+//-----------------------------------------
+// Вставить первоначальные значения
+//-----------------------------------------
+Function Ins_GP_SCUD_Pers(_wType:word;_wType_Hist:word; _cPers:comp;_cApp:comp;_cTitleDoc:comp=0;_cContDoc:comp=0) :boolean;
+var isAllOk:boolean;
+    isChange:boolean;
+    ii:longint;
+{ Result:=true;
+  //if _Wtype<>0 EXit;//только сотрудников!
+  var isNeedIns:boolean=false;
+  isChange:=false;
+  if Getfirst GP_SCUD_Pers where ((
+       0 == GP_SCUD_Pers.wType(noindex)
+   and  _cPers == GP_SCUD_Pers.cPersons ))<>tsok
+  { isNeedIns:=True;
+    ClearBuffer(#GP_SCUD_Pers);
+    isChange:=true
+  }
+
+  if _wType=0
+  { vSpr.pPersons:=_cPers;
+    if vSpr.Getfirst Persons <>tsok then exit;
+    // Если уволен и нет в скуде,то и не надо
+    timelog('GP_SCUD_PersEdit->Ins_GP_SCUD_Pers:Persons.Fio='+vSpr.Persons.Fio+', isNeedIns='+string(isNeedIns));
+    if vSpr.Persons.DisDate<>ZeroDate
+    if vSpr.Persons.DisDate<sub_months(Cur_Date,2)
+    { if isNeedIns=True //
+      { ReReadRecord(#GP_SCUD_Pers);
+        Exit
+      }
+    }
+    if not  isChange
+    { if GP_SCUD_Pers.Code    <>vSpr.Persons.StrTabn
+      or GP_SCUD_Pers.Fio     <>vSpr.Persons.Fio
+      or GP_SCUD_Pers.cKatPodr<>vSpr.Persons.GalDep
+      or GP_SCUD_Pers.CGP_SCUD_KATEG=0
+      or GP_SCUD_Pers.CGP_SCUD_GRUP=0
+        isChange:=true
+
+    }
+    GP_SCUD_Pers.cPersons:=_cPers;
+    GP_SCUD_Pers.Code:=vSpr.Persons.StrTabn;
+    GP_SCUD_Pers.Fio :=vSpr.Persons.Fio;
+    GP_SCUD_Pers.wType:=0;
+    if  vSpr.Persons.DisDate<GP_SCUD_Pers.Propusk_To
+    and vSpr.Persons.DisDate>ZeroDate
+    { isChange:=true;
+      GP_SCUD_Pers.Propusk_To:=vSpr.Persons.DisDate;
+    }
+    if vSpr.getfirst Passports=tsok
+    { if GP_SCUD_Pers.Passp_NMB      <>trim(vSpr.Passports.SER+' '+vSpr.Passports.NMB)//│Паспорт серия +Паспорт номер
+      or GP_SCUD_Pers.Passp_GivenBy  <>vSpr.Passports.GIVENBY   //│Паспорт: кем выдан
+      or GP_SCUD_Pers.Passp_GivenDate<>vSpr.Passports.GIVENDATE //│Паспорт: дата выдачи
+      or GP_SCUD_Pers.Passp_Podr     <>vSpr.Passports.GIVENPODR //│Паспорт: код подразделе
+      //GP_SCUD_Pers. :=vSpr.Pessports.TODATE    //│Паспорт: срок действия
+      or GP_SCUD_Pers.cTypeDoc       <>vSpr.Passports.DOCNAME
+        isChange:=true;
+
+      GP_SCUD_Pers.Passp_NMB      :=trim(vSpr.Passports.SER+' '+vSpr.Passports.NMB);//│Паспорт серия +Паспорт номер
+      GP_SCUD_Pers.Passp_GivenBy  :=vSpr.Passports.GIVENBY   ;//│Паспорт: кем выдан
+      GP_SCUD_Pers.Passp_GivenDate:=vSpr.Passports.GIVENDATE ;//│Паспорт: дата выдачи
+      GP_SCUD_Pers.Passp_Podr     :=vSpr.Passports.GIVENPODR ;//│Паспорт: код подразделе
+      //GP_SCUD_Pers. :=vSpr.Pessports.TODATE    //│Паспорт: срок действия
+      GP_SCUD_Pers.cTypeDoc       :=vSpr.Passports.DOCNAME;
+
+      //CREFGIVENBY │Ссылка на справочник: Кем выдан
+    }
+    //GP_SCUD_Pers.cKatPodr:=Persons.GalDep;
+    GP_SCUD_Pers.cKatPodr:=GetKatPodrByCatalogs(Persons.Department);
+
+    // ставим 5 категорию
+    if GP_SCUD_Pers.CGP_SCUD_KATEG=0
+      GP_SCUD_Pers.CGP_SCUD_KATEG:=iGP_SCUD_KategEdit.GetKategTypeNrec(5);
+    // группу 1 - сотрудники
+    if GP_SCUD_Pers.CGP_SCUD_GRUP=0
+       GP_SCUD_Pers.CGP_SCUD_GRUP:=iGP_SCUD_GrupEdit.GetGrupTypeNrec(1);
+  }
+  //заполним информацию о режиме
+  if _wType=0
+  if _cApp>0
+  { vSpr.pAppoint:=_cApp;
+    if vSpr.GetFirst Appointments=tsok
+    { if GP_SCUD_Pers.cKlRejim<>vSpr.Appointments.WorkRegime
+        isChange:=true;
+      GP_SCUD_Pers.cKlRejim:=vSpr.Appointments.WorkRegime;
+    }
+  } // if _wType=0
+  timelog('GP_SCUD_PersEdit->Ins_GP_SCUD_Pers:Persons.Fio='+vSpr.Persons.Fio+', isChange='+string(isChange));
+
+  if isNeedIns
+  { Result:=Insert Current GP_SCUD_Pers=tsok;
+  }
+  else
+  { if isChange
+      Result:=Update Current GP_SCUD_Pers=tsok;
+
+  }
+  isAllOk:=true;
+  var _Prefix:string= GetMemoPrefix(tnGP_SCUD_Pers);
+  if _Prefix='TXT' or _Prefix=''
+  if Getfirst Appendix=tsok
+  { var _tmp_File:string;
+    _tmp_File:=GetStringParameter('Files','OutputFilesDirectory',0)+'!temp.jpg';
+    var _Prefix:string=GetMemoPrefix(tnAppendix);
+    if _Prefix<>'' and _Prefix<>'TXT'
+    { if fileExist(_tmp_File) deletefile(_tmp_File);
+      if not fileExist(_tmp_File)
+      { _Try
+        { if _Prefix='AZM'
+          { isAllOk:=false;
+            var _Count:longint=GetPartMemoCount(Appendix.CONTENTS);
+            for (ii := 0; ii < _Count; ii++)
+            { /*
+               N := GetPartMemoName(NOTES, P)
+               S := GetPartMemoSize(NOTES, P)
+               K := GetPartMemoComment(NOTES, P)
+              */
+              _Prefix:=GetPartMemoPrefix(Appendix.CONTENTS, ii);
+              isAllOk:=ExportPartMemoToFile(Appendix.CONTENTS, ii, _tmp_File, false);
+              break; // пока только 1.
+            }
+          } //if _Prefix='AZM'
+          else
+          { isAllOk:=ExportMemoToFile(Appendix.CONTENTS, _tmp_File, false);
+          }
+          if isAllOk
+          { SetMemoPrefix(tnGP_SCUD_Pers,_Prefix);
+            if ImportFileToMemo(GP_SCUD_Pers.LPHOTO, _tmp_File, false)
+            { Update current GP_SCUD_Pers;
+            }
+          }
+        }
+        _except
+        else
+        {
+
+        }
+        _Finally
+        { if fileExist(_tmp_File) deletefile(_tmp_File);
+        }
+      } //if not fileExist(_tmp_File)
+    } //if _Prefix<>'' and _Prefix<>'TXT'
+  } //if Getfirst Appendix=tsok
+
+  //---------------------------
+  if isChange Ins_GP_SCUD_Pers_SP(_wType_Hist,_cTitleDoc,_cContDoc);
+
+
+} //Procedure Ins_GP_SCUD_Pers(_Num:word);
+
+//-----------------------------------------
+//   синхронизация справочника сотрудников
+//-----------------------------------------
+Procedure SyncAllPers;
+{ ResetBounds(#Persons);
+  timelog('GP_SCUD_PersEdit->SyncAllPers:START');
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm,
+          'Создание справочника сотрудников СКУД', RecordsInTable(#Persons));
+  _Loop fullcache Persons
+  { if not NextVisual then break;
+    timelog('GP_SCUD_PersEdit->SyncAllPers:Persons.FIO='+Persons.FIO+', ISEMPLOYEE='+Persons.ISEMPLOYEE);
+    if Persons.ISEMPLOYEE<>'С' and Persons.ISEMPLOYEE<>'У' continue;
+    Ins_GP_SCUD_Pers(0,0,Persons.Nrec,Persons.AppointCur)
+  } //_Loop Persons
+  SetBounds(#Persons);
+  ReScanPanel(#GP_SCUD_Pers);
+  StopVisual('',0);
+  timelog('GP_SCUD_PersEdit->SyncAllPers:FINISH');
+} //Procedure SyncAllPers;
+
+#doc
+    Создание/изменение буфера записи
+#end
+  Function MakeBufferPers(_pPersons:comp //ссылка на карточку
+                         ;_pAppointments:comp   //дата изменения
+                         ;_pTitleDoc:comp//ссылка на приказ
+                         ;_pContDoc:comp
+                         ;_TypeOper:word=0
+                         ):boolean;
+{ Result:=Ins_GP_SCUD_Pers(0,_TypeOper,_PPersons,_pAppointments,_pTitleDoc,_pContDoc);
+} //Function MakeBufferPers
+
+  Function DeleteBufferPers(_pPersons:comp //ссылка на карточку
+                         ;_pAppointments:comp   //дата изменения
+                         ;_pTitleDoc:comp//ссылка на приказ
+                         ;_pContDoc:comp
+                         ;_TypeOper:word=0
+                         ):boolean;
+  { #__UNUSED__(_pPersons,_pAppointments,_pTitleDoc,_pContDoc,_TypeOper)
+    Result:=False;
+
+    if _pPersons=0 then Exit;
+    if _pContDoc=0 then Exit;
+    if getfirst GP_Scud_Pers where (( _pPersons == GP_Scud_Pers.cPersons ))<>tsok then Exit;
+    //нет приказа - не удаляем
+    if getfirst GP_SCUD_Pers_Hist where
+       ((GP_SCUD_Pers.Nrec == GP_SCUD_Pers_Hist.cGP_SCUD_Pers
+       and _TypeOper   == GP_SCUD_Pers_Hist.wType(noindex)
+       and _pTitleDoc  == GP_SCUD_Pers_Hist.cTitleDoc(noindex)
+       and _pContdoc   == GP_SCUD_Pers_Hist.cContdoc(noindex)
+       ))<>tsok then Exit;
+    delete current GP_SCUD_Pers_Hist;
+    if getLast GP_SCUD_Pers_Hist where (( GP_SCUD_Pers.Nrec == GP_SCUD_Pers_Hist.cGP_SCUD_Pers ))
+      ordered by index GP_SCUD_PERS_HIST08 <>tsok then exit;
+    GP_SCUD_Pers.Fio            := GP_SCUD_Pers_Hist.Fio;// "Фио"
+    GP_SCUD_Pers.cKatPodr       := GP_SCUD_Pers_Hist.cKatPodr;// "Подразделение"
+    GP_SCUD_Pers.cKlRejim       := GP_SCUD_Pers_Hist.cKlRejim;//  "Режим"
+    update current GP_SCUD_Pers;
+    Result:=True;
+  } //DeleteBufferPers
+
+
+Function GetKatPodrByName(ww_str:string):comp;
+{ //'Подрядчики'
+  Result:=0;
+  if getfirst katpodr_flt where ((ww_str == katpodr_flt.name  ))=tsok
+  { Result:=katpodr_flt.nrec;
+  }
+} //Function GetKatPodrByName(ww_str:string):comp;
+
+
+//-----------------------------------------
+//
+//-----------------------------------------
+Procedure LoadProtectorCard;
+{
+if boDataProtectorCard then exit;
+//  message(boDataProtectorCard);
+   boDataProtectorCard:=true;
+   LoadVipRef(DataProtectorCard, 'GP_Protector');
+//   DataProtectorCard.LinkToExt(cfsGetCurrentContainerSelf, 'brAccessHistory',true);
+
+   LoadVipRef(DataProtectorCardTel, 'GP_Protector');
+   DataProtectorCardTel.LinkToExt(cfsGetCurrentContainerSelf, 'brPersTelList',true);
+/*
+   bogettune('NPOEM_OWN.SCUD.CanEditFirstKartocha')
+   {
+    DataProtectorCard.ProtectedStatusCtx := sci178Esc;
+    DataProtectorCardTel.ProtectedStatusCtx := sci178Esc;
+   }
+   else
+   {
+    DataProtectorCard.ProtectedStatusCtx := sci1Esc;
+    DataProtectorCardTel.ProtectedStatusCtx := sci1Esc;
+   }
+*/
+//   DataProtectorCard.ProtectedStatusCtx := sci1EscIns;
+
+//   DataProtectorCard.ProtectedStatusCtx(sci1EscIns);
+//   DataProtectorCard.AutoPalette := true;
+}
+
+
+Procedure PositionChanged;
+{ SetEditMode(CanEdittbl);
+  var _wnrec:comp;
+  _wnrec:=0;
+  _wnrec:=GP_SCUD_Pers.Nrec;
+  //timelog('GP_SCUD_PersEdit->PositionChanged: _wnrec='+string( _wnrec,0,0)) ;
+  iGP_SCUD_EventsEdit.InitParam(
+       cgiNotEdit
+      ,0,_wnrec
+      ,0,0
+      ,date(0,0,0)
+      ,date(0,0,0)
+      ,false);
+}
+//-----------------------------------------
+//   Проинициализровать данные
+//-----------------------------------------
+Function InitParam(
+  _wIntMode  : word;  // режим запуска (cgiNo, cgiPick, ...) см.GLOCONST.INC
+  _cNrec     : comp;  // ссылка на "Ведомость"
+  _cPersons  : comp;   // выбранная запись
+  _cKatpodr  : comp;   // выбранная запись
+  _cKatOrg   : longint; // включить определенные форматы
+  _DTB       : Date; //период просмотра
+  _DTE       : Date; //период просмотра
+  _NoVisual  : boolean=false //не перерисовывать экраны
+  ) : boolean;
+{ #__UNUSED__(_wIntMode,_cNrec,_cPersons,_cKatpodr,_cKatOrg,_DTB,_DTE,_NoVisual)
+  Result:=False;
+  Result:=True;
+} //Function InitParam(
+
+
+//---------------------------------------------
+// Тип документа
+//---------------------------------------------
+Function GetTypeDoc:word;
+{ Result:=GP_iSC_list_Of_Employees;//1003; //
+}
+
+//---------------------------------------------
+// получить наименование
+//---------------------------------------------
+Function GetPodrOrgName(_pNrec:comp):string;
+{ #__UNUSED__(_pNrec)
+  Result:='';
+  if GP_SCUD_Pers.wType=0
+  { if isValid(#KatPodr)
+      Result:=Katpodr.name;
+  }
+  else
+  { if isValid(#KatOrg)
+      Result:=KatOrg.name;
+  }
+} //Function GetPodrOrgName(_pNrec:comp):string;
+
+//---------------------------------------------
+// получить код
+//---------------------------------------------
+Function GetPodrOrgCode(_pNrec:comp):string;
+{ #__UNUSED__(_pNrec)
+  Result:='';
+  if GP_SCUD_Pers.wType=0
+  { if isValid(#KatPodr)
+      Result:=Katpodr.Kod;
+  }
+  else
+  { if isValid(#KatOrg)
+      Result:=KatOrg.UNN;
+  }
+} //Function GetPodrOrgName(_pNrec:comp):string;
+
+
+
+
+
+
+
+//========================================================
+// Визуальная часть
+//========================================================
+Window wnFilter 'Установите фильтры'  Cyan, EscClose;
+  Show at (,,51,15);
+Screen scrFilter 'Фильтры' ('Фильтры',,sci13Esc);
+Table KatPodr_Flt;
+Fields
+  wFilter :NoProtect;
+  Filtr_Katpodr  : PickButton,Protect;
+  Filtr_KatOrg   : PickButton,Protect;
+  Filtr_Persons  : PickButton,Protect;
+  sFio_Flt       : NoProtect;
+  sPassports_Flt : NoProtect;
+  sPropusk_Flt   : NoProtect;
+  wType_Flt      : [List
+     0 'сотрудники предприятия '
+    ,1 'внешние подрядчики'
+    ,2 'прочие' ], Protect;
+  dDUvBeg ('Уволен после') : NoProtect;
+  dDUvEnd ('Уволен до') : NoProtect;
+  dDPRBeg ('Срок действия пропуска после') : NoProtect;
+  dDPREnd ('Срок действия пропуска  до') : NoProtect;
+  Filtr_Kateg    : PickButton,Protect;
+  dDATOTCH :NoProtect;
+Buttons
+  cmOk    ,,, 'продолжить выполнение', hcAllBOk, scGalDial;
+  cmCancel,,, 'Отмена', hcAllBCancel, scGalDial;
+<<
+  `Фильтр по`
+  [.] подразделению` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] организации`   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] Сотруднику`    .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] по части фио`  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] номер паспорта`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] номер пропуска`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] тип записи`    .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] дате увольнения ` c.@@@@@@@@@@ по.@@@@@@@@@@
+  [.] пропуску действ.` c.@@@@@@@@@@ по.@@@@@@@@@@
+  [.] категории     `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] работающие`    на дату .@@@@@@@@@@@@@@@@@@@@
+
+ <. Продолжить .>  <.   Отмена   .>
+>>
+end; //Screen scrFilter (,,sci13Esс);
+HandleEvent
+cmInit:
+{ isProtect2:=isProtect;
+  if isProtect
+  { SetEditMode(True)
+  }
+
+}
+cmDone:
+{ if isProtect2
+    SetEditMode(false);
+}
+cmOk:
+{ CloseWindowEx(wnFilter,cmDefault)
+
+}
+end;// HandleEvent
+end; //Windows wnFilter 'Установите фильтры' , Cyan, EscClose;
+//**********************************************************************
+Window wnEditPers 'Редактирование'  Cyan, EscClose;
+  Show at (,,95,30);
+Screen scrEditPers 'Основные параметры' ('Основные параметры',,sci178Esc);
+  //Show at (,,76,15);
+  Show at (,,76,20);
+Table GP_SCUD_Pers;
+Fields
+  GP_SCUD_Pers.Fio          :NoProtect,NoPickButton,NoDel;
+  GP_SCUD_Pers.Code         :NoProtect,NoPickButton,NoDel;
+  KatPodr.Name             ('Подразделение',,sci1378Esc): Protect,NoDel;
+  [sType] GetPersTypeName(GP_SCUD_Pers.wType) ('Тип') :[30],Protect;
+  KatOrg.Name              ('Организация',,sci1378Esc): Protect,NoDel;
+  [Kateg] iGP_SCUD_KATEGEdit.GetKategName(GP_SCUD_Pers.CGP_SCUD_KATEG) ('Категории сотрудников',,sci1378Esc): Protect,PickButton ;
+  [Grup]  iGP_SCUD_GrupEdit.GetGrupName (GP_SCUD_Pers.CGP_SCUD_GRUP) ('Группа сотрудников',,sci1378Esc): Protect,PickButton ;
+  [LbPassport] 'Паспорт'   :Protect,Skip,{Font= {Bold=true}};
+  GP_SCUD_Pers.PASSP_NMB            ('Номер паспорта'):NoProtect,NoDel;
+  GP_SCUD_Pers.PASSP_GIVENDATE      ('Дата паспорта'):NoProtect,NoDel;
+  GP_SCUD_Pers.PASSP_GIVENBY        ('Паспорт выдан'):NoProtect,NoDel;
+  GP_SCUD_Pers.PASSP_PODR           ('Паспорт, код подразделения'):NoProtect,NoDel;
+  [DocName]   iCatFunc.GetCatalogsName(GP_SCUD_Pers.CTYPEDOC)            ('Тип документа'):NoProtect,NoDel;
+  Persons.DisDate : Protect, NoDel, Skip;
+  [LbPropusk] 'Пропуск'    :Protect,Skip,{Font= {Bold=true}};
+  GP_SCUD_Pers.PROPUSK_NMB          ('Пропуск, номер'):NoProtect,NoDel;
+  GP_SCUD_Pers.PROPUSK_FROM         ('Пропуск, действует с'):NoProtect,NoDel;
+  [Propus_Lock] if(GP_SCUD_Pers.PROPUSK_Lock=0,'нет','да') :Protect,NoDel
+   ,{Font={Color=if(GP_SCUD_Pers.PROPUSK_Lock=0,ColorSysBlack,ColorSysRed)}};
+  GP_SCUD_Pers.PROPUSK_TO           ('Пропуск, действует по'):NoProtect,NoDel;
+  KLREJIM.NRejim                    ('Режим',,sci1378Esc) : Protect,Pickbutton;
+  [sExt_Key] if(GP_SCUD_Pers.EXT_KEY<>'','Да','')   ('Внешний ключ') : Protect,NoPickbutton,NoDel;
+  [TB] if((GP_SCUD_Pers.PROPUSK_TB and 1)>0,'Да','')  ('Техника безопасности'):Protect,NoDel;
+  IsAlkoDouble ('Продуваться на алкорамке',,sci1378Esc) : NoProtect,Pickbutton;
+  LivName  ('Адрес проживания',,sci1Esc) : Protect,NoPickbutton;
+
+  [extMailLabel] 'Email' ('E-mail',,sci1Esc) :Protect,Skip;
+  [extMail]      sGetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.E-mail')('E-mail',,sci1Esc) : NoProtect,NoPickbutton;
+  [extPhoneLabel]'Телефон' ('Телефон',,sci1Esc) :Protect,Skip;
+  [extPhone]sGetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Телефон')           ('Телефон',,sci1Esc) : NoProtect,NoPickbutton;
+  [extVacBegLabel]'Отпуск. Начало' ('Отпуск. Начало',,sci1Esc) :Protect,Skip;
+  [extVacBeg]dGetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Отпуск. Начало')    ('Отпуск. Начало',,sci1Esc) : NoProtect,NoPickbutton;
+  [extVacEndLabel]'Отпуск. Окончание' ('Отпуск. Окончание',,sci1Esc) :Protect,Skip;
+  [extVacEnd]dGetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Отпуск. Окончание') ('Отпуск. Окончание',,sci1Esc) : NoProtect,NoPickbutton;
+  [extBDateLabel]'Дата рождения' ('Дата рождения',,sci1Esc) :Protect,Skip;
+  [extBDate]dGetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Дата рождения') ('Дата рождения',,sci1Esc) : NoProtect,NoPickbutton;
+
+<<
+ `ФИО`           .@@@@@@@@@@@@@@@@@@@@@@@@@@ `Таб.Номер/код` .@@@@@@@@@@@@@
+ `Подразделение` .@@@@@@@@@@@@@@@@@@@@@@@@@@ `Тип`           .@@@@@@@@@@@@@
+ `Организация`   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Категория`     .@@@@@@@@@@@@@@@@@@@@@@@@@@ `Группа`        .@@@@@@@@@@@@@
+ .@@@@@@@@@@@@@@ `Номер` .@@@@@@@@@@@@@@@@@@ `Выдан`         .@@@@@@@@@@@@@
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ `Код подразделения` .@@@@@@@@@
+ `Тип документа` .@@@@@@@@@@@@@@@@@@@@@@@@@@ `Дата увольнения`.@@@@@@@@@@@@
+ .@@@@@@@@@@@@@@ `Номер` .@@@@@@@@@@@@@@@@@@ `Выдан`         .@@@@@@@@@@@@@
+                 `Заблокирован`    .@@@@@@@@ `Действует до ` .@@@@@@@@@@@@@
+ `Режим работы`  .@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Экспортирован в СКУД`  .@@@@@@            `Техника безопасности`  .@@@@@@
+  [.] - продуваться на алкорамке`
+
+ `Адрес проживания`  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ .@@@@@@         .@@@@@@@@@@@@@@@@@@@@@@@@@@ .@@@@@@@         .@@@@@@@@@@@@
+ .@@@@@@@@@@@@@  .@@@@@@@@@                  .@@@@@@@@@@@@@@@@   .@@@@@@@@@
+ .@@@@@@@@@@@@@  .@@@@@@@@@
+
+
+>>
+
+End;//Screen scrEditPers
+/*
+browse brAccessHistory (, , sci178Esc);
+show at (,21,76,);
+Table AccessHistory;
+Fields
+  AccessHistory.addWord[1]  'КБ' :noProtect, checkBox;
+  AccessHistory.addWord[2]  'НИК' :noProtect, checkBox;
+  AccessHistory.addWord[3]  '215' :noProtect, checkBox;
+  AccessHistory.addWord[4]  '222' :noProtect, checkBox;
+  AccessHistory.addDate[1]  'Дата' :noProtect, pickbutton;
+  AccessHistory.addString[1] 'Основание'  ('Основание'): [12], nopickbutton, noprotect;
+  AccessHistory.addString[2] 'Примечание'  ('Примечание'): [12], nopickbutton, noprotect;
+end;
+*/
+
+text GP_SCUD_Pers.LPHOTO 'Фотография' :NoProtect;// (,,Sci1Esc);
+Show at (77,,,7);
+
+browse brPersTelList (, , sci178Esc); //Телефоны сотрудников
+show at (77,8,,15);
+Table Communications;
+Fields
+  Communications.addr  'Телефон' ('Телефон'):noProtect,noPickButton,{inputmask = '"+7"(999)999"-"9999'};
+end;
+
+Screen scrButtonstPers 'Основные параметры' ('Основные параметры',,sci178Esc);
+  Show at (77,16,,);
+<<
+>>
+end; //Screen scrButtonstPers
+
+HandleEvent
+cmInit:
+{
+   if CanEditTbl
+  { if getlast GP_SCUD_Pers_Hist=tsok and GP_SCUD_Pers.wType = 0
+    { if   GP_SCUD_Pers_Hist.cKatPodr       <> GP_SCUD_Pers.cKatPodr// "Подразделение"
+        or GP_SCUD_Pers_Hist.cKlRejim       <> GP_SCUD_Pers.cKlRejim//  "Режим"
+        or GP_SCUD_Pers_Hist.cGP_SCUD_Kateg <> GP_SCUD_Pers.cGP_SCUD_Kateg//) "Категории сотрудников"
+        or GP_SCUD_Pers_Hist.CGP_SCUD_GRUP  <> GP_SCUD_Pers.CGP_SCUD_GRUP// "Группа сотрудников"
+      { if message('Данные в последней записи истории не совпадают с карточкой'
+          +chr(13)+'(Подразделение, режим, категория или группа)'
+          +chr(13)+'Исправить карточку?',YesNo)=cmYes
+        { update current GP_SCUD_Pers set
+            GP_SCUD_Pers.cKatPodr       := GP_SCUD_Pers_Hist.cKatPodr// "Подразделен
+           ,GP_SCUD_Pers.cKlRejim       := GP_SCUD_Pers_Hist.cKlRejim//  "Режим"
+           ,GP_SCUD_Pers.cGP_SCUD_Kateg := GP_SCUD_Pers_Hist.cGP_SCUD_Kateg//) "Кате
+           ,GP_SCUD_Pers.CGP_SCUD_GRUP  := GP_SCUD_Pers_Hist.CGP_SCUD_GRUP
+           ;
+        }
+      }
+    } //if getlast GP_SCUD_Pers_Hist=tsok
+  }
+
+  if (GP_SCUD_Pers.wType = 1)//Внешние подрядчики
+  {
+    SetFieldState(#extMailLabel, sfVisible);
+    SetFieldState(#extMail, sfVisible);
+    SetFieldState(#extPhoneLabel, sfVisible);
+    SetFieldState(#extPhone, sfVisible);
+    SetFieldState(#extVacBegLabel, sfVisible);
+    SetFieldState(#extVacBeg, sfVisible);
+    SetFieldState(#extVacEndLabel, sfVisible);
+    SetFieldState(#extVacEnd, sfVisible);
+    SetFieldState(#extBDateLabel, sfVisible);
+    SetFieldState(#extBDate, sfVisible);
+  } else {
+    ClearFieldState(#extMailLabel, sfVisible);
+    ClearFieldState(#extMail, sfVisible);
+    ClearFieldState(#extPhoneLabel, sfVisible);
+    ClearFieldState(#extPhone, sfVisible);
+    ClearFieldState(#extVacBegLabel, sfVisible);
+    ClearFieldState(#extVacBeg, sfVisible);
+    ClearFieldState(#extVacEndLabel, sfVisible);
+    ClearFieldState(#extVacEnd, sfVisible);
+    ClearFieldState(#extBDateLabel, sfVisible);
+    ClearFieldState(#extBDate, sfVisible);
+    #extBDate
+  }
+
+
+  //CanEditTbl
+} //cmInit
+end;
+end;//wnEditPers
+
+
+//**********************************************************************
+Window wnEditPersHist 'Редактирование'  Cyan, EscClose;
+  Show at (,,80,10);
+Screen scrEditPers_Hist 'Основные параметры' ('Основные параметры',,sci178Esc);
+Table GP_SCUD_Pers_Hist;
+Fields
+  GP_SCUD_Pers_Hist.Fio          :NoProtect,NoPickButton,NoDel;
+  GP_SCUD_Pers_Hist.DTIZM        :NoProtect,NoDel;
+  KatPodr_Hist.Name             ('Подразделение',,sci1378Esc): Protect,NoDel;
+  [sType_Hist] GetPersTypeName(GP_SCUD_Pers.wType) ('Тип') :[30],Protect;
+  KatOrg_Hist.Name              ('Организация',,sci1378Esc): Protect,NoDel;
+  [Kateg_Hist] iGP_SCUD_KATEGEdit.GetKategName(GP_SCUD_Pers_Hist.CGP_SCUD_KATEG) ('Категории сотрудников',,sci1378Esc): Protect,PickButton ;
+  [Grup_Hist]  iGP_SCUD_GrupEdit.GetGrupName (GP_SCUD_Pers_Hist.CGP_SCUD_GRUP) ('Группа сотрудников',,sci1378Esc): Protect,PickButton ;
+  //LbPassport  :Protect,Skip,{Font= {Bold=true}};
+  //GP_SCUD_Pers_hist.PASSP_NMB            ('Номер паспорта'):NoProtect,NoDel;
+  //GP_SCUD_Pers_hist.PASSP_GIVENDATE      ('Дата паспорта'):NoProtect,NoDel;
+  //GP_SCUD_Pers_hist.PASSP_GIVENBY        ('Паспорт выдан'):NoProtect,NoDel;
+  //GP_SCUD_Pers_hist.PASSP_PODR           ('Паспорт, код подразделения'):NoProtect,NoDel;
+  //[DocName]   iCatFunc.GetCatalogsName(GP_SCUD_Pers.CTYPEDOC)            ('Тип документа'):NoProtect,NoDel;
+  LbPropusk    :Protect,Skip,{Font= {Bold=true}};
+  GP_SCUD_Pers_Hist.PROPUSK_NMB          ('Пропуск, номер'):NoProtect,NoDel;
+  GP_SCUD_Pers_Hist.PROPUSK_FROM         ('Пропуск, действует с'):NoProtect,NoDel;
+  GP_SCUD_Pers_Hist.PROPUSK_TO           ('Пропуск, действует по'):NoProtect,NoDel;
+<<
+ `ФИО`           .@@@@@@@@@@@@@@@@@@@@@@@@@@ `Дата изменения`.@@@@@@@@@@@@@
+ `Подразделение` .@@@@@@@@@@@@@@@@@@@@@@@@@@ `Тип`           .@@@@@@@@@@@@@
+ `Организация`   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Категория`     .@@@@@@@@@@@@@@@@@@@@@@@@@@ `Группа`        .@@@@@@@@@@@@@
+ .@@@@@@@@@@@@@@ `Номер` .@@@@@@@@@@@@@@@@@@ `Выдан`         .@@@@@@@@@@@@@
+                                             `Действует до ` .@@@@@@@@@@@@@
+>>
+End;//Screen scrEditPers
+end;//wnEditPersHist
+
+
+//**********************************************************************
+Browse brScudPers '' (,,sci17Esc);
+show at (,,,15);
+Table GP_SCUD_Pers;
+recMarker=pMarker;
+Fields
+  GP_SCUD_Pers.Code        'Код/Таб.№' :[20],Protect,NoPickButton,NoDel;
+  GP_SCUD_Pers.Fio         'Наименование' :[40],Protect,NoPickButton,NoDel;
+  IsAlko                   'Алкорамка'   :[4],Protect,NoPickButton,NoDel;
+  //GP_SCUD_Pers.Description 'Описание'     :[40],NoProtect,NoPickButton,NoDel;
+  sType                    'Тип' :[30],Protect;
+  GetPodrOrgCode(GP_SCUD_Pers.Nrec) 'Код/ИНН' ('Код подразделения') :[30],Protect,NoDel;
+  GetPodrOrgName(GP_SCUD_Pers.Nrec) 'Подразделение/Организация' :[30],Protect,NoDel;
+  GP_SCUD_KATEG.Name           'Категория'  ('Категория') :[20],Protect,NoDel;
+  Persons.DisDate              'Дата увол.': [10],Protect, NoDel;
+  CatPost.Name                 'Должность' : [20],Protect, NoDel;
+  GP_SCUD_Pers.PASSP_NMB       'Паспорт'    ('Номер паспорта'):Protect,NoDel;
+  GP_SCUD_Pers.PASSP_GIVENDATE 'Выдан'      ('Дата паспорта'):Protect,NoDel;
+  GP_SCUD_Pers.PROPUSK_NMB     'Пропуск'       ('Пропуск, номер'):Protect,NoDel;
+  GP_SCUD_Pers.PROPUSK_FROM    'Выдан'         ('Пропуск, действует с'):Protect,NoDel;
+  GP_SCUD_Pers.PROPUSK_TO      'Действует до'      ('Пропуск, действует по'):Protect,NoDel;
+  TB                           'ТБ'   ('Техника безопасности'):[3],Protect,NoDel;
+  [ZGD]     iGP_SCUD_EventsEdit.FindZGD(GP_SCUD_Pers.cKatPodr) 'ЗГД' : [20],Protect,NoDel;
+  [ZGD_Fio] iGP_SCUD_EventsEdit.FindZGD(GP_SCUD_Pers.cKatPodr,false,2) 'ЗГД' : [20],Protect,NoDel;
+end;//Browse brScudPers
+//------------------------------------------------------
+screen ScrPersHist ;
+show at (,16,70,16);
+<<
+ История изменений данных
+>>
+end;
+//------------------------------------------------------
+browse brPersHist;
+show at (,17,70,);
+Table GP_SCUD_Pers_Hist;
+Fields
+  [TYPE_HIST] GetTypeHistName(GP_SCUD_Pers_Hist.wType) 'Тип' :[15],Protect,NoDel;
+  GP_SCUD_Pers_Hist.DTIZM      'Дата','изменения'    ('Дата изменения'):[11],Protect,NoDel;
+  KatPodr_Hist.Kod                  'Подраз-','деление'       ('Код подразделения'):[6],Protect,NoDel;
+  GP_SCUD_Pers_Hist.PROPUSK_NMB     'Пропуск'       ('Пропуск, номер'):Protect,NoDel;
+  GP_SCUD_Pers_Hist.PROPUSK_FROM    'Выдан'         ('Пропуск, действует с'):Protect,NoDel;
+  GP_SCUD_Pers_Hist.PROPUSK_TO      'Действует до'      ('Пропуск, действует по'):Protect,NoDel;
+  Kateg_Hist   'Категория'        ('Категории сотрудников',,sci1378Esc):[20], Protect,PickButton ;
+  Grup_Hist    'Группа персонала' ('Группа сотрудников',,sci1378Esc):[20], Protect,PickButton ;
+  KatOrg_Hist.Name      'Организация'        ('Организация',,sci1378Esc): Protect,NoDel;
+
+end;
+//------------------------------------------------------
+screen ScrDocEvants ;
+show at (71,16,,16);
+<<
+ Выходы сотрудника
+>>
+end;
+//------------------------------------------------------
+Embedded emDocSP 'Спецификация' Interface    iGP_SCUD_EventsEdit.wnEventsPers;
+show at (71,17,,);
+end;
+//------------------------------
+
+//---------------------------------------------
+// Загрузчик интерфейса
+//---------------------------------------------
+
+procedure SetEditMode(Value: boolean);
+{
+  LoadProtectorCard;
+
+  inherited::SetEditMode(Value);
+
+  if bogettune('NPOEM_OWN.SCUD.CanEditFirstKartocha')
+  {
+   DataProtectorCard.SetProtected(False);
+   DataProtectorCardTel.SetProtected(False);
+  }
+  else{
+    DataProtectorCard.SetProtected(True);
+    DataProtectorCardTel.SetProtected(True);
+  }
+}
+
+Procedure LoadInterface(_boVisibleRun:boolean);
+{  inherited ::LoadInterface(_boVisibleRun);
+   isFilterRun:=false;
+   ReadParam;
+   NPOEM_OWN_SCUD_Pers_Other :=boGetTune('NPOEM_OWN.SCUD.Pers_Other');//'Отображать сторонних лиц
+      if (wIntMode and cgiPickMult)=cgiPickMult
+      and boVisibleRun
+      { DataProtector.ProtectedStatusCtx := sci1EscIns;
+        pMarker.AutoSave := True;
+        pMarker.LoadAuto := True;
+        pMarker.StoreName := 'GP_SCUD_PersdEdit';
+        pMarker.Caption   := (' Отмечено [%d] ');
+      }
+      else  pMarker.Disable:=true;
+      ReadParam;
+      if pKatPodr>0
+      { wFilter:=0;
+        ClearMarker(Marker_KatPodr);
+        InsertMarker(Marker_KatPodr,pKatPodr);
+        BitOnW(wFilter,1)
+      }
+      if wIntMode <> 0
+      {
+        SetEditMode(false);
+      }
+      else
+      {
+        SetEditMode(True)
+      }
+} //Procedure LoadInterface(_wRunType:word);
+
+
+
+//******************************************************************************
+// HandleEvent таблиц
+//******************************************************************************
+TableEvent table GP_SCUD_Pers;
+
+cmSetDefault:
+{ if isFilterRun Exit;
+  if not CanEdittbl then Exit;
+  ClearBuffer(#GP_SCUD_Pers);
+  GP_SCUD_Pers.wType:=1;
+  set GP_SCUD_Pers.cKatPodr:=GetKatPodrByName('Подрядчики');
+  SelectField(#katorg.name);
+  SetEditMode(true);
+  PutCommand(cmEdit);
+
+}
+cmInsertRecord:
+{ if not CanEdittbl
+  { Message('Добавление записи запрещено');
+    Exit;
+  }
+  Insert Current GP_SCUD_Pers;
+  Ins_GP_SCUD_Pers_SP(1002);
+}
+cmUpdateRecord:
+{ if not CanEdittbl
+  { Message('Изменение записи запрещено');
+    Exit;
+  }
+  Update Current GP_SCUD_Pers;
+  Ins_GP_SCUD_Pers_SP(1002);
+}
+cmDeleteRecord:
+{ message('Удаление запрещено!');
+  exit;
+  //delete GP_SCUD_Pers_Hist where ((  GP_SCUD_Pers.Nrec     == GP_SCUD_Pers_Hist.cGP_SCUD_Pers));
+  //delete Current GP_SCUD_Pers;
+}
+cmPositionChanged:
+{ PositionChanged;
+}
+end; //GP_SCUD_Pers
+
+TableEvent table GP_SCUD_Pers_Hist;
+cmSetDefault:
+{ exit;
+}
+cmInsert:
+{ Ins_GP_SCUD_Pers_SP(1002);
+  PutCommand(cmEdit);
+  abort;
+}
+cmInsertRecord:
+{
+if not CanEdittbl
+  { Message('Добавление записи запрещено');
+    Exit;
+  }
+  Insert Current GP_SCUD_Pers_Hist;
+
+}
+cmUpdateRecord:
+{ Update Current GP_SCUD_Pers_Hist;
+}
+cmDeleteRecord:
+{ message('Удаление запрещено!');
+  exit;
+  //delete Current GP_SCUD_Pers_hist;
+}
+end; //GP_SCUD_Pers_hist
+
+
+TableEvent table Communications;
+ cmSetDefault: {
+   ClearBuffer(tnCommunications);
+//   Communications.comtype = coCommunMobilePhone;
+ }
+ cmInsertRecord:{
+   Insert Current Communications;
+ }
+ cmUpdateRecord:{
+   Update Current Communications;
+ }
+ cmDeleteRecord:{
+   Delete Current Communications;
+ }
+end;
+
+/*
+TableEvent table accessHistory;
+ cmSetDefault: {
+   ClearBuffer(tnaccessHistory);
+ }
+ cmInsertRecord:{
+   Insert Current accessHistory;
+ }
+ cmUpdateRecord:{
+   Update Current accessHistory;
+ }
+ cmDeleteRecord:{
+   Delete Current accessHistory;
+ }
+end;
+ */
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+  HandleEvent
+    //-----------------------------
+    cmInit:
+    { timelog_init;
+      LoadInterFace(true);
+      if Marker<>0
+        pMarker.ImportFrom(Marker)
+      else
+        pMarker.ImportFromName(pMarker.StoreName);
+      dDATOTCH:=dGetTune('UP.DATOTCH');
+      SetFilterBounds(0);
+      SetFilterNm;
+      if cRec=0
+      { if Marker<>0
+        { GetMarker(Marker,0,cRec)
+        }
+      }
+      if cRec>0
+      { if getfirst GP_SCUD_Pers where (( cRec == GP_SCUD_Pers.nrec ))=tsok {}
+      }
+      if pr_CurUserAdmin
+      { if RecordsInTable(#GP_SCUD_Pers)=0
+          SyncAllPers
+      }
+      ReScanPanel(#GP_SCUD_Pers);
+      if (wIntMode and cgiMultiEdit)>0
+      { RunWindowModal(wnEditPers);
+        CloseInterface(cmDone);
+        exit;
+
+      }
+    }
+    //-----------------------------
+    cmOnVipLoad:
+    { LoadInterFace(false);
+    }
+
+    //-----------------------------
+    cmDone:
+    { UnLoadInterFace(true);
+/* lapus
+      if DataProtectorCard<>NullRef
+      { FreeVipInterface(DataProtectorCard);
+      }
+*/
+      SaveParam;
+    }
+    //-----------------------------
+    cmOnVipUnLoad:
+    {
+     UnLoadInterFace(false);
+    }
+    //-----------------------------
+    cmDefault:
+    { if (wIntMode and cgiPick)>0
+      {
+        if (wIntMode and cgiPickMult)=cgiPickMult
+        { if PMarker.Count=0
+          { pMarker.Mark;
+          }
+          if Marker<>0
+            pMarker.ExportTo(Marker);
+          else
+            pMarker.ExportToName(pMarker.StoreName);
+        }
+        else
+        { set cRec:=GP_SCUD_Pers.Nrec;
+        }
+        CloseInterface(cmDefault)
+      }
+      else Putcommand(cmEdit);
+    }
+    cmEdit:
+    {
+      if GetCurrentFormat=brScudPers
+         RunWindow(wnEditPers);
+       else
+       if GetCurrentFormat=brPersHist
+         RunWindow(wnEditPersHist);
+
+    }
+    cmExprFieldChanged :
+    {
+      case CurField of
+      #IsAlkoDouble:
+       {
+        doSetAttr(31557,GP_SCUD_Pers.nrec,'Продуваться на алкорамке', ExprFieldValue)
+       }
+      #extBDate:
+      {
+        if(StrToDate(ExprFieldValue, 'DD/MM/YYYY') <> ZeroDate){
+          dSetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Дата рождения', StrToDate(ExprFieldValue, 'DD/MM/YYYY'))
+        }else{
+          ExtAttr_DeleteValue(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Дата рождения');
+        }
+      }
+      #extVacBeg:
+      {
+        if(StrToDate(ExprFieldValue, 'DD/MM/YYYY') <> ZeroDate){
+          dSetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Отпуск. Начало', StrToDate(ExprFieldValue, 'DD/MM/YYYY'))
+        }else{
+          ExtAttr_DeleteValue(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Отпуск. Начало');
+        }
+      }
+      #extVacEnd:
+      {
+        if(StrToDate(ExprFieldValue, 'DD/MM/YYYY') <> ZeroDate){
+          dSetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Отпуск. Окончание', StrToDate(ExprFieldValue, 'DD/MM/YYYY'))
+        }else{
+          ExtAttr_DeleteValue(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Отпуск. Окончание');
+        }
+      }
+      end;
+      rereadrecord(#GP_SCUD_Pers);
+    }
+    cmCheckField:
+    { case CurField of
+      #GP_SCUD_Pers.wType:
+      { if GP_SCUD_Pers.wType=1
+        { if GP_SCUD_Pers.cPersons<>0
+          { Message('Запись связана с картотекой!'
+              +chr(13)+'Изменение типа записи запрещено!');
+            set GP_SCUD_Pers.wType:=0;
+          }
+        }
+      }
+      #extMail:
+      { var ww_str:string = GetViewerData();
+        if(ww_str <> ''){
+          sSetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.E-mail', ww_str)
+        }else{
+          ExtAttr_DeleteValue(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.E-mail');
+        }
+      }
+      #extPhone:
+      {
+        var ww_str:string = GetViewerData();
+        if(ww_str <> ''){
+          sSetAttr(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Телефон', ww_str)
+        }else{
+          ExtAttr_DeleteValue(coGP_SCUD_PERS, GP_SCUD_Pers.nrec, 'Подрядчик.Телефон');
+        }
+      }
+      end;
+    }
+    //----------------------
+    cmPick:
+    { if IsProtect
+      { Abort;
+        Exit;
+      }
+      case CurField of
+      #KatPodr.Name:
+      { if GP_SCUD_Pers.wType=1
+        {
+          set GP_SCUD_Pers.cKatPodr := 000A00000002954Dh; // Внешние подрядчики
+          //message('Запись связана с организацией, изменение запрещено' ) ;
+          //exit;
+        }
+        else
+        {
+          pTmp:= GP_SCUD_Pers.cKatPodr;
+          If (iGetKau.GetCodeKau(cgiPick,cgKau_KatPodr,pTmp) <> 0)
+          { set GP_SCUD_Pers.cKatPodr:=pTmp;
+         }
+        }
+      }
+      #KatOrg.Name:
+      { if GP_SCUD_Pers.wType=0
+        { message('Запись связана с картотекой сотрудников, изменение запрещено' ) ;
+          exit;
+        }
+        pTmp:= GP_SCUD_Pers.cKatOrg;
+        If (iGetKau.GetCodeKau(cgiPick,cgKau_KatOrg,pTmp) <> 0)
+        { if GP_SCUD_Pers.cKatpodr=0
+          { set GP_SCUD_Pers.cKatPodr:=GetKatPodrByName('Подрядчики');
+          }
+          set GP_SCUD_Pers.cKatOrg:=pTmp;
+        } //If (iGetKau.GetCodeKau(cgiPick,cgKau_KatOrg,pTmp) <> 0)
+      } //#KatOrg.Name:
+      #Kateg:
+      { pTmp:=GP_SCUD_Pers.CGP_SCUD_KATEG;
+        if RunInterface(GP_SCUD_KATEGEdit,cgiPick,pTmp,0)<>cmCancel
+        { set GP_SCUD_Pers.CGP_SCUD_KATEG:=pTmp
+        }
+      }
+      #Grup:
+      { pTmp:=GP_SCUD_Pers.CGP_SCUD_GRUP;
+        if RunInterface(GP_SCUD_GRUPEdit,cgiPick,pTmp,0)<>cmCancel
+        { set GP_SCUD_Pers.CGP_SCUD_GRUP:=pTmp
+        }
+      }
+      #Kateg_hist:
+      { pTmp:=GP_SCUD_Pers_Hist.CGP_SCUD_KATEG;
+        if RunInterface(GP_SCUD_KATEGEdit,cgiPick,pTmp,0)<>cmCancel
+        { set GP_SCUD_Pers_Hist.CGP_SCUD_KATEG:=pTmp
+        }
+      }
+      #Grup_hist:
+      { pTmp:=GP_SCUD_Pers_Hist.CGP_SCUD_GRUP;
+        if RunInterface(GP_SCUD_GRUPEdit,cgiPick,pTmp,0)<>cmCancel
+        { set GP_SCUD_Pers_Hist.CGP_SCUD_GRUP:=pTmp
+        }
+      }
+      #KLREJIM.NRejim: //'Режим'
+      { var wTmp:word;
+        wTmp := KLREJIM.Rejim;
+        if ( RunInterface('PickRej', wTmp) <> cmCancel )
+        if ( getfirst KLREJIM where (( wTmp == KLREJIM.Rejim)) = tsOk )
+        { pTmp:= KLREJIM.Nrec;
+          set GP_SCUD_Pers.cKlRejim:=KLREJIM.Nrec;
+        }
+      }
+      #Filtr_Katpodr:
+      { if RunInterface('GetPodaLN',12, Marker_KatPodr, 1)=cmDefault
+        { SetFilterNm(#Filtr_Katpodr);
+          BitOnW(wFilter,1);
+        }
+      }
+      //------------------------------
+      #Filtr_KatOrg:
+      { KauMarkerName := iGetKau.GetMarkerName(cgKau_KatOrg);
+        StoreMarker(Marker_KatOrg,KauMarkerName);
+        If (iGetKau.GetCodeKau(cgiPickMult,cgKau_KatOrg,Comp(0)) <> 0)
+        { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+          CopyMarker(Marker_KatOrg,Marker_Tmp);
+          DoneMarker(Marker_Tmp,'');
+          SetFilterNm(#Filtr_KatOrg);
+          BitOnW(wFilter,2);
+        }
+      }
+      //------------------------------
+      #Filtr_Persons:
+      { KauMarkerName := iGetKau.GetMarkerName(cgKau_Persons);
+        StoreMarker(Marker_Persons,KauMarkerName);
+        If (iGetKau.GetCodeKau(cgiPickMult,cgKau_Persons,Comp(0)) <> 0)
+        { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+          CopyMarker(Marker_Persons,Marker_Tmp);
+          DoneMarker(Marker_Tmp,'');
+          SetFilterNm(#Filtr_Persons);
+          BitOnW(wFilter,3);
+        }
+      }
+      #Filtr_Kateg:
+      { pTmp:=GP_SCUD_Pers.CGP_SCUD_KATEG;
+        if RunInterface(GP_SCUD_KATEGEdit,cgiPickMult,pTmp,Marker_Kateg)<>cmCancel
+        { SetFilterNm(#Filtr_Kateg);
+          BitOnW(wFilter,10);
+        }
+      }
+      end;
+      ReScanPanel(#GP_SCUD_PERS);
+    } //cmPick
+    //----------------------
+    cmDelOnProtect:
+    { Case Curfield of
+      //------------------------------
+      #Filtr_KatPodr:
+      { ClearMarker(Marker_KatPodr);
+        BitOffW(wFilter,1);
+        SetFilterNm(#Filtr_KatPodr);
+      }
+      //------------------------------
+      #Filtr_KatOrg:
+      { ClearMarker(Marker_KatOrg);
+        BitOffW(wFilter,2);
+        SetFilterNm(#Filtr_KatOrg);
+      }
+      //------------------------------
+      #Filtr_Persons:
+      { ClearMarker(Marker_Persons);
+        BitOffW(wFilter,3);
+        SetFilterNm(#Filtr_Persons);
+      }
+      #Filtr_Kateg:
+      { ClearMarker(Marker_Kateg);
+        SetFilterNm(#Filtr_Kateg);
+        BitOffW(wFilter,10);
+      }
+      end;
+    }
+
+    //--------------------------
+    cmPickClass:// внешние классификаторы
+    {
+      if UpdateTable
+      case CurTable of
+      #GP_SCUD_Pers: RunInterface('ExClassifier', coGP_SCUD_Pers, GP_SCUD_Pers.nRec);
+      end;
+    }
+    //--------------------------
+    cmFilterSave:
+    { UpdateTable;
+      if RunWindowModal(wnFilter)=cmDefault
+      { SetFilterBounds(0);
+      }
+      else RestFromA
+    }
+    //--------------------------
+    cmPickAttr:// внешние аттрибуты
+    {
+      if UpdateTable
+      case CurTable of
+      #GP_SCUD_Pers: RunInterface('Attribute', coGP_SCUD_Pers, GP_SCUD_Pers.nRec);
+      end;
+    }
+    cmValue1:
+    { if not UserAccessService.CanEdit(pStatus_GetDefault)
+      { Message('У вас нет прав для запуска расчета сальдо');
+        exit;
+
+      }
+      SyncAllPers
+    }
+    //--------------------------
+    cmHotKeys:
+    {
+      case CurTable of
+      #GP_SCUD_Pers:
+      { //ProcessCommand(RunMenu('GP_SCUD_PersEdit_Main_HotKey'));
+        PutCommand(RunMenu('GP_SCUD_PersEdit_Main_HotKey'));
+      }
+      end;
+    }
+  end;
+end.
+
+GP_SCUD_PersEdit_Main_HotKey Menu
+{
+- 'Фильтр на данные'     , cmFilterSave, 'Фильтр на данные', hcProc_NagrKaf, 'Alt+B',kbAltB, scMenuCtx;
+- 'Синхронизация с картотекой сотрудников'    , cmValue1   , 'Обновить', hcProc_NagrKaf, ,, scMenuCtx;
+-------------------;
+- 'Внешняя классификация', cmPickClass, 'Внешняя классификация', hcGkatalM1ExtClass, 'Alt+C', kbAltC, sci1Esc;
+- 'Внешние атрибуты'     , cmPickAttr , 'Заполнение внешних атрибутов по данной позиции', hcGkatalM1Attr, 'Alt+A', kbAltA, sci1Esc;
+
+}

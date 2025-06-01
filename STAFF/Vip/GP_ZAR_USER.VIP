@@ -1,0 +1,2608 @@
+/*************************************************************************************************\
+* Наименование: Права доступа к лицевым счетам по подразделениям                                  *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: необходимо разработать отдельный функционал по разграничению прав доступа           *
+* по подразделениям аналогичному в модуле ЗП                                                      *
+* USERRIGHTS ->  GP_USERRIGHTS                                                                    *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1754         |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+//------------------------------------------------------------------------------
+//                                                     (c) корпорация ГАЛАКТИКА
+// Галактика 8.1 - Заработная плата
+// Права доступа к лицевым счетам по подразделениям
+//------------------------------------------------------------------------------
+// обход каталога подразделений
+#include DepTree.vih
+#include Protector.vih
+
+#doc
+Интерфейс "Права доступа к лицевым счетам по подразделениям - Мотивация"
+#end
+interface GP_Zar_User 'Права доступа пользователей(Мотивация)' ('Настройка прав доступа к лицевым счетам по подразделениям', hcZar_User, scKlndbut) escclose, Cyan;
+//show at (,,74,25);
+
+  // список [отображаемых] пользователю подразделений
+  table struct UserDeps
+  (
+    Department: comp,
+    Parent: comp,
+    Code: string[40],
+    Name: string[60],
+    Disabled: boolean
+  )
+  with index
+  (
+    IDX0 = Department,
+    IDX1 = Parent + Name(length = 30),
+    IDX2 = Parent + Code
+  );
+
+  // помеченные администратором пользователи
+  table struct MarkUsers
+  (
+    cUser: comp,
+    Login: string,
+    Group: comp
+  )
+  with index
+  (
+    IDX0 = cUser,
+    IDX1 = Login(unique),
+    IDX2 = Group
+  );
+
+  // пометки по группам пользователей
+  table struct MarkUsersG = MarkUsers;
+  // пометки по пользователям
+  table struct MarkUsersU = MarkUsers;
+  // список пользователей
+  table struct ListUsers = MarkUsers;
+  // назначаемые права на подразделения
+  table struct SetRights = GP_USERRIGHTS;
+  // помеченные подразделения
+  table struct MarksDeps = GP_USERRIGHTS;
+//--------------GP
+var
+  IsCurrTree: boolean; // дерево или список
+  wModule:word;// тип модуля  = wType
+  _UserName:string;
+  Domain:string;
+//--------------GP
+Create view X
+  var
+    p2: double;
+    Node0,
+    Node1,
+    NodeM: comp;
+    PrChoice: word;
+    NotificationIsBeingSent: boolean;
+    // название окна, которое надо автоматически открывать при вызове инт-са
+    StartingWindow: string;
+    Protector: IProtector;
+    EditMode:  boolean;
+    // выставляемые опции доступа
+    OldAccess,
+    DefAccess: word;
+    // параметры замены разрешений
+    OldParams,
+    DefParams: word;
+    // опции выборочной пометки пользователей
+    FltPodrShare: word;
+    FltCanChange: word;
+    // отображаются все пользователи
+    ShowAllUsers: boolean;
+    // показывать склады
+    ViewSklad:    boolean;
+
+  as select
+    if(IsValid(tnMarkUsers), 'V', '')
+    (fieldname = UserMarked),
+
+    if(PrChoice = 0, '', '(' + if(Zar_User.CurCex = 0, 'все ' + if(ZAR_USER.PODRSHARE = '+', 'доступные ', '') + 'подразделения', KatPodrN.Name) + ')')
+    (fieldname = CurP),
+
+    Zar_User.*
+  from
+    Zar_User
+    , Zar_User Zar_User0
+    , Zar_User Zar_User1
+    , Zar_User Zar_User2
+    , Zar_User Zar_User3
+    , KatPodr(readonly)
+    , KatPodr KatPodrN
+    , KatPodr KatPodr1
+    , KatPodr KatPodr2
+    , KatPodr KatPodrM
+    , KatPodr KatPodrMP
+    , GP_USERRIGHTS
+    , UserDeps
+    , UserDeps UserSubDeps
+    , UserDeps UserDeps_GP
+    , GP_USERRIGHTS GP_USERRIGHTS1  // Для копирования прав доступа
+
+    , X$USERS (readonly)
+    , X$USERS X$USERS1 (readonly)
+    , X$USERS X$USERS2 (readonly)
+    , X$USERS X$USERS3 (readonly)
+    , GROUPS (readonly)
+    //, GROUPUSERS
+    , GROUPMembers
+    , MarkUsers(build)
+    , MarkUsersG(build)
+    , MarkUsersU(build)
+    , MarkUsersG MarkUsersE
+
+    , SetRights(build)
+    , SetRights SetRights1
+    , ListUsers
+  where
+  ((
+    // список пользователей на первой вкладке
+                    root == ZAR_USER.OWNNAME
+    and Domain+ZAR_USER.OWNNAME == X$USERS.XU$LOGINNAME
+    //and Zar_User.cUser == X$USERS.Atl_nrec
+    and Domain+ZAR_USER.OWNNAME == MarkUsers.Login
+    //and ZAR_USER.cUser == MarkUsers.cUser
+
+    and ZAR_USER.CURCEX  == KatPodrN.NRec
+
+    // подразделения для первой вкладки ("По пользователю")
+    and Node0 == UserDeps.Parent
+    and UserDeps.Department == UserSubDeps.Parent
+    and UserDeps.Department == KatPodr.nRec
+
+    // подразделения для второй вкладки ("По подразделению")
+    and Node1              == KatPodr1.cPodr
+    and KatPodr1.NRec      == GP_USERRIGHTS.cRecDs
+    and wModule            == GP_USERRIGHTS.WTYPE
+    and KatPodr1.NRec      == KatPodr2.cPodr
+    // пометки подразделений
+    and KatPodr1.NRec      == MarksDeps.cRecDs
+
+    // список пользователей на второй вкладке
+    and GP_USERRIGHTS.OWNNAME == ZAR_USER1.OWNNAME
+    and GP_USERRIGHTS.OWNNAME == X$USERS1.XU$LOGINNAME
+
+    // для окна выбора по группам пользователей
+    and GROUPS.ATL_NREC       == GROUPMembers.GROUPCODE
+                        and 0 == GROUPMembers.OBJTYPE
+     and GROUPMembers.OBJCODE == X$USERS2.ATL_NREC
+    and X$USERS2.XU$LOGINNAME == MarkUsersG.Login     // для проверки помечен ли пользователь
+    and GROUPS.ATL_NREC       == MarkUsersE.Group     // для проверки есть ли хоть одна пометка пользователя в группе
+    and X$USERS2.XU$LOGINNAME == ZAR_USER2.OWNNAME
+
+    // для окна выбора пользователей
+    and X$USERS3.XU$LOGINNAME == ZAR_USER3.OWNNAME
+    and X$USERS3.ATL_NREC     == MarkUsersU.cUser
+
+    // подразделения в образце
+    and NodeM              == KatPodrM.cPodr
+    and KatPodrM.NRec      == SetRights.cRecDs
+    and KatPodrM.NRec      == KatPodrMP.cPodr
+  ))
+
+// ограничение просмотра прав "только по себе" (если PrChoice <> 0)
+bounds User = UserName == ZAR_USER.OWNNAME
+// для отображения пользователей по выбранному условию отбора в окне выбора
+bounds ListUsers = X$USERS3.XU$LOGINNAME /== ListUsers.Login
+// для отображения пользователей в группах по выбранному условию отбора в окне выбора
+bounds ListGroup = X$USERS2.XU$LOGINNAME /== ListUsers.Login
+
+// не показывать склады
+bounds NoSklad = NodeM == KatPodrM.cPodr and 0 == KatPodrM.Sklad
+;
+
+Parameters
+  PrChoice,
+  StartingWindow
+  //GP
+  ,wModule
+  ;
+
+//------------------------------------------------------------------------------
+// проверка состояния бита, если установлен - true
+//------------------------------------------------------------------------------
+function GetBit(Bit: word; Value: word): boolean;
+{
+  Result := (Value and Bit) = Bit;
+} // function GetBit
+//------------------------------------------------------------------------------
+// инвертирование битов
+//------------------------------------------------------------------------------
+procedure SetBit(Bit: word; var Value: word);
+{
+  if GetBit(Bit, Value)
+    Value := Value and not Bit;
+  else
+    Value := Value or Bit;
+} // procedure SetBit
+//------------------------------------------------------------------------------
+//
+//------------------------------------------------------------------------------
+procedure UpdateTitle(MarkCount: longint);
+{
+  SetWindowTitle(CurWindow, 'Выбор зарегистрированных пользователей (выбрано: ' + string(MarkCount) + ')');
+}
+//------------------------------------------------------------------------------
+window wnSetMark 'Пометить по условиям' DoAccept, EscClose, Cyan;
+show at (,,55,7);
+screen scSetMark ('',, sci1Esc);
+notablenavigation;
+fields
+  FltPodrShare ('Разграничение прав доступа по подразделениям'): noprotect;
+  FltCanChange ('Доступ к редактированию списка подразделений'): noprotect;
+buttons
+  cmOk, default,,'Продолжить',,sci1Esc;
+  cmCancel,,,'Отмена',,sci1Esc;
+<<
+  `Права доступа [Разгр.]`  `Доступ к изменению [Изм.]`
+    (.) ограничены [да]`      (.) запрещен [нет]`
+    (.) не ограничены [нет]`  (.) разрешен [да]`
+    (.) в любом значении`     (.) в любом значении`
+
+     <. ~П~родолжить .>       <.   ~О~тмена   .>
+>>
+end;
+
+  HandleEvent
+    cmOk: CloseInterface(cmDefault);
+  end;
+end; // window wnMarkSample
+//------------------------------------------------------------------------------
+// список подразделений в образце
+//------------------------------------------------------------------------------
+window wnPodrSample 'Назначаемые подразделения' (,,sci1Esc) DoAccept, EscClose, Cyan;
+show at (,,,12);
+
+  tree 1 trPodrSample 'Подразделения' (,, sci1EnInsTree);
+  table KatPodrM;
+  fields
+    {font = {color = if(IsValid(tnSetRights), ColorMark, 0)}};
+    [MarkPodr] if(IsValid(tnSetRights), 'V', ''):[1], skip, noAutoSize;
+    KatPodrM.Name 'Наименование' ('Наименование подразделения'): [17], protect;
+    KatPodrM.KOD 'Код' ('Код подразделения'): [4], protect;
+  end; // tree
+
+  browse brPodrSample 'Подразделения' (,, sci1478Esc);
+  table SetRights ;
+  fields
+    SetRights.Name 'Наименование' ('Наименование подразделения'): [18], protect;
+    SetRights.KOD  'Код' ('Код подразделения'): [4], protect;
+  end; //browse brPodrSample
+
+  // при отображении в виде: подразделение - пользователи
+  TableEvent table KatPodrM;
+    cmTreeTop:
+      NodeM := 0;
+
+    cmTreeUp:
+      NodeM := KatPodrM.cPodr;
+
+    cmTreeDown:
+      NodeM := KatPodrM.NRec;
+
+    cmTreeNodeType:
+      if not IsValid(#KATPODRMP)
+        TreeSetNodeType(trPodrSample, ntfText);
+
+    cmTreeNeedOwner:
+      TreeJumpToRecord(trPodrSample, KatPodrM.cPodr);
+
+  end;
+
+  TableEvent table SetRights;
+  cmDeleteRecord:
+  {
+    delete current SetRights;
+  }
+
+  end;
+
+//------------------------------------------------------------------------------
+// пометить/разотметить ветвь подразделений с корнем в текущей вершине
+//------------------------------------------------------------------------------
+  procedure MarkCurrentBranch(Mark: boolean);
+  {
+    PushPos(#KatPodrM);
+    var Queue: TPtr;
+    Queue := InitMarker('', 8, 100, 200, false);
+    InsertMarker(Queue, KatPodrM.NRec);
+    var I: integer;
+
+    for(I := 0; I < GetMarkerCount(Queue); Inc(I))
+    {
+      var CurDepartment: comp;
+      GetMarker(Queue, I, CurDepartment);
+
+      if not Mark
+        delete SetRights1 where ((CurDepartment == SetRights1.cRecDs));
+      else
+      {
+        if getfirst SetRights1 where ((CurDepartment == SetRights1.cRecDs)) <> tsOk
+        {
+          if getfirst KatPodrM where ((CurDepartment == KatPodrM.NRec)) = tsOk
+          {
+            // либо это подразделение, либо склад, но при включенном отображении складов
+            if ViewSklad or (KatPodrM.Sklad = 0)
+            {
+              ClearBuffer(#SetRights1);
+              SetRights1.Marked  := '+';
+              SetRights1.cRecDs  := KatPodrM.NREC;
+              SetRights1.cGroup  := KatPodrM.CPODR;
+              SetRights1.Name    := KatPodrM.NAME;
+              SetRights1.Kod     := KatPodrM.KOD;
+
+              insert current SetRights1;
+            }
+          }
+        }
+      }
+
+      _loop KatPodrM where ((CurDepartment == KatPodrM.cPodr))
+      {
+        InsertMarker(Queue, KatPodrM.Nrec);
+      }
+    }
+
+    DoneMarker(Queue, '');
+    PopPos(#KatPodrM);
+  }
+//------------------------------------------------------------------------------
+// помечаем или снимаем пометку текущей записи
+//------------------------------------------------------------------------------
+  procedure MarkUnMark;
+  {
+    // если помечен, то удаляем пометки у всех нижестоящих
+    if IsValid(tnSetRights)
+      MarkCurrentBranch(false);
+    else // помечаем все вложенные
+      MarkCurrentBranch(true);
+
+    //RedrawCurrentAndGo(trPodrSample, true);
+  }
+//------------------------------------------------------------------------------
+  HandleEvent
+  cmInit:
+  {
+    ViewSklad := boGetTune('UP.ZAR.XP.SKLAFLAG');
+    case wModule of
+    0: SetTitle('Настройка прав доступа к модулю мотивация');
+    1: SetTitle('Настройка прав доступа к модулю СКУД');
+    2: SetTitle('Настройка подразделения для контроля в модуле СКУД');
+    3: SetTitle('Настройка прав доступа к подразделениям для плана работ КБ');
+    4: SetTitle('Настройка подразделений для рассылки нарядов ЗП');
+    end;
+    PopBounds(tnKATPODRM);
+    if not ViewSklad
+      PushBounds(tbNoSklad);
+
+    if RecordsInTable(tnSetRights) = 0
+    {
+      if Message('В образце нет подразделений. Добавить?', YesNo + Confirmation) = Yes
+        SetFormat(trPodrSample)
+      else
+      {
+        abort;
+        exit;
+      }
+    }
+    else
+    {
+      ReSetBounds(#SetRights);
+      SetFormat(brPodrSample);
+    }
+  }
+
+  cmAddNewRec:
+    PutCommand(cmInsert);
+
+  cmInsert:
+  {
+    abort;
+
+    if CurFormatInArea(brPodrSample) = brPodrSample
+    {
+      SetBounds(#SetRights);
+      SetFormat(trPodrSample);
+
+      if IsValid(#SetRights)
+        TreeJumpToRecord(trPodrSample, SetRights.cRecDs)
+      else
+        TreeJumpToRecord(trPodrSample, 0);
+    }
+  }
+
+  cmEdit:
+  {
+    // если в режиме списка отобразим в режиме пометки
+    if CurFormatInArea(brPodrSample) = brPodrSample
+    {
+      SetBounds(#SetRights);
+      SetFormat(trPodrSample);
+
+      if IsValid(#SetRights)
+        TreeJumpToRecord(trPodrSample, SetRights.cRecDs)
+      else
+        TreeJumpToRecord(trPodrSample, 0);
+    }
+  }
+
+  cmCancel:
+  {
+    // если в режиме пометки в дереве подразделений, то возвращаемся в режим списка
+    if CurFormatInArea(brPodrSample) = trPodrSample
+    {
+      abort;
+
+      ReSetBounds(#SetRights);
+      SetFormat(brPodrSample);
+
+      if getfirst SetRights <> tsOk {};
+    }
+  }
+
+  cmDefault:
+  {
+    // если в режиме выбора (пометки подразделений)
+    if CurFormatInArea(brPodrSample) = trPodrSample
+    {
+      abort;
+
+      if RecordsInTable(tnSetRights) = 0
+        MarkUnMark;
+
+      ReSetBounds(#SetRights);
+      SetFormat(brPodrSample);
+
+      if getfirst SetRights <> tsOk {};
+    }
+  }
+
+  cmMarkUnMark:
+  {
+    MarkUnMark;
+    ReScanPanel(#KATPODRM);
+  }
+
+  cmSelectAll:
+  {
+    ReSetBounds(#SetRights);
+    delete all SetRights;
+
+    insert SetRights(Marked,cRecDs,cGroup,Name,Kod)
+      select
+        '+'
+        , KatPodr.NREC
+        , KatPodr.CPODR
+        , KatPodr.NAME
+        , KatPodr.KOD
+      from
+        KatPodr
+      where (X.ViewSklad or (0 = KatPodr.Sklad));
+
+    SetBounds(#SetRights);
+    ReReadRecord(CurTable);
+  }
+
+  cmUnSelectAll:
+  {
+    ReSetBounds(#SetRights);
+    delete all SetRights;
+    SetBounds(#SetRights);
+
+    ReReadRecord(CurTable);
+  }
+
+  end; // HandleEvent window wnPodrSample
+end; // window wnPodrSample
+//------------------------------------------------------------------------------
+// формирует список пользователей
+//------------------------------------------------------------------------------
+procedure FormListUsers(ZarUsers: boolean);
+{
+  delete all ListUsers;
+
+  _loop X$USERS3
+  {
+    if IsValid(#ZAR_USER3) <> ZarUsers
+      continue;
+
+    ClearBuffer(#ListUsers);
+    ListUsers.cUser := X$USERS3.ATL_NREC;
+    ListUsers.Login := X$USERS3.XU$LOGINNAME;
+
+    insert current ListUsers;
+  }
+}
+//------------------------------------------------------------------------------
+// окно выбора и пометки пользователей системы
+//------------------------------------------------------------------------------
+window WinGroups 'Группы пользователей' ('',, sci1EscIns) DoAccept, EscClose, Cyan;
+  show at (,,80,20);
+
+browse brGroups 'Группы пользователей' ('',, sci1EscIns);
+show at (,,,6);
+table GROUPS;
+fields
+  {font = {color = if(IsValid(tnMarkUsersE), ColorMark, 0)}};
+  [MarkUser0] if(IsValid(tnMarkUsersE), 'V', ''):[1], skip, noAutoSize;
+  GROUPS.NAME 'Наименование' ('Наименование группы пользователей'): [40], protect, noautosize;
+  GROUPS.DESCRIPTION 'Описание' ('Описание группы'): [30], protect;
+end;
+
+browse brGROUPMembers 'Пользователи в группе' ('',, sci1EscIns);
+show at (,7,,15);
+table GROUPMembers;
+fields
+  {font = {color = if(IsValid(tnMarkUsersG), ColorMark, if(IsValid(#ZAR_USER2), 0, ColorSysGray))}};
+  [MarkUser2] if(IsValid(tnMarkUsersG), 'V', ''):[1], skip, noAutoSize;
+  X$USERS2.XU$LOGINNAME 'Пользователь' ('Логин пользователя'): [25], protect, noautosize;
+  X$USERS2.XU$FULLNAME  'Полное имя' ('Полное имя пользователя'): [40], protect;
+  [IsUsed2] if(IsValid(#ZAR_USER2), '*', '')
+    ('[*] - у пользователя есть настройки прав доступа'):[1], protect, noautosize;
+end;
+
+screen scSetAccessGr ('',, sci1Esc);
+show at (,16,,) fixed_Y;
+notablenavigation;
+fields
+  DefAccess ('Назначаемые новым пользователям разрешения и права доступа'): noprotect;
+  DefParams ('Параметры замены'): noprotect;
+<<
+ `Назначаемые права:`             `Параметры:`
+   [.] включать разграничение прав` [.] заменять текущие разрешения`
+   [.] разрешать изменение списка`  [.] очищать подразделения`
+>>
+end; //screen
+
+  HandleEvent
+  cmInit:
+  {
+    if getfirst GROUPS <> tsOk
+    {
+      Message('В системе отсутствуют группы пользователей.' + chr(13) + 'Создайте группы в системе Support.', Information);
+      abort;
+    }
+  }
+
+  cmDefault:
+  {
+    if RecordsInTable(tnMarkUsersG) = 0
+      PutCommand(cmMarkUnMark);
+  }
+
+  cmMarkUnMark:
+  {
+    case CurTable of
+    //------------
+      #GROUPS:
+      {
+        var MarkGroup: boolean;
+        // помечен ли в группе хоть один пользователь
+        MarkGroup := IsValid(#MarkUsersE);
+
+        PushPos(#GROUPMembers);
+
+        _loop GROUPMembers
+        {
+          // если снимаем пометки
+          if MarkGroup and IsValid(#MarkUsersG)
+            delete current MarkUsersG;
+          else
+          {
+            // если группа не была помечена, помечаем всех
+            if not MarkGroup
+            {
+              ClearBuffer(#MarkUsersG);
+              MarkUsersG.cUser := X$USERS2.ATL_NREC;
+              MarkUsersG.Login := X$USERS2.XU$LOGINNAME;
+              MarkUsersG.Group := GROUPS.ATL_NREC;
+              insert current MarkUsersG;
+            }
+          }
+        }
+
+        PopPos(#GROUPMembers);
+
+        ReReadRecord(tnGROUPS);
+        ReReadRecord(tnGROUPMembers);
+      }
+    //------------
+      #GROUPMembers:
+      {
+        if IsValid(#MarkUsersG)
+          delete current MarkUsersG
+        else
+        {
+          ClearBuffer(#MarkUsersG);
+          MarkUsersG.cUser := X$USERS2.ATL_NREC;
+          MarkUsersG.Login := X$USERS2.XU$LOGINNAME;
+          MarkUsersG.Group := GROUPS.ATL_NREC;
+          insert current MarkUsersG;
+        }
+
+        RedrawCurrentAndGo(brGROUPMembers, true);
+
+        ReReadRecord(tnGROUPS);
+        ReReadRecord(tnGROUPMembers);
+      }
+    end; //case
+  }
+
+  cmSelectAll:
+  {
+    case CurTable of
+    //------------
+      #GROUPS:
+      {
+        PushPos(#GROUPS);
+        PushPos(#GROUPMembers);
+
+        _loop GROUPS
+          _loop GROUPMembers
+          {
+            // если уже помечен, пропускаем
+            if IsValid(#MarkUsersG)
+              continue;
+
+            ClearBuffer(#MarkUsersG);
+            MarkUsersG.cUser := X$USERS2.ATL_NREC;
+            MarkUsersG.Login := X$USERS2.XU$LOGINNAME;
+            MarkUsersG.Group := GROUPS.ATL_NREC;
+            insert current MarkUsersG;
+          }
+
+        PopPos(#GROUPS);
+        PopPos(#GROUPMembers);
+
+        ReReadRecord(tnGROUPS);
+        ReReadRecord(tnGROUPMembers);
+      }
+    //------------
+      #GROUPMembers:
+      {
+        PushPos(#GROUPMembers);
+
+        _loop GROUPMembers
+        {
+          // если уже помечен, пропускаем
+          if IsValid(#MarkUsersG)
+            continue;
+
+          ClearBuffer(#MarkUsersG);
+          MarkUsersG.cUser := X$USERS2.ATL_NREC;
+          MarkUsersG.Login := X$USERS2.XU$LOGINNAME;
+          MarkUsersG.Group := GROUPS.ATL_NREC;
+          insert current MarkUsersG;
+        }
+
+        PopPos(#GROUPMembers);
+
+        ReReadRecord(tnGROUPS);
+        ReReadRecord(tnGROUPMembers);
+      }
+    end; //case
+  }
+
+  cmUnSelectAll:
+  {
+    case CurTable of
+    //------------
+      #GROUPS:
+      {
+        ReSetBounds(tnMarkUsersG);
+        delete all MarkUsersG;
+        SetBounds(tnMarkUsersG);
+      }
+    //------------
+      #GROUPMembers:
+      {
+        PushPos(#GROUPMembers);
+
+        _loop GROUPMembers
+        {
+          if IsValid(#MarkUsersG)
+            delete current MarkUsersG;
+        }
+
+        PopPos(#GROUPMembers);
+      }
+    end;
+
+    ReReadRecord(tnGROUPS);
+    ReReadRecord(tnGROUPMembers);
+  }
+
+  end; // HandleEvent window WinGroups
+end; // window WinGroups
+//------------------------------------------------------------------------------
+// окно выбора и пометки пользователей системы
+//------------------------------------------------------------------------------
+window WinUsers 'Выбор зарегистрированных пользователей' ('',, sci1EscIns) DoAccept, EscClose, Cyan;
+  show at (,,80,20);
+
+browse brUsers 'Пользователи';
+show at (,,,15);
+table X$USERS3;
+fields
+  {font = {color = if(IsValid(tnMarkUsersU), ColorMark, 0)}};
+  [MarkUser3] if(IsValid(tnMarkUsersU), 'V', ''):[1], skip, noAutoSize;
+  X$USERS3.XU$LOGINNAME 'Пользователь' ('Логин пользователя'): [25], protect, noautosize;
+  X$USERS3.XU$FULLNAME  'Полное имя' ('Полное имя пользователя'): [40], protect;
+  [IsUsed3] if(IsValid(#ZAR_USER3), '*', '')
+    ('[*] - у пользователя есть настройки прав доступа'):[1], protect, noautosize;
+end;
+
+screen scSetAccess ('',, sci1Esc);
+  show at (,16,,) fixed_Y;
+  notablenavigation;
+fields
+  DefAccess ('Назначаемые разрешения и права доступа'): noprotect;
+  DefParams ('Параметры замены'): noprotect;
+<<
+ `Назначаемые права:`             `Параметры:`
+   [.] включать разграничение прав` [.] заменять текущие разрешения`
+   [.] разрешать изменение списка`  [.] очищать подразделения`
+>>
+end; //screen
+
+//------------------------------------------------------------------------------
+// пометка или снятие пометки текущей записи
+//------------------------------------------------------------------------------
+  procedure MarkUnMarkUser;
+  {
+    if IsValid(#MarkUsersU)
+      delete current MarkUsersU;
+    else
+    {
+      ClearBuffer(#MarkUsersU);
+      MarkUsersU.cUser := X$USERS3.ATL_NREC;
+      MarkUsersU.Login := X$USERS3.XU$LOGINNAME;
+      insert current MarkUsersU;
+    }
+  }
+//------------------------------------------------------------------------------
+  HandleEvent
+  cmInit:
+  {
+    if getfirst X$USERS3 <> tsOk
+    {
+      Message('Нет пользователей по заданным параметрам.', Information);
+      abort;
+      exit;
+    }
+
+    SetWindowTitle(WinUsers, 'Выбор зарегистрированных пользователей (выбрано: ' + RecordsInTable(tnMarkUsersU) + ')');
+  }
+
+  cmDefault:
+  {
+    if RecordsInTable(tnMarkUsersU) = 0
+      MarkUnMarkUser;
+  }
+
+  cmMarkUnMark:
+  {
+    MarkUnMarkUser;
+    RedrawCurrentAndGo(brUsers, true);
+
+    UpdateTitle(RecordsInTable(tnMarkUsersU));
+  }
+
+  // помечаем выборочно
+  cmShowAll:
+  {
+    case CurTable of
+    //------------
+      #X$USERS3:
+      {
+        if RunWindowModal(wnSetMark) <> cmDefault
+          exit;
+
+        PushPos(#X$USERS3);
+
+        _loop X$USERS3
+        {
+          // если уже помечен, то пропускаем
+          if IsValid(#MarkUsersU)
+            continue;
+
+          // если нет настройки, то не помечаем
+          if not IsValid(#Zar_User3)
+            continue;
+
+          // если помечать только тех, у кого не включено разграничение прав
+          if (Zar_User3.PodrShare = '+') and (FltPodrShare = 1)
+            continue;
+
+          // если помечать только тех, у кого включено разграничение прав
+          if (Zar_User3.PodrShare <> '+') and (FltPodrShare = 0)
+            continue;
+
+          // если помечать только тех, у кого нет доступа к изменению
+          if (Zar_User3.CanChange = '+') and (FltCanChange = 0)
+            continue;
+
+          // если помечать только тех, у кого есть доступ к изменению
+          if (Zar_User3.CanChange <> '+') and (FltCanChange = 1)
+            continue;
+
+          ClearBuffer(#MarkUsersU);
+          MarkUsersU.cUser := X$USERS3.ATL_NREC;
+          MarkUsersU.Login := X$USERS3.XU$LOGINNAME;
+          insert current MarkUsersU;
+        }
+
+        PopPos(#X$USERS3);
+        ReReadRecord(CurTable);
+      }
+    end; //case
+  }
+
+  cmSelectAll:
+  {
+    PushPos(#X$USERS3);
+
+    _loop X$USERS3
+    {
+      if IsValid(#MarkUsersU)
+        continue;
+
+      ClearBuffer(#MarkUsersU);
+      MarkUsersU.cUser := X$USERS3.ATL_NREC;
+      MarkUsersU.Login := X$USERS3.XU$LOGINNAME;
+      insert current MarkUsersU;
+    }
+
+    PopPos(#X$USERS3);
+    ReReadRecord(#X$USERS3);
+
+    UpdateTitle(RecordsInTable(tnMarkUsersU));
+  }
+
+  cmUnSelectAll:
+  {
+    ReSetBounds(#MarkUsersU);
+    delete all MarkUsersU;
+    SetBounds(#MarkUsersU);
+    ReReadRecord(#X$USERS3);
+
+    UpdateTitle(RecordsInTable(tnMarkUsersU));
+  }
+
+  end; // HandleEvent window WinUsers
+end; // window WinUsers
+//------------------------------------------------------------------------------
+// сохранение настроек пользователя в образец
+//------------------------------------------------------------------------------
+  procedure SetSample;
+  {
+    if PrChoice <> 0
+      exit;
+
+    if GetBit(1,DefAccess) <> (Zar_User.PodrShare = '+')
+      SetBit(1,DefAccess);
+    if GetBit(2,DefAccess) <> (Zar_User.CanChange = '+')
+      SetBit(2,DefAccess);
+
+    ReSetBounds(#SetRights);
+    delete all SetRights;
+
+    // выгрузим подразделения, доступные пользователю
+    _loop GP_USERRIGHTS1 where ((Zar_User.OwnName == GP_USERRIGHTS1.OwnName
+     and wModule == GP_USERRIGHTS.WTYPE(noindex)
+    ))
+    {
+      SetRights.Buffer := Type$SetRights(GP_USERRIGHTS1.Buffer);
+      SetRights.NRec   := 0;
+      insert current SetRights;
+    }
+
+    ReSetBounds(#SetRights);
+  }
+//------------------------------------------------------------------------------
+// назначение прав по образцу
+//------------------------------------------------------------------------------
+  procedure UseSample;
+  {
+    if PrChoice <> 0
+      exit;
+    /*
+    if Message('Назначить "' + Zar_User.OwnName + '" разрешения по образцу?', YesNo + Confirmation) = Yes
+    {
+      Zar_User.PodrShare := if(GetBit(1,DefAccess), '+', '-');
+      Zar_User.CanChange := if(GetBit(2,DefAccess), '+', '-');
+
+      update current Zar_User;
+    }
+    */
+    if Message('Назначить "' + Zar_User.OwnName + '" подразделения ('
+       + string(RecordsInTable(tnSetRights)) + ') по образцу, очистив текущие?', YesNo + Confirmation) = Yes
+    {
+      delete GP_USERRIGHTS1 where ((Zar_User.OwnName == GP_USERRIGHTS1.OwnName
+       and wModule == GP_USERRIGHTS.WTYPE(noindex)
+      ));
+
+      _loop SetRights1
+      {
+        ClearBuffer(#GP_USERRIGHTS1);
+        GP_USERRIGHTS1.Buffer  := Type$GP_USERRIGHTS(SetRights1.Buffer);
+        GP_USERRIGHTS1.OwnName := Zar_User.OwnName;
+        GP_USERRIGHTS1.NRec    := 0;
+        GP_USERRIGHTS.WTYPE    := wModule;
+
+        insert current GP_USERRIGHTS1;
+      }
+    }
+
+    ReDrawPanel(CurTable);
+    PutCommand(cmPositionChanged);
+  }
+//------------------------------------------------------------------------------
+// Проверяет, доступно ли пользователю его текущее
+// подразделение (вызывается после изменения доступных подразделений)
+//------------------------------------------------------------------------------
+  procedure CheckCurDel;
+  {
+    if (ZAR_USER.PODRSHARE <> '+')
+      exit;
+/* GP - не меняем!
+    if ZAR_USER.CURCEX <> 0
+      if recordexists UserDeps where ((ZAR_USER.CURCEX == UserDeps.Department and (not UserDeps.Disabled))) <> tsOk
+        update current ZAR_USER set ZAR_USER.CURCEX := 0;
+*/
+  }
+//------------------------------------------------------------------------------
+// обработка смены режимов просмотра/редактирования
+//------------------------------------------------------------------------------
+  procedure SetEditMode(Value: boolean);
+  {
+    EditMode := Value;
+
+    // проверим, можно ли пользователю переключиться на режим редактирования
+    if EditMode and (PrChoice <> 0) and (Zar_User.CanChange <> '+')
+      EditMode := false;
+
+    if EditMode
+    {
+      SetInterfaceOptions(opEscClose);
+
+      if PrChoice = 0
+        Protector.SetProtectedStatusCtx(sci1378EscIns)
+      else
+        Protector.SetProtectedStatusCtx(sci13Esc);
+    }
+    else
+    {
+      SetInterfaceOptions(opEscClose or opCyanInterface);
+
+      // в режиме просмотра прав всех пользователей
+      if (PrChoice = 0)
+        Protector.SetProtectedStatusCtx(sci14EscIns)
+      else // в режиме просмотра прав "по себе", когда в списке видна лишь своя запись
+      {
+        // если пользователю разрешена корректировка
+        if (Zar_User.CanChange = '+')
+          Protector.SetProtectedStatusCtx(sci14Esc)
+        else
+          Protector.SetProtectedStatusCtx(sci1Esc);
+      }
+    }
+
+    Protector.SetProtected(not EditMode);
+
+    ReScanPanel(CurTable);
+  }
+
+Panel P0;
+//------------------------------------------------------------------------------
+// для настройки прав доступа по каждому пользователю отдельно
+//------------------------------------------------------------------------------
+browse brUsersList 'По пользователю' ('Настройка прав по пользователю',, sci1Esc);
+show at (,,,8);
+table ZAR_USER;
+fields
+  {font = {color = if(IsValid(tnMarkUsers), ColorMark, if(not IsValid(tnX$USERS), ColorSysGray, 0))}};
+  UserMarked:[1], skip, noAutoSize;
+  ZAR_USER.OWNNAME 'Пользователь' ('Логин пользователя',,sci178EscIns): [60], protect, noautosize;
+  [FullName] if(IsValid(tnX$USERS), X$USERS.XU$FULLNAME, '[пользователь не зарегистрирован в системе]')
+    'Полное имя' ('Полное имя пользователя',,sci178EscIns): [20], protect;
+  [IsLimited] if(Zar_User.PodrShare = '+','да','нет')
+    'Разгр.' ('Ограничивать права доступа списком разрешенных подразделений',,sci1378EscIns):[7], protect, noautosize, pickbutton;
+    // ограничивать доступ списком разрешенных подразделений
+    // "да":  доступ разрешен только к подразделениям из списка
+    // "нет": доступ разрешен ко всем подразделениям
+  [CanModify] if(Zar_User.CanChange = '+','да','нет')
+    'Изм.' ('Разрешение редактировать список своих подразделений',,sci1378EscIns):[7], protect, noautosize, pickbutton;
+end; // Browse brUsersList
+//------------------------------------------------------------------------------
+// для настройки прав доступа по подразделению
+//------------------------------------------------------------------------------
+tree 1 trPodrTree 'По подразделению' ('Настройка доступа к подразделению',, sci1EnInsTree);
+show at (,,,8);
+table KatPodr1;
+fields
+  {font = {color = if(IsValid(tnMarksDeps), ColorMark, 0)}};
+  [PodrMarked] if(IsValid(tnMarksDeps), 'V', ''):[1], skip, noAutoSize;
+  KatPodr1.Name 'Наименование' ('Наименование подразделения'): [18], protect;
+  KatPodr1.KOD  'Код' ('Код подразделения'): [4], protect;
+end; // tree
+#IFDEF _GP_
+//------------------------------------------------------------------------------
+// для настройки прав доступа по подразделению
+//------------------------------------------------------------------------------
+browse brPodrTree 'По подразделению' ('Настройка доступа к подразделению',, sci1EnInsTree);
+show at (,,,8);
+table KatPodr1;
+fields
+  {font = {color = if(IsValid(tnMarksDeps), ColorMark, 0)}};
+  PodrMarked //if(IsValid(tnMarksDeps), 'V', '')
+      :[1], skip, noAutoSize;
+  KatPodr1.Name 'Наименование' ('Наименование подразделения'): [18], protect;
+  KatPodr1.KOD  'Код' ('Код подразделения'): [4], protect;
+end; // tree
+
+#ENDIF
+//------------------------------------------------------------------------------
+//
+//------------------------------------------------------------------------------
+tabbedsheet top TabbedRights;
+show at (,9,,);
+
+tree trPodr 'По пользователю' (,, sci14EnEscTree);
+table UserDeps;
+fields
+  {font = {color = if (UserDeps.Disabled, ColorSysGray, 0); bold = (UserDeps.Department = Zar_User.CurCex)}};
+  UserDeps.Name 'Наименование' ('Наименование подразделения',, sci14EnEscTree): [18], protect;
+  UserDeps.Code 'Код' ('Код подразделения',, sci14EnEscTree): [4], protect;
+end; // tree
+
+//------------------------------------------------------------------------------
+browse brPodrUsers 'По подразделению' (,, sci178Esc);
+table GP_USERRIGHTS;
+fields
+  GP_USERRIGHTS.OWNNAME   'Пользователь' ('Логин пользователя'): [40], protect, noautosize;
+  X$USERS1.XU$FULLNAME    'Полное имя' ('Полное имя пользователя'): [60], protect;
+  [CanModify1] if(Zar_User1.CanChange = '+','да','нет')
+    'Изм.' ('Разрешение редактировать список своих подразделений'):[5], protect, noautosize, centered, nopickbutton;
+end;
+end; // tabbedsheet
+
+//------------------------------------------------------------------------------
+// обработчик загрузки списка подразделений
+//------------------------------------------------------------------------------
+function CollectDepartment(B: TKatPodr; Disabled: boolean): boolean;
+{
+  UserDeps.Department := B.NREC;
+  UserDeps.Parent := B.CPODR;
+  UserDeps.Name := B.NAME;
+  UserDeps.Code := B.KOD;
+  UserDeps.Disabled := Disabled;
+  Result := insert current UserDeps = tsOk;
+}
+
+//------------------------------------------------------------------------------
+// Догоним до дерева
+//------------------------------------------------------------------------------
+Function MyCheckUp(_cPodr:comp):boolean; cacheable;
+{ Result:=True;
+  if _cPodr=0 then exit;
+  if getfirst UserDeps where (( _cPodr == UserDeps.Department  )) <>tsok
+  {   insert into UserDeps (Department,Parent,Code,Name,DISABLED)
+      select
+            KatPodr.Nrec
+          , KatPodr.CPODR
+          , KatPodr.KOD
+          , KatPodr.NAME
+          , true
+          from KatPodr
+          where (( _cPodr == KatPodr.Nrec
+          ));
+     if getfirst UserDeps where (( _cPodr == UserDeps.Department  )) =tsok
+     { Result:=MyCheckUp(UserDeps.Parent);
+     }
+  }
+} //Function MyCheckUp(_cPodr:comp):boolean, cacheable;
+
+
+//------------------------------------------------------------------------------
+// загрузка списка подразделений
+//------------------------------------------------------------------------------
+procedure RefreshRightsList;
+{ var LastDep: comp;
+  LastDep := if(IsValid(#UserDeps), UserDeps.Department, 0);
+  ClearFuncCache;
+  ReSetBounds(#UserDeps);
+  delete all UserDeps;
+  var DI: IDepartmentIteratorEx;
+  LoadVipRef(DI, 'DepartmentIterator');
+  DI.SetExtended(true);
+  _UserName:=ZAR_USER.OWNNAME;
+  DI.SetUserName(ZAR_USER.OWNNAME);
+  BindEvent(CollectDepartment, DI.CollectDepartmentEx);
+  //gp  соберем все свое.
+  //IDepartmentIterator(DI).IterateDepartments(0, ifForceUSERRIGHTS or ifForceShowWarehouses);
+  insert into UserDeps (Department,Parent,Code,Name,DISABLED)
+      select
+            KatPodr.Nrec
+          , KatPodr.CPODR
+          , KatPodr.KOD
+          , KatPodr.NAME
+          , false
+          from KatPodr
+          where ((
+               _UserName    /== GP_USERRIGHTS.OWNNAME
+          and  KatPodr.Nrec /== GP_USERRIGHTS.crecds
+          and  wModule      /== GP_USERRIGHTS.wType
+          ));
+  ReReadRecord(#UserDeps_GP);
+  _Loop FullCache UserDeps_GP
+  { MyCheckUp(UserDeps_GP.Parent);
+
+  }
+  //GP ---
+  UnBindEvent(CollectDepartment, DI.CollectDepartmentEx);
+  SetBounds(#UserDeps);
+
+  CheckCurDel;
+
+  if LastDep = 0
+    TreeGetFirst(trPodr);
+  else
+    TreeJumpToRecord(trPodr, LastDep);
+}
+
+// при отображении в виде: пользователь - его подразделения
+TableEvent table UserDeps;
+
+  cmSetDefault:
+    if not IsValid(#KatPodr)
+      PutCommand(cmTreeOpenNode);
+
+  cmTreeTop:
+    Node0 := 0;
+
+  cmTreeUp:
+    Node0 := UserDeps.Parent;
+
+  cmTreeDown:
+    Node0 := UserDeps.Department;
+
+  cmTreeNodeType:
+    if not IsValid(#UserSubDeps)
+      TreeSetNodeType(trPodr, ntfText);
+
+  cmTreeNeedOwner:
+    TreeJumpToRecord(trPodr, UserDeps.Parent);
+
+end;
+
+TableEvent table GP_USERRIGHTS;
+  cmDeleteRecord:
+  {
+    if Message('Удалить пользователю "' + GP_USERRIGHTS.OWNNAME + '" доступ к подразделению ' + chr(13) + '"' + KatPodr1.Name + '"?', YesNo + Confirmation) = Yes
+      delete current GP_USERRIGHTS;
+  }
+end;
+
+// при отображении в виде: подразделение - пользователи
+TableEvent table KatPodr1;
+  cmTreeTop:
+    Node1 := 0;
+
+  cmTreeUp:
+    Node1 := KatPodr1.cPodr;
+
+  cmTreeDown:
+    Node1 := KatPodr1.NRec;
+
+  cmTreeNodeType:
+    if not IsValid(#KATPODR2)
+      TreeSetNodeType(trPodrTree, ntfText);
+
+  cmTreeNeedOwner:
+    TreeJumpToRecord(trPodrTree, KatPodr1.cPodr);
+
+end;
+
+TableEvent table ZAR_USER;
+  cmSetDefault:
+  {
+    abort;
+
+    Zar_User.OwnName := '?';
+
+    // пользователь может откорректировать список своих подразделений
+    Zar_User.CanChange := '+';
+    // по умолчанию включаем разграничение прав доступа
+    Zar_User.PodrShare := '+';
+  }
+
+  cmInsertRecord:
+  {
+    if insert current Zar_User <> tsOk
+      Message('Пользователь "' + OwnName + '" уже существует!', Information);
+  }
+
+  cmUpdateRecord:
+  {
+    if update current Zar_User <> tsOk
+    {
+      Message('Пользователь "' + OwnName + '" уже существует!', Information);
+      abort;
+      exit;
+    }
+
+    NotificationIsBeingSent := true;
+    Notify(cmTableChanged, longint(coZAR_USER));
+    NotificationIsBeingSent := false;
+  }
+
+  cmDeleteRecord:
+  {
+    if RecordsInTable(tnMarkUsers) = 0
+    {
+      // свою настройку удалять нельзя
+      if UpCase(Zar_User.OwnName) <> UpCase(UserName)
+        if Message('Удалить пользователя "' + Zar_User.OwnName + '"?', YesNo + Confirmation) = Yes
+        {
+          delete GP_USERRIGHTS1 where ((Zar_User.OwnName == GP_USERRIGHTS1.OwnName
+            and wModule == GP_USERRIGHTS1.WTYPE(noindex)
+          ));
+          delete current Zar_User;
+        }
+    }
+    else
+    {
+      if Message('Удалить выбранных (' + string(RecordsInTable(tnMarkUsers)) + ') пользователей?', YesNo + Confirmation) = Yes
+      {
+        ReSetBounds(#MarkUsers);
+
+        _loop MarkUsers
+        {
+          // свою настройку с правами доступа удалять никак нельзя
+          if UpCase(MarkUsers.Login) = UpCase(UserName)
+            continue;
+
+          delete GP_USERRIGHTS1 where ((MarkUsers.Login == GP_USERRIGHTS1.OwnName
+            and wModule == GP_USERRIGHTS1.WTYPE(noindex)
+          ));
+          delete Zar_User0 where ((MarkUsers.Login == Zar_User0.OwnName));
+        }
+
+        delete all MarkUsers;
+
+        SetBounds(#MarkUsers);
+      }
+    }
+  }
+
+  cmPositionChanged:
+  {
+    RefreshRightsList;
+    RereadRecord(#UserDeps);
+  }
+
+  cmCheckField:
+  {
+    case CurField of
+      #ZAR_USER.OWNNAME:
+      {
+        // только если переименовывают настройку не для своей учетной записи
+        if OldFieldValue <> UserName
+        {
+          set ZAR_USER.OWNNAME := ZAR_USER.OWNNAME;
+
+          if IsNew
+            UpdateTable;
+          else
+          {
+            if ZAR_USER.OWNNAME <> OldFieldValue
+            {
+              if Message('Вы действительно хотите заменить имя пользователя'#13 +
+                         'с "' + OldFieldValue + '" на "'+ ZAR_USER.OWNNAME + '"?', YesNo + Confirmation) <> Yes
+                set ZAR_USER.OWNNAME := OldFieldValue;
+              else
+              {
+                update GP_USERRIGHTS where ((OldFieldValue == GP_USERRIGHTS.OWNNAME
+                   and wModule == GP_USERRIGHTS.WTYPE(noindex)
+                  ))
+                  set GP_USERRIGHTS.OWNNAME := ZAR_USER.OWNNAME;
+
+                RefreshRightsList;
+                ReReadRecord(#UserDeps);
+                UpdateTable;
+              }
+            }
+          }
+
+          ProcessCommand(cmPositionChanged);
+        }
+      }
+    end; //case
+  }
+end;
+end; // Panel P0
+
+HandleEvent
+cmInit:
+{
+#IFDEF _GP_
+  Domain:='';
+  if getfirst X$Users3 where (( UserID() == X$Users3.Atl_nrec ))=tsok
+  { Domain:=Replace(X$Users3.xu$loginname,Username(),'');
+  }
+  case wModule of
+  0: SetTitle('Настройка прав доступа к модулю мотивация');
+  1: SetTitle('Настройка прав доступа к модулю СКУД');
+  2: SetTitle('Настройка подразделения для контроля в модуле СКУД');
+  3: SetTitle('Настройка прав доступа к подразделениям для плана работ КБ');
+  4: SetTitle('Настройка подразделений для рассылки нарядов ЗП');
+  end;
+  IsCurrTree:=true;
+#ENDIF
+  if getfirst Zar_User where (( UserName() == Zar_User.OwnName )) <> tsOk
+  {
+    ClearBuffer(#Zar_User);
+#ifdef Gal9_1
+    Zar_User.cUser     := UserId;
+#end
+    Zar_User.OwnName   := UserName;
+    // по умолчанию включаем разграничение прав доступа
+    Zar_User.PodrShare := '+';
+    // и запрещаем пользователю редактировать список подразделений
+    Zar_User.CanChange := '-';
+
+    insert current Zar_User;
+  }
+
+  // флаги по умолчанию для выборочной пометки
+  FltPodrShare := 0;
+  FltCanChange := 0;
+
+  // в образце по умолчанию включаем разграничения прав доступа и запрет
+  // изменять свой список подразделений
+  DefAccess := 1;
+  DefParams := 0;
+
+  // если открывается в режиме пользователя, а не в режиме администратора
+  if PrChoice <> 0
+  {
+    DisableCommand(cmSaveDoc);
+    DisableCommand(cmRestoreDoc);
+    DisableCommand(cmAlt1);
+    DisableCommand(cmAlt2);
+
+    // только разрешения текущего пользователя
+    PushBounds(tbUser);
+
+    ClearFieldOption(#CanModify, ofSelectable);
+    if (Zar_User.CanChange <> '+')
+      ClearFieldOption(#IsLimited, ofSelectable);
+
+    SetHelpAndStatusContext(brUsersList, #Zar_User.OwnName, sci1Esc, hcUseOwner);
+    SetHelpAndStatusContext(brUsersList, #FullName,  sci1Esc, hcUseOwner);
+    SetHelpAndStatusContext(brUsersList, #CanModify, sci1Esc, hcUseOwner);
+    SetHelpAndStatusContext(brUsersList, #IsLimited, sci1Esc, hcUseOwner);
+
+    SetTabbedSheetVisible(brPodrUsers, false);
+
+    ClearFieldState(#UserMarked, sfVisible);
+  }
+
+  SetFormat(brUsersList);
+
+  // Связываем протектор с интерфейсом
+  LoadVipRef(Protector, 'Protector');
+  Protector.LinkTo(cfsGetCurrentContainerSelf, 'MainWindow');
+
+  SetEditMode(false);
+}
+
+cmAddNewRec:
+  PutCommand(cmInsert);
+
+cmInsert:
+{
+  abort;
+
+  if not EditMode
+    if UpdateTable
+      SetEditMode(true);
+
+  // показывать в окне выбора всех пользователей (при добавление разрешений на подразделение)
+  ShowAllUsers := CurTable = #GP_USERRIGHTS;
+
+  ReSetBounds(#MarkUsersU);
+  delete all MarkUsersU;
+  SetBounds(#MarkUsersU);
+
+  OldParams := DefParams;
+
+  DefParams := 0;
+  ClusterDisabledField(#DefParams, 3);
+
+  // если отображаем не всех, а только без настроек
+  if not ShowAllUsers
+  {
+    // выгружаем только пользователей, для которых нет настроек прав
+    FormListUsers(false);
+    PushBounds(tbListUsers);
+  }
+
+  if RunWindowModal(WinUsers) = cmDefault
+  {
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Добавление пользователей', RecordsInTable(tnMarkUsersU));
+
+    PushPos(#GP_USERRIGHTS);
+    ReSetBounds(#MarkUsersU);
+
+    _loop MarkUsersU
+    {
+      if not NextVisual
+        break;
+
+      if getfirst Zar_User0 where ((MarkUsersU.Login == Zar_User0.OwnName)) = tsOk
+      {
+        // замена разрешений
+        if GetBit(1,DefParams)
+        { //GP блокируем
+          //Zar_User0.PodrShare := if(GetBit(1,DefAccess), '+', '-');
+          //Zar_User0.CanChange := if(GetBit(2,DefAccess), '+', '-');
+
+          update current Zar_User0;
+        }
+      }
+      else
+      {
+        ClearBuffer(#Zar_User0);
+#ifdef Gal9_1
+        Zar_User0.cUser     := MarkUsersU.cUser;
+#end
+        Zar_User0.OwnName   := MarkUsersU.Login;
+        Zar_User0.PodrShare := if(GetBit(1,DefAccess), '+', '-');
+        Zar_User0.CanChange := if(GetBit(2,DefAccess), '+', '-');
+
+        insert current Zar_User0;
+      }
+
+      case CurTable of
+      //-- в случае добавления прав на подразделение (на вкладке "По подразделению")
+        #GP_USERRIGHTS:
+        {
+          // не трогаем пользователей, которые сами редактируют свой список подразделений
+          if (Zar_User0.CanChange <> '+')
+          {
+            if getfirst GP_USERRIGHTS1 where ((KatPodr1.NRec == GP_USERRIGHTS1.cRecDs and Zar_User0.OwnName == GP_USERRIGHTS1.OwnName
+              and wModule == GP_USERRIGHTS1.WTYPE(noindex)
+
+            )) <> tsOk
+            {
+              ClearBuffer(#GP_USERRIGHTS1);
+#ifdef Gal9_1
+              GP_USERRIGHTS1.cUser   := Zar_User0.cUser;
+  #end
+              GP_USERRIGHTS1.OwnName := Zar_User0.OwnName;
+              GP_USERRIGHTS1.Marked  := '+';
+              GP_USERRIGHTS1.cRecDs  := KatPodr1.NRec;
+              GP_USERRIGHTS1.WTYPE    := wModule;
+              GP_USERRIGHTS1.cGroup  := KatPodr1.cPodr;
+              GP_USERRIGHTS1.Name    := KatPodr1.Name;
+              GP_USERRIGHTS1.Kod     := KatPodr1.Kod;
+
+              insert current GP_USERRIGHTS1;
+            }
+          }
+        }
+      end;
+    }
+
+    SetBounds(#MarkUsersU);
+    PopPos(#GP_USERRIGHTS);
+
+    StopVisual('',0);
+  }
+
+  ReSetBounds(#MarkUsersU);
+  delete all MarkUsersU;
+  SetBounds(#MarkUsersU);
+
+  if BoundActive(tbListUsers)
+    PopBounds(tbListUsers);
+
+  DefParams := OldParams;
+  ClusterDisabledField(#DefParams, 0);
+
+  ReReadRecord(CurTable);
+
+  ShowAllUsers := false;
+}
+
+cmHotKeys:
+{
+  case GetCurrentFormat of
+  //-- в случае списка всех пользователей
+    brUsersList:
+    {
+      // только для администратора
+      if (PrChoice = 0)
+        PutHotCommand(RunMenu('GP_BufferWorkMenu'));
+    }
+  //-- в дереве подразделений
+    trPodrTree:
+    {
+      // только для администратора
+      if (PrChoice = 0)
+        PutHotCommand(RunMenu('GP_AdminPodrUsersMenu'));
+    }
+  //-- подразделения текущего пользователя
+    trPodr:
+    {
+      // в случае отображения только подразделений текущего пользователя
+      if PrChoice <> 0
+        PutHotCommand(RunMenu('GP_WorkMenuCurUserOnly'));
+    }
+  end;
+}
+
+cmClose:
+{
+  if EditMode
+  {
+    if UpdateTable
+      SetEditMode(false);
+    abort;
+  }
+}
+
+cmCancel:
+{
+  if EditMode
+  {
+    if UpdateTable
+      SetEditMode(false);
+    abort;
+  }
+}
+
+cmDefault:
+{
+  if not IsValid(#UserDeps)
+    exit;
+
+  if UserDeps.Disabled
+    exit;
+
+  if CurTable = #UserDeps
+  {
+    // Запрещаем менять админу текущее подразделение
+    if PrChoice = 0
+      exit;
+    //GP - не меняем!
+    /*
+    var S: string;
+    if Zar_User.CurCex = UserDeps.Department
+      S := 'Установить текущими все подразделения?'
+    else
+      S := 'Установить подразделение "' + UserDeps.Name + '" текущим?';
+
+    if Message(S, Confirmation + YesNo) = Yes
+    {
+      set Zar_User.CurCex := if(Zar_User.CurCex = UserDeps.Department, 0, UserDeps.Department);
+      UpdateTable;
+
+      // только если изменились права текущего пользователя
+      if UpCase(Zar_User.OwnName) = UpCase(UserName)
+        // пересканировать текущие лицевые счета
+        RunInterface('GetPodAln', comp(0), Zar_User.CurCex, p2);
+
+      ReReadRecord(#Zar_User);
+      ReScanPanel(#UserDeps);
+    }
+    */
+  }
+}
+
+cmEdit:
+{
+  if not EditMode
+    SetEditMode(true);
+
+  // если текущим форматом является список доступных подразделений
+  case GetCurrentFormat of
+    trPodr:
+    {
+      if ((PrChoice <> 0) and (Zar_User.CanChange <> '+'))
+        Message('Вам не разрешено редактировать список доступных подразделений', Information);
+      else
+      {
+        if (not UpdateTable)
+          exit;
+
+        RunInterface('GP_SelPodr', Zar_User.OwnName,wModule);
+        ReReadRecord(#Zar_User);
+        RefreshRightsList;
+        ReReadRecord(#UserDeps);
+        CheckCurDel;
+
+        // только если изменились права текущего пользователя
+        if UpCase(Zar_User.OwnName) = UpCase(UserName)
+        {
+          // сообщить всем вставленным в деск интерфейсам об изменении перечня
+          // доступных подразделений
+          //GP Notify(cmTableChanged, longint(coGP_USERRIGHTS));
+          // пересканировать текущие лицевые счета
+          //GP RunInterface('GetPodAln', comp(0), Zar_User.CurCex, p2);
+        }
+      }
+    }
+  end;
+}
+
+// копировать настройки в образец
+cmSaveDoc:
+  SetSample;
+
+// установить настройки по образцу
+cmRestoreDoc:
+  UseSample;
+
+// замена разрешений по текущему или по выбранным пользователям
+cmAlt1:
+{
+  // сохраним текущее состояние флагов
+  OldParams := DefParams;
+  // выставим опцию замены если не выставлена
+  DefParams := DefParams or 1;
+  // так как в режиме замены, то эта опция обязательна и нередактируема
+  ClusterDisabledField(#DefParams, 1);
+
+  // формируем список тех, у кого настроены права доступа
+  FormListUsers(true);
+
+  // очистим текущие пометки и добавим
+  ReSetBounds(#MarkUsersU);
+  delete all MarkUsersU;
+
+  // если помеченные есть, то скопируем их
+  ReSetBounds(#MarkUsers);
+  _loop MarkUsers
+  {
+    // копируем, исключив пометки незарегистрированных в системе пользователей
+    if getfirst X$USERS3 where ((MarkUsers.Login == X$USERS3.XU$LOGINNAME)) = tsOk
+    {
+      ClearBuffer(#MarkUsersU);
+      MarkUsersU.Buffer  := Type$MarkUsersU(MarkUsers.Buffer);
+      insert current MarkUsersU;
+    }
+  }
+  SetBounds(#MarkUsers);
+  SetBounds(#MarkUsersU);
+
+  // покажем пользователей, которые зарегистрированы в системе
+  PushBounds(tbListUsers);
+
+  // выбираем пользователей, которым будут назначаться права
+  if RunWindowModal(WinUsers) = cmDefault
+  {
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Замена разрешений', RecordsInTable(tnMarkUsersU));
+
+    ReSetBounds(#MarkUsersU);
+
+    _loop MarkUsersU
+    {
+      if not NextVisual
+        break;
+
+      // если уже существует, то заменим разрешения
+      if getfirst Zar_User0 where ((MarkUsersU.Login == Zar_User0.OwnName)) = tsOk
+      {
+        if GetBit(1,DefParams)
+        {
+          //Zar_User0.PodrShare := if(GetBit(1,DefAccess), '+', '-');
+          //Zar_User0.CanChange := if(GetBit(2,DefAccess), '+', '-');
+
+          update current Zar_User0;
+        }
+
+        // в режиме замены удаляем безусловно
+        if GetBit(2,DefParams)
+          delete GP_USERRIGHTS1 where ((Zar_User0.OwnName == GP_USERRIGHTS1.OwnName
+         and wModule == GP_USERRIGHTS1.WTYPE(noindex)
+          ));
+      }
+    }
+
+    SetBounds(#MarkUsersU);
+
+    StopVisual('',0);
+  }
+
+  // восстановим прежнее состояние опций
+  DefParams := OldParams;
+
+  PopBounds(tbListUsers);
+
+  ReSetBounds(#MarkUsersU);
+  delete all MarkUsersU;
+  SetBounds(#MarkUsersU);
+
+  ReReadRecord(CurTable);
+}
+
+// замена разрешений по выбранным пользователям в группах
+cmAlt2:
+{
+  ReSetBounds(#MarkUsersG);
+  delete all MarkUsersG;
+  SetBounds(#MarkUsersG);
+
+  // сохраним текущее состояние флагов
+  OldParams := DefParams;
+  // выставим опцию замены, если не выставлена
+  DefParams := DefParams or 1;
+  // так как в режиме замены, то эта опция обязательна и нередактируема
+  ClusterDisabledField(#DefParams, 1);
+
+  // отбираем только тех, у кого уже есть настройки прав
+  FormListUsers(true);
+  PushBounds(tbListGroup);
+
+  if RunWindowModal(WinGroups) = cmDefault
+  {
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Замена разрешений', RecordsInTable(tnMarkUsersG));
+
+    ReSetBounds(#MarkUsersG);
+
+    _loop MarkUsersG
+    {
+      if not NextVisual
+        break;
+
+      // если уже существует, то заменим разрешения
+      if getfirst Zar_User0 where ((MarkUsersG.Login == Zar_User0.OwnName)) = tsOk
+      {
+        // если выставлен флаг замены разрешений у существующих
+        if GetBit(1,DefParams)
+        {
+          //Zar_User0.PodrShare := if(GetBit(1,DefAccess), '+', '-');
+          //Zar_User0.CanChange := if(GetBit(2,DefAccess), '+', '-');
+
+          update current Zar_User0;
+        }
+
+        // в режиме замены удаляем безусловно
+        if GetBit(2,DefParams)
+          delete GP_USERRIGHTS1 where ((Zar_User0.OwnName == GP_USERRIGHTS1.OwnName
+           and wModule == GP_USERRIGHTS1.WTYPE(noindex)
+          ));
+      }
+    }
+
+    SetBounds(#MarkUsersG);
+
+    StopVisual('',0);
+  }
+
+  // восстановим прежнее состояние опций
+  DefParams := OldParams;
+
+  PopBounds(tbListGroup);
+
+  ReSetBounds(#MarkUsersG);
+  delete all MarkUsersG;
+  SetBounds(#MarkUsersG);
+
+  ReReadRecord(CurTable);
+}
+
+cmPick:
+{
+  case CurField of
+    #CanModify:
+    { message('Изменение здесь запрещено!');
+      //if PrChoice = 0
+      //  set Zar_User.CanChange := if(Zar_User.CanChange = '+','-','+');
+    }
+
+    #IsLimited:
+    { message('Изменение здесь запрещено!');
+      //set Zar_User.PodrShare  := if(Zar_User.PodrShare = '+','-','+');
+    }
+
+  end; //case
+}
+
+cmMarkUnMark:
+{
+  case CurTable of
+  //------------
+    #Zar_User:
+    {
+      if IsValid(#MarkUsers)
+        delete current MarkUsers;
+      else
+      {
+        ClearBuffer(#MarkUsers);
+        MarkUsers.cUser := X$USERS.ATL_NREC;
+        MarkUsers.Login := ZAR_USER.OWNNAME;
+        insert current MarkUsers;
+      }
+
+      RedrawCurrentAndGo(brUsersList, true);
+    }
+  //------------
+    #KatPodr1:
+    {
+      if IsValid(#MarksDeps)
+        delete current MarksDeps;
+      else
+      {
+        ClearBuffer(#MarksDeps);
+        MarksDeps.Marked  := '+';
+        MarksDeps.cRecDs  := KatPodr1.NREC;
+        MarksDeps.cGroup  := KatPodr1.CPODR;
+        MarksDeps.Name    := KatPodr1.NAME;
+        MarksDeps.Kod     := KatPodr1.KOD;
+
+        insert current MarksDeps;
+      }
+
+      RedrawCurrentAndGo(trPodrTree, true);
+    }
+  end; //case
+
+}
+
+// помечаем выборочно
+cmShowAll:
+{
+  case CurTable of
+  //------------
+    #Zar_User:
+    {
+      if RunWindowModal(wnSetMark) <> cmDefault
+        exit;
+
+      PushPos(#ZAR_USER);
+
+      _loop ZAR_USER
+      {
+        // если уже помечен, то пропускаем
+        if IsValid(#MarkUsers)
+          continue;
+
+        if (Zar_User.PodrShare = '+') and (FltPodrShare = 1)
+          continue;
+
+        if (Zar_User.PodrShare <> '+') and (FltPodrShare = 0)
+          continue;
+
+        if (Zar_User.CanChange = '+') and (FltCanChange = 0)
+          continue;
+
+        if (Zar_User.CanChange <> '+') and (FltCanChange = 1)
+          continue;
+
+        ClearBuffer(#MarkUsers);
+        MarkUsers.cUser := X$USERS.ATL_NREC;
+        MarkUsers.Login := ZAR_USER.OWNNAME;
+        insert current MarkUsers;
+      }
+
+      PopPos(#ZAR_USER);
+      ReReadRecord(CurTable);
+    }
+  end; //case
+}
+
+cmSelectAll:
+{
+  case CurTable of
+  //------------
+    #Zar_User:
+    {
+      PushPos(#ZAR_USER);
+
+      _loop ZAR_USER
+      {
+        if IsValid(#MarkUsers)
+          continue;
+
+        ClearBuffer(#MarkUsers);
+        MarkUsers.cUser := X$USERS.ATL_NREC;
+        MarkUsers.Login := ZAR_USER.OWNNAME;
+        insert current MarkUsers;
+      }
+
+      PopPos(#ZAR_USER);
+      ReReadRecord(CurTable);
+    }
+  //------------
+    #KatPodr1:
+    {
+      ReSetBounds(#MarksDeps);
+      delete all MarksDeps;
+
+      insert MarksDeps(Marked,cRecDs,cGroup,Name,Kod)
+        select
+          '+'
+          , KatPodr.NREC
+          , KatPodr.CPODR
+          , KatPodr.NAME
+          , KatPodr.KOD
+        from
+          KatPodr;
+
+      SetBounds(#MarksDeps);
+      ReReadRecord(CurTable);
+    }
+  end; //case
+}
+
+cmUnSelectAll:
+{
+  case CurTable of
+  //------------
+    #Zar_User:
+    {
+      ReSetBounds(#MarkUsers);
+      delete all MarkUsers;
+      SetBounds(#MarkUsers);
+      ReReadRecord(CurTable);
+    }
+  //------------
+    #KatPodr1:
+    {
+      ReSetBounds(#MarksDeps);
+      delete all MarksDeps;
+      SetBounds(#MarksDeps);
+
+      ReReadRecord(CurTable);
+    }
+  end; //case
+}
+
+cmProtectedInput:
+{
+  Message('Запись корректируется другим пользователем', Information);
+  Stop;
+}
+
+cmTableChanged:
+{
+  if (GetNotificationInfoPtr = coZAR_USER) and not NotificationIsBeingSent
+    ReReadRecord(#ZAR_USER);
+}
+
+cmChangeTabbedSheetFormat:
+{
+  if Target = brPodrUsers
+  {
+#IFDEF _GP_
+      if not  IsCurrTree
+        SetFormat(brPodrTree);
+      else
+#ENDIF
+    SetFormat(trPodrTree);
+  }
+  else
+  {
+    SetFormat(brUsersList);
+    RefreshRightsList;
+  }
+
+  ReReadRecord(CurTable);
+}
+#IFDEF _GP_
+  cmAccording :
+  { var _pNrec:comp;
+    _pNrec:=KATPODR1.Nrec;
+    if IsCurrTree  // из дерева в список
+    { IsCurrTree := false;
+
+      ResetBounds(tnKatPodr1);
+      if getfirst KatPodr1 where (( _pNrec == KatPodr1.Nrec ))=tsok {}
+      SetFormat(brPodrTree);
+      ReScanPanel(tnKatPodr1);
+    }
+    else  // из списка в дерево
+    { IsCurrTree := true;
+      PushBounds(tnKatPodr1);
+      SetFormat(trPodrTree);
+      ReScanPanel(tnKatPodr1);
+      TreeJumpToRecord(trPodrTree, _pNrec);
+      ReScanPanel(tnKatPodr1);
+    }
+  }
+#ENDIF
+cmVal1:
+{ /*
+  if Message('Установить текущими все подразделения?', YesNo + Confirmation) = Yes
+  {
+    set Zar_User.CurCex := 0;
+    UpdateTable;
+    // пересканировать текущие доступные подразделения, если необходимо
+    if UpCase(Zar_User.OwnName) = UpCase(UserName)
+    {
+      RunInterface('GetPodAln', comp(0), Zar_User.CurCex, p2);
+      ReReadRecord(#Zar_User);
+    }
+
+    ReScanPanel(#UserDeps);
+  }
+  */
+}
+
+cmVal2:
+{
+  if RecordsInTable(tnMarkUsers) = 0
+  {
+    if Message('Очистить список подразделений пользователя "' + Zar_User.OwnName + '"?', YesNo + Confirmation) <> Yes
+      exit;
+
+    delete GP_USERRIGHTS1 where ((Zar_User.OwnName == GP_USERRIGHTS1.OwnName
+       and wModule == GP_USERRIGHTS1.WTYPE(noindex)
+    ));
+    //update current Zar_User set Zar_User.CurCex := 0;
+  }
+  else
+  {
+    if Message('Очистить подразделения у помеченных (' + string(RecordsInTable(tnMarkUsers)) + ') пользователей?', YesNo + Confirmation) <> Yes
+      exit;
+
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Очистка подразделений', RecordsInTable(tnMarkUsers));
+
+    ReSetBounds(#MarkUsers);
+
+    _loop MarkUsers
+    {
+      if not NextVisual
+        break;
+
+      if getfirst Zar_User0 where ((MarkUsers.Login == Zar_User0.OwnName)) = tsOk
+      {
+        // не обрабатываем, если у пользователя есть права на корректировку своего списка подразделений
+        if (Zar_User0.CanChange = '+')
+          continue;
+
+        // остальным удаляем безусловно
+        delete GP_USERRIGHTS1 where ((Zar_User0.OwnName == GP_USERRIGHTS1.OwnName
+         and wModule == GP_USERRIGHTS1.WTYPE(noindex)
+         ));
+
+        // выставим текущим все доступные
+        if (Zar_User0.CurCex <> 0)
+          update current Zar_User0 set Zar_User0.CurCex := 0;
+      }
+    }
+
+    SetBounds(#MarkUsers);
+
+    StopVisual('',0);
+  }
+
+  ReReadRecord(CurTable);
+  PutCommand(cmPositionChanged);
+}
+
+// добавляет помеченным пользователям выбранные подразделения
+cmVal3:
+{
+  if RunWindowModal(wnPodrSample) = cmDefault
+  {
+    // если список выбранных подразделений пуст
+    if RecordsInTable(tnSetRights) = 0
+      exit;
+
+    if RecordsInTable(tnMarkUsers) = 0
+    {
+      if Message('Добавить "' + Zar_User.OwnName + '" выбранные подразделения (' + string(RecordsInTable(tnSetRights))
+        + ')' + if(Zar_User.PodrShare <> '+',' и включить ему разграничение прав доступа?','?'), YesNo + Confirmation) <> Yes
+        exit;
+
+      StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Добавление подразделений', RecordsInTable(tnSetRights));
+
+      _loop SetRights
+      {
+        if not NextVisual
+          break;
+
+        // добавляем только если оно отсутствует среди разрешенных
+        if getfirst GP_USERRIGHTS1 where ((SetRights.cRecDs == GP_USERRIGHTS1.cRecDs and Zar_User.OwnName == GP_USERRIGHTS1.OwnName
+          and wModule == GP_USERRIGHTS1.WTYPE(noindex)
+        )) <> tsOk
+        {
+          ClearBuffer(#GP_USERRIGHTS1);
+          GP_USERRIGHTS1.Buffer  := Type$GP_USERRIGHTS(SetRights.Buffer);
+#ifdef Gal9_1
+          GP_USERRIGHTS1.cUser   := Zar_User.cUser;
+#end
+          GP_USERRIGHTS1.OwnName := Zar_User.OwnName;
+          GP_USERRIGHTS1.wType   := wModule;
+          GP_USERRIGHTS1.NRec    := 0;
+          insert current GP_USERRIGHTS1;
+        }
+
+        // если у пользователя не включены права доступа (и не предоставлены права на редактирование)
+        //if (Zar_User.PodrShare <> '+')
+        //   update current Zar_User set Zar_User.PodrShare := '+';
+      }
+
+      StopVisual('',0);
+    }
+    else
+    {
+      if Message('Добавить помеченным пользователям выбранные подразделения (' + string(RecordsInTable(tnSetRights))
+        + ') и включить им разграничение прав доступа?', YesNo + Confirmation) <> Yes
+        exit;
+
+      StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Добавление подразделений', RecordsInTable(tnMarkUsers) * RecordsInTable(tnSetRights));
+
+      ReSetBounds(#MarkUsers);
+      ReSetBounds(#SetRights);
+
+      _loop MarkUsers
+      {
+        if not NextVisual
+          break;
+
+        if getfirst Zar_User0 where ((MarkUsers.Login == Zar_User0.OwnName)) = tsOk
+        {
+          // если пользователю даны права самому редактировать свой список подразделений, то не нужно за него это делать
+          if (Zar_User0.CanChange = '+')
+            continue;
+
+          _loop SetRights
+          {
+            if not NextVisual
+              break;
+
+            // добавляем только если оно отсутствует среди разрешенных
+            if getfirst GP_USERRIGHTS1 where ((SetRights.cRecDs == GP_USERRIGHTS1.cRecDs and Zar_User0.OwnName == GP_USERRIGHTS1.OwnName
+               and wModule == GP_USERRIGHTS1.wType
+             )) <> tsOk
+            {
+              ClearBuffer(#GP_USERRIGHTS1);
+              GP_USERRIGHTS1.Buffer  := Type$GP_USERRIGHTS(SetRights.Buffer);
+#ifdef Gal9_1
+              GP_USERRIGHTS1.cUser   := Zar_User0.cUser;
+#end
+              GP_USERRIGHTS1.OwnName := Zar_User0.OwnName;
+              GP_USERRIGHTS1.wType   :=wModule;
+              GP_USERRIGHTS1.NRec    := 0;
+              insert current GP_USERRIGHTS1;
+            }
+          }
+
+          // если у пользователя не включены права доступа
+          //if (Zar_User0.PodrShare <> '+')
+          //  update current Zar_User0 set Zar_User0.PodrShare := '+';
+        }
+      }
+
+      SetBounds(#SetRights);
+      SetBounds(#MarkUsers);
+
+      StopVisual('',0);
+    }
+
+    ReReadRecord(CurTable);
+    PutCommand(cmPositionChanged);
+  }
+}
+
+// добавляет помеченным пользователям права к подразделению
+cmVal4:
+{
+  if not IsValid(#KatPodr1)
+    exit;
+
+  // сохраним установленные флаги
+  OldAccess := DefAccess;
+  OldParams := DefParams;
+
+  // и используем свои
+  DefAccess := 1;
+  DefParams := 0;
+
+  ClusterDisabledField(#DefParams, 3);
+
+  if RunWindowModal(WinUsers) = cmDefault
+  {
+    if RecordsInTable(#MarksDeps) = 0
+    {
+      StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Добавление подразделения пользователям', RecordsInTable(tnMarkUsersU));
+
+      ReSetBounds(#MarkUsersU);
+
+      _loop MarkUsersU
+      {
+        if not NextVisual
+          break;
+
+        // создадим настройку для пользователя если она отсутствует
+        if getfirst Zar_User0 where ((MarkUsersU.Login == Zar_User0.OwnName)) <> tsOk
+        {
+          ClearBuffer(#Zar_User0);
+#ifdef Gal9_1
+          Zar_User0.cUser     := MarkUsersU.cUser;
+#end
+          Zar_User0.OwnName   := MarkUsersU.Login;
+          Zar_User0.PodrShare := if(GetBit(1,DefAccess), '+', '-');
+          Zar_User0.CanChange := if(GetBit(2,DefAccess), '+', '-');
+
+          insert current Zar_User0;
+        }
+
+        if getfirst GP_USERRIGHTS1 where ((KatPodr1.NRec == GP_USERRIGHTS1.cRecDs and Zar_User0.OwnName == GP_USERRIGHTS1.OwnName
+         and   wModule == GP_USERRIGHTS1.wType(noindex)
+        )) <> tsOk
+        {
+          ClearBuffer(#GP_USERRIGHTS1);
+#ifdef Gal9_1
+          GP_USERRIGHTS1.cUser   := Zar_User0.cUser;
+#end
+          GP_USERRIGHTS1.OwnName := Zar_User0.OwnName;
+          GP_USERRIGHTS1.Marked  := '+';
+          GP_USERRIGHTS1.wType   := wModule;
+          GP_USERRIGHTS1.cRecDs  := KatPodr1.NRec;
+          GP_USERRIGHTS1.cGroup  := KatPodr1.cPodr;
+          GP_USERRIGHTS1.Name    := KatPodr1.Name;
+          GP_USERRIGHTS1.Kod     := KatPodr1.Kod;
+
+          insert current GP_USERRIGHTS1;
+        }
+      }
+
+      SetBounds(#MarkUsersU);
+
+      StopVisual('',0);
+
+      ReScanPanel(#GP_USERRIGHTS);
+    }
+    else
+    {
+      StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Добавление подразделений пользователям', RecordsInTable(tnMarkUsersU));
+
+      ReSetBounds(#MarkUsersU);
+      ReSetBounds(#MarksDeps);
+
+      _loop MarkUsersU
+      {
+        if not NextVisual
+          break;
+
+        // создадим настройку для пользователя если она отсутствует
+        if getfirst Zar_User0 where ((MarkUsersU.Login == Zar_User0.OwnName)) <> tsOk
+        {
+          ClearBuffer(#Zar_User0);
+#ifdef Gal9_1
+          Zar_User0.cUser     := MarkUsersU.cUser;
+#end
+          Zar_User0.OwnName   := MarkUsersU.Login;
+          Zar_User0.PodrShare := if(GetBit(1,DefAccess), '+', '-');
+          Zar_User0.CanChange := if(GetBit(2,DefAccess), '+', '-');
+
+          insert current Zar_User0;
+        }
+
+        // если пользователю даны права самому редактировать свой список подразделений, то не нужно за него это делать
+        if (Zar_User0.CanChange = '+')
+          continue;
+
+        _loop MarksDeps
+        {
+          if getfirst GP_USERRIGHTS1 where ((MarksDeps.cRecDs == GP_USERRIGHTS1.cRecDs and Zar_User0.OwnName == GP_USERRIGHTS1.OwnName
+         and   wModule == GP_USERRIGHTS1.wType(noindex)
+           )) <> tsOk
+          {
+            ClearBuffer(#GP_USERRIGHTS1);
+            GP_USERRIGHTS1.Buffer  := Type$GP_USERRIGHTS(MarksDeps.Buffer);
+#ifdef Gal9_1
+            GP_USERRIGHTS1.cUser   := Zar_User0.cUser;
+#end
+            GP_USERRIGHTS1.wType   := wModule;
+            GP_USERRIGHTS1.OwnName := Zar_User0.OwnName;
+            GP_USERRIGHTS1.NRec    := 0;
+
+            insert current GP_USERRIGHTS1;
+          }
+        }
+      }
+      // по итогу очищаем все пометки
+      delete all MarksDeps;
+
+      SetBounds(#MarksDeps);
+      SetBounds(#MarkUsersU);
+
+      StopVisual('',0);
+
+      ReScanPanel(#GP_USERRIGHTS);
+    }
+  }
+
+  ReSetBounds(#MarkUsersU);
+  delete all MarkUsersU;
+  SetBounds(#MarkUsersU);
+
+  // восстановим исходное состояние опций
+  DefAccess := OldAccess;
+  DefParams := OldParams;
+
+  ClusterDisabledField(#DefAccess, 0);
+  ClusterDisabledField(#DefParams, 0);
+}
+
+// добавляет помеченным (в группах) пользователям права к подразделению
+cmVal5:
+{
+  if not IsValid(#KatPodr1)
+    exit;
+
+  // сохраним установленные флаги
+  OldAccess := DefAccess;
+  OldParams := DefParams;
+
+  // и используем свои
+  DefAccess := 1;
+  DefParams := 0;
+
+  ClusterDisabledField(#DefParams, 3);
+
+  if RunWindowModal(WinGroups) = cmDefault
+  {
+    if RecordsInTable(#MarksDeps) = 0
+    {
+      if Message('Предоставить выбранным (' + RecordsInTable(tnMarkUsersG) + ') пользователям доступ к подразделению '
+        + chr(13) + '"' + KatPodr1.Name + '"?', YesNo + Confirmation) = Yes
+      {
+        StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Добавление доступа к подразделению', RecordsInTable(tnMarkUsersG));
+
+        ReSetBounds(#MarkUsersG);
+
+        _loop MarkUsersG
+        {
+          if not NextVisual
+            break;
+
+          // создадим настройку для пользователя если она отсутствует
+          if getfirst Zar_User0 where ((MarkUsersG.Login == Zar_User0.OwnName)) <> tsOk
+          {
+            ClearBuffer(#Zar_User0);
+#ifdef Gal9_1
+            Zar_User0.cUser     := MarkUsersG.cUser;
+#end
+            Zar_User0.OwnName   := MarkUsersG.Login;
+            Zar_User0.PodrShare := if(GetBit(1,DefAccess), '+', '-');
+            Zar_User0.CanChange := if(GetBit(2,DefAccess), '+', '-');
+
+            insert current Zar_User0;
+          }
+
+          // если пользователю даны права самому редактировать свой список подразделений, то не нужно за него это делать
+          if (Zar_User0.CanChange = '+')
+            continue;
+
+          if getfirst GP_USERRIGHTS1 where ((KatPodr1.NRec == GP_USERRIGHTS1.cRecDs and Zar_User0.OwnName == GP_USERRIGHTS1.OwnName
+            and wModule == GP_USERRIGHTS1.wType(noindex)
+          )) <> tsOk
+          {
+            ClearBuffer(#GP_USERRIGHTS1);
+#ifdef Gal9_1
+            GP_USERRIGHTS1.cUser   := Zar_User0.cUser;
+#end
+            GP_USERRIGHTS1.OwnName := Zar_User0.OwnName;
+            GP_USERRIGHTS1.Marked  := '+';
+            GP_USERRIGHTS1.wType   := wModule;
+            GP_USERRIGHTS1.cRecDs  := KatPodr1.NRec;
+            GP_USERRIGHTS1.cGroup  := KatPodr1.cPodr;
+            GP_USERRIGHTS1.Name    := KatPodr1.Name;
+            GP_USERRIGHTS1.Kod     := KatPodr1.Kod;
+
+            insert current GP_USERRIGHTS1;
+          }
+        }
+
+        SetBounds(#MarkUsersG);
+
+        StopVisual('',0);
+
+        ReScanPanel(#GP_USERRIGHTS);
+      }
+    }
+    else
+    {
+      if Message('Предоставить выбранным (' + RecordsInTable(tnMarkUsersG) + ') пользователям доступ к помеченным ('
+        + RecordsInTable(tnMarksDeps) + ') подразделениям?', YesNo + Confirmation) = Yes
+      {
+        StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Добавление доступа к подразделениям', RecordsInTable(tnMarkUsersG));
+
+        ReSetBounds(#MarkUsersG);
+        ReSetBounds(#MarksDeps);
+
+        _loop MarkUsersG
+        {
+          if not NextVisual
+            break;
+
+          // создадим настройку для пользователя если она отсутствует
+          if getfirst Zar_User0 where ((MarkUsersG.Login == Zar_User0.OwnName)) <> tsOk
+          {
+            ClearBuffer(#Zar_User0);
+#ifdef Gal9_1
+            Zar_User0.cUser     := MarkUsersG.cUser;
+#end
+            Zar_User0.OwnName   := MarkUsersG.Login;
+            Zar_User0.PodrShare := if(GetBit(1,DefAccess), '+', '-');
+            Zar_User0.CanChange := if(GetBit(2,DefAccess), '+', '-');
+
+            insert current Zar_User0;
+          }
+
+          // если пользователю даны права самому редактировать свой список подразделений, то не нужно за него это делать
+          if (Zar_User0.CanChange = '+')
+            continue;
+
+          _loop MarksDeps
+          {
+            if getfirst GP_USERRIGHTS1 where ((MarksDeps.cRecDs == GP_USERRIGHTS1.cRecDs and Zar_User0.OwnName == GP_USERRIGHTS1.OwnName
+               and  wModule == GP_USERRIGHTS1.wType(noindex)
+
+            )) <> tsOk
+            {
+              ClearBuffer(#GP_USERRIGHTS1);
+              GP_USERRIGHTS1.Buffer  := Type$GP_USERRIGHTS(MarksDeps.Buffer);
+#ifdef Gal9_1
+              GP_USERRIGHTS1.cUser   := Zar_User0.cUser;
+#end
+              GP_USERRIGHTS1.wType   := wModule;
+              GP_USERRIGHTS1.OwnName := Zar_User0.OwnName;
+              GP_USERRIGHTS1.NRec    := 0;
+
+              insert current GP_USERRIGHTS1;
+            }
+          }
+        }
+        // по итогу очищаем все пометки
+        delete all MarksDeps;
+
+        SetBounds(#MarksDeps);
+        SetBounds(#MarkUsersG);
+
+        StopVisual('',0);
+
+        ReScanPanel(#GP_USERRIGHTS);
+      }
+    }
+  }
+
+  ReSetBounds(#MarkUsersG);
+  delete all MarkUsersG;
+  SetBounds(#MarkUsersG);
+
+  // восстановим исходное состояние опций
+  DefAccess := OldAccess;
+  DefParams := OldParams;
+
+  ClusterDisabledField(#DefAccess, 0);
+  ClusterDisabledField(#DefParams, 0);
+}
+
+// удаляет доступ к подразделениям у всех
+cmVal6:
+{
+  if not IsValid(#KatPodr1)
+    exit;
+
+  if RecordsInTable(#MarksDeps) = 0
+  {
+    if Message('Удалить у пользователей доступ к подразделению ' + chr(13) + '"' + KatPodr1.Name + '"?', YesNo + Confirmation) <> Yes
+      exit;
+
+    StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Удаление доступа к подразделению', 1);
+
+    PushPos(#GP_USERRIGHTS);
+
+    _loop GP_USERRIGHTS
+    {
+      if not NextVisual
+        break;
+
+      // пропускаем тех, у кого есть права на редактирование списка подразделений
+      if IsValid(#Zar_User1) and (Zar_User1.CanChange = '+')
+        continue;
+
+      // удаляем подразделение для "бесправного"
+      delete GP_USERRIGHTS1 where ((GP_USERRIGHTS.NRec == GP_USERRIGHTS1.NRec));
+    }
+
+    PopPos(#GP_USERRIGHTS);
+
+    StopVisual('',0);
+
+    ReReadRecord(#KatPodr1);
+  }
+  else
+  {
+    if Message('Удалить у всех пользователей доступ к помеченным (' + RecordsInTable(tnMarksDeps) + ') подразделениям ?', YesNo + Confirmation) <> Yes
+      exit;
+
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Удаление доступа к подразделениям', RecordsInTable(tnMarksDeps));
+
+    ReSetBounds(#MarksDeps);
+    ReSetBounds(#GP_USERRIGHTS);
+
+    _loop MarksDeps
+    {
+      if not NextVisual
+        break;
+
+      _loop GP_USERRIGHTS where ((MarksDeps.cRecDs == GP_USERRIGHTS.cRecDs))
+      {
+        // пропускаем тех, у кого есть права на редактирование списка подразделений
+        if getfirst Zar_User0 where ((GP_USERRIGHTS.OwnName == Zar_User0.OwnName)) = tsOk
+          if Zar_User0.CanChange = '+'
+            continue;
+
+        // удаляем подразделение для "бесправного"
+        delete GP_USERRIGHTS1 where ((GP_USERRIGHTS.NRec == GP_USERRIGHTS1.NRec));
+      }
+    }
+
+    delete all MarksDeps;
+    SetBounds(#GP_USERRIGHTS);
+    SetBounds(#MarksDeps);
+
+    StopVisual('',0);
+
+    ReReadRecord(#KatPodr1);
+  }
+}
+
+cmPrintBase:
+{
+  GenerateReport;
+  Stop;
+}
+
+cmPrintBaseGround:
+{
+  PrintGeneratedReport;
+  Stop;
+}
+end; // HandleEvent
+end. // interface
+
+GP_WorkMenuCurUserOnly menu
+{
+ - 'Установить текущими все', cmVal1, 'Установить текущими все подразделения',,'',, sci1Esc;
+}
+
+GP_BufferWorkMenu menu
+{
+ - 'Пометить выборочно...', cmShowAll, 'Пометить выборочно',hcNoContext,'Ctrl+Gray +', kbCtrlGrayPlus, sci1Esc;
+ ----;
+ - 'Очистить подразделения', cmVal2, 'Очищает список подразделений пользователя',hcNoContext,'',, sci1Esc;
+ - 'Добавить подразделения', cmVal3, 'Добавляет помеченным пользователям выбранные подразделения',hcNoContext,'',, sci1Esc;
+ ----;
+ - 'Копировать в образец', cmSaveDoc, 'Сохраняет настройки пользователя в образец',hcNoContext, 'Ctrl+F2', kbCtrlF2, sci1Esc;
+ - 'Назначить по образцу', cmRestoreDoc,'Назначает разрешения по образцу',hcNoContext, 'Ctrl+F3', kbCtrlF3, sci1Esc;
+ ----;
+ - 'Замена разрешений...',cmAlt1,'Заменяет разрешения у выбранных пользователей',hcNoContext, 'Alt+1', kbAlt1, sci1Esc;
+ - 'Замена прав по группе...',cmAlt2,'Заменяет разрешения пользователям, входящим в выбранную группу',hcNoContext, 'Alt+2', kbAlt2, sci1Esc;
+}
+
+GP_AdminPodrUsersMenu menu
+{
+ - 'Разрешить доступ пользователям...',cmVal4,'Предоставление доступа к помеченным подразделениям (с выбором пользователей)',hcNoContext,'',, sci1Esc;
+ - 'Разрешить пользователям группы...',cmVal5,'Предоставление доступа к помеченным подразделениям (с выбором пользователей в группах)',hcNoContext,'',, sci1Esc;
+ ----;
+ - 'Удалить доступ к выбранным',cmVal6,'Удаление у всех пользователей доступа к выбранным подразделениям',hcNoContext,'',, sci1Esc;
+#IFDEF _GP_
+ - 'Режим представления: линейный/иерархический',cmAccording,'Режим представления: линейный/иерархический',hcNoContext,'Alt+S',kbAltS, sci1Esc;
+#ENDIF
+}

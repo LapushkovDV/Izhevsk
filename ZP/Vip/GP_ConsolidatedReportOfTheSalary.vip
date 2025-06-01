@@ -1,0 +1,427 @@
+/*************************************************************************************************\
+* Наименование: Сводные данные по зарплате                                                        *
+* Контур/Модуль: ЗП                                                                               *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#821          |09/01/18|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include ComFiltr.vih
+#include UserReport.vih
+
+#include GP_QueryBuilder.vih
+#include GP_ZSumVidOp.vih
+#include GP_ZSumVidUd.vih
+
+VipInterface UserReport_GP_ConsolidatedReportOfTheSalary Implements IUserReport;
+interface UserReport_GP_ConsolidatedReportOfTheSalary 'Сводные данные по зарплате', Cyan;
+show(10,5,190,35);
+
+var IsFilterSet:boolean;
+    FilterDat1,FilterDat2:date;
+    CF:CommonFiltr;
+    iQBuilder:GP_QueryBuilder new;
+
+table struct SRep(
+  Month:word,Year:word,PodrKod:string,TabN:TabnStr,FIO:string,Post:string,
+  VidSys:longint,Vid:longint,TypeName:string,Name:string,
+  Summa:tSumma,Hours:double,Days:double,
+  OrderNum:string,Kateg:word,VidWorkCode:word,VidWorkName:string,Schet:string,BornDate:date,
+  cLsch:comp,wTblSrc:word
+)
+with index(i=Year+Month+PodrKod+TabN+Vid);
+
+create view
+as select
+  SRep.Month
+from
+  SRep;
+
+browse brSRep (,,sci14Esc);
+table SRep;
+fields
+  SRep.Month 'Месяц' ('Месяц в котором произведен расчет',,):[6],Protect,NoAutoSize,Centered;
+  SRep.Year 'Год' ('Год в котором произведен расчет') :[5],Protect,NoAutoSize,Centered;
+  SRep.PodrKod 'Подр.' ('Код подразделения работника',,):[7],Protect,NoAutoSize,Centered;
+  SRep.TabN 'Таб. №' ('Табельный номер работника',,):[7],Protect,NoAutoSize,Centered;
+  SRep.FIO 'Фамилия' ('Фамилия и инициалы работника',,):[20],Protect;
+  SRep.Post 'Должность' ('Должность работника',,):[20],Protect;
+  SRep.Vid 'Код' ('Пользовательский код вида оплаты или вида удержания',,):[5],Protect,NoAutoSize;
+  SRep.TypeName 'Тип','начисления' ('Тип начисления',,):[11],Protect,NoAutoSize;
+  SRep.Summa 'Сумма' ('Результат расчета по виду оплаты или виду удержания',,):[12,'\2p[|-]366`666`666.88'],Protect,NoAutoSize;
+  SRep.Hours 'Часы' ('Количество часов',,):[5.1],Protect,NoAutoSize,Centered;
+  SRep.Days 'Дни' ('Количество дней',,):[5.1],Protect,NoAutoSize,Centered;
+  SRep.OrderNum 'Заказ' ('Номер производственного заказа',,):[7],Protect,NoAutoSize,Centered;
+  SRep.Kateg 'Категория' ('Код категории работника',,):[10],Protect,NoAutoSize,Centered;
+  SRep.VidWorkCode 'Код типа', 'занятости' ('Код вида работы работника',,):[10],Protect,NoAutoSize,Centered;
+  SRep.VidWorkName 'Тип занятости' ('Вид работы работника',,):[20],Protect;
+  SRep.Name 'Начисление' ('Наименование оплаты или удержания',,):[20],Protect;
+  if(SRep.TypeName='Начисление','01 - начисление','02 - удержание') 'Вид учета' :[15],Protect,NoAutoSize;
+  SRep.Schet '№ счета' ('Счет/субсчет по виду оплаты - ДЕБЕТ, по виду удержания - КРЕДИТ'):[10],Protect,NoAutoSize,Centered;
+  Sub_Date(date(1,SRep.Month,SRep.Year),SRep.BornDate)
+    'Возраст' ('Количество полных лет работника'):[8,'YY'],Protect,NoAutoSize,Centered;
+end;
+
+window WinFilter 'Фильтр' DoAccept, EscClose, Gray;
+show(20, 5, 100, 17);
+
+screen scRepPeriod (,,sci13Esc);
+show(,,,2) Fixed_Y;
+fields
+  FilterDat1 ('Начало периода',,):['MM.YYYY'],NoProtect;
+  FilterDat2 ('Окончание периода',,):['MM.YYYY'],NoProtect;
+<<
+   `Отчетный период с`.@@@@@@@@  `по`.@@@@@@@@
+>>
+end;
+embedded edCF interface CF;
+show(,3,,9) Fixed_Y;
+end;
+screen scRepParam (,,sci1Esc);
+show(,10,,);
+buttons
+  cmOK,,,'Установить',,sci1Esc;
+  cmCancel,,,'Выход',,sci1Esc;
+<<
+
+  <. ~У~становить .>                                            <. ~О~тмена  .>
+>>
+end;
+
+HandleEvent
+cmOK:{
+  PutCommand(cmDefault);
+}
+end;
+end;//WinFilter
+
+procedure FillSRep;
+var CurRec:type$SRep;
+    hQueryStr:longint;
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Отбор сводных данных по зарплате...', 0);
+
+  CurRec:=SRep.buffer;
+
+  delete all SRep;
+
+  //Начисления
+  iQBuilder.AddToSelect('Nachisl.MesN,Nachisl.YearN,KatPodr.Kod,Nachisl.strTabn,Persons.FIO,Post.Name');
+  iQBuilder.AddToSelect('Nachisl.VidOplS,Nachisl.VidOpl,''Начисление'',KlVidOpl.NVidOpl');
+  iQBuilder.AddToSelect('Sum(Nachisl.Summa),Sum(Nachisl.ChasF),Sum(Nachisl.KolDn)');
+  iQBuilder.AddToSelect('MnPlan.Number,Nachisl.Kateg,KLSovm.Sovm,KLSovm.NSovm');
+  iQBuilder.AddToSelect('case when LENGTH(Nachisl.cSubSchD)>0 then Nachisl.cSchetD||''/''||Nachisl.cSubSchD else Nachisl.cSchetD end');
+  iQBuilder.AddToSelect('Persons.BornDate,Nachisl.cLsch,'+string(coNachisl));
+  iQBuilder.AddToFrom('Nachisl');
+  iQBuilder.AddToFrom('left join KatPodr on (Nachisl.Cex = KatPodr.NRec)');
+  iQBuilder.AddToFrom('left join Persons on (Nachisl.tPerson = Persons.NRec)');
+  iQBuilder.AddToFrom('left join KLSovm on (cast(INT64(Persons.cSovm) as word) = KLSovm.Sovm)');
+  iQBuilder.AddToFrom('left join Catalogs Post on (Nachisl.cAppoint = Post.NRec)');
+  iQBuilder.AddToFrom('left join KlVidOpl on (Nachisl.VidOplS = KlVidOpl.VidOpl)');
+  iQBuilder.AddToFrom('left join MnPlan on (case '+string(cgKau_Zakaz));
+  iQBuilder.AddToFrom('                       when Nachisl.TblD[1] then Nachisl.cKauD[1]');
+  iQBuilder.AddToFrom('                       when Nachisl.TblD[2] then Nachisl.cKauD[2]');
+  iQBuilder.AddToFrom('                       when Nachisl.TblD[3] then Nachisl.cKauD[3]');
+  iQBuilder.AddToFrom('                       when Nachisl.TblD[4] then Nachisl.cKauD[4]');
+  iQBuilder.AddToFrom('                       when Nachisl.TblD[5] then Nachisl.cKauD[5]');
+  iQBuilder.AddToFrom('                       when Nachisl.TblD[6] then Nachisl.cKauD[6]');
+  iQBuilder.AddToFrom('                       else #comp(0)');
+  iQBuilder.AddToFrom('                     end = MnPlan.NRec)');
+
+  if (IsFilterSet) {
+    //Период
+    if (FilterDat1<>ZeroDate)
+      iQBuilder.AddToWhere('(Nachisl.YearN>'+string(Year(FilterDat1))+
+                           ' or (Nachisl.YearN='+string(Year(FilterDat1))+' and Nachisl.MesN>='+string(Month(FilterDat1))+'))');
+
+    if (FilterDat2<>ZeroDate)
+      iQBuilder.AddToWhere('(Nachisl.YearN<'+string(Year(FilterDat2))+
+                           ' or (Nachisl.YearN='+string(Year(FilterDat2))+' and Nachisl.MesN<='+string(Month(FilterDat2))+'))');
+
+    if (CF.GetPsnCount > 0)
+      iQBuilder.AddToWhereMarker('Nachisl.tPerson',CF.GetPersonsMarker);
+  }
+
+  iQBuilder.AddToGroupBy('Nachisl.MesN,Nachisl.YearN,KatPodr.Kod,Nachisl.strTabn,Persons.FIO,Post.Name');
+  iQBuilder.AddToGroupBy('Nachisl.VidOplS,Nachisl.VidOpl,KlVidOpl.NVidOpl,MnPlan.Number,Nachisl.Kateg,KLSovm.Sovm,KLSovm.NSovm');
+  iQBuilder.AddToGroupBy('case when LENGTH(Nachisl.cSubSchD)>0 then Nachisl.cSchetD||''/''||Nachisl.cSubSchD else Nachisl.cSchetD end');
+  iQBuilder.AddToGroupBy('Persons.BornDate,Nachisl.cLsch');
+
+  hQueryStr:=iQBuilder.Make;
+
+  //Архив начислений
+  sqlAddStr(hQueryStr,'UNION');
+
+  iQBuilder.AddToSelect('SumVidOp.MesN,SumVidOp.YearN,KatPodr.Kod,SumVidOp.strTabn,Persons.FIO,Post.Name');
+  iQBuilder.AddToSelect('SumVidOp.VidOpl,SumVidOp.VidOplP,''Начисление'',KlVidOpl.NVidOpl');
+  iQBuilder.AddToSelect('Sum(SumVidOp.Summa),Sum(SumVidOp.ChasF),Sum(SumVidOp.KolDn)');
+  iQBuilder.AddToSelect('MnPlan.Number,SumVidOp.Kateg,KLSovm.Sovm,KLSovm.NSovm');
+  iQBuilder.AddToSelect('case when LENGTH(SumVidOp.cSubSchD)>0 then SumVidOp.cSchetD||''/''||SumVidOp.cSubSchD else SumVidOp.cSchetD end');
+  iQBuilder.AddToSelect('Persons.BornDate,SumVidOp.cLsch,'+string(coSumVidOp));
+  iQBuilder.AddToFrom('SumVidOp');
+  iQBuilder.AddToFrom('left join KatPodr on (SumVidOp.Cex = KatPodr.NRec)');
+  iQBuilder.AddToFrom('left join Persons on (SumVidOp.tPerson = Persons.NRec)');
+  iQBuilder.AddToFrom('left join KLSovm on (cast(INT64(Persons.cSovm) as word) = KLSovm.Sovm)');
+  iQBuilder.AddToFrom('left join Catalogs Post on (SumVidOp.cAppoint = Post.NRec)');
+  iQBuilder.AddToFrom('left join KlVidOpl on (SumVidOp.VidOpl = KlVidOpl.VidOpl)');
+  iQBuilder.AddToFrom('left join MnPlan on (case '+string(cgKau_Zakaz));
+  iQBuilder.AddToFrom('                       when SumVidOp.TblD[1] then SumVidOp.cKauD[1]');
+  iQBuilder.AddToFrom('                       when SumVidOp.TblD[2] then SumVidOp.cKauD[2]');
+  iQBuilder.AddToFrom('                       when SumVidOp.TblD[3] then SumVidOp.cKauD[3]');
+  iQBuilder.AddToFrom('                       when SumVidOp.TblD[4] then SumVidOp.cKauD[4]');
+  iQBuilder.AddToFrom('                       when SumVidOp.TblD[5] then SumVidOp.cKauD[5]');
+  iQBuilder.AddToFrom('                       when SumVidOp.TblD[6] then SumVidOp.cKauD[6]');
+  iQBuilder.AddToFrom('                       else #comp(0)');
+  iQBuilder.AddToFrom('                     end = MnPlan.NRec)');
+
+  if (IsFilterSet) {
+    //Период
+    if (FilterDat1<>ZeroDate)
+      iQBuilder.AddToWhere('(SumVidOp.YearN>'+string(Year(FilterDat1))+
+                           ' or (SumVidOp.YearN='+string(Year(FilterDat1))+' and SumVidOp.MesN>='+string(Month(FilterDat1))+'))');
+
+    if (FilterDat2<>ZeroDate)
+      iQBuilder.AddToWhere('(SumVidOp.YearN<'+string(Year(FilterDat2))+
+                           ' or (SumVidOp.YearN='+string(Year(FilterDat2))+' and SumVidOp.MesN<='+string(Month(FilterDat2))+'))');
+
+    if (CF.GetPsnCount > 0)
+      iQBuilder.AddToWhereMarker('SumVidOp.tPerson',CF.GetPersonsMarker);
+  }
+
+  iQBuilder.AddToGroupBy('SumVidOp.MesN,SumVidOp.YearN,KatPodr.Kod,SumVidOp.strTabn,Persons.FIO,Post.Name');
+  iQBuilder.AddToGroupBy('SumVidOp.VidOpl,SumVidOp.VidOplP,KlVidOpl.NVidOpl,MnPlan.Number,SumVidOp.Kateg,KLSovm.Sovm,KLSovm.NSovm');
+  iQBuilder.AddToGroupBy('case when LENGTH(SumVidOp.cSubSchD)>0 then SumVidOp.cSchetD||''/''||SumVidOp.cSubSchD else SumVidOp.cSchetD end');
+  iQBuilder.AddToGroupBy('Persons.BornDate,SumVidOp.cLsch');
+
+  hQueryStr:=iQBuilder.Make(hQueryStr);
+
+  //Удержания
+  sqlAddStr(hQueryStr,'UNION');
+
+  iQBuilder.AddToSelect('Uder.MesN,Uder.YearN,KatPodr.Kod,Uder.strTabn,Persons.FIO,Post.Name');
+  iQBuilder.AddToSelect('Uder.VidUdS,Uder.VidUd,''Удержание'',KlVidUd.NVidUd');
+  iQBuilder.AddToSelect('Sum(Uder.SumUd),Sum(Uder.ChasF),Sum(Uder.KolDn)');
+  iQBuilder.AddToSelect('MnPlan.Number,Uder.Kateg,KLSovm.Sovm,KLSovm.NSovm');
+  iQBuilder.AddToSelect('case when LENGTH(Uder.cSubSchD)>0 then Uder.cSchetD||''/''||Uder.cSubSchD else Uder.cSchetD end');
+  iQBuilder.AddToSelect('Persons.BornDate,Uder.cLsch,'+string(coUder));
+  iQBuilder.AddToFrom('Uder');
+  iQBuilder.AddToFrom('left join KatPodr on (Uder.Cex = KatPodr.NRec)');
+  iQBuilder.AddToFrom('left join Persons on (Uder.tPerson = Persons.NRec)');
+  iQBuilder.AddToFrom('left join KLSovm on (cast(INT64(Persons.cSovm) as word) = KLSovm.Sovm)');
+  iQBuilder.AddToFrom('left join Catalogs Post on (Uder.cAppoint = Post.NRec)');
+  iQBuilder.AddToFrom('left join KlVidUd on (Uder.VidUdS = KlVidUd.VidUd)');
+  iQBuilder.AddToFrom('left join MnPlan on (case '+string(cgKau_Zakaz));
+  iQBuilder.AddToFrom('                       when Uder.TblD[1] then Uder.cKauD[1]');
+  iQBuilder.AddToFrom('                       when Uder.TblD[2] then Uder.cKauD[2]');
+  iQBuilder.AddToFrom('                       when Uder.TblD[3] then Uder.cKauD[3]');
+  iQBuilder.AddToFrom('                       when Uder.TblD[4] then Uder.cKauD[4]');
+  iQBuilder.AddToFrom('                       when Uder.TblD[5] then Uder.cKauD[5]');
+  iQBuilder.AddToFrom('                       when Uder.TblD[6] then Uder.cKauD[6]');
+  iQBuilder.AddToFrom('                       else #comp(0)');
+  iQBuilder.AddToFrom('                     end = MnPlan.NRec)');
+
+  if (IsFilterSet) {
+    //Период
+    if (FilterDat1<>ZeroDate)
+      iQBuilder.AddToWhere('(Uder.YearN>'+string(Year(FilterDat1))+
+                           ' or (Uder.YearN='+string(Year(FilterDat1))+' and Uder.MesN>='+string(Month(FilterDat1))+'))');
+
+    if (FilterDat2<>ZeroDate)
+      iQBuilder.AddToWhere('(Uder.YearN<'+string(Year(FilterDat2))+
+                           ' or (Uder.YearN='+string(Year(FilterDat2))+' and Uder.MesN<='+string(Month(FilterDat2))+'))');
+
+    if (CF.GetPsnCount > 0)
+      iQBuilder.AddToWhereMarker('Uder.tPerson',CF.GetPersonsMarker);
+  }
+
+  iQBuilder.AddToGroupBy('Uder.MesN,Uder.YearN,KatPodr.Kod,Uder.strTabn,Persons.FIO,Post.Name');
+  iQBuilder.AddToGroupBy('Uder.VidUdS,Uder.VidUd,KlVidUd.NVidUd,MnPlan.Number,Uder.Kateg,KLSovm.Sovm,KLSovm.NSovm');
+  iQBuilder.AddToGroupBy('case when LENGTH(Uder.cSubSchD)>0 then Uder.cSchetD||''/''||Uder.cSubSchD else Uder.cSchetD end');
+  iQBuilder.AddToGroupBy('Persons.BornDate,Uder.cLsch');
+
+  hQueryStr:=iQBuilder.Make(hQueryStr);
+
+  //Архив удержаний
+  sqlAddStr(hQueryStr,'UNION');
+
+  iQBuilder.AddToSelect('SumVidUd.MesN,SumVidUd.YearN,KatPodr.Kod,SumVidUd.strTabn,Persons.FIO,Post.Name');
+  iQBuilder.AddToSelect('SumVidUd.VidUd,SumVidUd.VidUdP,''Удержание'',KlVidUd.NVidUd');
+  iQBuilder.AddToSelect('Sum(SumVidUd.SumUd),0,0');
+  iQBuilder.AddToSelect('MnPlan.Number,SumVidUd.Kateg,KLSovm.Sovm,KLSovm.NSovm');
+  iQBuilder.AddToSelect('case when LENGTH(SumVidUd.cSubSchD)>0 then SumVidUd.cSchetD||''/''||SumVidUd.cSubSchD else SumVidUd.cSchetD end');
+  iQBuilder.AddToSelect('Persons.BornDate,SumVidUd.cLsch,'+string(coSumVidUd));
+  iQBuilder.AddToFrom('SumVidUd');
+  iQBuilder.AddToFrom('left join KatPodr on (SumVidUd.Cex = KatPodr.NRec)');
+  iQBuilder.AddToFrom('left join Persons on (SumVidUd.tPerson = Persons.NRec)');
+  iQBuilder.AddToFrom('left join KLSovm on (cast(INT64(Persons.cSovm) as word) = KLSovm.Sovm)');
+  iQBuilder.AddToFrom('left join Catalogs Post on (SumVidUd.cAppoint = Post.NRec)');
+  iQBuilder.AddToFrom('left join KlVidUd on (SumVidUd.VidUd = KlVidUd.VidUd)');
+  iQBuilder.AddToFrom('left join MnPlan on (case '+string(cgKau_Zakaz));
+  iQBuilder.AddToFrom('                       when SumVidUd.TblD[1] then SumVidUd.cKauD[1]');
+  iQBuilder.AddToFrom('                       when SumVidUd.TblD[2] then SumVidUd.cKauD[2]');
+  iQBuilder.AddToFrom('                       when SumVidUd.TblD[3] then SumVidUd.cKauD[3]');
+  iQBuilder.AddToFrom('                       when SumVidUd.TblD[4] then SumVidUd.cKauD[4]');
+  iQBuilder.AddToFrom('                       when SumVidUd.TblD[5] then SumVidUd.cKauD[5]');
+  iQBuilder.AddToFrom('                       when SumVidUd.TblD[6] then SumVidUd.cKauD[6]');
+  iQBuilder.AddToFrom('                       else #comp(0)');
+  iQBuilder.AddToFrom('                     end = MnPlan.NRec)');
+
+  if (IsFilterSet) {
+    //Период
+    if (FilterDat1<>ZeroDate)
+      iQBuilder.AddToWhere('(SumVidUd.YearN>'+string(Year(FilterDat1))+
+                           ' or (SumVidUd.YearN='+string(Year(FilterDat1))+' and SumVidUd.MesN>='+string(Month(FilterDat1))+'))');
+
+    if (FilterDat2<>ZeroDate)
+      iQBuilder.AddToWhere('(SumVidUd.YearN<'+string(Year(FilterDat2))+
+                           ' or (SumVidUd.YearN='+string(Year(FilterDat2))+' and SumVidUd.MesN<='+string(Month(FilterDat2))+'))');
+
+    if (CF.GetPsnCount > 0)
+      iQBuilder.AddToWhereMarker('SumVidUd.tPerson',CF.GetPersonsMarker);
+  }
+
+  iQBuilder.AddToGroupBy('SumVidUd.MesN,SumVidUd.YearN,KatPodr.Kod,SumVidUd.strTabn,Persons.FIO,Post.Name');
+  iQBuilder.AddToGroupBy('SumVidUd.VidUd,SumVidUd.VidUdP,KlVidUd.NVidUd,MnPlan.Number,SumVidUd.Kateg,KLSovm.Sovm,KLSovm.NSovm');
+  iQBuilder.AddToGroupBy('case when LENGTH(SumVidUd.cSubSchD)>0 then SumVidUd.cSchetD||''/''||SumVidUd.cSubSchD else SumVidUd.cSchetD end');
+  iQBuilder.AddToGroupBy('Persons.BornDate,SumVidUd.cLsch');
+
+  hQueryStr:=iQBuilder.Make(hQueryStr);
+
+  if (sqlSelectInto(hQueryStr,tnSRep)<>tsok)
+    message('Ошибка выполнения DSQL запроса при отборе данных.',error)
+  else {
+    if (getfirst SRep
+        where((
+          CurRec.Year==SRep.Year and CurRec.Month==SRep.Month and
+          CurRec.PodrKod==SRep.PodrKod and CurRec.TabN==SRep.TabN and CurRec.Vid==SRep.Vid
+        ))=tsok) {};
+  }
+  sqlFreeStr(hQueryStr);
+
+  //GetSurnameWithInitials
+
+  StopVisual;
+}
+
+procedure DropFilter;
+{
+  if (IsFilterSet) {
+    IsFilterSet:=false;
+
+    FillSRep;
+    ReReadRecord(tnSRep);
+  }
+}
+
+procedure SetFilter;
+{
+  IsFilterSet:=true;
+
+  FillSRep;
+
+  if (RecordsInTable(tnSRep)>0)
+    ReReadRecord(tnSRep);
+  else {
+    message('Не найдены записи удовлетворяющие фильтру.',Warning);
+    DropFilter;
+  }
+}
+
+HandleEvent
+cmInit:{
+  ReadMyDsk(FilterDat1,#__InterfaceName__+'FilterDat1',false);
+  if (FilterDat1=ZeroDate) {
+    FilterDat1:=dGetTune('UP.DATOTCH');
+    FilterDat1:=date(1,Month(FilterDat1),Year(FilterDat1));
+  }
+  ReadMyDsk(FilterDat2,#__InterfaceName__+'FilterDat2',false);
+  if (FilterDat2=ZeroDate) {
+    FilterDat2:=dGetTune('UP.DATOTCH');
+    FilterDat2:=date(Last_Day(FilterDat2),Month(FilterDat2),Year(FilterDat2));
+  }
+
+  if (RunWindowModal(WinFilter)=cmDefault)
+    SetFilter
+  else
+    FillSRep;
+}
+cmDone:{
+  SaveMyDsk(FilterDat1,#__InterfaceName__+'FilterDat1');
+  SaveMyDsk(FilterDat2,#__InterfaceName__+'FilterDat2');
+}
+cmDefault:{
+  PutCommand(cmEdit);
+}
+cmEdit:{
+  if (not IsValidAll(tnSRep)) exit;
+
+  if (SRep.wTblSrc=coNachisl or SRep.wTblSrc=coUder)
+    RunInterface('zRezult', SRep.cLsch, 0, 0)
+  else if (SRep.wTblSrc=coSumVidOp)
+    RunInterface('GP_ZSumVidOp', SRep.cLsch, 0, 0, -1, 3, 0, SRep.Year, SRep.Month, SRep.VidSys)
+  else if (SRep.wTblSrc=coSumVidUd)
+    RunInterface('GP_ZSumVidUd', SRep.cLsch, 0, 0, -1, SRep.Year, SRep.Month, SRep.VidSys);
+}
+cmHotKeys:{
+  if (IsFilterSet)
+    EnableCommand(cmIEHist)
+  else
+    DisableCommand(cmIEHist);
+
+  PutContextMenuCommand('GP_ConsolidatedReportOfTheSalary_HotKeys');
+}
+cmFilterSave:{//Установка фильтра
+  if (RunWindowModal(WinFilter)=cmDefault)
+    SetFilter;
+}
+cmIEHist:{//Снятие фильтра
+  DropFilter;
+}
+end;
+
+// Запуск отчета на выполнение при выборе его из списка отчетов
+procedure Run;
+{
+  RunWindow(wnMainWindow);
+}
+
+// Наименование отчета в списке
+function GetReportName: String;
+{
+  result := 'Сводные данные по зарплате';
+}
+
+function GetGroupName (Level : Word) : String;
+{
+  result := '';
+  case Level of
+    1 : result := 'Интерфейсы пользователя';
+  end;
+}
+
+// Приоритет отчета - сортировка внутри группы выполняется сначала
+// по приоритету, а затем по наименованию
+function GetPriority : Integer;
+{
+  result := 0;
+}
+
+// ModuleID модулей, в которых будет виден отчет
+// '*' - отчет будет виден в любом модуле
+function VisibleInModule(Ind : Byte) : String;
+{
+  result := '';
+  case Ind of
+    1 : result := 'MENUZARP';
+  end;
+}
+
+end.
+
+GP_ConsolidatedReportOfTheSalary_HotKeys menu
+{
+ - '~У~становка фильтра ...', cmFilterSave, 'Установить фильтр на данные', hcNoContext, 'Alt+B', kbAltB, sci1Esc,,,, bmpFilterSO;
+ - '~С~нятие фильтра',cmIEHist,'Снять фильтр на данные',hcNoContext,'Alt+H',kbAltH,sci1Esc;
+}

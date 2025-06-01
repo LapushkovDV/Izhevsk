@@ -1,0 +1,153 @@
+/*************************************************************************************************\
+* Наименование: ZarAPI алгоритм "Стоимость молока на дату"                                        *
+* Контур/Модуль: Заработная плата                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |SR00036086    |11/05/21|kurennykh                |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#component "Z_Zar"
+#include ZarAlg.vih
+#include Query.vih
+
+VipInterface ZarAlgorithm_Milk_Price  implements IZarAlgorithm licensed(free);
+
+Interface ZarAlgorithm_Milk_Price;
+
+Const
+  sTuneCode1 = 'UP.DATOTCH';
+  sTuneCode2 = 'NPOEM_OWN.ZP.MILK';
+End;
+
+Table Struct tmpCursMilk
+(
+  doSumRubl : double
+, dDateVal  : date
+)
+with index
+(
+  i01 = dDateVal
+);
+
+create view
+var
+  _log : string = '';
+as
+select
+  TuneVal.nRec
+from
+  TuneDef
+, TuneVal
+, tmpCursMilk
+where
+((
+                   sTuneCode1 == TuneDef.Code
+and             TuneDef.nRec == TuneVal.cTune
+and UserOfficeFilial(UserID) == TuneVal.Obj
+))
+;
+
+Procedure MyLog(_str : string);
+{
+  if (_log = '') then
+  {
+    _log := GetStringParameter('Files', 'OutputFilesDirectory', 0) + 'ZarAlgorithm_Milk_Price' + DateToStr(cur_date, 'DDMMYYYY') + '_' + timetostr(Cur_time, 'HHMMSS') + '.log';
+  }
+  LogStrToFile(_log, _str);
+}
+
+Procedure MysqlAddStr(var query_handle : longInt; add_query_str : string);
+{
+  sqlAddStr(query_handle, add_query_str);
+  MyLog('sql: ' + add_query_str);
+}
+
+Public Function CalcSum(Parameter : string) : double;
+{
+  result := 0;
+  if (getFirst TuneDef = tsOk) then
+  {
+    if (getFirst TuneVal = tsOk) then
+    {
+      MyLog('Значение "' + GetTuneName(sTuneCode1) + '" = ' + TuneVal.StrVal);
+
+      var qStr : longint = 0;
+      var oResultSet : IResultSet;
+
+      sqlFreeStr(qStr);
+
+      MysqlAddStr(qStr, ' select                                                                                                   ');
+      MysqlAddStr(qStr, '   valzar.sumrubl as doSumRubl                                                                            ');
+      MysqlAddStr(qStr, ' , valzar.datval  as dDateVal                                                                             ');
+      MysqlAddStr(qStr, ' from valzar inner join (                                                                                 ');
+      MysqlAddStr(qStr, '                           select                                                                         ');
+      MysqlAddStr(qStr, '                             max(valzar.datval) as dval                                                   ');
+      MysqlAddStr(qStr, '                           , fpperiod.name as sfpperiod                                                   ');
+      MysqlAddStr(qStr, '                           , valzar.kodvalut as cval                                                      ');
+      MysqlAddStr(qStr, '                           from valzar                                                                    ');
+      MysqlAddStr(qStr, '                           inner join fpperiod on valzar.datval between fpperiod.dbeg and fpperiod.dend   ');
+      MysqlAddStr(qStr, '                                               and fpperiod.ctper = #comp(4h)                             ');
+      MysqlAddStr(qStr, '                           where     valzar.kodvalut = #comp(' + coGetTune(sTuneCode2) + ')               ');
+      MysqlAddStr(qStr, '                           group by fpperiod.name, valzar.kodvalut                                        ');
+      MysqlAddStr(qStr, ' ) t on valzar.datval = t.dval and valzar.kodvalut = t.cval                                               ');
+
+      var objQuery : iQuery;
+          objQuery := queryManager.createQuery(qStr);
+
+      if (objQuery.execute.errorCode != tsOk) then
+      {
+        MyLog('Ошибка выполнения запроса');
+        sqlFreeStr(qStr);
+        Exit;
+      }
+      else
+      {
+        sqlCopyInto(objQuery, tntmpCursMilk, true);
+        MyLog('Таблица скопирована во времянку');
+        _Loop tmpCursMilk
+        {
+          MyLog(tmpCursMilk.doSumRubl + '    ' + tmpCursMilk.dDateVal);
+        }
+      }
+      sqlFreeStr(qStr);
+      if ((getFirst tmpCursMilk where Month(TuneVal.DateVal) = Month(tmpCursMilk.dDateVal) and Year(TuneVal.DateVal) = Year(tmpCursMilk.dDateVal))  = tsOk ) then
+      {
+        MyLog('Нашли по дате ' + tmpCursMilk.doSumRubl);
+        result := tmpCursMilk.doSumRubl;
+        Exit;
+      }
+      else
+      {
+        /*
+        //Петя попросил при отсутствии цен на текущий месяц ЗП возвращать ноль
+        if (getLast tmpCursMilk ordered by index i01 = tsOk) then
+        {
+          MyLog('Взяли последний ' + tmpCursMilk.doSumRubl);
+          result := tmpCursMilk.doSumRubl;
+          Exit;
+        }
+        */
+        MyLog('Не найдена цена молока в текущем месяце');
+
+        Exit;
+      }
+    }
+    else
+    {
+      MyLog('Не найдено значение настройки ' + sTuneCode1 + ' ' + GetTuneName(sTuneCode1));
+      Exit;
+    }
+  }
+  else
+  {
+    MyLog('Не найдена настройка ' + sTuneCode1);
+    Exit;
+  }
+}
+
+function GetDescription: string;
+{
+  result := 'Получение последней стоимости молока в текущем месяце';
+}
+
+end.

@@ -1,0 +1,803 @@
+/*************************************************************************************************\
+* Наименование: Передача нарядов в Планирование Производства - Потребности в материальных ресурсах*
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:                                                                                     *
+* Выбор счета по номеру заказа и так далее                                                        *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#3895         |30/01/19|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#define OBJINT_ALGORITM
+#include objintpl.vin
+//*********************************************
+#include GP_Log.Vih
+
+#include GP_Naryad2PotrTrud.Vih
+
+#doc
+Передача нарядов в Производство - Потребности в материальных ресурсах
+из "Заработная плата -> Операции -> НПО Энергомаш -> Просмотр нарядов <Энергомаш>"
+#3895
+#end
+
+//*********************************************
+Interface GP_Naryad2PotrTrud;
+//*********************************************
+var
+  gldt:GlobData;
+  oGP_Log : GP_Log;
+//----- Настройки
+  pWAYACCOU : comp     ; //NPOEM_OWN.ZP.NARYAD.EXPORT.Shablon
+  pHozOper  : comp     ; //NPOEM_OWN.ZP.NARYAD.EXPORT.HozOper 1204
+  sDesCR    : string   ; //NPOEM_OWN.ZP.NARYAD.EXPORT.DESCR
+  boCex     : boolean  ; //NPOEM_OWN.ZP.NARYAD.EXPORT.Cex
+  pStatus_Create : comp; //NPOEM_OWN.ZP.NARYAD.EXPORT.Status_Create
+  pStatus_Change : comp; //NPOEM_OWN.ZP.NARYAD.EXPORT.Status_Change
+
+//---- прочее
+  boLog      : boolean; // признак включения лога
+  boUpdate   : boolean; // признак обновления потребности
+
+  sLastError : string; // последняя ошибка - GetLastError;
+  Marker_Podr: TPtr  ; // Для отбора нарядов при проверке потребности
+  boGP_PrNaryad_Ext :boolean; // наличие расширения наряда
+//*****************************************
+Table Struct local tmp_sys_nar
+( Nrec:comp
+ ,NMnem :string
+)
+with index
+( tmp_sys_nar01= NMnem
+);
+//*****************************************
+Create view
+var
+//---- параметры импорта
+  pPRNaryad : comp;//Импортируемый наряд
+  DImport   : date;//Дата импорта
+  pKatPodr  : comp;//Подразделение
+  pSYS_NAR  : comp;// ссылка на шапку наряда
+  pPodrUp   : comp;//
+as select
+  WAYACCOU.Nrec
+From
+  WAYACCOU
+ ,WAYACCOU WAYACCOU_Other
+ ,SpWayAc SnSpWayAc
+ ,SpWayAc SpWayAc_Other
+ ,Sloj
+ // Для обработки одного наряда
+ ,PRNaryad
+ ,SYS_NAR
+ //-- Для обработки всего наряда
+ ,SYS_NAR SYS_NAR_Scan
+ ,PRNaryad PRNaryad_Scan
+ ,tmp_sys_nar
+ ,KatPodr KatPodr_S
+where ((
+      pWAYACCOU == WAYACCOU.Nrec
+ and  WayAccou.nRec          == SnSpWayAc.cWayAcMain
+ and  nfAnaly /*16*/         == SnSpWayAc.Code
+ and  SnSpWayAc.cValRes[1]   == Sloj.nRec
+ //and  SnSpWayAc.cValRes[2]   == snKatRole01.nRec
+ //------------------------
+ and  WAYACCOU.Nrec   == WayAccou_Other.cWayAccou
+ and  nfOther         == WayAccou_Other.TypeAlgor
+ //------------------------
+ and  WayAccou_Other.nRec == SpWayAc_Other.cWayAccou
+ and  1                   == SpWayAc_Other.TypeRec
+
+ //-----------
+ and 36        == MnPlan.TypePlan
+ and DImport   == MnPlan.STARTDATE
+ and pKatPodr  == MnPlan.cKatPodr(noindex)
+ and MnPlan.cSloj  ==  MNANAL.cSloj
+ and 0             ==  MNANAL.cBlock
+ and MnPlan.Nrec   ==  MNANAL.FLDAN1
+
+ //----------------------------
+ and pKatPodr == KatPodr.Nrec
+ //----------------------------
+ and 1204        == SoprHoz.TIPDOC
+ and MnPlan.Nrec == SoprHoz.CSOPRDOC
+ //-----------
+ and pPRNaryad    == PRNaryad.Nrec
+ and PRNaryad.tPerson == Appointments.Person
+ and PRNARYAD.DATOK   >>=Appointments.AppointDate
+ and PRNaryad.cLsch   == Appointments.cAddNrec2(noindex)
+ and PRNARYAD.cPodr   == Appointments.Post     (noindex)
+ and PRNaryad.MNREC   == SYS_NAR.Nrec
+ //-------------------------------------------------
+ and PrNaryad.Nrec    == GP_PrNaryad_Ext.cPrNaryad
+ //------------------------------------
+ and MnPlan.Nrec      == SPMNPLAN.cMnPlan
+ and PrNaryad.Nrec    == SPMNPLAN.cVal1(noindex) // записываем ссылку
+ and SPMNPLAN.Nrec    == SpMnPl.cSPMNPLAN
+ and SPMNPL.Nrec      == VALSPMNP.CSPMNPL
+ //-------------------------------------------------
+ and pSYS_NAR     == SYS_NAR_Scan.Nrec
+ and SYS_NAR_Scan.Nrec == PRNaryad_Scan.MNREC
+ //---------------
+ and pPodrUp          == KatPodr_S.cPodr
+))
+Bounds byMnPlan    MnPlan.Nrec     == SPMNPLAN.cMnPlan
+bounds byMnPlanNar SPMNPLAN.cVal1  == PrNaryad.Nrec
+ ;
+
+//**************************************
+create view vKatPodr
+var pKatPodr:comp;
+as select KAtPodr.Nrec
+From KatPodr
+where ((
+  pKatPodr == KatPodr.Nrec
+)) ; //create view vKatPodr
+
+
+//======================================
+//
+//======================================
+Constructor Init;
+{ Result:=True;
+  timelog_init;
+  //------------------------
+  set pWAYACCOU := coGetTune('NPOEM_OWN.ZP.NARYAD.EXPORT.Shablon');
+  set pHozOper  := coGetTune('NPOEM_OWN.ZP.NARYAD.EXPORT.HozOper');
+  set sDescr    := sGetTune ('NPOEM_OWN.ZP.NARYAD.EXPORT.DESCR'  );
+  set boCex     := boGetTune('NPOEM_OWN.ZP.NARYAD.EXPORT.Cex'    );//'Формировать потребность на уровне цеха(по 3 знакам кода)'
+  //------------------------
+  set pStatus_Create := coGetTune('NPOEM_OWN.ZP.NARYAD.EXPORT.Status_Create');
+  set pStatus_Change := coGetTune('NPOEM_OWN.ZP.NARYAD.EXPORT.Status_Change');
+  //------------------------
+  boLog:=false;
+  pPodrUp:=-99999;
+  //------------------------
+  if (gldt=NullRef)
+    GetVipRef(gldt,'GlobDataSource');
+  //------------------------
+  if getfirst WAYACCOU<>tsok
+  { //Message('Ошибка поиска шаблона заданного в настройке'
+    // +chr(13)+'NPOEM_OWN.ZP.NARYAD.EXPORT.Shablon'    );
+    pWAYACCOU:=0;
+  }
+  if getfirst SnSpWayAc<>tsok {}
+  if getfirst WayAccou_Other<>tsok {}
+} //Constructor Init;
+
+
+//================================
+// Получить последний номер
+Function GetLastNumMnPlan(MnPlanTypePlan: word; MnPlancWayAccou: comp): string; //M_MnPlan\VIP\Plan\CommonFunAlg.vip
+{
+  GetLastNumMnPlan := '';
+  var OldWayAccou : comp;
+  OldWayAccou := gldt.GetSetupMnf.GiveCurWayAccouNRec();
+  gldt.GetSetupMnf.ResetAllWayValue();
+  gldt.GetSetupMnf.InitAll(MnPlancWayAccou);
+
+  Var TypeForKatDoc : word = 0;
+  case MnPlanTypePlan of
+   toNeedMt        : TypeForKatDoc := cgDoc_1201; // Потребность в материалах
+   toMnfZakaz      : TypeForKatDoc := cgDoc_1202; // Производственный заказ
+   toPlan          : TypeForKatDoc := cgDoc_1203; // Производственный план
+   toNeedTr        : TypeForKatDoc := cgDoc_1204; // Потребность в трудовых ресурсах
+   toNeedEq        : TypeForKatDoc := cgDoc_1205; // Потребность в оборудовании
+   toPlanSb        : TypeForKatDoc := cgDoc_1206; // План сбыта
+   toPlanSnab      : TypeForKatDoc := cgDoc_1207; // План снабжения
+   toCorpoNeed     : TypeForKatDoc := cgDoc_1208; // Корпоративная потребность
+   toCorpoDelivery : TypeForKatDoc := cgDoc_1209; // Корпоративный план поставок
+   toCorpoManuf    : TypeForKatDoc := cgDoc_1210; // Корпоративный план производства
+   toCorpoBalance  : TypeForKatDoc := cgDoc_1211; // Плановые остатки
+   toPlanOper      : TypeForKatDoc := cgDoc_1212; // Пооперационный план
+   toClaimPrimDecl       : TypeForKatDoc := cgDoc_1214; // Годовая Первичная Заявка Заявителя
+   toClaimPrimCurator    : TypeForKatDoc := cgDoc_1215; // Годовая Первичная Заявка Куратора
+   toClaimPrimFinancier  : TypeForKatDoc := cgDoc_1216; // Годовая Первичная Заявка Финансистов
+   toBudgetYearPurch     : TypeForKatDoc := cgDoc_1217; // Годовой Бюджет Закупок
+   toJournalConsolidated : TypeForKatDoc := cgDoc_1218; // Консолидированный Журнал
+   toClaimConsolidated   : TypeForKatDoc := cgDoc_1219; // Консолидированная Заявка
+   toStandards           : TypeForKatDoc := cgDoc_1220; // Нормативы
+   toTEO                 : TypeForKatDoc := cgDoc_1221; // ТЭО
+   toKit                 : TypeForKatDoc := cgDoc_1222; // Набор
+   toClaimOPZ            : TypeForKatDoc := cgDoc_1223; // Оперативная Первичная Заявка
+  end; // case
+  // Формировать номер по таблице нумерации документов
+  if ( gldt.GetSetupMnf.GetKatRoleNRecObj(21) = 0 )
+  { GetLastNumMnPlan := GetLastNumD(TypeForKatDoc);
+  }
+  else // Формировать номер по шаблону из шаблона документа
+  { if ( GetFirst SpWayAc_Other=tsok )
+    {  SpWayAc_Other.sValRes60[1] := NextNumStr(SpWayAc_Other.sValRes60[1]);
+       update current SpWayAc_Other;
+       GetLastNumMnPlan := SpWayAc_Other.sValRes60[1];
+    }
+  }
+  gldt.GetSetupMnf.ResetAllWayValue();
+  gldt.GetSetupMnf.InitAll(OldWayAccou);
+} //Function GetLastNumMnPlan(MnPlanTypePlan: word; MnPlancWayAccou: comp): string; //M_MnPlan\VIP\Plan\CommonFunAlg.vip
+
+#doc
+  Включить протокол работы, предполагаем что лог
+#end
+Procedure InitLog(_log:string);
+{ if _log=''
+  { if boLog oGp_Log.Done(true);
+  }
+  else
+  { boLog:=true;
+    oGP_Log.Init(_log, true, true, true);
+  }
+} //Procedure InitLog(_log:string);
+
+Procedure WriteLog(_mes:string);
+{ oGP_Log.Write(_mes);
+} //Procedure WriteLog(_mes:string);
+
+//======================================
+// Поиск записи в потребности в материальных ресурсах
+//======================================
+Function FindMnPlan(_pKatPodr:comp; _Date:date; _boCreate:boolean) :comp;
+{ Result:=0;
+  pKatPodr:=_PKatPodr;
+  DImport :=Date(1,month(_Date),Year(_Date));
+
+  _Loop MnPlan
+  { Result:=MnPlan.Nrec;
+    if getfirst MNAnal=tsok {}
+    break;
+  }
+  if Result<>0 then Exit;
+  if not _boCreate Exit;
+  //----------------------------------
+  var _pNumSort:comp=1;
+  if (Getlast MnPlan where (( 36 == MnPlan.TYPEPLAN ))
+             ordered by MnPlan.NumSort = tsOK )
+  { _pNumSort:=MnPlan.NumSort+1;
+  }
+  ClearBuffer(#MnPlan);
+  MnPlan.CROLEAN1   :=SnSpWayAc.cValRes[2];//	Comp	4000C4657C3679DDh	по умолчанию
+  MnPlan.WKODGR1	  :=2;// Word	2	по умолчанию
+  MnPlan.CANVAL1    :=pKatPodr;//	Comp	0000000000000E4Ah	= CKATPODR
+  MnPlan.DESCR	    :=sDESCR;//String	aleksey.kurennykh	GAL_ESB, видимо
+  MnPlan.NAME       :='Трудозатраты '+KatPodr.Kod +' за '+DateToStr(DImport,'YYYY.MM');
+  MnPlan.CWAYACCOU  :=pWAYACCOU; //000B0000000001C3h	по умолчанию, ссылка на шаблон
+  MnPlan.STARTDATE  :=DImport  ; //01.01.2020	Первый день месяца
+  MnPlan.ENDDATE	  :=Cur_Date ; //Date	02.01.2020	Дата последнего обновления документа
+  MnPlan.CSLOJ	    :=SnSpWayAc.cValRes[1];//	000B00000000000Ah	по умолчанию, слой аналитик
+  MnPlan.TYPEPLAN	  :=36;//	по умолчанию
+  MnPlan.STATEMDATE	:=Date(Last_Day(MnPlan.STARTDATE),month(MnPlan.STARTDATE),Year(MnPlan.STARTDATE));//31.01.2020	дата создания документа (последний день месяца)
+  MnPlan.UTVDATE	  :=MnPlan.STATEMDATE;// Date	ДД.ММ.ГГГГ	дата, когда формирование документа завершено (вероятно, последний день месяца, но не обязательно)
+  MnPlan.WKODGRPODR	:=2;//	= WKODGR1
+  MnPlan.CKATPODR	  :=pKatPodr;//Comp	0000000000000E4Ah	= CANVAL1
+  MnPlan.NUMBER	    :=GetLastNumMnPlan(MnPlan.TypePlan,MnPlan.cWayAccou);//	85995/221	по шаблону или по стандартному алгоритму
+  MnPlan.CSTATUS	  :=pStatus_Create;//Comp	000100000000011Ch	статус, процесс их изменения по мере формирования документа оставляю на твое усмотрение
+  MnPlan.NUMSORT	  :=_pNumSort;//000000000000000Eh;//	по умолчанию
+  if Insert Current MnPlan=tsok
+  { Result:=MnPlan.Nrec
+  }
+  else
+  { sLastError:='Ошибка создания потребности на трудовые ресурсы'
+
+  }
+
+  //-------- SOPRHOZ
+  clearbuffer(#SOPRHOZ);
+  SoprHoz.DATOB    :=MnPlan.STATEMDATE;//	Date	31.01.2020	последнее число месяца
+  SoprHoz.CSOPRDOC :=MNPLAN.nrec;
+  SoprHoz.TIPDOC   :=1204;
+  SoprHoz.TIDKGAL	 :=1204;
+  SoprHoz.NODOC    :=MnPlan.NUMBER;//	85995/221	= MNPLAN.number
+  SoprHoz.DESCR    :=sDesCR       ;//	вероятно, GAL_ESB
+  SoprHoz.CHOZOPER :=pHozoper     ;//привязка ТХО тоже должна произойти автоматически, nrec и наименование ТХО будут пердоставлены позже
+  SOPRHOZ.NAMESHO  :=MnPlan.Name  ;
+  Insert Current SoprHoz;
+
+  //----------- MNANAL
+  ClearBuffer(#MNANAL);
+  //Имя поля	Тип	Новое значение	Комментарий
+  MNANAL.CSLOJ :=MnPlan.cSloj;//	Comp	000B00000000000Ah	по умолчанию
+  MNANAL.FLDAN1:=MnPlan.Nrec;//	Comp	000B000000005E73h	ссылка на шапку, MNPLAN
+  Insert current MNANAL;
+} //Function FindMnPlan(_pKatPodr:comp; _Date:date) :word;
+
+
+//=========================================
+// обновить MnPlan
+Procedure UpdateMnPlan;
+{ if MnPlan.ENDDATE	<>Cur_Date
+  or (MnPlan.CSTATUS<>pStatus_Change and pStatus_Change>0)
+  { if MnPlan.CSTATUS<>pStatus_Create
+      if pStatus_Change>0
+        MnPlan.CSTATUS:=pStatus_Change;
+    MnPlan.ENDDATE:=Cur_Date;
+    if update current MnPlan=tsok {};
+  }
+} //Function UpdateMnPlan;
+
+//----------------
+// Найти партию по кодц
+Function FindPartyByKod(_sKod:string) :comp; Cacheable;
+{ Result:=0;
+  _sKod:=trim(_sKod);
+  if _sKod='' then exit; //Есть ВА  "Номер партии" - может по нему нужно искать?
+  var _pNrec:comp=0;
+  _Try
+  { SQL
+    select Max(KatParty.Nrec)
+    From KAtParty
+    where KAtParty.Kod = :(_sKod)
+    into (_pNrec) ;
+    Result:=_pNrec;
+  }
+  _Except
+  else
+  {
+
+  }
+  if boLog
+  { WriteLog(' по коду партии '+_sKod+' нашли партию '+string(Result,0,0));
+  }
+
+} //Function FindPartyByKod(_sKod:string) :comp; Cacheable;
+
+//=============================================
+// Заполнить буфер SPMNPLAN
+//=============================================
+Procedure MakeBufferSPMNPLAN;
+{
+  var _wRazr:word=0;
+  if boGP_PrNaryad_Ext
+  { _wRazr:=GP_PrNaryad_Ext.PersRazr;
+  }
+  else
+  { if getLast Appointments=tsok
+      _wRazr:=Appointments.Category;
+  }
+  var _NUMBER:string = PrNaryad.StrTabn ;
+  //Имя поля	Тип	Новое значение	Комментарий
+  SPMNPLAN.CROLEAN1	:=SnSpWayAc.cValRes[7] ;//Comp	000A000000000013h	по умолчанию
+  SPMNPLAN.WKODGR1	:=7;//	по умолчанию
+  SPMNPLAN.CANVAL1	:=PrNaryad.cKauD[1]; //Comp	000A00000000001Ah	тематический заказ
+  SPMNPLAN.CROLEAN2	:=SnSpWayAc.cValRes[8]; //Comp	40004DE048FCD925h	по умолчанию
+  SPMNPLAN.WKODGR2	:=10;//	по умолчанию
+  // текстовое поле!!!!! ??????
+  if boGP_PrNaryad_Ext
+  { SPMNPLAN.CANVAL2	:=FindPartyByKod(GP_PrNaryad_Ext.ZNP) ;//Comp	000B0000000604C5h	ЗНП
+  }
+  SPMNPLAN.CMNPLAN	:=MnPlan.Nrec; //Comp	000B000000005E73h	ссылка на шапку, mnplan
+  //-------------------
+  SPMNPLAN.NUMBER	  :=_NUMBER;//String	00001	стандартная нумерация
+  SPMNPLAN.TYPEIZD	:=46;//	по умолчанию
+  SPMNPLAN.CIZD	    :=PRNARYAD.CPODR; //	00000000016A2BEEh	ссылка на профессию
+  SPMNPLAN.STARTDATE:=MnPlan.STARTDATE;//	Date	01.01.2020	формируется автоматически, пусть будет первым числом месяца, в представлении ее все равно нет
+  SPMNPLAN.ENDDATE 	:=PRNARYAD.DATOK;//Date	02.01.2020	фактическая дата выполнения работы
+  SPMNPLAN.EDTIME	  :=1;//	по умолчанию
+  SPMNPLAN.CSLOJ	  :=SnSpWayAc.cValRes[1];// Comp	000B00000000000Ah	по умолчанию
+  SPMNPLAN.SISOPL	  :=prnaryad.SISOPL;//Word	0	система оплаты, автоматически не подгрузилась
+  SPMNPLAN.RAZR	    :=_wRazr;//Word	0	разряд, автоматически не подгрузился
+  SPMNPLAN.CROLEIZD	:=SnSpWayAc.cValRes[10];//40008FCB35AA7D06h;//	по умолчанию  - наименование поля - роль объектов планирования
+
+} //Procedure MakeBufferSPMNPLAN;
+
+//=============================================
+// Заполнить буфер SPMNPL
+//=============================================
+Procedure MakeBufferSpMnPl;
+{
+   //	Имя поля	Тип	Новое значение	Комментарий
+  SPMNPL.CROLEAN1	:=SPMNPLAN.CROLEAN1	;//Comp	000A000000000013h	дублирует SPMNPLAN
+  SPMNPL.WKODGR1	:=SPMNPLAN.WKODGR1	;//Word	7
+  SPMNPL.CANVAL1	:=SPMNPLAN.CANVAL1	;//Comp	000A00000000001Ah
+  SPMNPL.CROLEAN2	:=SPMNPLAN.CROLEAN2	;//Comp	40004DE048FCD925h
+  SPMNPL.WKODGR2	:=SPMNPLAN.WKODGR2	;//Word	10
+  SPMNPL.CANVAL2	:=SPMNPLAN.CANVAL2	;//Comp	000B0000000604C5h
+  SPMNPL.CROLEAN4	:=40006EF07CD95E24h;//	по умолчанию
+  SPMNPL.WKODGR4	:=38;//	по умолчанию
+  SPMNPL.CANVAL4	:=SPMNPLAN.CMNPLAN;//Comp	000B000000005E73h	ссылка на шапку, MNPLAN
+  SPMNPL.CMNPLAN	:=SPMNPLAN.CMNPLAN;//	000B000000005E73h	ссылка на шапку, MNPLAN
+  SPMNPL.NUMBER	  :=SPMNPLAN.Number;//String	00001	стандартная нумерация
+  SPMNPL.STARTDATE:=SPMNPLAN.STARTDATE;//Date	01.01.2020	дублирует SPMNPLAN
+  SPMNPL.ENDDATE	:=SPMNPLAN.ENDDATE;//Date	02.01.2020
+  SPMNPL.TYPEIZD	:=SPMNPLAN.TYPEIZD; // Word	46
+  SPMNPL.CIZD	    :=SPMNPLAN.CIZD;// Comp	00000000016A2BEEh
+  SPMNPL.EDTIME	  :=1;//Word	1
+  SPMNPL.CMNANAL	:=MnAnal.Nrec;// Comp	000B00000004975Eh	ссылка на набор аналитик
+  SPMNPL.CSPMNPLAN:=SPMNPLAN.Nrec;//Comp	000B0000001623D7h	ссылка на SPMNPLAN
+  SPMNPL.SISOPL	  :=SPMNPLAN.SisOpl;//Word	0	дублирует SPMNPLAN
+  SPMNPL.RAZR	    :=SPMNPLAN.Razr;// Word	0
+  SPMNPL.WKOLAN	  :=37;//	по умолчанию
+  SPMNPL.CROLEIZD	:=SPMNPLAN.CROLEIZD;// Comp	40008FCB35AA7D06h	дублирует SPMNPLAN
+  SPMNPL.RECOMDATE:=SPMNPL.ENDDATE ;//	Date	02.01.2020	= ENDDATE
+  SPMNPL.CSLOJ	  :=SPMNPLAN.CSLOJ ;//00B00000000000Ah	по умолчанию
+
+} //Procedure MakeBufferSpMnPl;
+
+//=============================================
+// Заполнить буфер VALSPMNP
+//=============================================
+Procedure MakeBufferVALSPMNP;
+{ //Имя поля	Тип	Новое значение	Комментарий
+  VALSPMNP.NUM    := 1  ;//	Word	1	по умолчанию
+	VALSPMNP.EDTIME := 1  ;//	Word	1	по умолчанию
+	VALSPMNP.KOL    := PrNaryad.ChasF;//ChasFFld	Double	123.0000000000000000	количество нормо-часов
+	VALSPMNP.PRICE  := PrNaryad.Rascen;// 	Double	124.0000000000000000	стоимость нормо-часа
+	VALSPMNP.VPRICE := VALSPMNP.KOL*VALSPMNP.PRICE  ;//	Double	15252	произведение верхних двух
+	VALSPMNP.TYPEFIELD[01] := 1;//	количество
+	VALSPMNP.TYPEFIELD[02] := 2;//	цена в руб
+	VALSPMNP.TYPEFIELD[03] := 3;//	сумма в руб
+	VALSPMNP.TYPEFIELD[04] := 1;//	по умолчанию
+	VALSPMNP.TYPEFIELD[05] := 1;//
+	VALSPMNP.TYPEFIELD[06] := 1;//
+	VALSPMNP.TYPEFIELD[07] := 1;//
+	VALSPMNP.TYPEFIELD[08] := 1;//
+	VALSPMNP.TYPEFIELD[09] := 1;//
+	VALSPMNP.TYPEFIELD[10] := 1;//
+	VALSPMNP.TYPEFIELD[11] := 1;//
+	VALSPMNP.TYPEFIELD[12] := 1;//
+	VALSPMNP.TYPEFIELD[13] := 1;//
+	VALSPMNP.TYPEFIELD[14] := 1;//
+} //Procedure MakeBufferVALSPMNP;
+
+//=============================================
+// Обновление спецификации плана
+//=============================================
+Function UpdateSPMNPLAN(_direct:longint):boolean;
+{ Result:=False;
+  // ------------------
+  // ищем - вдруг есть привязка
+  // ------------------
+  var _boFind:boolean=false;
+  boGP_PrNaryad_Ext:=isValidAll(#GP_PrNaryad_Ext);
+
+
+  _Loop fullcache SPMNPLAN
+  { _boFind:=true;
+    if _Direct=-1 // удаляем
+    { _Loop fullcache SpMnPl
+      { _Loop VALSPMNP
+        { delete current VALSPMNP;
+
+        }
+        delete current SpMnPl;
+      } //_Loop SpMnPl
+      delete current SPMNPLAN;
+      boUpdate:=true;
+    } //if _Direct=-1 // удаляем
+    else
+    { MakeBufferSPMNPLAN;
+      Update current SPMNPLAN;
+
+      _Loop fullcache SpMnPl
+      { MakeBufferSpMnPl;
+        Update current SPMNPL;
+        _Loop fullcache VALSPMNP
+        {
+          if  VALSPMNP.KOL  <>PrNaryad.ChasF
+          or  VALSPMNP.PRICE<>PrNaryad.Rascen
+          { if boLog
+            { oGp_Log.Write('Изменили запись о наряде для '+PrNaryad.StrTabn
+                +', кол-во с '+string(VALSPMNP.KOL,0,2)+' на '+String(PrNaryad.ChasF,0,2)
+                +', расценку с '+string(VALSPMNP.PRICE,0,2)+' на '+String(PrNaryad.Rascen,0,2)
+                )
+
+            }
+            boUpdate:=true;
+          }
+          MakeBufferVALSPMNP;
+          update current VALSPMNP;
+        } //_Loop VALSPMNP
+      } //_Loop fullcache SpMnPl
+    } //else if _Direct=-1 // удаляем
+    break;
+  } //_Loop SPMNPLAN
+  //============================
+  if _boFind then Exit;
+  //============================
+  boUpdate:=true;
+  //-------------- SPMNPLAN
+  clearbuffer(#SPMNPLAN);
+
+  MakeBufferSPMNPLAN;
+
+  //=============================
+  SPMNPLAN.cval1 := PRNARYAD.nrec  ; // сохраним ссылку на будущее
+  //=============================
+
+  if insert current SPMNPLAN<>tsok
+  { sLastError:='Ошибка записи в SPMNPLAN';
+    exit;
+  }
+
+
+  //--------------- SPMNPL
+  ClearBuffer(#SPMNPL);
+  MakeBufferSPMNPL;
+  Insert Current SPMNPL;
+
+  //---------- VALSPMNP
+  clearbuffer(#VALSPMNP);
+	VALSPMNP.CSPMNPL:= SPMNPL.Nrec;//	Comp	000B000000159F5Fh	ссылка на SPMNPL
+  MakeBufferVALSPMNP;
+  Insert current VALSPMNP;
+  //-------------------------------
+  Result:=true;
+} //Function UpdateSPMNPLAN(_direct:longint):boolean;
+
+
+//-----------------------------------------------------
+// Для поиска вышестоящего подразделения
+//-----------------------------------------------------
+Function GetKatPodrUp(_PKatPodr:comp):comp; cacheable;
+{ Result:=_PKatPodr;
+  if _PKatPodr=0 then exit;
+  set vKatPodr.pKatPodr:=_PKatPodr;
+  if vKatPodr.getfirst KatPodr<>tsok exit;
+  if pos('-',vKatPodr.KatPodr.kod)>0
+  { Result:=GetKatPodrUp(vKatPodr.KatPodr.cPodr);
+  }
+} //Function GetKatPodrUp(_PKatPodr:comp):comp; cacheable;
+
+
+
+
+
+//------------------------------------------------------------------------------
+#doc
+  Отправка одной спецификации наряда в потребность в материальных ресурсах
+#end
+Function ExportNaryadSP(_pPRNaryad:comp; _Direct:integer;_DBeg:date;_pCex:comp; _boFindMnPlan:boolean) :boolean;
+{ Result:=False;
+  if not _boFindMnPlan
+  { boUpdate:=false;
+  }
+  if pWAYACCOU=0
+  { sLastError:='Не задана настройка NPOEM_OWN.ZP.NARYAD.EXPORT.Shablon';
+    exit;
+  } //if pWAYACCOU=0
+  if _pPRNaryad=0
+  { sLastError:='Не задан ID спецификации наряда ';
+    Exit;
+  }
+  set pPRNaryad:=_pPRNaryad;
+
+  var _isAllOk:boolean=True;
+  // просто так - там всегда одна запись
+  _Loop PRNaryad
+  { if not _boFindMnPlan
+    { var _pKatPodr:comp=_pCex;
+      if _pCex=0  _pKatPodr:=PRNaryad.Cex;
+      if boCex
+      { _pKatPodr:=GetKatPodrUp(_pKatPodr);
+      }
+      // тут же будем позиционированы на потребность
+      var _pMnPlan:comp=FindMnPlan(_pKatPodr,_DBeg,True);
+      if _pMnPlan=0
+      { _isAllOk:=false;
+        break;
+      }
+    } //if not _boFindMnPlan
+    UpdateSPMNPLAN(_direct);
+  } //_Loop PRNaryad
+  Result:=_isAllOk;
+  if not _boFindMnPlan
+    if boUpdate
+       UpdateMnPlan;
+} //Function ExportNaryad(_pPRNaryad:comp; _Direct:integer) :boolean;
+
+//------------------------------------------------------------------------------
+#doc
+  Отправка  наряда в потребность в материальных ресурсах
+#end
+Function ExportNaryad(_pSys_Nar:comp; _Direct:integer; _boFindMnPlan:boolean) :boolean;
+{ sLastError:='';
+  Result:=False;
+  pSys_Nar:=_pSys_Nar;
+
+  if pWAYACCOU=0
+  { sLastError:='Не задана настройка NPOEM_OWN.ZP.NARYAD.EXPORT.Shablon';
+    exit;
+  } //if pWAYACCOU=0
+  if _pSys_Nar=0
+  { sLastError:='Не задан ID наряда ';
+    Exit;
+  }
+  if not _boFindMnPlan
+     boUpdate:=false;
+  //========================
+  var _isAllOk:boolean=false;
+  //---- основное формирование
+  _Loop Sys_Nar_Scan
+  { _isAllOk:=True;
+    //---------------------------
+    // Проверенный наряд Sys_Nar.Choice= 3 --- AddChoice(3  , 'Проверен');
+    //---------------------------
+    StartNewVisual(vtNumericVisual, vfThread + vfTimer, 'Обработка наряда '+Sys_Nar_Scan.NMNEM, 100);
+    var _pKatPodr:comp=Sys_Nar_Scan.Cex;
+    if boCex
+    { _pKatPodr:=GetKatPodrUp(_pKatPodr);
+    }
+    if not _boFindMnPlan
+    { // тут же будем позиционированы на потребность
+      var _pMnPlan:comp=FindMnPlan(_pKatPodr,Sys_Nar_Scan.DATAN,True);
+      if _pMnPlan=0
+      { _isAllOk:=false;
+        break;
+      }
+    }
+    //===================================
+    _Loop PRNaryad_Scan
+    { _isAllOk:=ExportNaryadSP(PRNaryad_Scan.Nrec,_Direct,Sys_Nar_Scan.DATAN,Sys_Nar_Scan.Cex,true);
+      if not _isAllOk then break;
+    } //_Loop PRNaryad_Scan
+    StopVisual('',0);
+    if not _isAllOk then break;
+  } //_Loop Sys_Nar_Scan
+  //========================
+  Result:=_isAllOk;
+  if not _boFindMnPlan
+    if boUpdate
+       UpdateMnPlan;
+} //Function ExportNaryad(_pSys_Nar:comp; _Direct:integer) :boolean;
+
+
+//------------------------------------------------------------------------------
+// Добавим по иерархии подразделений
+Function AddMarker_Podr(_pKatPodr:comp) :boolean;
+{ Result:=true;
+  //vKatPodr.pKatPodr:=_pKatPodr;
+  _Loop Katpodr_S where (( _pKatPodr == KatPodr_S.cPodr ))
+  { if pos('-',Katpodr_S.Kod)=0 continue; // другой цех?
+    InsertMarker(Marker_Podr,Katpodr_S.Nrec);
+    PushPos(tnKatPodr_S);
+    Result:=AddMarker_Podr(Katpodr_S.Nrec);
+    PopPos(tnKatPodr_S);
+    if not Result then break;
+  } //_Loop Katpodr_S where (( _pKatPodr == KatPodr_S.cPodr ))
+
+} //Function AddMarker_Podr(_pKatPodr:comp) :boolean;
+
+
+//------------------------------------------------------------------------------
+#doc
+  формирование потребности
+#end
+Function CheckDoc(_pDoc:comp;_pKatPodr:comp;_DT:date) :boolean;
+{ Result:=false;
+  pKatPodr:=_PKatPodr;
+  DImport :=_DT;
+
+  var _boFind:boolean=false;
+  _Loop MnPlan
+  { if _pDoc=MnPlan.Nrec
+    { if getfirst MNAnal=tsok {}
+      _boFind:=true;
+      break;
+    }
+  }
+  var _DatOtch:date=dGetTune('Up.DatOtch');
+  var _boArch :boolean=_Dt<_DatOtch;
+  if not _boFind
+  { if boLog
+    { WriteLog('Не смогли найти Потребность в трудовых резервах');
+
+    }
+    exit;
+  } //if not _boFind
+
+  if boLog
+  { WriteLog('Расчет потребности '+MnPlan.Number+' '+MnPlan.Name);
+  }
+
+  //===========================
+  // Обработка потребности
+  boUpdate:=false;
+  Var _IsAllOk:boolean=true;
+  if MnPlan.cKatPodr=0
+  { WriteLog('В потребности не заполнено поле подразделение!');
+    exit;
+  }
+  Marker_Podr := InitMarker('', 8, 10, 10);
+  InsertMarker(Marker_Podr,MnPlan.cKatPodr);
+  // нужно с рекурсией добавить подчиненные
+  do {
+    AddMarker_Podr(MnPlan.cKatPodr);
+  } while false;
+  var _DTB:date=date(1,month(_DT),Year(_DT));
+  var _DTE:date=date(Last_Day(_DT),month(_DT),Year(_DT));
+  if boLog
+  { WriteLog('Период расчета '+DateToStr(_DTB,'DD/MM/YYYY')+' - '+DateToStr(_DTE,'DD/MM/YYYY')
+     +', отобрано подразделений '+String(GetMarkerCount(Marker_Podr)));
+  }
+
+  StartNewVisual(vtNumericVisual,vfTimer ,'Проверка потребности '
+                  +chr(13)+ MnPlan.Name,0);
+
+  do { // Для прерывания
+     // Для отбора нарядов по подразделению
+     var ii :longint;
+     var _pPodr:comp=0;
+     For (ii:=0; ii<GetMarkerCount(Marker_Podr); ii++)
+     { if not GetMarker(Marker_Podr,ii,_pPodr) then continue;
+       iNextVisual('Обработка нарядов подразделения '
+          +chr(13)+ShowKau(cgKau_Katpodr,_pPodr));
+       if boLog
+       { WriteLog('обработка  '+ShowKau(cgKau_KatPodr,_pPodr));
+       }
+       delete all tmp_sys_nar;
+       _Try
+       { SQL select
+           sys_nar.Nrec  as Nrec
+          ,sys_nar.NMnem as NMnem
+         From sys_nar
+         where sys_nar.cex=:(_pPodr)
+           and sys_nar.DATAN >=:(_DTB)
+           and sys_nar.DATAN <=:(_DTE)
+           and (
+              sys_nar.choice=3 // только проверенные?
+             // возможно в архивных периодах надо все
+           )
+         into tmp_sys_nar byname;
+       }
+       _Except
+       else
+       { timelog('Возникло исключение при запуске запроса для tmp_sys_nar '+ExploreException);
+       }
+       if boLog
+       { WriteLog('отобрали нарядов  '+String(RecordsInTable(#tmp_sys_nar)));
+       }
+       _Loop tmp_sys_nar
+       { _isAllOk:=ExportNaryad(tmp_sys_nar.Nrec,1,true);
+         if not _isAllOk break;
+       }
+       if not _isAllOk break;
+     } //For (ii:=0; ii<GetMarkerCount(Marker_Podr); ii++)
+     if not _isAllOk break;
+     //=== проверим на удаление нарядов
+     PushBounds(tbbyMnPlan);
+     PushBounds(tbbyMnPlanNar);
+     _Loop fullcache SpMnPlan
+     { NextVisual;
+       var _bodel:boolean=not isValidAll(#PRNaryad);
+       if not _boDel
+       { if isValidAll(#SYS_NAR)
+         // возможно в архивных периодах надо все
+            if SYS_NAR.Choice<>3
+              _boDel:=true;
+
+       }
+       if _boDel
+       { boUpdate:=true;
+         if boLog WriteLog('Удалили позицию '+SpMnPlan.Number);
+         _Loop fullcache SpMnPl
+         { _Loop fullcache VALSPMNP
+           { delete current VALSPMNP;
+           }
+           delete current SpMnPl;
+         } //_Loop SpMnPl
+         delete current SPMNPLAN;
+       } //if not isValidAll(#PRNaryad)
+     } //_Loop SpMnPlan
+     PushBounds(#PRNaryad);
+     PushBounds(#SpMnPlan);
+     if boUpdate
+     { UpdateMnPlan;
+     }
+  } while False
+  StopVisual('');
+  DoneMarker(Marker_Podr,'');
+
+  Result:=_IsAllOk;
+
+} //Function CheckDoc(_pDoc:comp) :boolean;
+
+
+//------------------------------------------------------------------------------
+#doc
+ Получить последнюю ошибку
+#end
+Function GetLastError:string;
+{ Result:=sLastError;
+} //Function GetLastError:string;
+
+
+end.  // Interface
+#undef OBJINT_ALGORITM

@@ -1,0 +1,262 @@
+/*************************************************************************************************\
+* Наименование: Реализация класса GP_FillKlndrFromWorkPattern                                     *
+*               "Заполнение полей из справочника шаблонов рабочих дней"                           *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#49           |29/03/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include ClndrFnc.vih
+#include ExtAttr.vih
+
+#include GP_FillKlndrFromWorkPattern.vih
+interface GP_FillKlndrFromWorkPattern;
+
+#include Grafik.inc
+#include ExtAttr.var
+var iCalendarFun:CalendarFunctions;
+
+create view
+from
+  KlRejim,Grafik,SpGraf,SpWork,Klndr,
+  GP_KlndrExt,GP_WorkPatternExt,GP_SpWorkExt,
+  Prazd,WorkPattern HolidayPattern;
+
+procedure ClearExtFields(D:byte;var bKlndrExt:type$GP_KlndrExt);
+{
+  bKlndrExt.StartWorkDay[D]:=ZeroTime;
+  bKlndrExt.EndWorkDay[D]:=ZeroTime;
+  bKlndrExt.StartShift2[D]:=ZeroTime;
+  bKlndrExt.EndShift2[D]:=ZeroTime;
+  bKlndrExt.StartBreak1[D]:=ZeroTime;
+  bKlndrExt.EndBreak1[D]:=ZeroTime;
+  bKlndrExt.StartBreak2[D]:=ZeroTime;
+  bKlndrExt.EndBreak2[D]:=ZeroTime;
+}
+
+procedure SetWorkPattern(cWorkPattern,cCalendar:comp;D:byte;var bKlndr:type$Klndr;var bKlndrExt:type$GP_KlndrExt);
+var WorkMinutes,NightMinutes,i:word;
+{
+  bKlndr.DayChas[D]:=0;
+  bKlndr.DayMin[D]:=0;
+  bKlndr.CHNChas[D]:=0;
+  bKlndr.CHNMin[D]:=0;
+  bKlndr.Holidayh[D]:=0;
+
+  bKlndrExt.cWorkPattern[D]:=cWorkPattern;
+  ClearExtFields(D,bKlndrExt);
+
+  i:=0;
+  WorkMinutes:=0;
+  NightMinutes:=0;
+  _loop SpWork where((cWorkPattern==SpWork.cWorkPattern and SpWork.NRec==GP_SpWorkExt.cSpWork)) {
+    i++;
+
+    WorkMinutes+=word(SpWork.DayChas*60+SpWork.DayMin+SpWork.NightChas*60+SpWork.NightMin);
+    NightMinutes+=word(SpWork.NightChas*60+SpWork.NightMin);
+
+    if (i=1) {
+      //Начало рабочего дня
+      bKlndrExt.StartWorkDay[D]:=SpWork.tStart;
+      //Окончание рабочего дня
+      bKlndrExt.EndWorkDay[D]:=SpWork.tEnd;
+    } else if (i=2) {
+      //Начало смены 2
+      bKlndrExt.StartShift2[D]:=SpWork.tStart;
+      //Окончание смены 2
+      bKlndrExt.EndShift2[D]:=SpWork.tEnd;
+    }
+
+    //Начало обеда 1
+    if (bKlndrExt.StartBreak1[D]=ZeroTime)
+      bKlndrExt.StartBreak1[D]:=GP_SpWorkExt.StartBreak1;
+    //Окончание обеда 1
+    if (bKlndrExt.EndBreak1[D]=ZeroTime)
+      bKlndrExt.EndBreak1[D]:=GP_SpWorkExt.EndBreak1;
+    //Начало обеда 2
+    if (bKlndrExt.StartBreak2[D]=ZeroTime)
+      bKlndrExt.StartBreak2[D]:=GP_SpWorkExt.StartBreak2;
+    //Окончание обеда 2
+    if (bKlndrExt.EndBreak2[D]=ZeroTime)
+      bKlndrExt.EndBreak2[D]:=GP_SpWorkExt.EndBreak2;
+  }//_loop SpWork
+
+  bKlndr.DayChas[D]:=WorkMinutes div 60;
+  bKlndr.DayMin[D]:=WorkMinutes mod 60;
+
+  bKlndr.CHNChas[D]:=NightMinutes div 60;
+  bKlndr.CHNMin[D]:=NightMinutes mod 60;
+
+  if (iCalendarFun.IsHoliday(cCalendar,date(D,bKlndr.MonthK,bKlndr.YearK)))
+    bKlndr.Holidayh[D]:=WorkMinutes/60;
+}
+
+function Run(Rejim:word;YearK:integer;MonthK:integer=0):boolean;
+var SpGrafCount:longint;
+    Mon1,Mon2,m:integer;
+    i:word;
+    KlndrDate:date;
+    IsNewRec,MatchVariances:boolean;
+    cWorkPattern:comp;
+    Days:longint;
+    dCur,dStart,dEnd:date;
+{
+  result:=false;
+
+  if (getfirst fastfirstrow KlRejim where((Rejim==KlRejim.Rejim))<>tsok) {
+    message('Не найден режим с кодом = '+string(Rejim),error);
+    exit;
+  }
+
+  if (KlRejim.cCalendar=0) {
+    message('У режима работ '+KlRejim.NRejim+' нет шаблона.',Information);
+    exit;
+  }
+  if (getfirst fastfirstrow Grafik where((KlRejim.cCalendar==Grafik.NRec))<>tsok) {
+    message('Не найден шаблон с NRec = '+string(KlRejim.cCalendar,0,0),error);
+    exit;
+  }
+  if (getfirst fastfirstrow HolidayPattern where(('Выходной'==HolidayPattern.NameP(noindex)))<>tsok) {
+    message('Не найден шаблон рабочего дня с именем "Выходной"',error);
+    exit;
+  }
+
+  SpGrafCount:=0;
+  _loop SpGraf where((KlRejim.cCalendar==SpGraf.cGrafik)) SpGrafCount++;
+  if (SpGrafCount=0) {
+    message('В шаблоне отсутствует спецификация.',Information);
+    exit;
+  }
+
+  if (MonthK=0) {//весь год
+    Mon1:=1;
+    Mon2:=12;
+  } else {//один месяц
+    Mon1:=MonthK;
+    Mon2:=MonthK;
+  }
+  KlndrDate:=date(1,Mon2,YearK);
+  KlndrDate:=date(Last_Day(KlndrDate),Mon2,YearK);
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm,
+                 'Заполнение полей из справочника шаблонов рабочих дней...',
+                 CalcDaysBetweenDates(date(1,Mon1,YearK),KlndrDate,false)+Mon2-Mon1+1);
+
+  MatchVariances := ((Grafik.FilialNo and stoMatchSPCalendarData) <> 0); //Учитывать отклонения календаря
+  if (SpGrafCount<>7) {//Сменный график
+    if (getfirst SpGraf where((KlRejim.cCalendar==SpGraf.cGrafik))<>tsok) {};
+
+    dCur:=date(1,Mon1,YearK);
+    if (Grafik.LastDate<dCur)  {
+      dStart:=Grafik.LastDate;
+      dEnd:=dCur;
+    } else {
+      dStart:=dCur;
+      dEnd:=Grafik.LastDate;
+    }
+    Days:=0;
+    for(dCur:=dStart;dCur<dEnd;dCur:=Add_Day(dCur,1)) {
+      if (Grafik.TypePattern=1) //по рабочим дням
+        if (iCalendarFun.IsWeekEndWithVariances(Grafik.cCalendar, dCur, MatchVariances))
+          continue;
+
+      Days++;
+    }
+    Days:=Days mod SpGrafCount;
+    if (Days>0)
+      for(i:=1;i<=Days;i++)
+        if (getnext SpGraf where((KlRejim.cCalendar==SpGraf.cGrafik))<>tsok) {};
+  }
+
+  for(m:=Mon1;m<=Mon2;m++) {
+    if (not NextVisual) break;
+
+    KlndrDate:=date(1,m,YearK);
+    if (getfirst fastfirstrow Klndr
+        where((Rejim==Klndr.Rejim and m==Klndr.MonthK and YearK==Klndr.YearK))<>tsok) {
+      message('Отсутствует график на '+DateToStr(KlndrDate,'Month YYYY г.'),Information);
+      nNextVisual(Last_Day(KlndrDate));
+      continue;
+    }
+
+    IsNewRec:=getfirst fastfirstrow GP_KlndrExt
+              where((Rejim==GP_KlndrExt.Rejim and m==GP_KlndrExt.MonthK and YearK==GP_KlndrExt.YearK))<>tsok;
+    if (IsNewRec) {
+      ClearBuffer(tnGP_KlndrExt);
+      GP_KlndrExt.Rejim:=Rejim;
+      GP_KlndrExt.YearK:=YearK;
+      GP_KlndrExt.MonthK:=m;
+    }
+
+    for(i:=1;i<=Last_Day(KlndrDate);i++) {
+      if (not NextVisual) break;
+
+      dCur:=date(i,Klndr.MonthK,Klndr.YearK);
+      if (SpGrafCount=7) {//Недельный график
+        if (Klndr.DayChas[i]=0 and Klndr.DayMin[i]=0) {
+          GP_KlndrExt.cWorkPattern[i]:=HolidayPattern.NRec;
+          ClearExtFields(i,GP_KlndrExt.buffer);
+          continue;
+        }
+
+        if (Day_Of_Week(dCur)>5)
+          if (not iCalendarFun.IsWeekEndWithVariances(Grafik.cCalendar, dCur, MatchVariances))
+            if (getfirst fastfirstrow Prazd where ((dCur == Prazd.dDate))=tsok) {
+              dCur:=StrToDate(SubStr(Prazd.Name,(Length(Prazd.Name) - 9),10),'DD/MM/YYYY');
+              if (dCur=ZeroDate) {
+                message('В названии рабочего выходного дня "'+Prazd.Name+'" отсутствует дата переноса.',error);
+                continue;
+              }
+            }
+
+        if (getfirst SpGraf
+            where((KlRejim.cCalendar==SpGraf.cGrafik and date(1, 1, Day_Of_Week(dCur))==SpGraf.dDate))<>tsok) {
+          message('В шаблоне нет записи для дня недели '+DateToStr(dCur,'Day')+'.',error);
+          continue;
+        }
+        if (SpGraf.cWorkPattern=0) {
+          message('В шаблоне для дня недели '+DateToStr(dCur,'Day')+' не указан Шаблон рабочего дня.',error);
+          continue;
+        }
+      } else {//Сменный график
+        if (Grafik.TypePattern=1) //по рабочим дням
+          if (iCalendarFun.IsWeekEndWithVariances(Grafik.cCalendar, dCur, MatchVariances)) {
+            GP_KlndrExt.cWorkPattern[i]:=HolidayPattern.NRec;
+            ClearExtFields(i,GP_KlndrExt.buffer);
+            continue;
+          }
+      }
+
+      //Обработка предпраздничных дней
+      cWorkPattern:=SpGraf.cWorkPattern;
+      if ((Grafik.FilialNo and stoShortenPreHolidays)<>0) //Сокращать предпраздничные дни
+        if (iCalendarFun.IsHoliday(Grafik.cCalendar,Add_Day(dCur,1)))
+          if (getfirst fastfirstrow GP_WorkPatternExt where((cWorkPattern==GP_WorkPatternExt.cWorkPattern))=tsok)
+            if (GP_WorkPatternExt.cPreHolidayPattern<>0)
+              cWorkPattern:=GP_WorkPatternExt.cPreHolidayPattern;
+
+      SetWorkPattern(cWorkPattern,Grafik.cCalendar,i,Klndr.buffer,GP_KlndrExt.buffer);
+
+      if (SpGrafCount<>7) {//Сменный график
+        if (getnext SpGraf where((KlRejim.cCalendar==SpGraf.cGrafik))<>tsok)
+          if (getfirst SpGraf where((KlRejim.cCalendar==SpGraf.cGrafik))<>tsok) {};
+      }
+    }
+
+    if (update current Klndr = tsok) {
+      if (IsNewRec)
+        insert current GP_KlndrExt;
+      else
+        update current GP_KlndrExt;
+    }
+  }
+
+  StopVisual;
+
+  result:=true;
+}
+
+end.

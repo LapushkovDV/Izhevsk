@@ -1,0 +1,269 @@
+/*************************************************************************************************\
+* Наименование: Функции для определения начальников подразделений                                 *
+* Контур/Модуль: *                                                                                *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1166         |07/12/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+/*
+Доработан алгоритм определения начальника указанного работника:
+
+1. Алгоритм, по которому определяется начальник подразделения:
+В подразделении ищется работник, название должности которого совпадает с одним из названий из предопределённого списка
+- Начальник цеха
+- Начальник отдела
+- Начальник управления
+- Главный металлург
+- Главный механик
+- Главный сварщик
+- Главный технолог
+- Главный энергетик
+- Начальник центра
+или начинается с указанных слов:
+- Директор
+- Заместитель генерального директора
+- Генеральный директор
+- Руководитель аппарата
+- Заместитель главного конструктора
+
+2. Алгоритм, по которому определяется начальник работника:
+а) Берем первые три цифры кода подразделения, в котором работает работник.
+б) Ищем подразделение, код которого точно совпадает с этими тремя цифрами.
+в) В этом подразделении ищем начальника по алгоритму, указанному в п.1.
+г) Если найденный начальник подразделения сам работник, для которого мы ищем начальника, ищем начальника по алгоритму,
+указанному в п.1. для вышестоящего подразделения.
+
+Примечание:
+Для получения отладочной информации при работе библиотеки нужно добавить в Vip.prj строку:
+
+#define __DEBUG__
+*/
+#include GP_DepChief.vih
+#include AppFuncs.vih // Функции работы с назначениями
+#include CatFunc.vih // Функции работы с каталогом
+
+#ifdef __DEBUG__
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#end
+
+interface GP_DepChief;
+
+  table struct SChiefPos
+  (
+    PosName: String[50],
+    CompMode: Byte
+  )
+  With index
+  (
+    SChiefPos01 = CompMode + PosName
+  );
+
+  create view
+    from
+      #ifdef __DEBUG__
+      Persons,
+      #end
+      Appointments (ApntStatus01),
+      Catalogs,
+      SChiefPos (SChiefPos01)
+  ;
+
+  var
+    VAppFuncs: AppointmentsFunctions;
+    ICatFunc: CatalogsFunctions;
+
+  #ifdef __DEBUG__
+  #include GP_Log.var
+  #end
+
+  // Ищет работника, который являлся начальником указанного подразделения на указанную дату
+  function GetDepChief(cDep: tNRec; OnDate: Date; var cPositon: Comp): tNRec;
+  begin
+    #ifdef __DEBUG__
+    oGP_Log.Info('GetDepChief(' + To_Char(cDep, 0, 0) + ', ' + To_Char(OnDate) + ')');
+    #end
+     var _PosName: String = '';
+    // Проходим по всем работникам, которые числились в этом подразделении на указанную дату
+    _loop backward Appointments where ((
+             0    == Appointments.LPrizn
+      and cDep    == Appointments.Department
+      and OnDate >>= Appointments.AppointDate
+      and Appointments.Post == Catalogs.NRec
+      #ifdef __DEBUG__
+      and Appointments.Person == Persons.NRec
+      #end
+    )) ordered by index ApntStatus01 {
+      if Appointments.DateEnd != ZeroDate and Appointments.DateEnd < OnDate then
+        continue;
+
+      if IsValidAll(tnCatalogs) then
+      begin
+        #ifdef __DEBUG__
+        if IsValidAll(tnPersons) then
+          oGP_Log.Info('  ' + Persons.FIO + ' с ' + To_Char(Appointments.AppointDate) + ' по ' + To_Char(Appointments.DateEnd));
+        #end
+        _PosName := LoCase(Trim(Catalogs.Name));
+        #ifdef __DEBUG__
+        oGP_Log.Info(' _PosName: ' + _PosName);
+        #end
+        // Если назначение было временным и оно на указанную дату уже закончилось, пропускаем его
+        // Пытаемся найти в списке должностей должность, название которой точно совпадает с названием искомой должности
+        if getFirst SChiefPos where ((CM_EXACT == SChiefPos.CompMode and _PosName == SChiefPos.PosName)) = tsOk then
+        begin
+          #ifdef __DEBUG__
+          oGP_Log.Info('  Найдено точное совпадение');
+          #end
+          cPositon := Appointments.Post;
+          result := Appointments.Person;
+          exit;
+        end else
+        begin
+          #ifdef __DEBUG__
+          oGP_Log.Info('  Точное совпадение не найдено. Проверка начинается с:');
+          #end
+          // Пытаемся найти в списке должностей должность, название которой начинается с заданных слов
+          _loop SChiefPos where ((CM_START_WITH == SChiefPos.CompMode))
+          begin
+            #ifdef __DEBUG__
+            oGP_Log.Info('  "' + SubStr(_PosName, 1, Length(SChiefPos.PosName)) + '" = "' + SChiefPos.PosName + '"');
+            #end
+            if SubStr(_PosName, 1, Length(SChiefPos.PosName)) = SChiefPos.PosName then
+            begin
+              #ifdef __DEBUG__
+              oGP_Log.Info('  Найдено совпадение "начинается с"');
+              #end
+              cPositon := Appointments.Post;
+              result := Appointments.Person;
+              exit;
+            end;
+          end;
+        end;
+      end;
+    }//_loop Appointments
+  end;
+
+  // Ищет работника, который являлся начальником указанного работника на указанную дату
+  function GetPersChief(cPersons: tNRec; OnDate: Date; var cChiefPos: Comp; var cChiefDep: Comp): tNRec;
+  var
+    cDep: Comp;
+  begin
+    #ifdef __DEBUG__
+    oGP_Log.Info('GetPersChief(' + To_Char(cPersons, 0, 0) + ')');
+    #end
+    result := 0;
+    cDep := GetPersTopDep(cPersons, OnDate);
+    // if result and Appointments.Person =
+    if cDep != 0 then
+      result := GetDepChief(cDep, OnDate, cChiefPos);
+    // Если найден начальник, но это сам работник, начальника которого мы ищем
+    if cPersons = result then
+    begin
+      // Ищем начальника вышестоящего подразделения
+      #ifdef __DEBUG__
+      oGP_Log.Info('  Работник является начальником подразделения');
+      #end
+      if getFirst Catalogs where ((cDep == Catalogs.NRec)) = tsOk then
+      begin
+        #ifdef __DEBUG__
+        oGP_Log.Info('  Подразделение: ' + Catalogs.Name);
+        #end
+        var cTopDep: Comp = Catalogs.cParent;
+        if getFirst Catalogs where ((cTopDep == Catalogs.NRec)) = tsOk then
+        begin
+          #ifdef __DEBUG__
+          oGP_Log.Info('  Вышестоящее подразделение: ' + Catalogs.Name);
+          #end
+          result := GetDepChief(cTopDep, OnDate, cChiefPos);
+          if result != 0 then
+            cChiefDep := cTopDep;
+        end;
+      end;
+    end else
+      cChiefDep := cDep;
+  end;
+
+  // Возращает NRec подразделения, в котором числился работник на указанную дату
+  function GetPersDep(cPersons: tNRec; OnDate: Date): tNRec;
+  var
+    cAppoint: tNRec; // ссылка на текущее назначение
+  begin
+    result := 0;
+    cAppoint := VAppFuncs.GetAppNRec_OnDate(cPersons, OnDate);
+    if getFirst Appointments where ((cAppoint == Appointments.NRec)) = tsOK then
+      result := Appointments.Department;
+  end;
+
+  // Возращает NRec подразделения с трехзначным кодом, в котором числился работник на указанную дату
+  function GetPersTopDep(cPersons: tNRec; OnDate: Date): tNRec;
+  begin
+    result := 0;
+    var cDep: Comp = GetPersDep(cPersons, OnDate);
+    if cDep = 0 then
+      exit;
+    if getFirst Catalogs where ((cDep == Catalogs.NRec)) != tsOk then
+      exit;
+    if Length(Catalogs.Code) < 3 then
+      exit;
+    if Length(Catalogs.Code) = 3 then
+    begin
+      result := Catalogs.NRec;
+      exit;
+    end;
+    // Искомый трехзначный код подразделения
+    var DepCode: String = SubStr(Catalogs.Code, 1, 3);
+    while Catalogs.cParent != 0 do
+    begin
+      var cTemp: Comp = Catalogs.cParent;
+      if getFirst Catalogs where ((cTemp == Catalogs.NRec)) != tsOk then
+        exit;
+      // Если код подразделения совпадает с искомым
+      if Catalogs.Code = DepCode then
+      begin
+        result := Catalogs.NRec;
+        exit;
+      end;
+    end;
+  end;
+
+  // Добавляет должность в перечень должностей руководителей
+  function AddChiefPosition(_PosName: String; _CompMode: Byte = CM_EXACT): Boolean;
+  begin
+    // ClearBuffer(#SChiefPos);
+    SChiefPos.PosName := LoCase(Trim(_PosName));
+    SChiefPos.CompMode := LoCase(Trim(_CompMode));
+    result := (insert current SChiefPos) = tsOk;
+  end;
+
+  handleEvent
+    cmOnVipLoad:
+      begin
+        #ifdef __DEBUG__
+        oGP_Log.Init('GP_DepChief.log', true, true, true);
+        #end
+        // Список должностей начальников
+        AddChiefPosition('Начальник цеха', CM_EXACT);
+        AddChiefPosition('Начальник отдела', CM_EXACT);
+        AddChiefPosition('Начальник управления', CM_EXACT);
+        AddChiefPosition('Главный металлург', CM_EXACT);
+        AddChiefPosition('Главный механик', CM_EXACT);
+        AddChiefPosition('Главный сварщик', CM_EXACT);
+        AddChiefPosition('Главный технолог', CM_EXACT);
+        AddChiefPosition('Главный энергетик', CM_EXACT);
+        AddChiefPosition('Начальник центра', CM_EXACT);
+
+        AddChiefPosition('Директор', CM_START_WITH);
+        AddChiefPosition('Заместитель генерального директора', CM_START_WITH);
+        AddChiefPosition('Генеральный директор', CM_START_WITH);
+        AddChiefPosition('Руководитель аппарата', CM_START_WITH);
+        AddChiefPosition('Заместитель главного конструктора', CM_START_WITH);
+      end;
+    #ifdef __DEBUG__
+    cmOnVipUnLoad:
+      oGP_Log.Done(true);
+    #end
+  end;
+
+end.

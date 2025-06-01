@@ -1,0 +1,271 @@
+/*************************************************************************************************\
+* Наименование: УП - НПО Энергомаш - Скуд - Настройка  - Пересчет табелей                         *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: Пересчет табелей например по командировкам из LanDocs                               *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#3692         |16/02/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+#include GP_Log.vih
+#include GP_Staff_Func.Vih
+
+#doc
+УП - НПО Энергомаш - Скуд - Настройка  - Пересчет табелей
+<p>#3692
+Если для приказа на командировку ВА "Признак импорта из LANDOCS" имеет значение "1",
+то запускать процедуру переформирования табеля учета рабочего времени по сотрудникам, входящим в приказ. После переформирования табеля менять значение ВА "Признак импорта из LANDOCS" на значение "2".
+Также запускается создание контрагентов.
+#end
+
+//**********************************************************
+Interface GP_WT_Recalc 'Пересчет табелей' , EscClose;
+Show at (,,5,5);
+//**********************************************************
+var
+  CS: IContextSession; // для захвата прикладного контекста табеля
+  pGP_Staff_Func :GP_Staff_Func;
+  pVA_PRIKAZ_LANDOCS :comp;//'Признак импорта из LANDOCS'
+
+  oGP_Log     : GP_Log;
+//===========================
+Table Struct local tmp_Prikaz
+(  cLschet  : comp
+  ,cPersons : comp
+  ,DSTART   : date
+  ,DEND     : date
+  ,Fio      : String[50]
+  ,StrTabn  : String[50]
+)
+with index
+( tmp_Prikaz01 = cPersons+DSTART
+);
+
+//===========================
+Table Struct local Tmp_WT_ReCalc
+(  cLschet  : comp
+  ,StrTabn  : String[50]
+  ,YearK    : word
+  ,Mes      : word
+)
+with index
+( Tmp_WT_ReCalc01 = StrTabn+YearK+Mes
+ ,Tmp_WT_ReCalc02 = cLschet+YearK+Mes
+);
+//=========================
+Create View
+var
+  pPrikaz:comp;
+as select   tmp_Prikaz.* ,Tmp_WT_ReCalc.*
+
+
+From
+   Prikaz
+  ,tmp_Prikaz
+  ,Tmp_WT_ReCalc
+  ,LsTab
+where ((
+     pPrikaz == Prikaz.Nrec
+and  Tmp_WT_ReCalc.cLschet == LsTab.cLschet
+and  Tmp_WT_ReCalc.YearK  == LsTab.YearN
+and  Tmp_WT_ReCalc.Mes    == LsTab.MesN
+
+));
+
+
+//-------------------------
+Procedure MyInitLog;
+{ oGP_Log.Init('GP_WT_Recalc.Log', true, true, true);
+} //Procedure MyInitLog;
+
+//-------------------------
+Procedure MyWriteLog(_s:string);
+{ oGP_Log.Write(_s);
+} //Procedure MyInitLog;
+
+
+//===============================
+// Добавить запись к перерасчету
+//------------------------------
+Procedure InsTmp_WT_ReCalc(_StrTabn:string; _cLschet:comp; _Mes:word; _Year:word);
+{ if Getfirst Tmp_WT_ReCalc where ((
+         _cLschet  == Tmp_WT_ReCalc.cLschet
+    and  _Year     == Tmp_WT_ReCalc.YearK
+    and  _Mes      == Tmp_WT_ReCalc.Mes
+  ))=tsok then Exit;
+ ClearBuffer(#Tmp_WT_ReCalc);
+
+
+ Tmp_WT_ReCalc.cLschet  :=_cLschet;
+ Tmp_WT_ReCalc.StrTabn  :=_StrTabn;
+ Tmp_WT_ReCalc.YearK    :=_Year   ;
+ Tmp_WT_ReCalc.Mes      :=_Mes    ;
+ insert current Tmp_WT_ReCalc;
+
+} //Procedure InsTmp_WT_ReCalc(_StrTabn:string; _cLschet:comp; _Mes:word; _Year:word);
+
+//===============================
+// Выбрать приказы на командировки для пересчета табеля
+//------------------------------
+Function GetPrikazForRecalc:Boolean;
+var _Mes,_Year:word;
+    _wDT :date;
+
+{ MyWriteLog('Выбрать приказы на командировки для пересчета табеля');
+  Result:=False;
+  _Try
+  { SQL select
+       SpPrikaz.clsch    as cLschet
+      ,SpPrikaz.cPersons as cPersons
+      ,PRIKAZETAP.DSTART as DSTART
+      ,PRIKAZETAP.DEND   as DEND
+      ,Persons.Fio       as FIO
+      ,Persons.StrTabn   as StrTabn
+
+    From AttrVal
+    inner join Prikaz     on Prikaz.Nrec          = AttrVal.cRec
+    inner join SpPrikaz   on SpPrikaz.cPrikaz     = Prikaz.nrec
+    inner join Persons    on Persons.Nrec         = SpPrikaz.cPersons
+    inner join Prikaz PRIKAZETAP on PrikazEtap.TipDoc    = 2 //cgEtap
+                                and PrikazEtap.cSpPrikaz = SpPrikaz.nRec
+    where AttrVal.wTable   = 9308 // coPrikaz
+     and  AttrVal.cAttrNam =:(pVA_PRIKAZ_LANDOCS)
+     and  AttrVal.vDouble  =1
+    into tmp_Prikaz;
+  }
+  _Except
+  else
+  { MyWriteLog('Возникло исключение при запуске запроса 001 '+ExploreException);
+    Exit;
+  }
+  MyWriteLog('Отобрано записей '+String(RecordsInTable(#tmp_Prikaz)));
+  if not NextVisual then Exit;
+  _Try
+  { SQL Update AttrVal set AttrVal.vDouble=2.00
+    where AttrVal.wTable = 9308 //coPrikaz
+     and  AttrVal.cAttrNam =:(pVA_PRIKAZ_LANDOCS)
+     and  AttrVal.vDouble  =1;
+  }
+  _Except
+  else
+  { MyWriteLog('Возникло исключение при запуске запроса 002 '+ExploreException);
+
+    Exit;
+  }
+  //===========================
+  var _pGP_KATORGGROUP:comp=coGetTune('UP.STAFF.RECEPTION.GP_KATORGGROUP');
+  var _Marker_Tmp     :tPtr=InitMarker('', 8, 10, 10);
+  //===========================
+  _Loop tmp_Prikaz
+  {
+    if not NextVisual then Exit;
+    if tmp_Prikaz.DStart=ZeroDate continue;
+    _wDT :=date(1,month(tmp_Prikaz.DStart),Year(tmp_Prikaz.DStart));
+    do
+    { _Mes  :=Month(_wDT);
+      _Year :=Year(_wDT);
+      InsTmp_WT_ReCalc(tmp_Prikaz.StrTabn,tmp_Prikaz.cLschet,_Mes,_Year);
+      _wdt:=Add_months(_wDT,1);
+      if _wdt>date(1,month(tmp_Prikaz.DEND),Year(tmp_Prikaz.DEND)) break;
+
+    }  while true
+
+      // проверим и при необходимости создадим организацию
+    if _pGP_KATORGGROUP>0
+    if not FoundMarker(_Marker_Tmp,tmp_Prikaz.cPersons)
+    { var _pKatOrg:comp=pGP_Staff_Func.CheckKatOrgByPers(tmp_Prikaz.cPersons,True);
+      if _pKatOrg>0 // уже был
+      { if not pGP_Staff_Func.UpdateOrgFromPersons(_pKatOrg)
+          MyWriteLog(' ошибка при обновлении данных по контрагенту '+pGP_Staff_Func.GetLastError);
+
+      }
+      InsertMarker(_Marker_Tmp,tmp_Prikaz.cPersons);
+    }
+  } //_Loop tmp_Prikaz
+  Result:=True;
+  DoneMarker(_Marker_Tmp,'');
+} //Function GetPrikazForRecalc:Boolean;
+
+//===============================
+// Переформирование табеля
+//-------------------------------
+Function RecalcWT :boolean;
+{ Result:=False;
+  _Loop Tmp_WT_ReCalc
+  { if not NextVisual then Exit;
+    if getfirst LsTab<>tsok then continue;
+    if LSTAB.LASTDATE<>ZeroDate then continue;
+    var _WTR:integer=ReFormWorkingTable(Tmp_WT_ReCalc.cLschet,Tmp_WT_ReCalc.Mes,Tmp_WT_ReCalc.YearK);
+    Timelog(Tmp_WT_ReCalc.StrTabn+' ReFormWorkingTable= '+String(_WTR));
+  } //_Loop Tmp_WT_ReCalc
+
+  Result:=True;
+}//Function RecalcWT :boolean;
+
+//===============================
+// Переформирование табеля
+//-------------------------------
+Function FormDoc:boolean;
+{ Result:=False;
+  timelog('GP_WT_Recalc->FormDoc:Выбор командировок');
+  pVA_PRIKAZ_LANDOCS:=ExtAttr_ID(coPrikaz,VA_PRIKAZ_LANDOCS);
+  if pVA_PRIKAZ_LANDOCS>0
+  { if not GetPrikazForRecalc then Exit;
+
+  }
+  Result:=RecalcWT;
+  Result:=True;
+
+} //Function FormDoc:boolean;
+
+
+//===============================================================
+#doc
+ Окно с паузой. Во избежания вылета галактики при автозапуске нужно сделать паузу
+ Падает NowRun
+#end
+window wnPause 'Паузв'
+show at (,,10,5);
+ screen scrMain;
+ <<
+    Смотрите файл GP_WT_Recalc.Log
+
+ >>
+ end;
+End;
+
+//--------------------------------------------
+// Обработчик событий интерфейса
+//--------------------------------------------
+HandleEvent
+//------------------------------
+cmInit:
+{ timelog_init;
+  timelog('GP_WT_Recalc->cmInit');
+  var CL: ContextList;
+  if (not CL.Add(CS, 'WorkingTable'))
+  { abort;
+    exit;
+  }
+  delete all Tmp_WT_ReCalc;
+  delete all tmp_Prikaz;
+  MyInitLog;
+  //---------------------
+  StartNewVisual(vtNumericVisual,vfTimer + vfBreak + vfConfirm,'Ждите, идет пересчет табеля',0);
+  //---------------------
+  FormDoc;
+  //---------------------
+  StopVisual('',0);
+  //---------------------
+  oGP_Log.Done(False);
+  RunWindow(wnPause);
+  StartTimer(cmValue2,3,False);
+
+}
+//------------------------------
+cmValue2:
+{ StopTimer(cmValue2);
+  closeinterface(cmDone) ;
+}
+end;
+end.

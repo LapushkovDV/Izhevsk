@@ -1,0 +1,987 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                лист 7-к Структура численности персонала и оплата труда                          *
+* Контур/Модуль: ЗП                                                                               *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#819          |22/03/18|Потапов А.В.             |НПО Энергомаш                    *
+* Разработка  |#819          |25/06/18|Евдокимов М.А.           |НПО Энергомаш                    *
+* Разработка  |#819          |20/07/18|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_RKStat.vih
+#include TotalOrganizationAttributes.vih
+#include CatFunc.vih
+#include Query.vih
+#include PAFILTER.VIH
+#include CLSFUNCS.VIH
+#include GP_UDR_RKStat.vih //potapov
+
+#define GPInt GP_RKStat_List7K // #(GPInt)
+#define GPNam 07-К Структура численности персонала и оплата труда // #(GPNam)
+
+VipInterface #(GPInt) Implements IGP_RKStat;
+Interface #(GPInt);
+
+const
+  #include Excel.inc;
+  ATTRNAM_NAME_KLVIDOPL_RAZDEL = 'Входит в показатели по статистике'; //Внешний атрибут к виду оплат для определения принадлежности вида оплат к разделу формы 7К
+  OBORCFG_VREP_RKSTAT7K: word = 65502; //OborCfg.vRep для хранения настроек отчета
+end;
+
+#include TotalOrganizationAttributes.var
+
+table struct mtStatRK // результаты для вывода
+(
+  wRow: word
+, fVal: array [1..2] of double
+)
+with index
+(
+  mtStatRK00 = wRow
+);
+
+var
+  CLSF          : CurLSFunctions;
+  oCatFunc      : CatalogsFunctions;
+  iUDR          : GP_UDR_RKStat; //potapov
+  dRep          : date;
+  katPodrMarker : TPtr;
+  wPrintRash    : word;
+  wToExistFile  : word;
+  sToExistFile  : string;
+
+create view
+var
+  #include PAFILTER.VAR
+select
+  PAF.GetDepartmentFilterStr() (fieldName=FiltrPodr)
+from
+  mtStatRK
+, KlVidOpl
+, OborCfg
+, OborCfgCol
+where ((
+  OBORCFG_VREP_RKSTAT7K == OborCfg.vRep and
+  year(dRep)            == OborCfg.NRep and
+  OborCfg.Nrec          == OborCfgCol.cOborCfg
+))
+;
+
+//#region Вспомогательные процедуры, функции
+
+// возвращает подномер строки отчета по категории и коду вида работы
+function wWhatKat(_wKat: word; _wSovm: word = 0): word; cacheable;
+{
+  result := if(_wSovm = 2,       //Если Вид работы = "По договору ГПХ"
+               4,                //Тогда физлица по договорам ГПХ
+               case(_wKat;       //Иначе проверяем Категорию:
+                    5      : 1,  //руководители
+                    6,7    : 2,  //Специалисты, служащие
+                    1,2,3,4: 3;  //Рабочие
+                    0
+                   )
+              );
+}
+
+// добавляет значение в таблицу результата
+// _wRow номер строки отчета
+// _wCol номер периода
+// _fVal значение
+// _rsltMode способ установки значения: 0 - суммировать, 1 - заменять
+procedure AddRow(_wRow, _wCol: word; _fVal: double; _rsltMode: word = 0);
+{
+  if ( getfirst mtStatRK where((_wRow == mtStatRK.wRow)) <> tsOk )
+  {
+    ClearBuffer(#mtStatRK);
+    mtStatRK.wRow := _wRow;
+    mtStatRK.fVal[_wCol] := _fVal;
+    insert current mtStatRK;
+  }
+  else
+  {
+    if _rsltMode = 0
+      mtStatRK.fVal[_wCol] += _fVal;
+    else if (_fVal != 0)
+      mtStatRK.fVal[_wCol] := _fVal;
+    update current mtStatRK;
+  }
+}
+
+//#endregion Вспомогательные процедуры, функции
+
+
+//#region Показатели, формируемые по результатам расчета заработной платы (начислениям)
+
+// формирует выборку с видами оплат
+sql query qSumOpl =
+  select
+    SumVidOp.Kateg                       as wKateg,
+    LSchet.Sovm                          as wSovm,
+    avSpKau.Code                         as sStatIndicator,
+    sum(SumVidOp.Summa)/1000             as fSum
+  from
+    SumVidOp
+  join LSchet
+    on LSchet.Nrec = SumVidOp.cLSch
+  join KlVidOpl
+    on KlVidOpl.VidOpl = SumVidOp.VidOpl
+  join AttrNam
+    on AttrNam.wTable = :coKlVidOpl and AttrNam.Name = :AttrNamName
+  join AttrVal
+    on AttrVal.wTable = :coKlVidOpl and AttrVal.cRec = KlVidOpl.Nrec and AttrVal.cAttrNam = AttrNam.Nrec
+  join SpKau avSpKau
+    on avSpKau.Nrec = AttrVal.vComp
+  left join KatPodr
+    on KatPodr.Nrec = SumVidOp.CexOZ
+  where
+    SumVidOp.YearN = :wYear and
+    SumVidOp.MesN between :wMesBeg and :wMesEnd and
+    SumVidOp.CexOZ in (select cRec from tmpFltrKatPodr) and
+    (
+      (KatPodr.Kod not in ('_Студенты', 'Вет')) or                        //Исключаем ветеранов и студентов
+      (avSpKau.Code in ('ЕдПрем', 'МатПомощь', 'ЛьготыПенс', 'Жилье'))     //для строк 2-43
+    )
+    //LSchet.Sovm in (0, 2)
+  group by
+    SumVidOp.Kateg,
+    LSchet.Sovm,
+    avSpKau.Code;
+
+function GetResultSetBySumOpl(__dBeg, __dEnd: date): IResultSet;
+{
+  var wYear  : word    = Year(__dEnd);
+  var wMesBeg: word    = Month(__dBeg);
+  var wMesEnd: word    = Month(__dEnd);
+  result := queryManager.createQuery(qSumOpl)
+                        .setParam('coKlVidOpl', coKlVidOpl)
+                        .setParam('AttrNamName', ATTRNAM_NAME_KLVIDOPL_RAZDEL)
+                        .setParam('wYear', wYear)
+                        .setParam('wMesBeg', wMesBeg)
+                        .setParam('wMesEnd', wMesEnd)
+                        .getResultSet;
+}
+
+// добавляет группу значений в таблицу результата по видам оплат
+procedure AddSumsBySumOplResultSet(rs: IResultSet; _wCur: word);
+{
+  if rs = NullRef exit;
+  if rs.getFirst = tsOk do
+  {
+    var wKat: word = wWhatKat(rs.row.Val('wKateg'), rs.row.Val('wSovm'));
+    var sStatIndicator: string = rs.row.Val('sStatIndicator');
+    case sStatIndicator of
+      'ОкладТариф'     : if (wKat > 0 and wKat <  4) AddRow(13+wKat, _wCur, rs.row.Val('fSum')); //"Оплата по окладу, тарифу"
+      'Премии'         : if (wKat > 0 and wKat <  4) AddRow(17+wKat, _wCur, rs.row.Val('fSum')); //"Премии (без учета годовой премии)"
+      'ГодПрем'        : if (wKat > 0 and wKat <  4) AddRow(21+wKat, _wCur, rs.row.Val('fSum')); //"Годовая премия"
+      'Сверхурочные'   : if (wKat > 0 and wKat <  4) AddRow(25+wKat, _wCur, rs.row.Val('fSum')); //"Оплата сверхурочной работы, работы в выходные и праздничные дни"
+      'Доплаты'        : if (wKat > 0 and wKat <  4) AddRow(29+wKat, _wCur, rs.row.Val('fSum')); //"Доплаты и надбавки"
+      'ГПХ'            : if (wKat > 0 and wKat <= 4) AddRow(33,      _wCur, rs.row.Val('fSum')); //"Оплата по договорам гражданско-правового характера"
+      'ПрочиеВыплаты'  : if (wKat > 0 and wKat <  4) AddRow(34+wKat, _wCur, rs.row.Val('fSum')); //"Прочие выплаты"
+      'ВыходноеПособие':                             AddRow(48,      _wCur, rs.row.Val('fSum')); //"Выходное пособие"
+      'ЕдПрем'         :                             AddRow(51,      _wCur, rs.row.Val('fSum')); //"Выплата единовременных пособий и премий"
+      'МатПомощь'      :                             AddRow(52,      _wCur, rs.row.Val('fSum')); //"Материальная помощь работникам"
+      'ЛьготыПенс'     :                             AddRow(55,      _wCur, rs.row.Val('fSum')); //"Льготы для неработающих пенсионеров"
+      'Жилье'          :                             AddRow(65,      _wCur, rs.row.Val('fSum')); //"Обеспечение жильем работников предприятия"
+    end;
+  } while rs.getNext = tsOk;
+}
+
+//#endregion Показатели, формируемые по результатам расчета заработной платы (начислениям)
+
+
+//#region Показатель "Средняя численность"
+
+// формирует выборку по статистическим данным (средняя численность)
+sql query qStatis =
+  select
+    Statis.Kateg as wKateg,
+    Statis.Sovm as wSovm,
+    sum(Statis.SredKol)/:wMesCnt as SredKol,
+    sum(Statis.KolRabK)/:wMesCnt as KolRabK
+  from Statis
+  left join KatPodr
+    on KatPodr.Nrec = Statis.Cex
+  where
+    Statis.YEARN = :wYear and
+    Statis.MESN between :wMesBeg and :wMesEnd and
+    Statis.Cex in (select cRec from tmpFltrKatPodr) and
+    Statis.Sovm <> 3 and //in (0, 2) //Исключаем внутренних совместителей
+    KatPodr.Kod not in ('_Студенты', 'Вет')
+  group by
+    Statis.Kateg,
+    Statis.Sovm;
+
+function GetResultSetByStatis(__dBeg, __dEnd: date): IResultSet;
+{
+  var wYear  : word    = Year(__dEnd);
+  var wMesBeg: word    = Month(__dBeg);
+  var wMesEnd: word    = Month(__dEnd);
+  var wMesCnt: word    = (wMesEnd - if(Day(__dEnd) <= 15, 1, 0)) - (wMesBeg - if(Day(__dBeg) <= 15, 1, 0));
+  if (wMesCnt = 0) wMesCnt := 1;
+
+  result := queryManager.createQuery(qStatis)
+                        .setParam('wYear', wYear)
+                        .setParam('wMesBeg', wMesBeg)
+                        .setParam('wMesEnd', wMesEnd)
+                        .setParam('wMesCnt', wMesCnt)
+                        .getResultSet;
+}
+
+//добавляет группу значений в таблицу результата по статистическим данным (средняя численность)
+procedure AddSumsByStatisResultSet(rs: IResultSet; _wCur: word);
+{
+  if rs = NullRef exit;
+  if rs.getFirst = tsOk do
+  {
+    var wKat: word = wWhatKat(rs.row.Val('wKateg'), rs.row.Val('wSovm'));
+    if word(rs.row.Val('wSovm')) = 4
+      wKat := 4; //Для вида работ "Физические лица вне штата" - категория = ГПХ
+    if wKat > 0 and wKat <= 4
+      AddRow(38 + wKat, _wCur, rs.row.Val('SredKol'));
+      //AddRow(38 + wKat, _wCur, if(wKat=4, rs.row.Val('KolRabK'), rs.row.Val('SredKol')));
+  } while rs.getNext = tsOk;
+}
+
+//#endregion Показатель "Средняя численность"
+
+
+//#region Показатель "Льготы для неработающих пенсионеров"
+
+//возвращает суммы "Частичная оплата предприятия" из РПД 108
+//"Компенсация стоимости санаторно-курортного лечения и отдыха"
+//по сотрудникам подразделения "Ветераны"
+sql query qSumRPD108ForVeterans =
+  select
+    sum(GP_RaiseHistExt108.SumPred) / 1000
+  from
+    GP_RaiseHistExt108
+  join RaiseHist
+    on RaiseHist.Nrec = GP_RaiseHistExt108.cRaiseH
+  join ContDoc
+    on ContDoc.Nrec = RaiseHist.cContDoc
+  join Catalogs CatDep
+    on CatDep.Nrec = ContDoc.cDopRef
+  join PartDoc
+    on PartDoc.Nrec = ContDoc.cPart
+  join TitleDoc
+    on TitleDoc.nRec = PartDoc.cDoc
+  where
+    GP_RaiseHistExt108.DatZBeg between :dbeg and :dend and
+    CatDep.Name like 'Ветераны' and
+    TitleDoc.wStatus = 1
+;
+function fSumRPD108ForVeterans(__dbeg, __dend: date): double;
+{
+  result := queryManager.createQuery(qSumRPD108ForVeterans)
+                        .setParam('dbeg', __dbeg)
+                        .setParam('dend', __dend)
+                        .getResultValue;
+}
+
+//#endregion Показатель "Льготы для неработающих пенсионеров"
+
+
+//#region Показатель "Организация отдыха рабочих"
+
+//возвращает суммы "Частичная оплата предприятия" из РПД 108
+//"Компенсация стоимости санаторно-курортного лечения и отдыха"
+//по сотрудникам всех подразделений за исключением подразделения "Ветераны"
+//с заполненным полем "Количество мест"
+sql query qSumRPD108ForEmployees =
+select
+    sum(GP_RaiseHistExt108.SumPred) / 1000
+  from
+    GP_RaiseHistExt108
+  join RaiseHist
+    on RaiseHist.Nrec = GP_RaiseHistExt108.cRaiseH
+  join ContDoc
+    on ContDoc.Nrec = RaiseHist.cContDoc
+  join Catalogs CatDep
+    on CatDep.Nrec = ContDoc.cDopRef
+  join ExtCatLinks
+    on ExtCatLinks.ObjType = 11 and ExtCatLinks.StaffCat = CatDep.Nrec
+  join Persons
+    on Persons.Nrec = ContDoc.Person
+  join PartDoc
+    on PartDoc.Nrec = ContDoc.cPart
+  join TitleDoc
+    on TitleDoc.nRec = PartDoc.cDoc
+  where
+    GP_RaiseHistExt108.DatZBeg between :dbeg and :dend and
+    ( (GP_RaiseHistExt108.KolMest > 0) or ( GP_RaiseHistExt108.KolDet = 0 and GP_RaiseHistExt108.KolMest = 0) ) and
+    CatDep.Name not like 'Ветераны' and
+    ExtCatLinks.ExtCat in (select cRec from tmpFltrKatPodr) and
+    TitleDoc.wStatus = 1 and
+    Persons.cSovm = #comp(0);
+
+function fSumRPD108ForEmployees(__dbeg, __dend: date): double;
+{
+  result := queryManager.createQuery(qSumRPD108ForEmployees)
+                        .setParam('dbeg', __dbeg)
+                        .setParam('dend', __dend)
+                        .getResultValue;
+}
+
+//#endregion Показатель "Организация отдыха рабочих"
+
+
+//#region Показатель "Организация детского отдыха"
+
+//возвращает суммы "Частичная оплата предприятия" из РПД 108
+//"Компенсация стоимости санаторно-курортного лечения и отдыха"
+//по сотрудникам всех подразделений за исключением подразделения "Ветераны"
+//с заполненным полем "Количество детей"
+sql query qSumRPD108ForChildren =
+  select
+    sum(GP_RaiseHistExt108.SumPred) / 1000 as sum
+  from
+    GP_RaiseHistExt108
+  join RaiseHist
+    on RaiseHist.Nrec = GP_RaiseHistExt108.cRaiseH
+  join ContDoc
+    on ContDoc.Nrec = RaiseHist.cContDoc
+  join Catalogs CatDep
+    on CatDep.Nrec = ContDoc.cDopRef
+  join ExtCatLinks
+    on ExtCatLinks.ObjType = 11 and ExtCatLinks.StaffCat = CatDep.Nrec
+  join Persons
+    on Persons.Nrec = ContDoc.Person
+  join PartDoc
+    on PartDoc.Nrec = ContDoc.cPart
+  join TitleDoc
+    on TitleDoc.nRec = PartDoc.cDoc
+  where
+    GP_RaiseHistExt108.DatZBeg between :dbeg and :dend and
+    GP_RaiseHistExt108.KolDet > 0 and
+    GP_RaiseHistExt108.KolMest = 0 and
+    CatDep.Name not like 'Ветераны' and
+    ExtCatLinks.ExtCat in (select cRec from tmpFltrKatPodr) and
+    TitleDoc.wStatus = 1 and
+    Persons.cSovm = #comp(0);
+
+function fSumRPD108ForChildren(__dbeg, __dend: date): double;
+{
+  result := queryManager.createQuery(qSumRPD108ForChildren)
+                        .setParam('dbeg', __dbeg)
+                        .setParam('dend', __dend)
+                        .getResultValue;
+}
+
+//#endregion Показатель "Организация детского отдыха"
+
+
+//#region Показатель "Обучение персонала"
+
+//возвращает стоимость обучения по приказу РПД 35, 135
+sql query qSumRPD35 =
+  select
+    sum(Education.PaySum) / 1000
+  from
+    ContDoc
+  join Catalogs CatDep
+    on CatDep.Nrec = ContDoc.cDopRef
+  join ExtCatLinks
+    on ExtCatLinks.ObjType = 11 and ExtCatLinks.StaffCat = CatDep.Nrec
+  join Education
+    on Education.cContDoc = ContDoc.Nrec
+  where
+    ContDoc.TypeOper in (35, 135, 36, 136) and
+    Education.wType > 0 and
+    Education.FromDate between :dbeg and :dend;
+
+function fSumRPD35(__dbeg, __dend: date): double;
+{
+  result := queryManager.createQuery(qSumRPD35)
+                        .setParam('dbeg', __dbeg)
+                        .setParam('dend', __dend)
+                        .getResultValue;
+}
+
+//#endregion Показатель "Обучение персонала"
+
+
+//#region Показатели, вводимые пользователем вручную
+
+// проверяет наличие настройки отчета OborCfgCol,
+// соответствующую ручному вводу значения показателя формы
+// при необходимости создает
+procedure RefreshOborCfgManualValue(excelRowNumber: word; indicatorName: string; rsltMode: word = 0);
+{
+  if getfirst OborCfgCol where ((OborCfg.Nrec == OborCfgCol.cOborCfg and excelRowNumber == OborCfgCol.nCol)) != tsOk
+  {
+    ClearBuffer(#OborCfgCol);
+    OborCfgCol.cOborCfg := OborCfg.Nrec;
+    OborCfgCol.nCol := excelRowNumber;
+    OborCfgCol.Name := indicatorName;
+    OborCfgCol.Attr[0] := rsltMode;
+    insert current OborCfgCol;
+  }
+}
+
+// обновляет настройки отчета OborCfg, OborCfgCol
+procedure RefreshOborCfg;
+{
+  if getfirst OborCfg != tsOk
+  {
+    ClearBuffer(#OborCfg);
+    OborCfg.vRep := OBORCFG_VREP_RKSTAT7K;
+    OborCfg.nRep := Year(dRep);
+    OborCfg.RepName := 'GP_RKStat_List7K';
+    insert current OborCfg;
+  }
+  RefreshOborCfgManualValue(39, 'Средняя численность - руководители', 1);
+  RefreshOborCfgManualValue(40, 'Средняя численность - специалисты, служащие', 1);
+  RefreshOborCfgManualValue(41, 'Средняя численность - рабочие', 1);
+  RefreshOborCfgManualValue(42, 'Средняя численность - физлица ГПХ', 1);
+  RefreshOborCfgManualValue(54, 'Организация и проведение корпоративных мероприятий');
+  RefreshOborCfgManualValue(55, 'Льготы для неработающих пенсионеров');
+  RefreshOborCfgManualValue(57, 'Проведение спортивно-массовых мероприятий');
+  RefreshOborCfgManualValue(58, 'Организация питания');
+  RefreshOborCfgManualValue(62, 'Медицинское обслуживание работников');
+  RefreshOborCfgManualValue(63, 'ДМС');
+  RefreshOborCfgManualValue(64, 'Страхование жизни/здоровья/от несчастных случаев');
+  RefreshOborCfgManualValue(67, 'Права и гарантии профсоюзной организации');
+  RefreshOborCfgManualValue(72, 'Обучение персонала');
+  RefreshOborCfgManualValue(73, 'Подбор и адаптация персонала');
+  RefreshOborCfgManualValue(74, 'Из стр.68 - расходы на профориентационные мероприятия');
+  RefreshOborCfgManualValue(75, 'Оценка персонала');
+  RefreshOborCfgManualValue(76, 'Организация и проведение конференций работников, конкурсов профмастерства');
+  RefreshOborCfgManualValue(78, 'Консалтинг (в области управления персоналом)');
+}
+
+//#endregion Показатели, вводимые пользователем вручную
+
+//Заполняет таблицу mtStatRK значениями показателей
+procedure MakeRK;
+{
+  var iCol      : integer;
+  var i         : longint;
+  var c         : comp;
+  var wPer      : word = if(Month(dRep) > 6, 2, 1);
+  var wCur      : word;
+  var dBeg, dEnd: array [1..2] of date;
+
+  dBeg[1] := To_Date( 1,  1, Year(dRep));
+  dBeg[2] := To_Date( 1,  7, Year(dRep));
+  dEnd[1] := if(Month(dRep) <= 6, dRep, To_Date(30, 6, Year(dRep)));
+  dEnd[2] := dRep;
+
+  //Получаем маркер с фильтром по подразделениям.
+  //Если фильтр не установлен - в маркере все доступные подразделения
+  katPodrMarker := CLSF.LoadFullCurrentDepartmentList;
+  //Формируем временную sql-таблицу с нреками из katPodrMarker чтобы использовать ее в запросах
+  //при расчете показателей для фильтрации
+  sqlCreateTmpTable('table tmpFltrKatPodr(cRec: comp) with index (i01=cRec);', ctmNormal);
+  var q: IQuery = queryManager.CreateQuery('Insert tmpFltrKatPodr (cRec) values (:cRec)');
+  for(i := 0; GetMarker(katPodrMarker, i, c); i++)
+    if q.setParam('cRec', c).execute.errorCode != tsOk
+    {
+      message('Ошибка заполнения временной таблицы tmpFltrKatPodr: ' + q.errorCode, error);
+      break;
+    }
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Формируются данные для Листа 7-к.', 0);
+
+  //Цикл по полугодиям
+  for(wCur := 1; wCur <= wPer; wCur++)
+  {
+    //Устанавливаем значения, рассчитываемые по архиву начислений
+    AddSumsBySumOplResultSet(GetResultSetBySumOpl(dBeg[wCur], dEnd[wCur]), wCur);
+
+    //Устанавливаем значения, рассчитываемые по статистическим данным (средняя численность)
+    AddSumsByStatisResultSet(GetResultSetByStatis(dBeg[wCur], dEnd[wCur]), wCur);
+
+    //Устанавливаем значение показателя "Льготы для неработающих пенсионеров"
+    AddRow(55, wCur, fSumRPD108ForVeterans(dBeg[wCur], dEnd[wCur]));
+
+    //Устанавливаем значение показателя "//Организация отдыха рабочих"
+    AddRow(60, wCur, fSumRPD108ForEmployees(dBeg[wCur], dEnd[wCur]));
+
+    //Устанавливаем значение показателя "Организация детского отдыха"
+    AddRow(61, wCur, fSumRPD108ForChildren(dBeg[wCur], dEnd[wCur]));
+
+    //Устанавливаем значение показателя "Обучение персонала"
+    AddRow(72, wCur, fSumRPD35(dBeg[wCur], dEnd[wCur]));
+
+    //Показатели, заполненные вручную
+    _loop OborCfgCol
+      AddRow(OborCfgCol.nCol, wCur, OborCfgCol.Sum[wCur], OborCfgCol.Attr[0]);
+
+  }
+  StopVisual;
+
+  DoneMarker(katPodrMarker, '');
+  sqlDropTmpTable('tmpFltrKatPodr');
+}
+
+function isDataRK : boolean;
+{
+  if isvalid(#mtStatRK)
+    result := true
+  else
+    result := false;
+}
+
+procedure PrintRK;
+{
+  var i : integer;
+  var iRow : integer = 14;
+
+  if isDataRK
+  {
+    if xlSetActiveSheetByName('7-к')
+    {
+      StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Выгружаю данные для Листа 7-к в Excel.', 0);
+      TOA.Bind(0);
+      xlSetCellStringValue(Trim(TOA1.GetNaming.GetFullName()),2,4,2,4);
+////    xlSetCellStringValue(DateToStr(dRep,'DD.MM.YYYY'),3,3,3,3); // в представленном заказчиком файле такая дата красная.
+      xlSetCellDateValue(dRep,3,4,3,4);
+      _loop mtStatRK ordered index mtStatRK00
+      {
+        if (not NextVisual) break;
+        xlSetCellNumberValue(mtStatRK.fVal[1], mtStatRK.wRow,5,mtStatRK.wRow,5);
+        xlSetCellNumberValue(mtStatRK.fVal[2], mtStatRK.wRow,8,mtStatRK.wRow,8);
+      }
+  
+      StopVisual;
+    }
+  }
+}
+
+procedure SaveRK;
+{
+  // potapov
+  iUDR.SaveDate  ('RKS7_dRep', dRep);
+  iUDR.SaveWord  ('RKS7_wToExistFile', wToExistFile);
+  iUDR.SaveString('RKS7_sToExistFile', sToExistFile);
+  iUDR.SaveWord  ('RKS7_wPrintRash', wPrintRash);
+
+/*
+  SaveMyDsk (dRep, 'RKS7_dRep');
+  SaveMyDsk (wToExistFile, 'RKS7_wToExistFile');
+  SaveMyDsk (sToExistFile, 'RKS7_sToExistFile');
+  SaveMyDsk (wPrintRash, 'RKS7_wPrintRash');
+*/
+}
+
+procedure ClearRK;
+{
+  delete all from mtStatRK;
+}
+
+procedure initRK;
+{
+  //potapov
+  set dRep := iUDR.ReadDate('RKS7_dRep');
+  if dRep = 0
+    set dRep := To_Date(31,12,Year(Cur_Date));
+/*
+  if (not (ReadMyDsk(dRep, 'RKS7_dRep', false)))
+    set dRep := To_Date(31,12,Year(Cur_Date));
+*/
+
+  RefreshOborCfg;
+
+  //potapov
+  set wPrintRash   := iUDR.ReadWord  ('RKS14_wPrintRash'  );
+  set sToExistFile := iUDR.ReadString('RKS14_sToExistFile');
+  set wToExistFile := iUDR.ReadWord  ('RKS14_wToExistFile');
+  if wToExistFile = 1 
+    ToggleFieldVisible(#sToExistFile,true )
+  else
+    ToggleFieldVisible(#sToExistFile,false);
+/*
+  if (not (ReadMyDsk(wToExistFile, 'RKS7_wToExistFile', false)))
+    set wToExistFile := 0;
+
+  if wToExistFile = 1
+    ToggleFieldVisible(#sToExistFile,true )
+  else
+    ToggleFieldVisible(#sToExistFile,false);
+
+  if (not (ReadMyDsk(sToExistFile, 'RKS7_sToExistFile', false)))
+    set sToExistFile := '';
+
+  if (not (ReadMyDsk(wPrintRash, 'RKS7_wPrintRash', false)))
+    set wPrintRash := 1;
+*/
+}
+
+function isCheckRepParam(isStayAlone : boolean) : boolean;
+{
+  result := false;
+  if dRep = 0
+  {if isStayAlone message('Не задана дата!', Error); exit;}
+  if wToExistFile = 1
+  if not ExistFile(sToExistFile)
+  {if isStayAlone message('Ошибка открытия файла!', Error); exit;}
+  result := true;
+}
+//++++++++++++++++++++++++++++++++++++++++++++++++
+window WinRKParamEx 'Параметры формирования. Лист 7-к.' Gray;
+show at (,,95,14);
+Screen sEx(,,sci1Esc);
+  show (,,,4) fixed_y;
+  fields
+    dRep   ('Дата формирования'): {Font = {BackColor = if(dRep = 0, ColorNeed, 0)}}, noprotect;
+    FiltrPodr ('Выбранные подразделения',hcStaffAppDepartment,sci13Esc): Protect, PickButton ;
+<< 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end;
+browse brManualValuesEx (,,sci1Esc);
+  show(,5,,12);
+  table OborCfgCol;
+  fields
+    OborCfgCol.Name 'Показатель': [40], protect;
+    OborCfgCol.Sum[1] '1 полугодие': [10,2], noprotect;
+    OborCfgCol.Sum[2] '2 полугодие': [10,2], noprotect;
+    OborCfgCol.Attr[0] 'Результат': [List 0 'Суммировать', 1 'Замещать'], protect;
+end;
+screen sc2Ex(,,sci1Esc);
+  show(,13,,) fixed_y;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+<<
+   <. ~С~охранить .>                                                        <. ~З~акрыть .>
+>>
+end;
+HandleEvent
+  cmOK:
+  {
+    SaveRK;
+    initRK;
+    if not isCheckRepParam(true)
+      exit;
+    CloseWindowEx(CurWindow,cmDefault);
+  }
+  cmCancel:
+  {
+    SaveRK;
+    CloseWindowEx(CurWindow,cmCancel);
+  }
+end;
+end;//WinRKParamEx
+//++++++++++++++++++++++++++++++++++++++++++++++++
+//++++++++++++++++++++++++++++++++++++++++++++++++
+window WinRKParam 'Параметры формирования. Лист 7-к.' Gray;
+  show (,,95,18);
+Screen s1(,,sci1Esc);
+  show (,,,6) fixed_y;
+  fields
+    dRep   ('Дата формирования'): {Font = {BackColor = if(dRep = 0, ColorNeed, 0)}}, noprotect;
+    FiltrPodr ('Выбранные подразделения',hcStaffAppDepartment,sci13Esc): /*{Font = {BackColor = if(sPodr1 = 'Не выбраны подразделения', ColorNeed, 0)}},*/Protect, PickButton ;
+//     wPrintRash  ('Печать расшифровки'), noprotect;
+    wToExistFile('Добавить в существующий файл'), noprotect;
+    sToExistFile('Добавить в существующий файл',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sToExistFile = '', ColorNeed, 0)}},protect;
+<< 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   [.] Добавить в существующий файл          `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end;
+browse brManualValues (,,sci1Esc);
+  show(,7,,15);
+  table OborCfgCol;
+  fields
+    OborCfgCol.Name 'Показатель': [40], protect;
+    OborCfgCol.Sum[1] '1 полугодие': [10,2], noprotect;
+    OborCfgCol.Sum[2] '2 полугодие': [10,2], noprotect;
+    OborCfgCol.Attr[0] 'Результат': [List 0 'Суммировать', 1 'Замещать'], protect;
+end;
+screen sc2(,,sci1Esc);
+  show(,16,,) fixed_y;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+<<
+   <. ~С~охранить .>                                                        <. ~З~акрыть .>
+>>
+end;
+
+HandleEvent
+  cmOK:
+  {
+    if not isCheckRepParam(true)
+      exit;
+    CloseWindowEx(CurWindow,cmDefault);
+  }
+end;
+end;//WinRKParam
+//++++++++++++++++++++++++++++++++++++++++++++++++
+
+function OpenNewRKS : boolean;
+{
+  result := false;
+  sToExistFile := TranslatePath('%ClientStartPath%') +'XLS_ЭМ\Staff\RKStat.xltm';
+  if xlCreateExcelWithTemplate(sToExistFile, true)
+    result := true;
+}
+function OpenExistRKS : boolean;
+{
+  result := false;
+  xlOpenExcel(true);
+  if xlOpenWorkBook(sToExistFile)
+    result := true;
+}
+
+function SetParamRK : boolean;
+{
+  result := false;
+  if RunWindowModal(WinRKParam)=cmDefault
+    result := true;
+}
+
+
+/* копия из листа 15-к. в ТЗ нет расшифровки, отключаем. если понадобится включаем и допиливаем по требованиям
+procedure PrintRash;
+{
+  var lLine : longint;
+  var lRB, lRE, lCB, lCE : longint = 1;
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Печать расшифровки.', 0);
+  lRB := lRE := 2;
+  lCB := 1;
+  lLine:=0;
+  xlMergeCells(1,1,1,4);
+  xlSetCellStringValue('Расшифровка листа 15-к. Данные на '+datetostr(dRep,'DD.MM.YYYY')+'.',1,1,1,1);
+  if isvalid(#ttSpecRK)
+  {
+    lCE := 0;
+    //'+chr(10)+'
+    lCE++; xlSetCellStringValue('№пп',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('ФИО',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Тип'+chr(10)+'карточки',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'приема'+chr(10)+'на работу',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'увольнения',lRE,lCE,lRE,lCE);
+//    lCE++; xlSetCellStringValue('Причина'+chr(10)+'увольнения',lRE,lCE,lRE,lCE);
+//    lCE++; xlSetCellStringValue('Вид'+chr(10)+'образования',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'поступления',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'окончания',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Наименование учебного заведения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Уровень'+chr(10)+'учебного'+chr(10)+'заведения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Базовая кафедра',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Наименование специальности по диплому',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Код'+chr(10)+'специальности'+chr(10)+'по диплому',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Подразделение'+chr(10)+'код',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Должность',lRE,lCE,lRE,lCE);
+//    lCE++; xlSetCellStringValue('Ученая степень',lRE,lCE,lRE,lCE);
+//    lCE++; xlSetCellStringValue('Дата'+chr(10)+'присвоения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Договор с ОУ',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Ученический целевой договор',lRE,lCE,lRE,lCE);
+//    lCE++; xlSetCellStringValue('Стаж'+chr(10)+'работы'+chr(10)+'на предприятии',lRE,lCE,lRE,lCE);
+    lRE++;
+    _loop ttSpecRK ordered index ttSpecRK01
+    {
+      if (not NextVisual) break;
+      lCE := 0;//datetostr(dRep,'DD.MM.YYYY')
+      lCE++; xlSetCellStringValue(++lLine                                                                ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(sFIO                                                                   ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttSpecRK.sTypePsn                                                      ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(if(ttSpecRK.dAppoint<>0,datetostr(ttSpecRK.dAppoint,'DD.MM.YYYY'),'')  ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(if(ttSpecRK.dDismiss<>0,datetostr(ttSpecRK.dDismiss,'DD.MM.YYYY'),'')  ,lRE,lCE,lRE,lCE);
+//      lCE++; xlSetCellStringValue(ttSpecRK.sDissRea                                                      ,lRE,lCE,lRE,lCE);
+//      lCE++; xlSetCellStringValue(ttSpecRK.sVidEdu                                                       ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(if(ttSpecRK.dBegEdu<>0,datetostr(ttSpecRK.dBegEdu,'DD.MM.YYYY'),'')    ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(if(ttSpecRK.dEndEdu<>0,datetostr(ttSpecRK.dEndEdu,'DD.MM.YYYY'),'')    ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttSpecRK.sInst                                                         ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttSpecRK.sLevelInst                                                    ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttSpecRK.sBaseKaf                                                      ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttSpecRK.sSpecName                                                     ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetNumberFormat('@'                                                                       ,lRE,lCE,lRE,lCE);
+             xlSetCellStringValue(ttSpecRK.sSpecCode                                                     ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetNumberFormat('@'                                                                       ,lRE,lCE,lRE,lCE);
+             xlSetCellStringValue(ttSpecRK.sDeptCode                                                     ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttSpecRK.sPost                                                         ,lRE,lCE,lRE,lCE);
+//      lCE++; xlSetCellStringValue(ttSpecRK.sEduDegr                                                      ,lRE,lCE,lRE,lCE);
+//      lCE++; xlSetCellStringValue(if(ttSpecRK.dEduDegr<>0,datetostr(ttSpecRK.dEduDegr,'DD.MM.YYYY'),'')  ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttSpecRK.sDogEduC                                                      ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttSpecRK.sDogEduU                                                      ,lRE,lCE,lRE,lCE);
+//      lCE++; xlSetCellStringValue(round(ttSpecRK.fStaj,2)                                                ,lRE,lCE,lRE,lCE);
+      lRE++;
+    }
+  }
+  lRE--;
+//  xlWrapText(lRB,lCB,lRB,lCE);
+  xlAutoFit(lRB,lCB,lRE,lCE);
+  xlAlignCellsEx(xlCenter,xlCenter,lRB,lCB,lRB,lCE);
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0, lRB,lCB,lRE,lCE);
+  StopVisual;
+}
+*/
+
+procedure PrintRepPage(isStayAlone : boolean);
+{
+  var isOkFile : boolean = false;
+  var isDoRep  : boolean = false; 
+  
+  ClearRK;
+  initRK;
+
+  if isStayAlone
+    if SetParamRK
+      isDoRep := true;
+  if not isStayAlone
+    isDoRep := isCheckRepParam(true);
+
+  if isDoRep
+  {
+    MakeRK;
+    if isDataRK
+    {
+      if isStayAlone
+      {
+        if wToExistFile = 0 {isOkFile := OpenNewRKS  ;}
+        if wToExistFile = 1 {isOkFile := OpenExistRKS;}
+      }
+      else
+      {
+        isOkFile := true;
+      }
+      if isOkFile
+      {
+        PrintRK;
+
+/* в ТЗ нет расшифровки, отключаем. если понадобится включаем
+        if (wPrintRash = 1) and isStayAlone
+        {
+          var i, j : integer = 0;
+          var s    : string = '';
+          xlGetSheetsCount(j);
+          while i<=j
+          {
+            xlSetActiveSheet(++i);
+            xlGetSheetName(i,s);
+            if s='7-к' break;
+          }
+          xlSetActiveSheet(++i);
+          xlAddSheet;
+          xlSetSheetName(i,'Расшифровка 7-к'); 
+          xlSetActiveSheet(i);
+          PrintRash;
+        }
+*/
+
+        xlSetActiveSheetByName('7-к');
+        if wToExistFile = 0 {sToExistFile:='';}
+        if isStayAlone
+          xlKillExcel;
+      }
+      else if isStayAlone message('Проверте наличие файла шаблона по пути EXE\XLS_ЭМ\Staff');
+    }
+    else if isStayAlone message('Нет данных для отчета.');
+  }
+  SaveRK;
+  ClearRK;
+  closeinterface(cmDefault);
+}
+//++++++++++++++++++++++++++++++++++++++++++++++++
+//--------------------------------------------------------
+function bSetRepParam : boolean;  
+{
+  result := false;
+  if RunWindowModal(WinRKParamEx)=cmDefault
+    result := true;
+}//function bSetRepParam
+Function GetReportName: String;
+{
+  GetReportName := '#(GPNam) (ЭМ)';
+}
+function GetPriority : Integer;
+{
+  GetPriority := 7;
+}
+procedure initRKStatRepParam;
+{
+  initRK;
+}
+function dRepOnDateParam : date;
+{
+  dRepOnDateParam := dRep;
+}
+//--------------------------------------------------------
+tableevent table OborCfgCol;
+  cmUpdateRecord: update current OborCfgCol;
+end;
+
+handleevent
+  cmInit:
+  {
+    PrintRepPage(true);
+  }
+  cmPick:
+  {
+    case CurField of
+      #FiltrPodr: { PAF.ChangeDepartmentFilter(true); RereadRecord; }
+      #sToExistFile: set sToExistFile := GetFileName('*.xls;*.xlsx;*.xlsm','Выбор файла...');
+    end;
+  }
+  cmDelOnprotect:
+  {
+    case CurField of
+      #FiltrPodr:      { PAF.ClearDepartmentFilter; RereadRecord; }
+      #sToExistFile:{ set sToExistFile:=''; }
+    end;
+  }
+  cmCheckField:
+  {
+    case CurField of
+      #wToExistFile:
+      {
+        if wToExistFile = 1 
+          ToggleFieldVisible(#sToExistFile,true )
+        else
+          ToggleFieldVisible(#sToExistFile,false);
+      }
+      #dRep:
+      {
+        RefreshOborCfg;
+        RereadRecord(#OborCfgCol);
+      }
+    end;
+  }
+end;
+
+
+End.
+//---------------------------------------------------------------------------------
+#include UserReport.vih
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+Procedure Run;
+{
+  runinterface(#(GPInt));
+}
+Function GetReportName: String;
+{
+  GetReportName := '#(GPNam) (ЭМ)';
+}
+Function GetGroupName (Level : Word) : String;
+{
+  GetGroupName := '';
+  Case Level of
+//    1 : GetGroupName := 'Сводные отчеты по зарплате';
+    1 : GetGroupName := 'Формы "Роскосмоса"';
+  End;
+}
+function GetPriority : Integer;
+{
+  GetPriority := 3;
+}
+function VisibleInModule(Ind : Byte) : String;
+{
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+//     1 : VisibleInModule := 'MENUZARP';
+  end;
+}
+End.

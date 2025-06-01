@@ -1,0 +1,1553 @@
+
+/*************************************************************************************************\
+* Наименование: Импорт Договоров из Excel в Галактику                                             *
+* Контур/Модуль: Обмен бизнес-документами                                                         *
+* Примечание:  Импорт из Excel финансовых ПКП и ФинОпераций                                       *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата      |Исполнитель              |Проект                         *
+* ---------------------------------------------------------------------------------------------   *
+* Разработка  |#3260         |18/08/2018|Шунин А.Г.               |НПО Энергомаш                  *
+\*************************************************************************************************/
+const
+#include fpConst.inc
+end;
+#include ValFunc.vih
+
+Interface GP_XL2PKP 'Договора. Загрузка Финансовых ПКП и Аналитики к товарным ПКП' gray dialog;
+show (, , 150, 15);
+
+const
+ moChXl         =   1b;
+ moInsDOC       =  10b;
+ moInsAvansAttr = 100b;
+end;
+
+table struct mtXLFO // финоперации
+(
+IDDOC1C: longint,
+Npp1C: longint,
+cRec: comp, // Это товарный CalPlan к которому делаем ФинОперации
+cST: comp,
+DBeg: Date, DEnd: Date, // Период планирования.
+cPeriod: comp, // последняя неделя года из DEnd
+CGRAN: comp,
+cCO: comp,
+Summa:double,
+cFpOborot : comp,
+NAME: string[80],
+sResult : string[30],
+Line: longint
+)
+with index ( i1 = cRec, i2 = IDDOC1C ) ;
+
+table struct mtXLPKP // Финансовые ПКП
+(
+cRec: comp, // Это товарный CalPlan к которому делаем Финансовый
+IDDOC1C: longint,
+Npp1C: longint,
+cFinPKP: comp,
+FinSumma: double,
+TovSumma: double, // Сумма по Товарному ПКП
+vid: word,
+Prc: double,
+Days: double,
+Error: boolean,
+Line: longint ,
+sResult1: string[30],
+sResult2: string[30]
+)
+with index ( i1 = cRec + vid, i2 = IDDOC1C, i3= cFinPKP) ;
+
+table struct mtFinFO
+(
+ cRec    : comp, // Это ФинОперация к Финансовому ПКП
+ cFinPKP : comp, // Это Финансовый CalPlan
+ cTovPKP : comp, // Это товарный CalPlan
+ cTovFO : comp, // Это ФинОперация к товарному ПКП
+ FinSumma : double,
+ TovSumma : double,
+ TovFOSumma : double,
+
+ FO_Summa : double, // Сумма ФинОперации к Финансовому ПКП
+ Delta : double,
+ sResult: string[30]
+)
+with index ( i1 = cFinPKP + cRec , i2 = cRec);
+
+type TMyAnalitW= record
+ NPP:word;
+ cSloj: comp;
+ wKau: array[1..10] of word;
+end;
+
+#include ValFunc.var
+
+var
+ pSloj, pSloj0: comp;
+ pPLANSSCH, pPERIOD: comp;
+ bInsDB: boolean;
+ lMode: longint;
+
+ Counter, MaxLine, MaxCol , ii, Coli: longint;
+ pStr, nm_file1,nm_file2: string;
+ liVisual: longint;
+
+ ExcelFileName1: string;
+ ExcelFileName2: string;
+
+ xlNrec: comp;
+
+ minNRec1 :comp = 100000000h;        // условно, Максимальный код из 1С
+ minNRecF:comp = 1000000000h;       // minNRec + 1 разряд для Финансового ПКП
+ minNRec2:comp = 0001000000000000h; // условно, Минимальный nRec в Галактике с офисом ()
+
+ cHozoper1C_YES:comp = 000B000000000002h; // Есть бюджет договора из 1С
+ cHozoper1C_NOT:comp = 000B000000000003h; // Нет бюджета договора из 1С
+
+ FinFO_nRec: comp;
+
+ lKodDOC, lVID, lPrc, lDays, lUpDOC  : longint;
+ xlKodDOC, xlUpDOC: longint;
+ xlPrc , xlDays: double;
+ xlVID, xlDate: string;
+
+lST,lSum,lPP,lPD1,lPD2, lCO, lNpp, xlNpp :longint;
+xlST,xlPP, xlCO:string;
+xlST0: string;
+xPD1,xPD2 : date;
+xlSum: double;
+bPos: byte;
+
+xlPP0:string;
+tPP: comp;
+PD1,PD2 : date;
+
+ SJ, SJ0: TMyAnalitW;
+
+ boExist: boolean;
+ sNameHOZOPER: string;
+
+create view vM
+  as
+select * from  
+ CALPLAN
+,DOGOVOR
+,mtXLPKP
+,CalPlan FinCalPlan
+
+, mtXLFO
+
+, mtFinFO
+, mtXLFO mtTovFO // для Создания Финопераций к Финансовым ПКП
+, mtFinFO mtFinFO_free
+
+, HashAn
+, HashAn HashAnFind
+, SoprHOZ
+, SoprHoz FinSoprHoz
+// Справочники
+    , FPTPER
+    , FPPERIOD
+    , FPCO
+      , FPSTBUD
+      , FPSTBUD FPSTBUD2 (FPSTBUD03)
+      , FPSTBUD FPSTBUD3 (FPSTBUD03)
+    , SpSloj (SPSLOJ03)
+    , SLOJ
+    , HOZOPER
+
+,FPOBOROT TovFPOBOROT
+,FPOBOROT FinFPOBOROT
+
+where
+((
+
+            xlNrec == CALPLAN.nrec and
+  CALPLAN.CDOGOVOR == DOGOVOR.nrec
+and
+           403 == SoprHoz.TipDoc and
+  CalPlan.nRec == SoprHoz.cSoprDoc
+
+and
+   mtXLFO.cFpOborot == FPOBOROT.nRec
+
+and
+   mtXLPKP.cFinPKP == FinCalPlan.nRec
+
+and                   FinCalPlan.NRec       == PlanPays.cCalPlan  and
+           word(FinCalPlan.TermDefBy + 1)   == PlanPays.VidPlat   and
+                      PlanPays.NRec         == PaySchem.cPlanPays
+
+and  CALPLAN.CDOGOVOR == IERCALPL.CDOGOVOR and
+      FinCalPlan.NRec == IERCALPL.CREC
+
+and      // Запись в журнале хозопераций
+             Word(403)    == FinSoprHoz.TipDoc   and
+          FinCalPlan.NRec == FinSoprHoz.cSoprDoc
+
+and   HashAn.CSLOJ  == HashAnFind.CSLOJ and
+      HashAn.CBLOCK == HashAnFind.CBLOCK and
+      HashAn.CANALIT[1] == HashAnFind.CANALIT[1] and
+      HashAn.CANALIT[2] == HashAnFind.CANALIT[2] and
+      HashAn.CANALIT[3] == HashAnFind.CANALIT[3] and
+      HashAn.CANALIT[4] == HashAnFind.CANALIT[4] and
+      HashAn.CANALIT[5] == HashAnFind.CANALIT[5] and
+      HashAn.CANALIT[6] == HashAnFind.CANALIT[6] and
+      HashAn.CANALIT[7] == HashAnFind.CANALIT[7] and
+      HashAn.CANALIT[8] == HashAnFind.CANALIT[8] and
+      HashAn.CANALIT[9] == HashAnFind.CANALIT[9] and
+      HashAn.CANALIT[10] == HashAnFind.CANALIT[10] and
+      HashAn.NPP == HashAnFind.NPP (noindex)
+
+and mtXLPKP.cRec == mtTovFO.cRec   // для Создания Финопераций к Финансовым ПКП
+
+and mtXLPKP.cFinPKP == mtFinFO.cFinPKP
+                   and mtFinFO.cTovFO == TovFPOBOROT.nRec
+                   and mtFinFO.cREC   == FinFPOBOROT.nRec
+
+// and mtTovFO.cFpOborot == TovFPOBOROT.nRec //
+// and FinFO_nRec == FinFPOBOROT.nRec
+
+and
+        pSloj == SLOJ.nRec   and
+        pSloj == SpSloj.cMain
+and                                       //  '01/09/2018' '06/09/2018'
+      tPP == FPPERIOD.CTPER and   (   FPPERIOD.DBEG <= PD1  and  PD1 <= FPPERIOD.DEND)
+and
+       'НЕДЕЛЯ' == FPTPER.NAME
+
+and
+  0000000000000000h == FPSTBUD.CMAIN and
+              xlST0 == FPSTBUD.CODE
+
+and
+  0000000000000000h == FPSTBUD2.CMAIN
+and      mtXLFO.cST == FPSTBUD2.CNODE
+
+and
+  0000000000000000h == FPSTBUD3.CMAIN
+and   FPSTBUD2.nRec == FPSTBUD3.CNODE
+
+and
+  0000000000000000h == FPCO.CMAIN and
+               xlCO == FPCO.ABBR
+
+and
+           403 == HOZOPER.TIDK and
+  sNameHOZOPER == HOZOPER.NAME1
+))
+;
+
+function GetSt(var sStr: string) : comp;
+{
+  result := 0;
+  if (sStr  = '')    exit;
+
+  if sStr = '24106' sStr := '2202'    else
+  if sStr = '24103' sStr := '21607'   else
+  if sStr = '24121' sStr := '2161514' else
+  if sStr = '24104' sStr := '21607'   else
+  if sStr = '24101' sStr := '2161514' else
+  if sStr = '1219'  sStr := '11614'   else
+  if sStr = '24111' sStr := '2161505' ;
+  xlST0 := sStr; 
+
+    if (GetFirst FPSTBUD = tsOk)
+    {
+      Result := FPSTBUD.Nrec;
+    }
+}
+
+function GetIdx(pKAU: word): word;
+{
+  var i: word;
+  result := 0;
+  for(i := 1; i <= SJ.NPP; i++)
+  if SJ.wKau[i] = pKAU then {result := i; break;}
+}
+
+Procedure SetWKau2SJ;
+{
+  ClearAdvRecord(SJ);
+  var i: word = 0;
+  _Loop SpSloj
+  {
+    i++;    if        SpSloj.Npp < 11
+              SJ.wKau[SpSloj.Npp] := SpSloj.KODGRKAU;
+  }
+
+  SJ.NPP := i;
+  SJ.cSloj := pSloj;
+}
+
+Procedure PutBufferFinCalPlanSoprHoz; // позаимвтствовал тут L_Dogovor\vip\FinCalPlan\pkpsoph.vpp
+var tmpSumma: double=0;
+{
+  FinSoprHoz.cSoprDoc := FinCalPlan.nRec;
+
+  if ( Dogovor.cDogovor = 0 )
+    {
+      FinSoprHoz.cDogovor    := Dogovor.nRec;
+      FinSoprHoz.cAppDogovor := 0;
+    }
+  else
+    {
+      FinSoprHoz.cDogovor    := Dogovor.cDogovor;
+      FinSoprHoz.cAppDogovor := Dogovor.nRec;
+    }
+
+  FinSoprHoz.DatOb   := FinCalPlan.dInput;
+  FinSoprHoz.TipDoc  := 403;
+  FinSoprHoz.TiDkGal := 403;
+  FinSoprHoz.NoDoc   := FinCalPlan.NoDoc;
+  FinSoprHoz.Descr   := 'GAL_IMPORT'; // FinCalPlan.Descr;
+  FinSoprHoz.DesGr   := FinCalPlan.DesGr;
+  FinSoprHoz.cOrg    := FinCalPlan.cOrg;
+
+  if ( FinCalPlan.DirectPlat = 0 )
+    tmpSumma := FinCalPlan.SummaSpec;
+  else
+    if ( FinCalPlan.DirectMC = 0 )
+      tmpSumma := FinCalPlan.Summa;
+
+  if ( FinCalPlan.cVal = 0 )
+    FinSoprHoz.Summa := tmpSumma
+  else
+    FinSoprHoz.Summa := oValFunc.GetNatCurrency(FinCalPlan.cVal
+                                           , tmpSumma
+                                           , if (FinCalPlan.dValCurse = ZeroDate, FinCalPlan.dInput, FinCalPlan.dValCurse));
+
+  FinSoprHoz.KodValut := FinCalPlan.cVal;
+
+  if ( FinCalPlan.cVal <> 0 )
+    FinSoprHoz.SumValut := tmpSumma;
+}
+
+  screen createdScreen;
+    fields
+      lMode  :NoProtect;
+      nm_file1:NoProtect, PickButton;
+      nm_file2:NoProtect, PickButton;
+
+    buttons
+      cmImpFPKP; cmImpFO; cmImpALL; cmMakeFO_FPKP; cmCheckAllFO;
+<<
+ `Режим:`
+ [.] Проверка данных Excel`
+ [.] Добавление/изменение Финансовых ПКП и Финопераций в БД`
+ [.] Изменять Атрибут Аванс. Отсрочка поставки, дни к плану платежей Финансовых ПКП`
+
+
+                для Примера: G:\Договоры ФО 20180831.xls
+ 1.Файл финансовых ПКП      .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ <. 1.Загрузить Финансове ПКП.>
+
+                для Примера: G:\Договоры КБК 20180831.xls
+ 2.Файл финансовых Операций .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ <. 2.Загрузить ФинОперации.>
+
+                            <. Пуск 1,2,3.>                                           <. 3.создать ФинОперации к Финансовым ПКП.>
+
+                            <. Проверить Все Финоперации и исправить Период планирования .>
+>>
+  end;
+
+
+function ReadColNumByNamesOK1: boolean;
+Var str: string;
+   lCol:longint;
+{
+str := '';
+
+lKodDOC := lVID := lPrc := lDays := lNpp := lUpDOC := longint(0);
+
+
+lCol:=0;
+    while lCol <= MaxCol // по Колонкам первой строки
+    do
+    {
+      lCol++;
+
+        xlgetcellvalue(1, lCol   ,str );
+        str  := UpCase(trim( str ));
+// КодДоговора	ВидОплаты	ПроцентОплаты	СрокОтсрочки
+
+            Case str of
+        'НОМЕРСТРОКИ': lNpp     :=lCol;
+        'КОДДОГОВОРА': lKodDOC :=lCol;
+          'ВИДОПЛАТЫ': lVID    :=lCol;
+      'ПРОЦЕНТОПЛАТЫ': lPrc    :=lCol;
+       'СРОКОТСРОЧКИ': lDays   :=lCol;
+    'КОДВЫШЕСТОЯЩЕГО', 'КОДГРУППАДОГОВОРОВ': lUpDOC   :=lCol;
+
+            end; // Case
+    }
+
+    if lKodDOC  = 0 or lVID  = 0 or lPrc = 0 or lDays=0 or lUpDOC=0 or lNpp = 0
+    {
+        message ( 'Ошибка формата файла. Не найдена колонка'
+                +''#13'КодДоговора='+  lKodDOC
+                +''#13'ВидОплаты='+  lVID
+                +''#13'ПроцентОплаты='+  lPrc
+                +''#13'СрокОтсрочки='+  lDays
+                +''#13'КодГруппаДоговоров='+ lUpDOC
+                +''#13'НомерСтроки='+ lNpp
+                );
+
+
+       result := False;
+    }
+    else
+    result := true;
+}
+
+function ReadColNumByNamesOK2: boolean;
+Var str: string;
+   lCol:longint;
+{
+str := '';
+
+lKodDOC := lST := lSum := lNpp := lCO:= lPP := lPD1:= lPD2:= lUpDOC:= longint(0);
+lCol:=0;
+    while lCol <= MaxCol // по Колонкам первой строки
+    do
+    {
+      lCol++;
+
+        xlgetcellvalue(1, lCol   ,str );
+        str  := UpCase(trim( str ));
+
+            Case str of
+        'НОМЕРСТРОКИ': lNpp     :=lCol;
+        'КОДДОГОВОРА': lKodDOC :=lCol;
+          'СТАТЬЯКБК': lST     :=lCol;
+              'СУММА': lSum    :=lCol;
+         'ВИДПЕРИОДА': lPP     :=lCol;
+             'ПЕРИОД': lPD1    :=lCol;
+          'ПЕРИОДКОН': lPD2    :=lCol;
+          'КОДЦФО': lCO := lCol;
+    'КОДГРУППАДОГОВОРОВ': lUpDOC   :=lCol;
+            end; // Case
+    }
+
+    if lKodDOC  = 0 or lST  = 0 or lSum = 0 or lCO = 0 or lUpDOC=0 or lNpp = 0 or lPD1 = 0 or lPD2 = 0 or lPP = 0
+    {
+        message ( 'Ошибка формата файла. Не найдена колонка'
+                +''#13'НомерСтроки='+ lNpp
+                +''#13'КодДоговора='+  lKodDOC
+                +''#13'СтатьяКБК='+  lST
+                +''#13'КодЦФО='+ lCO
+                +''#13'Сумма='+  lSum
+                +''#13'КодГруппаДоговоров='+ lUpDOC
+                +''#13'ВидПериода='+  lPP
+                +''#13'Период='+ lPD1
+                +''#13'ПериодКон='+ lPD2
+                );
+
+
+       result := False;
+    }
+    else
+    result := true;
+}
+
+procedure xlOut1(pCol:longint;pStr: string);
+{
+  xlSetCellStringValue(pStr,Counter,MaxCol+pCol,Counter,MaxCol+pCol);
+}
+#define _DateS(_Str) date(substr(#_Str,1,2),substr(#_Str,4,2),substr(#_Str,7,4))
+
+procedure InsertMarkerUnic(markers,item: longInt);
+{
+  if not FoundMarker(markers, item )  InsertMarker(markers, item );
+}
+
+Procedure ChechFPOBOROT(pRec: comp);
+{
+  var newPeriod: comp = mtTovFO.CPERIOD;
+  var NewNAME: string = mtTovFO.NAME;
+  Var boUp :word = 0;
+    if Getfirst FPOBOROT where ((pRec == FPOBOROT.nRec )) = tsOK
+    {
+        if NewNAME <> ''
+        if FPOBOROT.NAME <> NewNAME
+        {
+          FPOBOROT.NAME := NewNAME;
+          boUp++;
+        }
+
+        if FPOBOROT.CPERIOD <> newPeriod
+        {
+          FPOBOROT.CPERIOD := newPeriod ;
+          boUp++;
+        }
+
+        if boUp > 0
+        {
+           if Update current FPOBOROT = tsOK
+           LogStrToFile('#_xlFO_upDate.log' , string(pRec,0,0) + ' UpDateED. By Line= ' + mtTovFO.LINE)
+           else
+           LogStrToFile('#_xlFO_upDate.log' , string(pRec,0,0) + ' NOT UpDateED. ERROR. By Line= ' + mtTovFO.LINE)
+        }
+    }
+    else
+    {
+       LogStrToFile('#_xlFO_upDate.log' , string(pRec,0,0) + ' Not Found. By Line= ' + mtTovFO.LINE);
+    }
+
+}// Procedure ChechFPOBOROT(pRec: comp);
+
+HandleEvent
+
+cmInit: {
+  pPLANSSCH := comp(14); // Надо где-то из настроек взять
+  pSloj := 000A000000000005h; // Надо где-то из настроек взять
+  SJ.cSloj := 0;
+
+  if not ReadMyDsk(lMode, 'NODOC2_lMode', false) lMode := 1b;
+  lMode := lMode or moInsDOC xor moInsDOC;// принудительно выключить Добавление/изменение Финансовых ПКП и Финопераций в БД`
+
+  if not ReadMyDsk(nm_file1, 'NODOC2_nm_file1',    false) nm_file1 := 'G:\Договоры 20180828.xls';
+  if not ReadMyDsk(nm_file2, 'NODOC2_nm_file2',    false) nm_file2 := 'G:\Договоры 20180828.xls';
+
+ tPP := 0 ; // 3096224743817219; // cgFpTPerEd_Week + 000B000000000000h;
+ PD1 := Cur_Date;
+
+ if getfirst FPTPER = tsOK tPP := FPTPER.nrec;
+
+ if getfirst FPPERIOD = tsOK pPERIOD := FPPERIOD.nrec
+ else
+ {
+   pPERIOD := comp(3096224743818554);
+   Message('не найден Период планирования неделя для даты' + PD1);
+ }
+
+
+ sNameHOZOPER := 'Есть бюджет договора из 1С';
+ if getfirst HOZOPER = tsOK cHozoper1C_YES := HOZOPER.nREC;
+
+ sNameHOZOPER := 'Нет бюджета договора из 1С';
+ if getfirst HOZOPER = tsOK cHozoper1C_NOT := HOZOPER.nREC;
+
+
+}
+// --------------------------------------------------------------------------------
+
+cmImpFPKP:
+{
+
+  Delete all mtXLPKP;
+/*
+  if UpCASE(Substr(nm_file1,length(nm_file1)-2,3)) = 'DBF'
+  if vM.GetTableFromDBF(#mtXLPKP,'') = tsOK
+  vM.PutTableToDBF(#mtXLPKP,'');
+  */
+//  Delete all cmXLKBK;
+
+  SaveMyDsk(nm_file1, 'NODOC2_nm_file1');
+  SaveMyDsk(lMode, 'NODOC2_lMode');
+
+  if (not ExistFile(nm_file1))
+  { message('Не найден шаблон файла "'+nm_file1+'"');
+    exit;
+  }
+
+  if (not xlCreateExcelWithTemplate(nm_file1,true))
+  { message('Ошибка создания нового файла в Excel"'+nm_file1+'".');
+    exit;
+  }
+
+    if (xlIsExcelValid) xlSetActiveSheetByName('1');
+
+    xlGetUsedRange(0,0,MaxLine,MaxCol);
+
+StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Чтение Финансовых ПКП из Excel ...'#13 + nm_file1, MaxLine div 5);
+
+Var mkErrList: longint = InitMarker('',4,100,10,false);
+
+// Читаем заголовок и находим номера колонок по названию полей
+// MaxLine := 100;
+
+Counter := 1;
+        xlOut1(1, 'Статус XL');
+        xlOut1(2, 'Обработка');
+        xlOut1(3, 'Статус БД');
+        xlOut1(4, 'Fin CalPlan.nRec');
+        xlOut1(6, 'PlanPays.nrec');
+        xlOut1(7, 'PaySchem.nrec');
+        xlOut1(8, 'Статус Атрибута');
+// xlOut1(20, STRING(_CurDateTime));
+Counter:=1;
+if ReadColNumByNamesOK1
+while counter < MaxLine
+do
+{
+  Counter++;
+
+  if Counter mod 5 = 0
+  if not nextvisual break;
+
+  xlgetcellvalue(Counter, lUpDOC  , xlUpDOC  );
+  xlgetcellvalue(Counter, lKodDOC , xlKodDOC );
+
+
+  if xlUpDOC > 0 xlNrec := comp(xlKodDOC) // У нижестоящего
+           else  xlNrec := comp(xlKodDOC) + comp(minNRec1); // У одиночного
+  if Getfirst CalPlan <> tsOK
+  {
+    xlOut1(1,'Ошибка. Нет CalPlan ');
+    continue;
+  }
+
+  if FoundMarker(mkErrList, xlKodDOC )
+  {
+    xlOut1(1,'Ошибка по другой записи этого докумена');
+    continue;
+  }
+
+  clearBuffer(#mtXLPKP);
+  mtXLPKP.IDDOC1C := xlKodDOC;
+  mtXLPKP.cRec := xlNrec;
+
+  xlgetcellvalue(Counter, lVID    , xlVID   );
+
+  xlVID := UpCase(trim(xlVID));
+  if xlVID = 'АВАНС'      mtXLPKP.vid := 0 else
+  if xlVID = 'ПОСТОПЛАТА' mtXLPKP.vid := 1 else { xlOut1(1,'Ошибка. не известный xlVID= ' + xlVID);      continue; }
+
+  xlgetcellvalue(Counter, lPrc    , xlPrc   ); if xlPrc  < 0.001 then { xlOut1(1,'Ошибка. % = 0'); InsertMarkerUnic(mkErrList, xlKodDOC ); continue; }
+  xlgetcellvalue(Counter, lDays   , xlDays  ); if xlDays < 0.9   then { xlOut1(1,'Ошибка. Отсрочка = 0');InsertMarkerUnic(mkErrList, xlKodDOC ); continue; }
+
+  mtXLPKP.Prc := xlPrc ;
+  mtXLPKP.Days:= xlDays;
+  mtXLPKP.Line:= Counter;
+
+  xlgetcellvalue(Counter, lNpp , xlNpp );
+  if xlNpp < 1
+  {
+    xlOut1(1,'Ошибка. Пустой Номер строки из 1C');
+    InsertMarkerUnic(mkErrList, xlKodDOC );
+    continue;
+  }
+  mtXLPKP.Npp1C := xlNpp;
+  mtXLPKP.cFinPKP := comp( string(mtXLPKP.IDDOC1C)  + string(mtXLPKP.Npp1C) ) + minNrecF;
+
+  insert current mtXLPKP;
+  xlOut1(1,'OK в памяти');
+} // while counter < MaxLine
+
+var nIndex: longint = 0;
+While GetMarker(mkErrList, nIndex, xlKodDOC) do
+{
+   nIndex++;
+//    _Loop mtXLPKP where ((xlKodDOC == mtXLPKP.IDDOC1C))
+   while getfirst mtXLPKP where ((xlKodDOC == mtXLPKP.IDDOC1C)) = tsOK
+   {
+      counter := mtXLPKP.LINE;
+      xlOut1(2, 'В одной из строчек по документу ошибка');
+//       UpDate current mtXLPKP set mtXLPKP.Error = true;
+      Delete current mtXLPKP ;
+   }
+}
+DoneMarker(mkErrList,'');
+
+
+// Обработка сумм к документу
+
+xlNrec := comp(0);
+Var DOCSumma, SummDEC: double;
+Var LastNRec: comp = 0;
+
+_Loop mtXLPKP ordered by index i1
+if not mtXLPKP.Error
+{
+    if xlNrec <> mtXLPKP.cREC
+    {
+
+        if xlNrec <> 0
+        if ABS(SummDEC) > 0.0000001
+        {
+           PushPos(#mtXLPKP);
+               if getfirst mtXLPKP where (( LastNRec == mtXLPKP.cFinPKP)) = tsOK
+               {
+                  mtXLPKP.FinSumma := mtXLPKP.FinSumma + SummDEC;
+                  UpDate current mtXLPKP;
+               }
+
+               if ABS(SummDEC) > 1.00 // Дельта больше 1 рубля
+               {
+                 counter := mtXLPKP.LINE;
+                 xlOut1(2,'Сумма не сходится на ' + string(SummDEC) );
+               }
+           PopPos(#mtXLPKP);
+        }
+
+
+        xlNrec := mtXLPKP.cREC; // Это Товарный CalPlan
+        if getfirst CalPlan <> tsOK
+        {
+           counter := mtXLPKP.LINE;
+           xlOut1(3,'1CalPlan <> tsOK');
+           continue;
+        }
+
+        SummDEC := DOCSumma := CalPlan.SUMMASPEC;
+    }
+
+
+    mtXLPKP.FinSumma := DOCSumma * mtXLPKP.Prc / 100; // CalPlan.SUMMASPEC * mtXLPKP.Prc / 100 ;
+    mtXLPKP.FinSumma := Round(mtXLPKP.FinSumma,2);
+    SummDEC := SummDEC - mtXLPKP.FinSumma;
+
+    LastNRec := mtXLPKP.cFinPKP;
+
+    mtXLPKP.TovSumma := CalPlan.SUMMASPEC;
+    UpDate current mtXLPKP;
+}
+
+if (lMode and moInsAvansAttr) > 0
+{
+  StopVisual;
+  liVisual := RecordsInTable(#mtXLPKP) div 3;
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Импорт Атрибута к Плану платежей для Финансовых ПКП в БАЗУ Данных', liVisual);
+}
+
+if (lMode and moInsAvansAttr) > 0 // Атрибут
+_Loop mtXLPKP ordered by index i1
+if not mtXLPKP.Error
+{
+    if (liVisual++ mod 3) = 0
+    if not NextVisual then break;
+    counter := mtXLPKP.LINE;
+
+    boExist := (Getfirst FinCalPlan = tsOK);
+    if not boExist
+    {
+      xlOut1(5,'Финансовый CalPlan <> tsOK')
+    }
+    else
+    if FinCalPlan.DESCR <> 'GAL_IMPORT'
+    {
+       xlOut1(5, string(FinCalPlan.nrec,0,0));
+       xlOut1(6, 'FinCalPlan.DESCR <> GAL_IMPORT');
+    }
+    else
+    {
+       xlOut1(5, string(FinCalPlan.nrec,0,0));
+       if getfirst PlanPays where ((FinCalPlan.NRec == PlanPays.cCalPlan)) = tsOK
+       {
+         xlOut1(6, string(PlanPays.nrec,0,0));
+         var doOldValue: double = doGetAttr(coPLANPAYS, PLANPAYS.nRec, '.Аванс. Отсрочка поставки, дни');
+
+         if doOldValue = mtXLPKP.Days
+           xlOut1(8,'Атрибут OK')
+         else
+         {
+           if doSetAttr(coPLANPAYS, PLANPAYS.nRec, '.Аванс. Отсрочка поставки, дни', mtXLPKP.Days)
+           xlOut1(8,'Атрибут изменён')
+           else
+           xlOut1(8,'Атрибут не изменён. Ошибка.')
+         }
+       }
+       else
+       xlOut1(6,'3 PLANPAYS <> tsOK')
+
+    }
+}
+
+if (lMode and moInsDOC) > 0
+{
+  StopVisual;
+  liVisual := RecordsInTable(#mtXLPKP) div 3;
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Импорт Финансовых ПКП в БАЗУ Данных', liVisual);
+}
+
+if (lMode and moInsDOC) > 0
+_Loop mtXLPKP ordered by index i1
+if not mtXLPKP.Error
+{
+    if (liVisual++ mod 3) = 0
+    if not NextVisual then break;
+
+//    if xlNrec <> mtXLPKP.cREC // Новый документ
+  //  if DocSumma > 0.01
+
+    xlNrec := mtXLPKP.cREC; // Это CalPlan к которому делаем Финансовый
+    counter := mtXLPKP.LINE;
+
+    xlUpDOC := 0;
+    if getfirst CalPlan = tsOK   xlUpDOC++   else  xlOut1(2,'2CalPlan <> tsOK');
+    if getfirst DOGOVOR = tsOK   xlUpDOC++   else  xlOut1(3,'DOGOVOR <> tsOK');
+
+    if xlUpDOC < 2 continue;
+
+    boExist := (Getfirst FinCalPlan = tsOK);
+
+//    if not boExist clearbuffer(#FinCalPlan);
+    FinCalPlan.buffer := CalPlan.buffer;
+
+    FinCalPlan.nRec := mtXLPKP.cFinPKP;
+    FinCalPlan.SUMMASPEC := 0;
+    FinCalPlan.Summa     := mtXLPKP.FinSumma; // CalPlan.SUMMASPEC * mtXLPKP.Prc / 100 ;
+    FinCalPlan.DIRECTPLAT:= CalPlan.DIRECTMC;
+    FinCalPlan.DIRECTMC  := 0;
+    FinCalPlan.NODOC :=   LPadCh(string(mtXLPKP.Npp1C),'0',4)
+                        + if(mtXLPKP.vid = 0, ' Аванс ',' Постоплата ')
+                        + string(mtXLPKP.Prc) + '%';
+
+    FinCalPlan.TermDefBy := mtXLPKP.vid;
+
+    FinCalPlan.NDAYS :=  mtXLPKP.Days;
+
+    var boPlanPays: boolean = (getfirst PlanPays = tsOK);
+
+      if not boPlanPays ClearBuffer(#PlanPays);
+
+      PlanPays.VidPlat   := FinCalPlan.TermDefBy + 1; // 1= аванс 2 = по факту
+      PlanPays.cCalPlan  := FinCalPlan.NRec;
+      PlanPays.cVal      := FinCalPlan.cVal;
+      PlanPays.Summa     := FinCalPlan.Summa;
+      PlanPays.DefBy     := 1; // 0 = ничего, 1 = PlanPays.Summa, 2 = CalPlan.Summa*PlanPaysAvan.Percent/100
+      PlanPays.TermDefBy := FinCalPlan.TermDefBy;
+
+      if PlanPays.VidPlat = 1 // аванс
+      {
+        PlanPays.dFrom     := if (FinCalPlan.TermDefBy = 0, FinCalPlan.dFrom, FinCalPlan.dTo);
+        PlanPays.dTo       := FinCalPlan.dTo;
+        FinCalPlan.CPREDPLAN := comp(0);
+
+        doSetAttr(coPLANPAYS, PLANPAYS.nRec, '.Аванс. Отсрочка поставки, дни', mtXLPKP.Days);
+      }
+      else // постоплата
+      {
+        PlanPays.DFROM := ADD_Day(CALPLAN.DTO,1);
+        PlanPays.DTO   := ADD_Day(CALPLAN.DTO,mtXLPKP.Days);
+        FinCalPlan.CPREDPLAN := CalPlan.nRec;
+      }
+
+
+      if boPlanPays
+        UpDate current PlanPays
+      else
+        Insert current PlanPays;
+
+
+// для всех Финансовых ПКП
+// -начало- Заполнение схемы платежей, если задан связанный товарный ПКП
+
+      var boPaySchem: boolean = (getfirst PaySchem = tsOK);
+
+          if not boPaySchem ClearBuffer(#PaySchem);
+          PaySchem.cPlanPays := PlanPays.NRec;
+
+          if FinCalPlan.TermDefBy =0
+            PaySchem.PayType   := Word(1)  // 1 - аванс 3-  факт
+          else
+            PaySchem.PayType   := Word(3); // 1 - аванс 3-  факт
+
+          PaySchem.cCalPlan  := FinCalPlan.NRec;
+          PaySchem.cPlat     := FinCalPlan.cPlat;     // НЕ !!! Перекрёстно
+          PaySchem.cPlatBank := FinCalPlan.cPlatBank;
+          PaySchem.cPol      := FinCalPlan.cPol;
+          PaySchem.cPolBank  := FinCalPlan.cPolBank;
+          PaySchem.Code      := '0001';
+          PaySchem.Direct    := FinCalPlan.DirectPlat;
+          PaySchem.cVal      := FinCalPlan.cVal;
+          PaySchem.Summa     := FinCalPlan.Summa;
+          PaySchem.Percent   := 100;
+
+          PaySchem.CMCPLAN := CalPlan.nRec;
+
+
+          if boPaySchem
+            UpDate current PaySchem
+          else
+            Insert current PaySchem;
+
+// -конец- Заполнение схемы платежей, если задан связанный товарный ПКП
+
+          xlOut1(7, string(PaySchem.nrec,0,0));
+
+    if boExist
+      { if  UpDate current FinCalPlan = tsOK mtXLPKP.sResult1 := 'UpDateED '+ string(FinCalPlan.NRec) ;}
+    else
+      { if  insert current FinCalPlan = tsOK mtXLPKP.sResult1 := 'InsertED '+ string(FinCalPlan.NRec) ;};
+
+          if getfirst IERCALPL <> tsOK
+          {
+             clearbuffer(#IERCALPL);
+             IERCALPL.CDOGOVOR := FinCalPlan.CDOGOVOR;
+             IERCALPL.CREC     := FinCalPlan.NRec;
+             IERCALPL.CUPREC   := FinCalPlan.NRec;
+             IERCALPL.ISLEAF := 1;
+             insert current IERCALPL;
+          }
+
+ LogStrToFile('#FinSoprHoz.txt', 'DOC1C= ' +mtXLPKP.IDDOC1C +'  FinCalPlan.NRec=' + FinCalPlan.NRec );
+    var boFinSH: boolean = ( (getfirst FinSoprHoz ) = tsOK) ;
+    PutBufferFinCalPlanSoprHoz;
+    if boFinSH
+      { if UpDate current FinSoprHoz = tsOK  mtXLPKP.sResult2 := 'UpDateED '+ string(FinSoprHoz.NRec) ;}
+    else
+      { if Insert current FinSoprHoz = tsOK  mtXLPKP.sResult2 := 'InsertED '+ string(FinSoprHoz.NRec) ;}
+
+
+    if mtXLPKP.vid = 0 // аванс
+    {
+      CalPlan.CPREDPLAN := FinCalPlan.nRec;
+//      CalPlan.TermDefBy := 1; // в Днях ыв 
+//      CalPlan.NDAYS := mtXLPKP.Days; // Сколько дней после аванса..
+      UpDate current CalPlan;
+    }
+
+    mtXLPKP.cFinPKP := FinCalPlan.nRec;
+    UpDate current mtXLPKP;
+
+    xlOut1(4, if(boExist, 'Обновлён', 'Добавлен') );
+    xlOut1(5, string(FinCalPlan.nrec,0,0));
+    xlOut1(6, string(PlanPays.nrec,0,0));
+
+
+} // _Loop mtXLPKP
+xlkillExcel;
+  vM.PutTableToDBF(#mtXLPKP,'#mtXLPKP.DBF',ptfFullTable);
+
+StopVisual('',0);
+
+} // cmImpFPKP:
+
+// --------------------------------------------------------------------------------
+cmImpFO:
+{
+  if pPERIOD = 0
+  {
+    Message('Не могу загрузить финоперации'#13+'Не найден Период планирования неделя для даты ' + PD1 );
+    exit;
+  } //  Message('НАЖАЛ ВСЁ');
+
+
+  Delete all mtXLFO;
+
+  SaveMyDsk(nm_file2, 'NODOC2_nm_file2');
+  SaveMyDsk(lMode, 'NODOC2_lMode');
+
+  if (not ExistFile(nm_file2))
+  { message('Не найден шаблон файла "'+nm_file2+'"');
+    exit;
+  }
+
+  if (not xlCreateExcelWithTemplate(nm_file2,true))
+  { message('Ошибка создания нового файла в Excel"'+nm_file2+'".');
+    exit;
+  }
+
+    if (xlIsExcelValid) xlSetActiveSheetByName('1');
+
+    xlGetUsedRange(0,0,MaxLine,MaxCol);
+
+StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Импорт ФинОпераций из Excel ...'#13 + nm_file2, MaxLine div 5);
+
+Var mkErrList: longint = InitMarker('',4,100,10,false);
+
+Counter := 1;
+        xlOut1(1, 'Статус XL');
+        xlOut1(2, 'Проверка XL');
+        xlOut1(3, 'SoprHOZ');
+
+if (lMode and moInsDOC) > 0
+{
+        xlOut1(4, 'FpOb_действие');
+        xlOut1(5, 'FpOborot.nRec');
+}
+else
+        xlOut1(4, 'FpOborot.nRec НЕ Проверял. Только проверка Excel');
+
+var ErrLine: word;
+Counter := 1;
+// Читаем заголовок и находим номера колонок по названию полей
+if ReadColNumByNamesOK2
+while counter < MaxLine
+do
+{
+  Counter++;
+  ErrLine := 0;
+
+  if Counter mod 5 = 0
+  if not nextvisual break;
+
+  xlgetcellvalue(Counter, lUpDOC  , xlUpDOC  );
+  xlgetcellvalue(Counter, lKodDOC , xlKodDOC );
+
+  if xlUpDOC > 0 xlNrec := comp(xlKodDOC) // У нижестоящего
+           else  xlNrec := comp(xlKodDOC) + comp(minNRec1); // У одиночного
+  if Getfirst CalPlan <> tsOK
+  {
+    xlOut1(1,'Ошибка. Нет CalPlan ');
+    continue;
+  }
+
+  clearBuffer(#mtXLFO);
+
+  mtXLFO.cREC := CalPlan.nRec;
+  mtXLFO.IDDOC1C := xlKodDOC;
+
+  xlgetcellvalue(Counter, lST  , xlST ); xlST := trim(xlST);
+
+  if (bPos := Pos(' ',xlST) ) > 0 xlST := SubStr(xlST,1,bPos-1);
+
+  // Период планирования
+  #define _DateS(_Str) date(substr(#_Str,1,2),substr(#_Str,4,2),substr(#_Str,7,4))
+
+  xlgetcellvalue(Counter, lPD1   , xlDate);  xlDate := Trim(xlDate);
+  if xlDate <> '' mtXLFO.DBeg := #_DateS(xlDate);
+
+  xlgetcellvalue(Counter, lPD2   , xlDate);  xlDate := Trim(xlDate);
+  if xlDate <> '' mtXLFO.DEnd := #_DateS(xlDate);
+
+  mtXLFO.cST := GetST(xlST);
+  if mtXLFO.cST = comp(0) 
+  {
+    xlOut1(1,'Ошибка. Не найдена Статья');
+    InsertMarkerUnic(mkErrList, xlKodDOC );
+    continue;
+  }
+  mtXLFO.CGRAN := FPSTBUD.CGRAN;
+
+  if Getfirst FPSTBUD2 = tsOK
+  {
+     var C: longint =0;
+     _LOOP FPSTBUD2
+     if Getfirst FPSTBUD3 <> tsOK
+     {
+       mtXLFO.cST   := FPSTBUD2.nRec;
+       mtXLFO.CGRAN := FPSTBUD2.CGRAN;
+       C++;
+       break;
+     }
+     if C > 0
+     xlOut1(5,'Вместо '+xlST+' выбрана Статья ' + FPSTBUD2.CODE);
+  }
+
+  xlgetcellvalue(Counter, lCO , xlCO);
+  xlCO := trim(xlCO);
+  xlCO := LPadCh(xlCO,'0',3);
+
+  if getfirst FPCO = tsOK  mtXLFO.cCO := FPCO.nRec
+  else
+  {
+    mtXLFO.cCO := coGetAttr(coFPSTBUD,mtXLFO.cST, '.ЦФО'); // coGetAttr(22217, 11606, '.ЦФО')
+    if mtXLFO.cCO <> comp(0)
+      xlOut1(2, 'ЦО по статье: ' + sGetAttr(coFPSTBUD,mtXLFO.cST, '.ЦФО'))
+    else
+    {
+      xlOut1(1,'Ошибка. Не найден ЦО');
+      xlOut1(2, ''''+xlCO);
+
+      InsertMarkerUnic(mkErrList, xlKodDOC );
+      continue;
+    }
+  }
+
+  xlgetcellvalue(Counter, lNpp , xlNpp );
+  if xlNpp < 1
+  {
+    xlOut1(1,'Ошибка. Пустой Номер строки из 1C');
+    InsertMarkerUnic(mkErrList, xlKodDOC );
+    continue;
+  }
+
+  mtXLFO.Npp1C := xlNpp;
+
+  xlgetcellvalue(Counter, lSum , xlSum );
+
+  if ABS(xlSum ) < 0.001
+  {
+    xlOut1(1,'Ошибка. Не указана Сумма');
+    xlOut1(2, ''''+xlSum);
+
+    InsertMarkerUnic(mkErrList, xlKodDOC );
+    continue;
+  }
+
+  xlgetcellvalue(Counter, lPP   , xlPP);  xlPP := Trim(xlPP);
+
+  if xlPP <> ''              mtXLFO.NAME := xlPP;
+  if mtXLFO.DBeg <> ZeroDate mtXLFO.NAME := mtXLFO.NAME +  ' c ' + DateToSTR(mtXLFO.DBeg,'DD.MM.YYYY');
+  if mtXLFO.DEnd <> ZeroDate mtXLFO.NAME := mtXLFO.NAME + ' по ' + DateToSTR(mtXLFO.DEnd,'DD.MM.YYYY');
+
+
+  if mtXLFO.DEnd = ZeroDate
+    PD1 := Date(31,12,2018) // Пустые даты в Excel чисто случайно ВСЕ соответствуют документам 2018года.
+  else
+    PD1 := Date(31,12,Year(mtXLFO.DEnd));
+
+   if getfirst FPPERIOD = tsOK mtXLFO.cPERIOD := FPPERIOD.nrec
+   else
+   {
+     xlOut1(1,'не найден Период планирования неделя для даты' + PD1);
+     InsertMarkerUnic(mkErrList, xlKodDOC );
+     continue;
+   }
+
+  mtXLFO.Summa := xlSum ;
+  mtXLFO.Line := Counter;
+
+
+  xlOut1(1,'OK');
+  if FoundMarker(mkErrList, xlKodDOC )
+  {
+    xlOut1(2,'Ошибка по другой записи этого докумена');
+    continue;
+  }
+
+  insert current mtXLFO;
+  xlOut1(1,'OK в памяти');
+
+} // while counter < MaxLine
+
+var nIndex: longint = 0;
+While GetMarker(mkErrList, nIndex, xlKodDOC) do
+{
+   nIndex++;
+   while getfirst mtXLFO where ((xlKodDOC == mtXLFO.IDDOC1C)) = tsOK
+   do
+   {
+      counter := mtXLFO.LINE;
+      xlOut1(2, 'В одной из строчек по документу ошибка');
+      Delete current mtXLFO;
+   }
+}
+DoneMarker(mkErrList,'');
+        // 3)	Если на вкладке <Бюджетирование> есть хотя бы одна статья бюджета (или несколько) без указания суммы
+// (даже если суммы по другим статьям заполнены)
+if (Getfirst mtXLFO where mtXLFO.Summa < 0.0001 )  = tsOK
+{
+  var NullREC: comp = mtXLFO.cREC;
+  var lNullREC: longint = mtXLFO.LINE;
+  _Loop mtXLFO where ((NullREC == mtXLFO.cREC))
+  {
+    counter := mtXLFO.LINE;
+    if lNullREC = counter
+      xlOut1(2, 'нет Суммы в строке ' + lNullREC)
+    else
+      xlOut1(2, 'нет Суммы. по этому документу пропускаю');
+    Delete current mtXLFO;
+  }
+}
+
+if ((Getfirst mtXLFO where mtXLFO.CGRAN <> comp(0) ) = tsOK )  pSloj := mtXLFO.CGRAN;
+
+ClearAdvRecord(SJ0);
+SJ0.npp := 5;
+SJ0.wKau[1] := 22   ;
+SJ0.wKau[2] := 1    ;
+SJ0.wKau[3] := 14   ;
+SJ0.wKau[4] := 5022 ;
+SJ0.wKau[5] := 7    ;
+SJ0.cSloj := 000A000000000005h;
+
+SJ := SJ0;
+if SJ.cSloj <> pSloj then SetWKau2SJ;
+
+
+if (lMode and moInsDOC) > 0
+{
+  StopVisual;
+  liVisual := RecordsInTable(#mtXLFO) div 3;
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Импорт в БАЗУ Данных', liVisual);
+}
+
+if (lMode and moInsDOC) > 0
+_Loop mtXLFO
+{
+    if (liVisual++ mod 3) = 0
+    if not NextVisual then break;
+
+    xlNrec := mtXLFO.cREC;
+    counter := mtXLFO.LINE;
+
+    xlUpDOC := 0;
+    if getfirst CalPlan = tsOK   xlUpDOC++   else  xlOut1(3,'3CalPlan <> tsOK');
+    if getfirst SOPRHOZ = tsOK   xlUpDOC++   else  xlOut1(4,'3SOPRHOZ <> tsOK'); // тут не нашёл
+
+    if xlUpDOC < 2 continue;
+
+    xlOut1(3, string(SOPRHOZ.nRec,0,0));
+
+    SOPRHOZ.CHOZOPER := cHozoper1C_YES; // 1C с АНАЛИТИКОЙ  ЗАМЕНИТЬ на  cHozoper1C_YES  + добавить  cHozoper1C_NOT для остальных
+
+    clearbuffer(#HashAn);
+
+    if pSloj <> mtXLFO.cGRAN
+    {
+       pSloj := mtXLFO.cGRAN;
+
+       if pSloj = SJ0.cSloj
+         SJ := SJ0;
+       else
+       SetWKau2SJ;
+    }
+
+    if pSloj = SJ0.cSloj then
+    {
+      HashAn.CANALIT[1] := mtXLFO.cCO;
+      HashAn.CANALIT[2] := CalPlan.cOrg;
+      HashAn.CANALIT[3] := CalPlan.cDogovor;
+      HashAn.CANALIT[4] := CalPlan.nRec;
+//      HashAn.CANALIT[9] := // Проект из Группы Документов Оснований
+    }
+    else
+    {
+      HashAn.CANALIT[GetIdx(cgKau_FpCO)]   := mtXLFO.cCO;
+      HashAn.CANALIT[GetIdx(cgKau_KatOrg)] := CalPlan.cOrg;
+      HashAn.CANALIT[GetIdx(cgKau_Dogovor)]:= CalPlan.cDogovor;
+      HashAn.CANALIT[GetIdx(cgKau_CalPlan)]:= CalPlan.nRec;
+    }
+
+    HashAn.CSLOJ := SJ.cSloj;
+    HashAn.NPP := SJ.NPP;
+
+//    mtXLFO.cFpOborot := (comp(mtXLFO.IDDOC1C) shl 2 ) + comp(mtXLFO.Npp1C);
+    mtXLFO.cFpOborot := comp( string(mtXLFO.IDDOC1C)  + string(mtXLFO.Npp1C) );
+
+    boExist := (Getfirst FPOBOROT = tsOK);
+
+    if not boExist clearbuffer(#FPOBOROT);
+
+
+    FPOBOROT.nRec :=  mtXLFO.cFpOborot;
+    FPOBOROT.DESCR := 'GAL_IMPORT'; //SOPRHOZ.DESCR;
+    FPOBOROT.DESGR := SOPRHOZ.DESGR;
+    FPOBOROT.DATOB := SOPRHOZ.DATOB;
+    FPOBOROT.NODOC := SOPRHOZ.NODOC;
+    FPOBOROT.TIDKGAL := SOPRHOZ.TIDKGAL;
+    FPOBOROT.TIDK := SOPRHOZ.TIDKGAL;
+    FPOBOROT.CSOPRDOC := SOPRHOZ.CSOPRDOC ;
+    FPOBOROT.CSOPRHOZ := SOPRHOZ.nrec;
+    FPOBOROT.CHOZOPER := SOPRHOZ.CHOZOPER;
+    FPOBOROT.CPLANSSCH := pPLANSSCH;
+    FPOBOROT.KODREG  := 150;
+    FPOBOROT.CPERIOD := mtXLFO.cPERIOD   ; // 3096224743818429;
+    FPOBOROT.CCO     := mtXLFO.cCO; // 3096224743817230;
+    FPOBOROT.CSTBUD  := mtXLFO.cST; // 11614;
+    FPOBOROT.SUMMA   := mtXLFO.Summa;
+    //FPOBOROT.CVAL := mtXLFO.CVAL;
+
+    //FPOBOROT.SUMVAL  := mtXLFO.0;
+    FPOBOROT.NAME := mtXLFO.NAME;
+
+
+    if getfirst HashAnFind = tsOK
+      HashAn.nRec := HashAnFind.nRec
+    else
+    {
+      HashAn.nRec := comp(0);
+      insert current HashAn;
+    }
+
+    FPOBOROT.CHASHDOC := HashAn.nRec;
+    FPOBOROT.CANDOC[1] := HashAn.CANALIT[1];
+    FPOBOROT.CANDOC[2] := HashAn.CANALIT[2];
+    FPOBOROT.CANDOC[3] := HashAn.CANALIT[3];
+    FPOBOROT.CANDOC[4] := HashAn.CANALIT[4];
+    FPOBOROT.CANDOC[5] := HashAn.CANALIT[5];
+    FPOBOROT.WANDOC[1] := SJ.wKau[1];
+    FPOBOROT.WANDOC[2] := SJ.wKau[2];
+    FPOBOROT.WANDOC[3] := SJ.wKau[3];
+    FPOBOROT.WANDOC[4] := SJ.wKau[4];
+    FPOBOROT.WANDOC[5] := SJ.wKau[5];
+
+    var i: word;
+    for(i := 1; i <= SJ.NPP; i++) if HashAn.CANALIT[i] = comp(0)  HashAn.CANALIT[i] := comp(1);
+
+    if getfirst HashAnFind = tsOK
+      HashAn.nRec := HashAnFind.nRec
+    else
+    { HashAn.nRec := comp(0);
+      insert current HashAn;
+    }
+
+    FPOBOROT.CHASHBUD := HashAn.nRec;
+    FPOBOROT.CANBUD[1] := HashAn.CANALIT[1];
+    FPOBOROT.CANBUD[2] := HashAn.CANALIT[2];
+    FPOBOROT.CANBUD[3] := HashAn.CANALIT[3];
+    FPOBOROT.CANBUD[4] := HashAn.CANALIT[4];
+    FPOBOROT.CANBUD[5] := HashAn.CANALIT[5];
+    FPOBOROT.WANBUD[1] := SJ.wKau[1];
+    FPOBOROT.WANBUD[2] := SJ.wKau[2];
+    FPOBOROT.WANBUD[3] := SJ.wKau[3];
+    FPOBOROT.WANBUD[4] := SJ.wKau[4];
+    FPOBOROT.WANBUD[5] := SJ.wKau[5];
+
+    if boExist
+     { if UpDate current FPOBOROT = tsOK mtXLFO.sResult := 'UpDateED '+ string(FPOBOROT.NRec) ;}
+    else
+     { if insert current FPOBOROT = tsOK mtXLFO.sResult := 'InsertED '+ string(FPOBOROT.NRec) ;};
+
+    UpDate current SOPRHOZ;
+
+    mtXLFO.cFpOborot := FpOborot.nrec;
+    UpDate current mtXLFO;
+
+    xlOut1(4, if(boExist, 'Обновлён', 'Добавлен') );
+    xlOut1(5, string(FpOborot.nrec,0,0));
+
+
+} // _Loop mtXLFO
+
+xlkillExcel;
+
+vM.PutTableToDBF(#mtXLFO,'#mtXLFO.DBF',ptfFullTable);
+
+StopVisual;
+} // cmImpFO:
+
+// --------------------------------------------------------------------------------
+
+cmMakeFO_FPKP:
+if (lMode and moInsDOC) = 0 message('Не Установлен параметр добавлять\изменять документы'#13'Пропускаю.')
+else
+{
+
+liVisual := RecordsInTable(#mtXLFO) div 3;
+StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Импорт в БАЗУ Данных', liVisual);
+
+// Суммы по ФинОперациям для Финансовых ПКП
+delete all mtFinFO_free;
+
+// Наполнение таблицы - список ФинОпераций к Финансовым ПКП
+_Loop mtXLPKP
+if not mtXLPKP.Error
+{
+    _Loop mtTovFO
+    {
+      mtFinFO.cRec := comp( string(mtXLPKP.IDDOC1C)  + string(mtXLPKP.Npp1C) + string(mtTovFO.Npp1C)  ) + minNrecF;
+      mtFinFO.cFinPKP := mtXLPKP.cFinPKP;
+      mtFinFO.cTovPKP := mtXLPKP.cRec;
+      mtFinFO.cTovFO :=  mtTovFO.cFPOBOROT;
+      mtFinFO.FinSumma := mtXLPKP.FinSumma;
+      mtFinFO.TovSumma := mtXLPKP.TovSumma;
+      mtFinFO.TovFOSumma := mtTovFO.Summa;
+      mtFinFO.FO_Summa := 0 ; // mtFinFO.TovFOSumma * mtFinFO.FinSumma / mtFinFO.TovSumma;
+//      mtFinFO.FO_Summa := 0 ; //Round(mtFinFO.FO_Summa,2);
+      insert current mtFinFO;
+    }
+
+} // _Loop mtXLPKP
+
+var CurFinPKP :comp = comp(0);
+Var DOCSumma, SummDEC: double;
+Var LastNRec: comp = 0;
+
+// Обработка сумм к документу
+_Loop mtXLPKP ordered by index i3
+if not mtXLPKP.Error
+_Loop mtFinFO
+{
+    if CurFinPKP <> mtFinFO.cFinPKP
+    {
+
+        if CurFinPKP <> 0
+        if ABS(SummDEC) > 0.0000001
+        {
+           PushPos(#mtFinFO);
+               if getfirst mtFinFO where (( LastNRec == mtFinFO.cRec)) = tsOK
+               {
+                  mtFinFO.FO_Summa := mtFinFO.FO_Summa + SummDEC;
+                  UpDate current mtFinFO;
+               }
+
+               if ABS(SummDEC) > 1.00 // Дельта больше 1 рубля
+               {
+                 // counter := mtFinFO.LINE;
+                 // xlOut1(2,'Сумма не сходится на ' + string(SummDEC) );
+                 mtFinFO.Delta := SummDEC;
+               }
+
+           PopPos(#mtFinFO);
+        }
+
+
+        CurFinPKP := mtFinFO.cFinPKP; // Это Товарный CalPlan
+        SummDEC := DOCSumma := mtFinFO.FinSumma;
+    }
+
+    mtFinFO.FO_Summa := mtFinFO.TovFOSumma * mtFinFO.FinSumma / mtFinFO.TovSumma;
+    mtFinFO.FO_Summa := Round(mtFinFO.FO_Summa,2);
+    SummDEC := SummDEC - mtFinFO.FO_Summa;
+
+    LastNRec := mtFinFO.cRec;
+
+    UpDate current mtFinFO;
+} // _Loop mtFinFO
+
+vM.PutTableToDBF(#mtFinFO,'#mtFinFO.DBF',ptfFullTable);
+
+_Loop mtXLPKP ordered by index i3
+if not mtXLPKP.Error
+_Loop mtFinFO
+{
+ LogStrToFile('#mtFinFO.txt', '1 mtFinFO.cRec= ' +mtFinFO.cRec);
+
+    if (liVisual++ mod 3) = 0
+    if not NextVisual then break;
+var wCnt: word = 0;
+
+    if getfirst FinCalPlan = tsOK wCnt++;
+ LogStrToFile('#mtFinFO.txt', '11 mtFinFO.cRec= ' +mtFinFO.cRec + ' wCnt=' + wCnt );
+
+    if getfirst FinSoprHoz = tsOK wCnt++;
+
+ LogStrToFile('#mtFinFO.txt', '12 mtFinFO.cRec= ' +mtFinFO.cRec + ' wCnt=' + wCnt );
+    if getfirst TovFPOBOROT= tsOK wCnt++;
+
+ LogStrToFile('#mtFinFO.txt', '13 mtFinFO.cRec= ' +mtFinFO.cRec + ' wCnt=' + wCnt );
+/*
+1 mtFinFO.cRec= 68720708547
+11 mtFinFO.cRec= 68720708547 wCnt=0    FinCalPlan       mtXLPKP.cFinPKP == FinCalPlan.nRec
+12 mtFinFO.cRec= 68720708547 wCnt=0    FinSoprHoz                      403== FinSoprHoz.TipDoc and  FinCalPlan.NRec == FinSoprHoz.cSoprDoc
+
+13 mtFinFO.cRec= 68720708547 wCnt=1
+*/
+    if wCnt = 3
+    {
+
+ LogStrToFile('#mtFinFO.txt', '2 mtFinFO.cRec= ' +mtFinFO.cRec);
+
+       FinSoprHoz.CHOZOPER := cHozoper1C_YES; // 1C с АНАЛИТИКОЙ  ЗАМЕНИТЬ на  cHozoper1C_YES  + добавить  cHozoper1C_NOT для остальных
+
+       // Количество ФинОпераций в ФинановымПКП = Количество Финоперации к Товарному * Количество Финансовых ПКП
+//       FinFO_nRec := comp( string(mtXLPKP.IDDOC1C)  + string(mtXLPKP.Npp1C) + string(mtTovFO.Npp1C)  ) + minNrecF;
+// mtFinFO.cRec
+       boExist := (Getfirst FinFPOBOROT = tsOK);
+
+       FinFPOBOROT.buffer := TovFPOBOROT.buffer;
+
+       FinFPOBOROT.nRec     := mtFinFO.cRec;
+       FinFPOBOROT.TIDKGAL  := FinSoprHoz.TIDKGAL;
+       FinFPOBOROT.TIDK     := FinSoprHoz.TIDKGAL;
+       FinFPOBOROT.CSOPRDOC := FinSoprHoz.CSOPRDOC ;
+       FinFPOBOROT.CSOPRHOZ := FinSoprHoz.nrec;
+       FinFPOBOROT.CHOZOPER := FinSoprHoz.CHOZOPER;
+       FinFPOBOROT.SUMMA    := mtFinFO.FO_Summa;
+
+        if boExist
+          { if UpDate current FinFPOBOROT = tsOK mtFinFO.sResult := 'UpDateED ' + string(FinFPOBOROT.nRec); }
+        else
+          { if insert current FinFPOBOROT = tsOK mtFinFO.sResult := 'InsertED ' + string(FinFPOBOROT.nRec); }
+
+       UpDate current FinSoprHoz;
+       UpDate current mtFinFO;
+  }
+vM.PutTableToDBF(#mtFinFO,'#mtFinFO2.DBF',ptfFullTable);
+
+} // _Loop mtFinFO
+
+StopVisual;
+
+} // cmMakeFO_FPKP:
+// --------------------------------------------------------------------------------
+
+cmCheckAllFO:
+{
+  var OldblMode: longint = lMode;
+  lMode := moChXl; // moChXl = 1b
+
+    ProcessCommand(cmImpFPKP);
+    ProcessCommand(cmImpFO);
+
+  lMode := OldblMode;
+    // список ФинОпераций к Финансовым ПКП и к Товарным ПКП
+
+  var boGloBreak: boolean = false;
+  MaxLine := RecordsInTable(#mtXLPKP) * RecordsInTable(#mtXLFO);
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Проверка ФинОпераций...', MaxLine div 5);
+      _Loop mtXLPKP
+      if not mtXLPKP.Error
+      {
+          _Loop mtTovFO
+          {
+              MaxLine--;
+              if MaxLine mod 5 = 0
+              if not nextvisual { break; boGloBreak := true;}
+
+            ChechFPOBOROT( comp( string(mtTovFO.IDDOC1C)  + string(mtTovFO.Npp1C) ) ); // для Товарного ПКП
+            ChechFPOBOROT((comp( string(mtXLPKP.IDDOC1C)  + string(mtXLPKP.Npp1C) + string(mtTovFO.Npp1C)  ) + minNrecF ) ); // для Финансового ПКП
+          }
+         if boGloBreak  break;
+      } // _Loop mtXLPKP
+  StopVisual;
+
+}// cmCheckAllFO
+
+cmPick:
+  { case CurField of
+    #nm_file1:
+    { var ww_str:string=GetFileName('*.xl*;*.DBF','Выберите файл c данными по Табелям из КИС');
+      if ww_str<>''
+         set nm_file1:=ww_str;
+    }
+    #nm_file2:
+    { var ww_str:string=GetFileName('*.xl*;*.DBF','Выберите файл c данными по Табелям из КИС');
+      if ww_str<>''
+         set nm_file2:=ww_str;
+    }
+    end;
+  }
+cmImpALL:
+{
+  ProcessCommand(cmImpFPKP);
+  ProcessCommand(cmImpFO);
+
+  ProcessCommand(cmMakeFO_FPKP); // всегда последний!
+}
+cmDone:
+{
+   SaveMyDsk(lMode, 'NODOC2_lMode');
+}
+end;
+end.
+
+.form GP_XL2PKPfrm
+.nameInlist 'Договора. Загрузка Финансовых ПКП и Аналитики к товарным ПКП'
+.ard
+.f 'NUL'
+.begin
+ runInterface(GP_XL2PKP);
+ end.
+.endForm
+// КБК
+// КодДоговора	СтатьяКБК	Сумма	ВидПериода	Период	ПериодКон
+// select * from FPOBOROT where nRec = 000B0000000001CEh;
+/*
+if not ((PD1 = xPD1) and (PD2 = xPD2) and (xlPP0 = xlPP ) )
+{
+   PD1 := xPD1; PD2 := xPD2 ; xlPP0 := xlPP;
+   if xlPP = 'ГОД' then   else
+  // единицы измерения
+  cgFpTPerEd_Day           = 0;  // день
+  cgFpTPerEd_Week          = 1;  // неделя
+  cgFpTPerEd_Month         = 2;  // месяц
+  cgFpTPerEd_Quater        = 3;  // квартал
+  cgFpTPerEd_HalfYear      = 4;  // полугодие
+  cgFpTPerEd_Year          = 5;  // год
+}
+
+23130 одиночный
+195/18 от 12.02.2018 Услуги по транспортировке
+АО "Спецавтобаза №1"
+
+sql
+
+select FPSTBUD.* from FPSTBUD
+inner join FPSTBUD FPSTBUD2 on FPSTBUD.nRec = FPSTBUD2.CNODE
+left  join FPSTBUD FPSTBUD3 on FPSTBUD2.nRec = FPSTBUD3.CNODE
+where FPSTBUD2.nRec is not Null
+;
+
+
+
+*/
+
+// Создание таблицы платежей по финансовому ПКП
+
+// sql select * from CALPLAN where #comp(3096224743819925) or nRec = #comp(3096224743819926);

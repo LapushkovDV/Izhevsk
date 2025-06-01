@@ -1,0 +1,752 @@
+/*************************************************************************************************\
+* Наименование: Интерфейс приказа РПД-111 ДМС. Перечень полисов                                   *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: 30.11.17 Для отражения отмены действия полиса в данное РПД добавлен функционал      *
+*             РПД-10 (DelRaise на отдельной вкладке). При утверждении приказа регистрируются      *
+*             снятия доплат "ДМС" при наличии DelRaise.                                           *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#231          |19/06/17|Шагубаков М.Р.           |НПО Энергомаш                    *
+* Разработка  |#1329         |30/11/17|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#component "Z_StaffOrders"
+#include MoneyRound.vih
+#include RPD.vih
+
+#doc
+  Интерфейс приказа "ДМС. Перечень полисов"
+#end
+
+
+VipInterface RPD_111(RPD_Base_Raise)
+  licensed(free);
+public:
+  procedure IRPD_Base.EnableDisable;
+  function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+  function IRPD_Base.ChildCheckOneOrder(cNrec : comp = 0): boolean;
+  procedure IRPD_Base.MyDel;
+end;
+
+//****************************************
+Interface RPD_111 '' escclose;
+//****************************************
+
+view as
+select GP_RaiseHistExt111.Nrec
+from GP_RaiseHistExt111,
+     Catalogs VarStrah,
+     DelRaise,
+     Catalogs DelRaiseCat
+where
+((
+  RaiseHist.nrec               == GP_RaiseHistExt111.cRaiseH and
+  GP_RaiseHistExt111.cVarStrah == VarStrah.nrec and
+  cgDelRaiseRPD10              == DelRaise.wTypeInfo and
+  ContDoc.nRec                 == DelRaise.cOrderCont1 and
+  DelRaise.cRaiseType          == DelRaiseCat.Nrec
+));
+
+//******************************************************************************
+//#region Вспомогательные методы
+
+//Устанавливает доступность полей приказа для редактирования
+procedure SetFieldsSelectable(value: boolean);
+{
+  ToggleFieldSelectable(#GP_RaiseHistExt111.PolisDMS, value);
+  ToggleFieldSelectable(#VarStrah.Name, value);
+  ToggleFieldSelectable(#GP_RaiseHistExt111.DateBeg, value);
+  ToggleFieldSelectable(#GP_RaiseHistExt111.DateEnd, value);
+  ToggleFieldSelectable(#DelRaiseCat.Name, value);
+  ToggleFieldSelectable(#DelRaise.dRaiseAbort, value);
+}
+
+//Возвращает текст сообщения пользователю с детализацией о невалидности записи RaiseHist
+function GetNotValidRaiseHistUserInfo: string;
+{
+  var EmptyRequiredFields: string = ''; //незаполненные обязательные поля
+
+  if RaiseHist.dRec = 0
+    EmptyRequiredFields += 'С даты';
+
+  if RaiseHist.dDat2 = 0
+    EmptyRequiredFields += if(EmptyRequiredFields = '', '', ''#13#3) + 'По дату';
+
+  if GP_RaiseHistExt111.PolisDMS = ''
+    EmptyRequiredFields += if(EmptyRequiredFields = '', '', ''#13#3) + 'Номер полиса ДМС';
+
+  if GP_RaiseHistExt111.cVarStrah = 0
+    EmptyRequiredFields += if(EmptyRequiredFields = '', '', ''#13#3) + 'Программа страхования';
+
+  result := if(EmptyRequiredFields = '', '',
+               ''#3'Не заполнены обязательные поля: '#13 + EmptyRequiredFields);
+}
+
+//Проверяет на валидность данные в записи RaiseHist
+//Возвращает true, если запись валидна
+function RaiseHistIsValid: boolean;
+{
+  result := RaiseHist.dRec > 0 and
+            RaiseHist.dDat2 > 0 and
+            GP_RaiseHistExt111.PolisDMS != '' and
+            GP_RaiseHistExt111.cVarStrah != 0;
+}
+
+//Заполняет маркер m нреками доступных для выбора надбавок по сотруднику personsNrec на дату d
+//Raise ищет в утвержденных РПД-111 по сотруднику и в надбавках к назначениям сотрудников с видом
+//надбавки из настройки (или подчиненными видами)
+procedure FillMarkerWithAllowedRaisesForPick(personsNrec: comp; d: date; var m: tPtr);
+{
+  if m = 0
+    m := InitMarker('', 8, 10, 10, true);
+
+  var raiseTypeNrec: comp;
+  raiseTypeNrec := coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD111');
+
+  var raiseNrec: comp = 0;
+
+  sql_loop
+  select distinct Raise.Nrec
+  from ContDoc
+  join PartDoc
+       on PartDoc.Nrec = ContDoc.cPart
+  join TitleDoc
+       on TitleDoc.Nrec = PartDoc.cDoc and
+          TitleDoc.wStatus = 1
+  join RaiseHist
+       on RaiseHist.cContDoc = ContDoc.Nrec
+  join Raise
+       on Raise.Nrec = RaiseHist.cRaise and
+          Raise.FromDate <= :(d) and ( Raise.ToDate = 0 or Raise.ToDate >= :(d) )
+  where ContDoc.Person = :(personsNrec) and
+        ContDoc.TypeOper = 111
+  union
+  select Raise.Nrec
+  from Raise
+  join Catalogs catRaiseType
+       on catRaiseType.Nrec = Raise.RaiseType and
+          ( catRaiseType.Nrec    = :(raiseTypeNrec) or
+            catRaiseType.cParent = :(raiseTypeNrec) )
+  where Raise.Person = :(personsNrec) and
+        Raise.FromDate <= :(d) and
+        ( Raise.ToDate = 0 or Raise.ToDate >= :(d) )
+  into (raiseNrec)
+  {
+    InsertMarker(m, raiseNrec);
+  }
+}
+
+//Запускает интерфейс выбора удаляемого полиса, записывает в DelRaise
+procedure PickDelRaise;
+{
+  var d: date;
+  d := TitleDoc.DocDate;
+
+  var allowedRaisesMarker: tPtr;
+  allowedRaisesMarker := InitMarker('', 8, 10, 10, true);
+  FillMarkerWithAllowedRaisesForPick(Persons.Nrec, TitleDoc.DocDate, allowedRaisesMarker);
+
+  var raiseNrec: comp = 0;
+
+  if (runinterface(GP_Staff::GP_GetRaise, Persons.Nrec, d, raiseNrec, 0,
+                   TitleDoc.nRec, allowedRaisesMarker) = cmDefault)
+    if getfirst Raise where ((raiseNrec == Raise.nRec)) = tsOk
+    {
+      //скопировал из RPD_10 CopyRaiseToDelRaise
+      set DelRaise.iRaseAttr     := Raise.RaiseAttr;
+      set DelRaise.cRaiseType    := Raise.RaiseType;
+      set DelRaise.cCurrency     := Raise.RaiseCurr;
+      set DelRaise.cAppointments := Raise.Appoint;
+      set DelRaise.cRaiseSTS     := Raise.cStRaise;
+      set DelRaise.dSum1         := Raise.Sum;
+      set DelRaise.dFromDate     := Raise.FromDate;
+      set DelRaise.dToDate       := Raise.ToDate;
+      set DelRaise.wPrizn2       := Raise.wPriz2;
+      set DelRaise.dRaiseAbort   := Raise.dRAbort;
+      set DelRaise.dDopDate      := Raise.dDop1;
+      set DelRaise.sOrderNmb2    := Raise.OrderNmb2;
+      set DelRaise.dOrderDate2   := Raise.OrderDate2;
+      set DelRaise.wPrizn        := Raise.wPrizn;
+      set DelRaise.cCat1         := Raise.cCat1;
+      set DelRaise.cOrderCont2   := Raise.cRDop;
+      set DelRaise.cSource       := Raise.nRec;
+      set DelRaise.wTypeInfo     := cgDelRaiseRPD10;
+      set DelRaise.cOrderCont1   := ContDoc.nRec;
+      set DelRaise.cRef1         := Persons.nRec;
+      set DelRaise.cRef2         := TitleDoc.nRec;
+
+      if (DelRaise.nRec = 0)
+        insert current DelRaise;
+      else
+        update current DelRaise;
+    }
+}
+
+//Актуализирует данные в Raise по DelRaise (скопировал из RPD_10)
+procedure CopyAllDelRaiseToRaise;
+{
+  _loop DelRaise
+  {
+    if getfirst Raise where ((DelRaise.cSource == Raise.nRec)) = tsOK
+    {
+      set Raise.RaiseAttr  := DelRaise.iRaseAttr;
+      set Raise.FromDate   := DelRaise.dFromDate;
+      set Raise.ToDate     := DelRaise.dToDate;
+      set Raise.wPriz2     := DelRaise.wPrizn2;
+      set Raise.dRAbort    := DelRaise.dRaiseAbort;
+      set Raise.dDop1      := DelRaise.dDopDate;
+      set Raise.OrderNmb2  := DelRaise.sOrderNmb2;
+      set Raise.OrderDate2 := DelRaise.dOrderDate2;
+      set Raise.wPrizn     := DelRaise.wPrizn;
+      set Raise.cCat1      := DelRaise.cCat1;
+      set Raise.cRDopEnd   := DelRaise.cOrderCont1;
+      set Raise.rSum3      := DelRaise.dSum3;
+
+      update current Raise;
+    }
+  }
+}
+
+//#endregion Вспомогательные методы
+//******************************************************************************
+
+//******************************************************************************
+//#region Визуальная часть
+
+TabbedSheet top tsRPD111;
+  show(,9,,17);
+
+FormatsGroup fgrRaise 'Назначение';
+  show (,9,,17);
+
+Browse brwRaise111 'Назначение доплаты' (,, sci178Esc);
+  show at (, 9,,13);
+  table RaiseHist;
+  Fields
+    RaiseCat.Name     'Вид доплаты/надбавки', ('Вид доплаты/надбавки.', hcStaffRaiseType, sci1378Esc):[20], protect;
+    RaiseHist.rHSum   'Сумма/процент доплаты/надбавки', ('Сумма/процент доплаты/надбавки', hcStaffRaiseSum): [13.3], noprotect;
+    'Нац.валюта'      'Валюта', ('Валюта оплаты.', hcStaffRaiseCurr, sci1378Esc):[10] , protect;
+    RaiseHist.dRec    'С даты', ('Дата, с которой установлена доплата', hcStaffRaiseFromDate, sci1378Esc): [10,'DD/MM/YYYY'], noprotect, centered,
+      {Font = {BackColor = if (RaiseHist.dRec = 0, ColorNeed, 0)}};
+    RaiseHist.dDat2   'По дату', ('Дата, по которую установлена доплата', hcStaffRaiseFromDate, sci1378Esc): [10,'DD/MM/YYYY'], noprotect, centered,
+      {Font = {BackColor = if (RaiseHist.dDat2 = 0, ColorNeed, 0)}};
+end;   //  brwRaise
+
+screen scrRaise111Ext111 'Назначение доплаты (расширение)' (,, sci178Esc);
+  show at (, 14,,17) fixed_y;
+  table RaiseHist; //GP_RaiseHistExt111;
+  Fields
+    GP_RaiseHistExt111.PolisDMS  ('Полис ДМС'): noprotect,
+      {Font = {BackColor = if (GP_RaiseHistExt111.PolisDMS = '', ColorNeed, 0)}};
+    VarStrah.name                ('Вид страхования'): protect, pickbutton,
+      {Font = {BackColor = if (GP_RaiseHistExt111.cVarStrah = 0, ColorNeed, 0)}};
+    GP_RaiseHistExt111.SummaVoz  ('Сумма возмещения'): noprotect;
+    GP_RaiseHistExt111.DateBeg   ('Начало действия'): noprotect, centered;
+    GP_RaiseHistExt111.DateEnd   ('Окончание действия'): noprotect, centered;
+<<
+ `Номер полиса ДМС` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@   `Программа страхования` .@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Сумма возмещения` .@@@@@@@@@@@@@@@@@@ `Начало действия`  .@@@@@@@@@@ `Окончание действия`  .@@@@@@@@@@
+>>
+end; //screen scrRaise111Ext111
+
+end; //FormatsGroup fgrRaise
+
+Browse brwRaise10 'Снятие' (,, sci178Esc);
+  show at (,9,,17);
+  table DelRaise;
+  Fields
+    DelRaiseCat.Name 'Вид доплаты/надбавки',
+      ('Вид доплаты/надбавки.', hcStaffRaiseType, sci1378Esc): [20],  protect;
+    DelRaise.dSum1 'Сумма',
+      ('Сумма доплаты/надбавки', hcStaffRaiseSum): [8.2], skip;
+    'Нац.валюта' 'Валюта',
+      ('Валюта оплаты.', hcStaffRaiseCurr): [8] , skip;
+    DelRaise.dFromDate 'С даты',
+      ('Дата, с которой установлена доплата', hcStaffRaiseFromDate):
+        [10,'DD/MM/YYYY'], skip, centered;
+    DelRaise.dToDate 'По дату',
+      ('Дата, по которую установлена доплата', hcStaffRaiseToDate):
+        [10,'DD/MM/YYYY'], skip, centered;
+    DelRaise.dRaiseAbort 'Дата снятия'
+      ('Дата, с которой снимается доплата', hcStaffRaiseToDate):
+        [10,'DD/MM/YYYY'], noprotect, centered;
+end; //Browse brwRaise10
+
+end; //TabbedSheet tsRPD111
+//--------------------------
+OverLoadFormats brPsn;
+OverLoadFormats SCRDETRAISE;
+
+//******************************************************************************
+// Люди по данному РПД
+//******************************************************************************
+browse brPsn  (, hcStaffWinPr, sci1378Esc);
+show at (,,, 8) fixed_y;
+table ContDoc;
+  fields
+  ContDoc.wAttrDoc2 'Вид назначения'('Основное назначение или совмещение',, sci178Esc):
+    [list 'основное назначение', 'совмещение'], [15], noautosize, protect;
+  fullNamePodr    'Подразделение' ('Подразделение'): [25], protect;
+  Persons.FIO     'ФИО' ('Фамилия имя отчество'): [28], protect;
+#IFDEF _GP_
+  sTabNmb
+#ELSE
+  [sTabNmb] if (Appointments.lPrizn = 0, GetStrTabn(Persons.TabNmb,Persons.StrTabn), GetStrTabn(Appointments.AppTabNmb, Appointments.StrTabN))
+#ENDIF
+                  'Табельный №' ('Табельный номер'): [12], skip;
+  Catalogs.Name   'Должность' ('Должность (из основного назначения или совмещения - для увольнения совместителей)' , hcStaffWinPr) :[15], skip;
+#IFDEF _GP_
+  [FOR_ND] IF(isValidAll(#RaiseHist),'Н','')+IF(isValidAll(#DelRaise),'С','') 'НС' ('Н - назначена,С - Снятие ') :[5] ,Protect,NoDel,NoAutoSize,NoPickButton;
+#ENDIF
+  PersOrderState       'Исполнение'  ('Исполнение', hcStaffWinPr): [12], skip,
+      { font = {Color = if ( isValid(#ContDoc) and (TitleDoc.wStatus <> 1) and (ContDoc.wYearPr = 0 or ContDoc.wYearPr = 3) and isValid(#AllMemo), ColorSysRed, 0)} };
+  [space_w] '               ' '' :[20],NoDel ,NoAutoSize ;
+end; //browse brPsn
+
+screen scrDetRaise (, hcStaffWinPr, sci1ESc);
+  show at (,18,,) fixed_y;
+table ContDoc;
+Fields
+  fAgreement ('Доп. соглашение к трудовому договору'): protect, pickbutton;
+  ContDoc.SBottom ('Основание'): [40], noprotect;
+Buttons
+  cmViewAdvance1,,, 'Просмотр примечания к приказу', hcStaffWinPr;
+  cmValue21,,, 'Дополнительные условия по приказу';
+<<
+ `Доп. соглашение` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Основание`       .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  <.  Примечание  .>    <. Доп. условия .>
+>>
+end; // screen scrDetRaise
+
+//#endregion Визуальная часть
+//******************************************************************************
+Procedure ReReadCurAndSubTable;
+{ ReScanPanel(#Contdoc);
+  ReScanPanel(#DelRaise);
+  ReScanPanel(#RaiseHist);
+} //Procedure ReReadCurAndSubTable;
+
+//******************************************************************************
+//#region Перекрытые методы
+
+// Процедура удаления своих записей, привязанных у удаляемому приказу
+Procedure MyDel;
+{
+  _loop RaiseHist
+  {
+    delete all from GP_RAISEHISTEXT111 where ((RaiseHist.Nrec == GP_RaiseHistExt111.cRaiseH));
+  }
+  delete DelRaise where ((
+     cgDelRaiseRPD10    == DelRaise.wTypeInfo and
+     ContDoc.nRec       == DelRaise.cOrderCont1
+  ));
+  inherited::MyDel;
+}
+
+//-------------------------------------------------
+// Процедура открытия\закрытия полей для редактирования
+//-------------------------------------------------
+Procedure EnableDisable;
+{
+  var sTitle:string;
+  inherited::EnableDisable;
+
+  cfsSetCurrentContainer('Z_STAFFORDERS::ORDERSLIST');
+  cfsGetProp('WHATISINORDER',cfpTitle, sTitle);
+  cfsSetProp('WHATISINORDER',cfpTitle, replace(sTitle,'Приказ','Список'));
+  cfsSetProp('L_EDITTITLE_N_приказа',cfpTitle,'Номер списка');
+  cfsSetProp('L_EDITTITLE_Дата_приказа',cfpTitle,'Дата списка');
+  //-----------------------------
+  cfsSetCurrentContainer(cfsGetCurrentContainerSelf);
+  //-----------------------------
+  if fnFieldsOpen // не утвержден
+  {
+    SetHelpAndStatusContext(brwRaise111, -1, sci178Esc, 'StaffWinPr');
+    SetHelpAndStatusContext(brwRaise10, -1, sci178Esc, 'StaffWinPr');
+  }
+  else //утвержден
+  {
+    SetHelpAndStatusContext(brwRaise111, -1, sci1Esc, 'StaffWinPr');
+    SetHelpAndStatusContext(brwRaise10, -1, sci1Esc, 'StaffWinPr');
+  }
+  SetFieldsSelectable(fnFieldsOpen);
+  ReReadCurAndSubTable;
+} //Procedure EnableDisable;
+
+// Выполняет утверждение текущего приказа
+function ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+var Marker_Tmp:longint;
+    ii:longint;
+    _pnrec:comp;
+{
+  Marker_Tmp  :=InitMarker('', 8, 50, 10, True);
+  ClearMarker(Marker_Tmp);
+  if cNrec <> 0
+  { if GetFirst ContDoc where ((cNrec == ContDoc.NRec))=tsok {};
+    cNrec:=0;
+  }
+  _loop fullcache RaiseHist
+  {
+    //-----------------
+    // Уберем вообще доплату
+    //-----------------
+    InsertMarker(Marker_Tmp,RaiseHist.Nrec);
+    update current RaiseHist set RaiseHist.cContDoc:=0;
+  } //_loop fullcache RaiseHist
+  //---------------------------------------------
+  //result := inherited::ChildConfirmOneOrder(cNrec);
+  RESULT:=TRUE;
+  //---------------------------------------------
+  //#232.#19
+  /*
+  с таким способом генерится запись в корзину и удаляется
+  SRR.DelRaiseMsg(Raise.NRec, Raise.Person, Raise.Appoint);
+  _Loop RaiseHist
+  { _loop fullcache Raise
+      update current Raise set Raise.Appoint    := 0;
+  }
+  */
+  CopyAllDelRaiseToRaise;
+
+  for(ii:=0;ii<GetMarkerCount(Marker_Tmp);ii++)
+  { if GetMarker(Marker_Tmp,ii,_pNrec)
+    { if getfirst RaiseHist where (( _pNrec == RaiseHist.Nrec ))=tsok
+      {  update current RaiseHist set RaiseHist.cContDoc:=ContDoc.Nrec;
+         if getfirst Raise=tsok
+         {  update current Raise set
+             Raise.OrderNmb1 := TitleDoc.DocNmb,
+             Raise.OrderDate1 := TitleDoc.DocDate,
+             Raise.Person:=ContDoc.Person
+             ;
+            // проапдейтить, а вдруг что-то изменилось
+            iHRaise.UpdNeedRHist(Raise.Nrec, 0, Raise.OrderDate1, Raise.OrderNmb1);
+
+         }
+      }
+    }
+  }//for(ii:=0;ii<GetMarkerCount(Marker_Tmp);ii++)
+  DoneMarker(Marker_Tmp,'');
+  _loop fullcache Raise where ((ContDoc.Nrec == Raise.cRDopEnd))
+  {
+    Raise.ToDate     := Raise.dRAbort;
+    Raise.Person     := Persons.nRec;
+    Raise.OrderNmb2  := TitleDoc.DocNmb;
+    Raise.OrderDate2 := TitleDoc.DocDate;
+    Raise.Appoint    := 0;
+    if ( update current Raise = tsOK )
+      iHRaise.Pers_InsToRHist(Raise.Nrec,
+                              Raise.FromDate,
+                              Raise.ToDate,
+                              word(10),
+                              Raise.OrderDate2,
+                              Raise.OrderNmb2,
+                              ContDoc.Nrec);
+  } //_loop fullcache Raise where ((ContDoc.Nrec == Raise.cRDopEnd))
+} //function ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+
+//Выполняет проверку текущего приказа
+function ChildCheckOneOrder(cNrec : comp = 0): boolean;
+{
+  //Проверки доплат для полисов ДМС не нужны
+  result := true;
+  if cNrec <> 0
+  { if GetFirst ContDoc where ((cNrec == ContDoc.NRec))=tsok {};
+    cNrec:=0;
+  }
+  var _COl:longint=0;
+  var _DocNMB:string='';
+  var _DocDate:Date=ZeroDate;
+  var _NRAZD:word;
+  _loop fullcache RaiseHist
+  { if getfirst GP_RaiseHistExt111<>tsok then continue;
+    if GP_RaiseHistExt111.PolisDMS='' then continue;
+
+    SQL Select Count(GP_RaiseHistExt111.PolisDMS)
+      ,Max(TitleDoc.DOCNMB)
+      ,Max(TitleDoc.DOCDate)
+      ,Max(PartDoc.NRAZD)
+    FROM GP_RaiseHistExt111
+    inner join RaiseHist on RaiseHist.Nrec= GP_RaiseHistExt111.cRaiseH
+    inner join ContDoc on ContDoc.Nrec = RaiseHist.cContDoc
+    inner join PartDoc on PartDoc.Nrec = ContDoc.cPart
+    inner join TitleDoc on TitleDoc.Nrec = PartDoc.cDoc
+    left outer join DelRaise on//будем искать не отмененные доплаты по всем приказам
+                    // DelRaise.cOrderCont1 = :(ContDoc.Nrec)
+                    DelRaise.cOrderCont1> RaiseHist.cContDoc
+                and DelRaise.wTypeInfo =1 //cgDelRaiseRPD10
+                and DelRaise.cSource = RaiseHist.cRaise
+
+    where GP_RaiseHistExt111.PolisDMS=:(GP_RaiseHistExt111.PolisDMS)
+      and GP_RaiseHistExt111.Nrec<>:(GP_RaiseHistExt111.Nrec)
+      and (DelRaise.Nrec is Null)
+    into (_COl,_DocNMB,_DocDate,_NRAZD)
+    ;
+    if _col>0
+    { Result:=false;
+      SetErrorOrder('Полис '+GP_RaiseHistExt111.PolisDMS+' уже есть в приказе '+_DocNMB
+        +DateToStr(_DocDate,' от DD.MM.YYYY ')+', раздел '+_NRAZD);
+    }
+  } //_loop fullcache RaiseHist
+} //function ChildCheckOneOrder(cNrec : comp = 0): boolean;
+
+//#endregion Перекрытые функции
+//******************************************************************************
+
+TableEvent table RaiseHist;
+  cmSetDefault:
+  {
+    inherited::HandleEvent(cmSetDefault);
+    var ParentSav : comp;
+    ParentSav := coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD111');
+    if (ParentSav <> 0)
+    {
+      RaiseHist.cRaiseType := ParentSav;
+      RaiseHist.iHAttr := CheckTypeRaise(ParentSav);
+      Raise.RaiseAttr := RaiseHist.iHAttr;
+      Raise.RaiseType := ParentSav;
+    }
+    RaiseHist.Nrec := GetNextNrec(tnRaiseHist, 0);
+    clearbuffer(#GP_RaiseHistExt111);
+    GP_RaiseHistExt111.Nrec := GetNextNrec(tnGP_RaiseHistExt111, 0);
+    GP_RaiseHistExt111.cRaiseH := RaiseHist.Nrec;
+    SetModified(true);
+  }
+  cmInsertRecord:
+  {
+    if inherited::handleevent(cmInsertRecord) = heOk
+    {
+      GP_RaiseHistExt111.cRaiseH := RaiseHist.nrec;
+      GP_RaiseHistExt111.cPerson := RaiseHist.cPsn;
+      insert current GP_RaiseHistExt111;
+    }
+  }
+  cmUpdateRecord:
+  {
+    if inherited::handleevent(cmUpdateRecord) = heOk
+    {
+      if isValidAll(#GP_RaiseHistExt111)
+      {
+        GP_RaiseHistExt111.cRaiseH := RaiseHist.nrec;
+        GP_RaiseHistExt111.cPerson := RaiseHist.cPsn;
+        update current GP_RaiseHistExt111;
+      }
+    }
+  }
+  cmDeleteRecord:
+  {
+    if isValidAll(#GP_RaiseHistExt111)
+      delete current GP_RaiseHistExt111;
+    inherited::handleevent(cmDeleteRecord);
+  }
+  cmCheckRecord:
+  { if TitleDoc.wStatus<>1
+    { if not RaiseHistIsValid
+      {
+        Message(GetNotValidRaiseHistUserInfo, Error);
+        Abort;
+      }
+      inherited::handleevent(cmCheckRecord);
+    }
+  }
+end; //TableEvent RaiseHist
+
+TableEvent table ContDoc;
+  cmInsertRecord:
+  {
+    //При добавлении нового сотрудника в приказ вызываем выбор вида доплаты/надбавки
+    if inherited::handleevent(cmInsertRecord) = heOk
+    {
+      if SelectFormat(brwRaise111)
+      {
+        SelectField(#RaiseCat.Name);
+        PutCommand(cmPick);
+      }
+    }
+  }
+end; //TableEvent ContDoc
+
+TableEvent table DelRaise;
+  cmSetDefault:
+  {
+    ClearBuffer(tnDelRaise);
+    DelRaise.cOrderCont1 := ContDoc.nRec;
+    DelRaise.cRef1       := Persons.nRec;
+    DelRaise.wTypeInfo   := cgDelRaiseRPD10;
+    DelRaise.cRef2       := TitleDoc.nRec;
+    DelRaise.nRec        := comp(0);
+  }
+  cmUpdateRecord:
+  {
+    if Update Current DelRaise = tsOk
+      Update Current ContDoc;
+  }
+  cmDeleteRecord:
+  {
+    if (Message(chr(3) + 'Удалить ' + DelRaiseCat.Name + ' ?', YesNo) = Yes)
+    {
+      Delete current DelRaise;
+      ReReadRecord(tnDelRaise);
+    }
+  }
+end; //TableEvent DelRaise
+
+HandleEvent
+
+  cmCheckField:
+  {
+    case CurField of
+      #GP_RaiseHistExt111.PolisDMS,
+      #VarStrah.name,
+      #GP_RaiseHistExt111.DateBeg,
+      #GP_RaiseHistExt111.DateEnd,
+      #GP_RaiseHistExt111.SummaVoz:
+      {
+        SetModified(true);
+      }
+      #RaiseHist.dRec:
+      {
+        Set GP_RaiseHistExt111.DateBeg := RaiseHist.dRec;
+      }
+      #RaiseHist.dDat2:
+      {
+        Set GP_RaiseHistExt111.DateEnd := RaiseHist.dDat2;
+      }
+    end;
+    inherited::handleevent(cmCheckField);
+  }
+
+  cmPick:
+  {
+    case CurField of
+      #RaiseCat.Name:
+      {
+        ParentSav := coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD111');
+
+        var wPickResult: word = cmCancel;
+        if GetFirst FastFirstRow Catalogs where ((ParentSav == Catalogs.cParent)) = tsOk
+          wPickResult := RunInterface(Z_STAFFCAT::PickCatalog2, 0, ParentSav, 0, 0);
+        else
+          wPickResult := RunInterface(GP_STAFF::GP_PickCatalogWithOneRec, -17, ParentSav);
+
+        if (wPickResult = cmDefault)
+        {
+          //PreviousType := RaiseHist.cRaiseType; // взвести флаг того, что поменяли наименование
+          set RaiseHist.cRaiseType := ParentSav;
+          set RaiseHist.iHAttr := CheckTypeRaise(ParentSav);
+          set Raise.RaiseAttr := RaiseHist.iHAttr;
+          set Raise.RaiseType := ParentSav;
+          ReReadRecord(tnCatalogs);
+        }
+
+        exit;
+      }
+      #DelRaiseCat.Name:
+      {
+        PickDelRaise;
+        exit;
+      }
+    end;
+    inherited::HandleEvent(cmPick);
+    case CurField of
+      #VarStrah.Name:
+      {
+        if RunInterface(Z_StaffCat::PickCatalog2, 4006, GP_RaiseHistExt111.cVarStrah, 0) = cmDefault
+          SetModified(True);
+        ReReadRecord(tnCatalogs);
+      }
+      #persons.fio:
+      {
+        if isvalidall(#Persons)
+        {
+          //Запрещаем пользователю выбирать умерших сотрудников
+          if (Persons.ddop1 != 0)
+          {
+            message('Запрещено выбирать сотрудников с заполненным полем "Дата смерти"', error);
+            PutCommand(cmDelOnProtect);
+          }
+          else
+          {
+            //Если пользователь выбрал корректного сотрудника и это новая позиция -
+            //сразу вызываем вставку этой записи, чтобы далее вызвать добавление вида доплаты/надбавки
+            if(isNew) UpdateTable();
+            SelectFieldInFormat(brwRaise111, #RaiseCat.Name);
+          }
+        }
+      }
+    end;
+  }
+
+  cmMulSelDO:
+  {
+    if UpdateTable
+      UpdNeedField(CurField);
+  }
+
+  cmCalc:
+  {
+    update current ContDoc set TypeOper = 9;
+    inherited::Handleevent(cmCalc);
+    update ContDoc where ((PartDoc.nrec == contdoc.cPart)) set TypeOper = 111;
+    _loop Contdoc where ((PartDoc.nrec == contdoc.cPart))
+      NOAA.DeleteAgreementLinks(coContDoc, ContDoc.nrec)
+  }
+
+  cmHotKeys:
+  {
+    //Если приказ не утвержден
+    if (TitleDoc.wStatus = 0 or (boUsePartOrders and TitleDoc.wStatus = 3
+      and (ContDoc.wYearPr = 0 or ContDoc.wYearPr = 3))) // не утвержден
+    {
+      var LocalMenu:longint;
+      //Добавим пункт меню для импорта реестра гостиничных услуг
+
+      LocalMenu := LoadMenu('Rpd_MenuCopy');
+      AddMenuItem(LocalMenu, 'Импорт новых полисов ДМС', cmValue31);
+      AddMenuItem(LocalMenu, 'Импорт новых полисов ДМС (формат с изменениями)', cmValue32);
+      PutHotCommand(RunLoadMenu(LocalMenu));
+    }
+  }
+
+  cmValue31:
+  {
+    OnIdle(0);
+    if isValidAll(#contDoc)
+    { message('В РПД уже есть записи, Импорт запрещен!' );
+      exit;
+    }
+    else
+    { RunInterface('GP_Staff::GP_RPD111_Import', PartDoc.nrec);
+      ReReadRecord;
+    }
+  }
+
+  cmValue32:
+  {
+    OnIdle(0);
+    if isValidAll(#contDoc)
+    { message('В РПД уже есть записи, Импорт запрещен!' );
+      exit;
+    }
+    else
+    { RunInterface('GP_Staff::GP_RPD111_Import_v2', PartDoc.nrec, '');
+      ReReadRecord;
+    }
+  }
+
+  cmOnVipload:
+  { timelog_init;
+    inherited::Handleevent(cmOnVipload);
+  }
+  cmOnVipUnload:
+  {
+    inherited::Handleevent(cmOnVipUnload);
+    cfsSetCurrentContainer('Z_STAFFORDERS::ORDERSLIST');
+    cfsSetProp('L_EDITTITLE_N_приказа',cfpTitle,'Номер приказа');
+    cfsSetProp('L_EDITTITLE_Дата_приказа',cfpTitle,'Дата приказа');
+  }
+
+end; //handleevent
+
+End.

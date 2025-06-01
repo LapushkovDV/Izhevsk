@@ -1,0 +1,1521 @@
+/*************************************************************************************************\
+* Наименование: Импорт Договоров из Excel в Галактику                                             *
+* Контур/Модуль: Обмен бизнес-документами                                                         *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата      |Исполнитель              |Проект                         *
+* ---------------------------------------------------------------------------------------------   *
+* Разработка  |#3260         |18/08/2018|Шунин А.Г.               |НПО Энергомаш                  *
+\*************************************************************************************************/
+#doc
+<p>Импорт Договоров из Excel в Галактику #3260
+<p> Добавлены поля DOGOVOR:
+<p>  string100 :NAME,ARCHNUM
+<p>  comp: CDOGDSA, CDOGDS, CTENDER,
+<p>  Назначение CPROG по KATNAZNA.NAME или KATNAZNA.NAZCODE
+<p> Добавлена возможность задать значение из из настроек импорта.
+<p> В имени поля первый символ "=" всё после "=" считается значением поля без чтения источника
+<p> Добавлен импорт проекта в Группу документа.
+<p> Обновление группы в существующем документе реализовано с допущением, что группа может быть единственной для Несколько групп НЕ РАБОТАЕТ / работает не предсказуемо
+<p> Добавлен импорт внешнего атрибута числа <- Номер записи источника (N строки Excel)
+<p> Добавлен импорт внешнего атрибута - строка
+<p> Добавлен импорт внешнего атрибута - число
+<p> Добавлен импорт внешнего атрибута - Ссылка
+<p>   Добавлены типы ссылок:
+<p>   Ссылка на Подразделение. Поиск по наименованиию подразделения. Влияет в дальнейшем для поиска МОЛ
+<p>   Ссылка на МОЛ. Поиск по наименованию МОЛ (обычно это ФИО сотрудника). Если ранее был поиск подразделения, то nRec этого подразделения будет ограничивать список МОЛ
+<p>   Ссылка на Сотрудника. Поиск по табельному номеру
+<p>   Ссылка на Пользовательскую аналитика
+
+<p> добавлена Постобработка документов:
+<p> Обновление ДАТ и номера вышестоящего по подчинённым договорам, которые загружены как CALPLAN к вышестоящему
+<p> Создаются CALPLAN для одиночных договоров
+<p> Soprhoz и IERDOG к CALPLAN
+
+#end
+
+///
+/// В тексте кода ссылка на документ:
+/// \\10.10.10.229\erp проектная документация\Реализация\Запросы данных\ЗД.27. Реестр договоров (+)\Предоставленные данные
+/// 2018.08.18 Загрузка договоров и ПКП по данным из 1С
+///
+#component "C_ExpImp"
+
+#include iercp.vih
+#include ChkSoprHoz.vih       // Проверка ХозОпераций документа5
+#include SHManager.vih     // описание интерфейса для работы с SoprHoz
+#include ValFunc.vih
+
+Alter InterFace ieTempDogovor; 
+overload
+Function DefineField( sFieldValue : String; HeadOrSpec : Byte; sCode : String ) : Boolean;
+Function ImportField( IsHeader : Boolean; wNumber : Word; Var sFieldValue : String ) : Boolean;
+Function ImportExcelField( sFieldName : string; iRow : longInt; Var sFieldValue : String ) : Boolean;
+procedure AddDocument(IsHeader : Boolean);
+function ImportDocument( cTempDoc : Comp ) : comp;
+function CheckDocumentSignature(var cDocument : Comp) : Boolean;
+procedure UpdateDocument(cTempDocument, cExistingDocument : Comp);
+Procedure ImportMarkedDocuments; // ПостОбработка после импрта всех документов
+function SetToKatVidD(strKatVid : string; var aDirect, aVidDog : Word) : Comp;
+end;
+#include exImConst.inc
+// include ieCommon.vpp
+#include ValFunc.var
+var iSHoz   : ObjSHmanager; // интерфейс для работы с SoprHoz
+Var iIerCP  : IerCP;        // Иерархия ПКП
+
+var bo_UpDATE_ONLY_IMPORT: boolean; // = true Изменять только со статусом cMYNotes,  =false изменять всё
+var cMYNotes: comp; // Статус документа, который можно обновлять при импорте.
+var bo_UpDATE_ATTR_Need: boolean; // = true Изменять внешние АТРИБУТЫ несмотря на bo_UpDATE_ONLY_IMPORT,  =false изменять всё
+
+Create view
+as
+select  DogovorUP.nRec
+from
+Dogovor DogovorUP
+,GROUPSCH
+,SPGRSCH
+,IERGRSCH
+
+,CALPLAN
+
+// ,ATTRDOG
+//,PLANDOG
+, AttrNam, KatPodr, KatMOL, Persons, BUHSCHET, KlSkidka, KatPayment, Dover, KatED
+, IERCALPL, SoprHoz
+where
+((
+    tHeader.CDOGDSA== DogovorUP.CDOGDS
+and tHeader.DIRECT == DogovorUP.DIRECT (noindex) // тут DogovorUP.CDOGDS - хранит ID документа из 1С, CDOGDSA - ID вышестоящего
+
+and tHeader.CDOGDS == CALPLAN.nRec
+
+and Dogovor.nRec == ATTRDOG.CDOGOVOR // 000B0000000064BFh
+and Dogovor.nRec == PLANDOG.CDOGOVOR
+and Dogovor.nRec == ATTRDOG.CDOGOVOR
+
+and
+  // Запись в журнале хозопераций
+  Word(403)        == SoprHoz.TipDoc   and
+  CalPlan.NRec     == SoprHoz.cSoprDoc
+
+and
+  CalPlan.CDOGOVOR == IERCALPL.CDOGOVOR and
+  CalPlan.NRec     == IERCALPL.cRec
+
+))
+;
+var
+//  minNRec1 :comp = 1000000000;
+
+  minNRec1 :comp = 100000000h;        // условно, Максимальный код из 1С
+  minNRecF:comp = 1000000000h;       // minNRec + 1 разряд для Финансового ПКП
+  minNRec2:comp = 0001000000000000h; // условно, Минимальный nRec в Галактике с офисом ()
+
+  sLastFieldValue : string;
+  cLastPodr: comp;
+  lCurColumn: longint;
+
+  dAbstractBiGDATE : Date = Date(31,12,2100);
+  sNullNoDoc: string[100] = 'Б/Н';
+
+function GetSrcAddres:string;
+{
+  result := 'R' +string(lCurRow)+'C'+ string(lCurColumn);
+}
+
+Function GetIEHFldsCODE: word;
+{
+  var bPos: byte;
+  var sTemp: string = '';
+    sTemp := IEHFlds.Value;
+    bPos  := Pos('"', sTemp );
+    GetIEHFldsCODE := word( If ( bPos <> 0, SubStr( sTemp, 1, bPos - 1 ), sTemp ));
+}
+
+var Digits:string = '0123456789';
+var New_DDOC: Date;
+procedure GetDateFromSTR(S: string);
+{
+  Var D,M: Byte =0;
+  var Y : word = 0;
+  New_DDOC := ZeroDate;
+// 05.12.2015
+  D := Byte(SubStr(S,1,2));
+  if 0 < D  and D < 32
+  {
+    M := Byte(SubStr(S,4,2));
+    if 0 < M  and M < 13
+    {
+      Y := Word(SubStr(S,7,4));
+      if  1911 < Y  and Y < 2055
+      {
+         New_DDOC := Date(D,M,Y);
+      }
+    }
+
+  }
+}
+function GetDocNUM_and_NewDDOC(pStr: string): string;
+{
+  New_DDOC := ZeroDate;
+  var S : string = pStr ;
+  var bPos, bPosG, C : word = 0;
+
+  if (bPos := Instr(' от ',S)) > 0 C:=4;
+
+  if C = 0
+  if (bPos := Instr(' от',S)) > 0 C:=3 ;
+
+  if C>0
+  {
+     if instr(substr(S,bPos+C,1),Digits) > 0
+     if instr(substr(S,bPos+C+1,1),Digits) > 0
+     if instr(substr(S,bPos+C+2,1),'.') > 0
+     GetDateFromSTR(substr(S,bPos +C,15));
+
+     C := 300; // флаг
+  }
+
+  if C = 300
+  {
+    S := substr(S,1,bPos-1)
+  }
+  else
+  {
+    if (bPos := Instr('.',S)) > 0
+     GetDateFromSTR(substr(S,bPos-2,15));
+
+  }
+
+  if (bPos := Instr('№',S)) > 0  S := substr(S,bPos+1,255);
+
+  result := pStr; // := S; ОСТАВЛЯТЬ номер как в 1с
+}
+
+Procedure PutBufferCalPlanSoprHoz; // позаимвтствовал тут L_Dogovor\vip\CalPlan\pkpsoph.vpp
+var tmpSumma: double=0;
+{
+  SoprHoz.cSoprDoc := CalPlan.nRec;
+
+  if ( Dogovor.cDogovor = 0 )
+    {
+      SoprHoz.cDogovor    := Dogovor.nRec;
+      SoprHoz.cAppDogovor := 0;
+    }
+  else
+    {
+      SoprHoz.cDogovor    := Dogovor.cDogovor;
+      SoprHoz.cAppDogovor := Dogovor.nRec;
+    }
+
+  SoprHoz.DatOb   := CalPlan.dInput;
+  SoprHoz.TipDoc  := 403;
+  SoprHoz.TiDkGal := 403;
+  SoprHoz.NoDoc   := CalPlan.NoDoc;
+  SoprHoz.Descr   := CalPlan.Descr;
+  SoprHoz.DesGr   := CalPlan.DesGr;
+  SoprHoz.cOrg    := CalPlan.cOrg;
+
+  if ( CalPlan.DirectPlat = 0 )
+    tmpSumma := CalPlan.SummaSpec;
+  else
+    if ( CalPlan.DirectMC = 0 )
+      tmpSumma := CalPlan.Summa;
+
+  if ( CalPlan.cVal = 0 )
+    SoprHoz.Summa := tmpSumma
+  else
+    SoprHoz.Summa := oValFunc.GetNatCurrency(CalPlan.cVal
+                                           , tmpSumma
+                                           , if (CalPlan.dValCurse = ZeroDate, CalPlan.dInput, CalPlan.dValCurse));
+
+  SoprHoz.KodValut := CalPlan.cVal;
+
+  if ( CalPlan.cVal <> 0 )
+    SoprHoz.SumValut := tmpSumma;
+}
+
+function SetToKatVidD(strKatVid : string; var aDirect, aVidDog : Word) : Comp;
+{
+// iehDogovor + 58 : strKatVidD := sFieldValue; // Вид договора
+
+LogStrToFile('#Up_SetToKatVidD.txt', '1 strKatVid=' + strKatVid  + ' ' + tHeader.CDOGDS);
+
+  result := comp(0);
+  if strKatVid = '' exit;
+
+   if '21' = strKatVid  strKatVid := '21. с поставщиком ТМЦ, услуг, работ' else
+   if '11' = strKatVid  strKatVid := '11. внутренний рынок'                else
+   if '12' = strKatVid  strKatVid := '12. внешний рынок (ВЭД)';
+
+  if (LinkToKatVidD.GetFirst FastFirstRow KatVidD where (( strKatVid == KatVidD.NAME (noindex) ))= tsOk)
+  {
+     aDirect := LinkToKatVidD.KatVidD.DIRECT;
+     aVidDog := LinkToKatVidD.KatVidD.VidDog;
+
+LogStrToFile('#Up_SetToKatVidD.txt', '2 strKatVid=' + strKatVid  + ' ' + aDirect );
+     Result := LinkToKatVidD.KatVidD.NRec;
+     exit;
+  }
+  aDirect := 1;
+  if 'С поставщиком' = strKatVid aDirect := 2 else
+  if Instr('ПОКУ',UpCASE(strKatVid)) = 1 aDirect := 2;
+
+LogStrToFile('#Up_SetToKatVidD.txt', '1 strKatVid=' + strKatVid  + ' ' + tHeader.CDOGDS);
+  Result := inherited::SetToKatVidD(strKatVid, aDirect, aVidDog);
+
+} // function SetToKatVidD
+
+Function UpdateCalPlanSoprHoz: boolean;  // позаимвтствовал тут L_Dogovor\vip\CalPlan\pkpsoph.vpp
+{
+  if (CalPlan.DirectMC = 100)
+    {
+      Result := TRUE;
+      Exit;
+    }
+
+  RereadRecord(#SoprHoz);
+
+  PutBufferCalPlanSoprHoz;
+
+/*
+Возникло необработанное исключение
+ExObjIfcNoInit (ExRef)
+ссылка не была инициализирована
+
+"Да" - Продолжить, "Нет" - Отлаживать в окне отладчика
+"Отмена" - Не выдавать больше это сообщение
+
+  if (IsValid(#SoprHoz))
+    Result := iSHoz.UpdByHan(SoprHoz.Bufferp) = tsOk
+  else
+    Result := iSHoz.InsByHan(SoprHoz.Bufferp) = tsOk;
+*/
+
+  if (IsValid(#SoprHoz))
+    Result := UpDate current SoprHoz = tsOk
+  else
+  {
+    SoprHoz.nRec := GetNextNRec(#SoprHoz, 0);
+    Result := Insert current SoprHoz = tsOk
+
+  }
+  if Result = false
+  LogStrToFile('#SoprHoz.txt','Error to UpDate or Insert SoprHoz for CalPlan.nRec=' + CalPlan.nRec);
+
+  RereadRecord(#SoprHoz);
+}
+
+procedure FillCALPLAN;
+{
+      CALPLAN.DIRECTMC := tHeader.direct;
+      CALPLAN.DIRECTPLAT := 0;
+
+      if (fun.ThisCodePresentInTune(iehDogovor + 58))
+      {
+          CALPLAN.CMARAVT  := tHeader.cviddog;
+      }
+
+      // Грузоотправитель / грузополучатель
+      if ((fun.ThisCodePresentInTune(iehDogovor + 28)) or (fun.ThisCodePresentInTune(iehDogovor + 29)))
+        if (tHeader.Direct = 1) // Сбыт
+        {
+          if (tHeader.cGrPol <> Comp(0))
+            CALPLAN.CGRPOL := tHeader.cGrPol;
+        }
+        else // Снабжение
+        {
+          if (tHeader.cGrOtp <> Comp(0))
+            CALPLAN.cGrOtp := tHeader.cGrOtp;
+        }
+
+
+      // Контрагент2, Плательщик / получатель платежей
+      if ((fun.ThisCodePresentInTune(iehDogovor + 18)) or (fun.ThisCodePresentInTune(iehDogovor + 19)))
+        if (tHeader.Direct = 1) // Сбыт
+        {
+          if (tHeader.cPlat <> Comp(0))
+            CALPLAN.CPLAT := tHeader.cPlat;
+        }
+        else // Снабжение
+        {
+          if (tHeader.cPol <> Comp(0))
+            CALPLAN.CPOL := tHeader.cPol;
+        }
+        // Контрагент2, Банк плательщика / получателя платежей
+        if ((fun.ThisCodePresentInTune(iehDogovor + 20)) or (fun.ThisCodePresentInTune(iehDogovor + 21)) or
+            (fun.ThisCodePresentInTune(iehDogovor + 22)))
+          if (tHeader.Direct = 1) // Сбыт
+          {
+            if ((tHeader.cPlat <> Comp(0)) and (tHeader.cBankPlat <> Comp(0)))
+              CALPLAN.CPLATBANK := tHeader.cBankPlat;
+          }
+          else // Снабжение
+          {
+            if ((tHeader.cPol <> Comp(0)) and (tHeader.cBankPol <> Comp(0)))
+              CALPLAN.CPOLBANK := tHeader.cBankPol;
+          }
+
+
+          if (fun.ThisCodePresentInTune(iehDogovor + 5))
+          {
+            CALPLAN.DFROM     := tHeader.DBEG;
+            CALPLAN.DINPUT := CALPLAN.DFROM;
+          }
+
+          if (fun.ThisCodePresentInTune(iehDogovor + 6))
+            CALPLAN.DTO := tHeader.dEnd; // Дата окончания действия договора
+
+          if ((fun.ThisCodePresentInTune(iehDogovor + 9)) or (fun.ThisCodePresentInTune(iehDogovor + 10)))
+            if (tHeader.cOrg <> Comp(0))
+              CALPLAN.CORG := tHeader.cOrg; // Контрагент2
+
+
+          if (fun.ThisCodePresentInTune(iehDogovor + 41))
+            CALPLAN.NODOC_EXT := tHeader.NODOC;     // Это не перепутано такой фокус
+
+          if (fun.ThisCodePresentInTune(iehDogovor + 41))
+            CALPLAN.NODOC := tHeader.NoDoc_Ext; // Входящий номер
+
+
+          if (fun.ThisCodePresentInTune(iehDogovor + 11))
+          {
+                 CALPLAN.CVAL      := tHeader.CVAL ;
+                 CALPLAN.VHODNAL   := tHeader.VHODNAL   ;
+          }
+
+          if (fun.ThisCodePresentInTune(iehDogovor + 56))
+                 CALPLAN.SUMMASPEC := tHeader.SUMMA;
+
+          if (fun.ThisCodePresentInTune(iehDogovor + 57))
+                 CALPLAN.SUMNDS    := tHeader.SUMNDS;
+          if (fun.ThisCodePresentInTune(iehDogovor + 112)) // Наименование или код назначения KATNAZNA.NAME','KATNAZNA.NAME или KATNAZNA.NAZCODE', 'C120', i
+            CalPlan.cNazna    := tHeader.CPROG;
+
+          if (GetFirst FastFirstRow tAttrDog where((tHeader.NRec == tAttrDog.cDogovor)) = tsOk)
+          {
+            if (tAttrDog.cPodr <> Comp(0))
+            if (fun.ThisCodePresentInTune(iehDogovor + 13))
+              CALPLAN.COTVPODR := tAttrDog.cPodr; // Центр ответственности
+
+          }
+
+} // procedure FillCALPLAN
+
+var wKey: word = 0; // для Dogovor
+
+// ImportDocument если есть вышестоящий - то не договор, а товарный ПКП к вышестоящему
+function ImportDocument( cTempDoc : Comp ) : comp;
+{
+  wKey := 0;
+  result := 0;
+  if (cTempDoc <> 0)
+  {
+    if (GetFirst tHeader where ((cTempDoc == tHeader.NRec)) <> tsOk)
+      Exit;
+  }
+
+tHeader.NODOC_EXT :=  GetDocNUM_and_NewDDOC(tHeader.NODOC_EXT);
+if New_DDOC <> Zerodate
+if (tHeader.DBEG = Zerodate) or (tHeader.DBEG = dAbstractBiGDATE)
+{
+   tHeader.DDOC   := New_DDOC;
+   tHeader.DInput := New_DDOC;
+   tHeader.DBEG   := New_DDOC;
+}
+UpDate current tHeader;
+  if tHeader.CDOGDSA <> comp(0) // есть вышестоящий - то не договор, а товарный ПКП к вышестоящему
+  {
+    // Чтоб не прописывать 2рой раз соответствие полей.
+    // Заполним запись Dogovor, но вставлять её не будем
+       ClearBuffer(#Dogovor);
+        Dogovor.Buffer := type$Dogovor(tHeader.Buffer);
+
+      // Заполнение полей по умолчанию, если в процессе импорта они не задавались
+        SetSomeEmptyField_Dogovor;
+
+       ClearBuffer(#CALPLAN);
+         CALPLAN.nRec := Dogovor.CDOGDS ;
+         CALPLAN.DESGR     := Dogovor.DESGR     ;
+         CALPLAN.DESCR     := Dogovor.DESCR     ;
+         CALPLAN.CGRPOL    := Dogovor.CGRPOL    ;
+         CALPLAN.CORG      := Dogovor.CORG      ;
+         CALPLAN.CPLAT     := Dogovor.CPLAT     ;
+         CALPLAN.CPLATBANK := Dogovor.CBANKPLAT;
+         CALPLAN.CPOL      := Dogovor.CPOL      ;
+         CALPLAN.CPOLBANK  := Dogovor.CBANKPOL  ;
+         CALPLAN.DFROM     := Dogovor.DBEG;
+         CALPLAN.DTO       := Dogovor.DEND;
+         CALPLAN.DINPUT    := Dogovor.DINPUT;
+         CALPLAN.NODOC_EXT := Dogovor.NODOC;     // Это не перепутано такой фокус
+         CALPLAN.NODOC     := Dogovor.NODOC_EXT;
+         CALPLAN.VHODNAL   := Dogovor.VHODNAL   ;
+         CALPLAN.CVAL      := Dogovor.CVAL ;
+         CALPLAN.SUMMASPEC := DOGOVOR.SUMMA;
+         CALPLAN.SUMNDS    := DOGOVOR.SUMNDS;
+         CalPlan.cNazna    := Dogovor.cProg;
+         CALPLAN.DIRECTMC  := DOGOVOR.direct;
+         CALPLAN.DIRECTPLAT := 0;
+         CALPLAN.CMARAVT:= tHeader.cviddog;
+         CALPLAN.CDOGOVOR  := Dogovor.CDOGDSA; // если вышестоящего ещё нет, то храним его код1С, если есть, то ниже перебъём
+
+         refImpDef.SetToKatNotes(403 , 'оформляемый', CalPlan.Status, CalPlan.cNote); // Статус документа
+
+       // Центр ответственности
+      if (GetFirst tAttrDog where((tHeader.NRec == tAttrDog.cDogovor)) = tsOk)
+         CALPLAN.COTVPODR := tAttrDog.cPodr;
+
+      if getfirst DogovorUP = tsOK
+      {
+         if bo_UpDATE_ONLY_IMPORT
+         if DogovorUP.cNote <> cMYNotes
+         {
+             fun.Set_sCurFieldName('Договор изменён пользователем. Пропускаю '+ String(DogovorUP.nRec,0,0) ); // GetSrcAddres);
+             fun.LogErrorDetail(0, 2, DogovorUP.NODOC, DogovorUP.nRec ); // 2 - Warning
+
+             fun.UpdateImportLog(tHeader.NRec, 0 , ieImported, ExImLogT.nRec);
+           exit;
+         }
+         CALPLAN.CDOGOVOR  := DogovorUp.nRec;
+         dogovorup.cviddog:= calplan.cmaravt;
+      }
+
+      fun.UpdateImportLog(tHeader.NRec, CALPLAN.nREC, ieImported, ExImLogT.nRec);
+      if Insert current CalPlan <> tsOK {}
+      result := CALPLAN.nREC;
+
+      // Копирование внешних атрибутов для заголовка
+      iExAttr.CopyAllAttrEx1(coIEHFlds, tHeader.nRec, coCALPLAN, CALPLAN.nRec, false);
+      oExtClass.CopyAllClassValEx(coIEHFlds, tHeader.nRec, coCALPLAN, CALPLAN.nRec);
+
+      Delete all NoVisual tSpec Where ((tHeader.TiDk == tSpec.TiDk  and
+                                        tHeader.NRec == tSpec.cDoc));
+      Delete all NoVisual tAttrDog where((tHeader.NRec == tAttrDog.cDogovor));
+      Delete all NoVisual tPlanDog where((tHeader.NRec == tPlanDog.cDogovor));
+      Delete current tHeader;
+
+      ClearBuffer(#Dogovor);
+      exit;
+  }
+Var isAloneDoc: boolean = (tHeader.DESGR = ''); // одинокий договор - делать Товарный План
+
+     if not isAloneDoc
+     {
+         tHeader.DESGR := '';
+         Update current tHeader;
+     }
+
+  result := inherited::ImportDocument( cTempDoc );
+  if getfirst Dogovor where (( result == Dogovor.nRec)) = tsOK
+  {
+     if Dogovor.CLANG1 <> comp(0)
+     {
+        ClearBuffer(tnSPGRSCH);
+        SPGRSCH.CGROUPSCH := Dogovor.CLANG1;
+        SPGRSCH.WLIST :=1;
+        SPGRSCH.CBASEDOC := Dogovor.nREC;
+        Insert Current SPGRSCH;
+
+        Dogovor.CLANG1 := comp(0);
+        wKey++; // UpDate current Dogovor;
+     }
+
+     if wKey > 0
+       UpDate current Dogovor;
+
+  } // if getfirst Dogovor where (( result == Dogovor.nRec)) = tsOK
+} // function ImportDocument( cTempDoc : Comp ) : comp;
+
+
+Create View vwKauGen as select SpKau.nRec, KATNAZNA.nRec from SpKau, KATNAZNA;
+Create View vwFPBUD as select FPSTBUD.nRec, FPSTBUD.NAME from FPSTBUD ;
+
+function GetSt(var sStr: string) : comp;
+{
+  result := 0;
+  if (sStr  = '')    exit;
+
+  if sStr = '24106' sStr := '2202'    else
+  if sStr = '24103' sStr := '21607'   else
+  if sStr = '24121' sStr := '2161514' else
+  if sStr = '24104' sStr := '21607'   else
+  if sStr = '24101' sStr := '2161514' else
+  if sStr = '1219'  sStr := '11614'   else
+  if sStr = '24111' sStr := '2161505' ;
+  
+
+    if (vwFPBUD.GetFirst FPSTBUD where ((comp(0) == FPSTBUD.CMAIN and sStr == FPSTBUD.CODE)) = tsOk)
+    {
+      Result := vwFPBUD.FPSTBUD.Nrec;
+    }
+}
+function GetKATNAZNA(var sStr: string) : comp;
+{
+  result := 0;
+  if (sStr  = '')    exit;
+
+    if (vwKauGen.GetFirst KATNAZNA where ((sStr == KATNAZNA.NAZCODE)) = tsOk)
+    {
+      Result := vwKauGen.KATNAZNA.Nrec
+    }
+    else
+    if (vwKauGen.GetFirst KATNAZNA where ((sStr == KATNAZNA.Name)) = tsOk)
+    {
+      Result := vwKauGen.KATNAZNA.Nrec
+    }
+
+}// function GetKATNAZNA(var sStr: string) : comp;
+function GetUserKauId (wKau: word; var sKau: string) : comp;
+{
+  result := 0;
+  if (sKau = '')    exit;
+
+   // Если значение найдено среди спецификаций данной пользовательской аналитики
+    if (vwKauGen.GetFirst SpKau where ((wKau == SpKau.KodGrKau
+                                    and sKau == SpKau.Code)) = tsOk)
+    {
+      sKau := vwKauGen.SpKau.Code + ' ' + vwKauGen.SpKau.NAME;
+      Result := vwKauGen.SpKau.Nrec
+
+    }
+    else
+    if (vwKauGen.GetFirst SpKau where ((wKau == SpKau.KodGrKau
+                                         and sKau == SpKau.Name)) = tsOk)
+    {
+      sKau := vwKauGen.SpKau.Code + ' ' + vwKauGen.SpKau.NAME;
+      Result := vwKauGen.SpKau.Nrec
+    }
+}
+
+Function DefineField( sFieldValue : String; HeadOrSpec : Byte; sCode : String ) : Boolean;
+{
+
+ // Function DefineField вызывается только есть sFieldValue не пустое
+  DefineField := true;
+  sFieldValue := Trim(sFieldValue);
+  if HeadOrSpec = ieHeader
+  {
+    case (Word(sCode)) of   // Код поля
+       iehDogovor + 14 ,
+       iehDogovor + 46 ,
+       iehDogovor + 43 :
+       {
+         var S: string;
+         S := ExtractDelimitedWord( sFieldValue, 1, ' ');
+         S := S + ' ' + ExtractDelimitedWord( sFieldValue, 2, ' ');
+         S := S + ' ' + ExtractDelimitedWord( sFieldValue, 3, ' ');
+         sFieldValue := S;
+       }
+
+      iehDogovor + 11 :  // Валюта
+      {
+        fun.Set_sCurFieldName( 'Валюта'+GetSrcAddres);// Валюта
+        Case sFieldValue of
+      'руб.': { tHeader.TipMoney := 1 ; sFieldValue := ''; } // sFieldValue := 'рубль'; }
+      'EUR' : { tHeader.TipMoney := 3 ; sFieldValue := 'евро';  }
+      'USD' : { tHeader.TipMoney := 3 ; sFieldValue := 'доллар США'; }
+      'KZT' : { tHeader.TipMoney := 3 ; sFieldValue := 'казахский тенге'; }
+        end;
+
+        tHeader.VhodNal := 1;  // Налоги входят
+      }
+
+      iehDogovor + 33 , // Контрагент1: внутренний номер
+      iehDogovor + 34 , // Контрагент2: внутренний номер
+      iehDogovor + 35 , // Плательщик: внутренний номер
+      iehDogovor + 36 , // Получатель платежей: внутренний номер
+      iehDogovor + 37 , // Грузоотправитель: внутренний номер
+      iehDogovor + 38 : // Грузополучатель: внутренний номер
+      {
+          if (sFieldValue <> '') sFieldValue :=  LPadCh(sFieldValue,'0',9);
+      }
+
+      iehDogovor + 63 : //  sKuratPodrKod      := sFieldValue;
+      {
+        Var bPos : word;
+        bPos := Pos(' ', sFieldValue); // Выделяем код подразделения
+        if bPos > 0
+        {
+           sFieldValue := SubStr(sFieldValue,1,bPos-1);
+        }
+      }
+
+      iehDogovor + 56 ,//: tHeader.Summa      := double(sFieldValue); // Сумма по договору
+      iehDogovor + 57 ,//: tHeader.SumNDS     := double(sFieldValue); // Сумма налогов по договору
+      iehDogovor + 74 ,//: tPlanDog.SUMAVANS   := double(sFieldValue);
+      iehDogovor + 80 ,//: tPlanDog.SUMOTGR    := double(sFieldValue);
+      iehDogovor + 86 ://  tPlanDog.SUMPLAT    := double(sFieldValue);
+      {
+        sFieldValue := Replace(sFieldValue,' ','');  // Из Excel читается разделитель - ',' меняем на '.
+        sFieldValue := Replace(sFieldValue,',','.'); // Из Excel читается разделитель - ',' меняем на '.
+      }
+
+      iehDogovor + 101 :  tHeader.ARCHNUM := sFieldValue;
+      iehDogovor + 102 :  tHeader.NAME    := sFieldValue;
+    end; //   case (Word(sCode)) of   // Код поля
+
+    case (Word(sCode)) of   // Код поля
+      iehDogovor + 13 :
+      {
+        sFieldValue := Replace(sFieldValue,'.','');
+        sFieldValue := Replace(sFieldValue,'  ','');
+        sFieldValue := SubStr(sFieldValue,1,80);
+
+        // MAP ЦО Энергомаш 1С->Галактика
+        if sFieldValue = '005 Заместитель генерального директора - Руководитель программы РД191'
+           sFieldValue:= '005 Заместитель генерального директора - руководитель Дирекции программ РД191'
+        else
+        if sFieldValue = '015 Пресс-секретарь, начальник пресс-службы'
+           sFieldValue:= '015 Начальник пресс-службы' ;
+//        else
+//        if sFieldValue = '017 Директор по производству'
+//           sFieldValue:= '020 Директор по производству';
+
+        fun.Set_sCurFieldName( 'Центр ответственности'+GetSrcAddres);
+        tAttrDog.cPodr := refImpDef.SetToFpCO(sFieldValue, ''); // Центр ответственности: Наименование
+        exit;
+      }
+
+      iehDogovor + 14 :
+      {
+        fun.Set_sCurFieldName( 'Контрагент1: ответственное лицо'+GetSrcAddres);
+        tAttrDog.cOtv_My    := refImpDef.SetToPersons(sFieldValue,'С');
+        tAttrDog.Otv_My_FIO := sFieldValue;
+        exit;
+      }
+      iehDogovor + 32 : fun.Set_sCurFieldName( 'Прайс-лист: Наименование'+GetSrcAddres); // Прайс-лист: Наименование
+      iehDogovor + 43 :
+      {
+        fun.Set_sCurFieldName( 'Контрагент1: контактное лицо'+GetSrcAddres);
+        tAttrDog.cCont_My    := refImpDef.SetToPersons(sFieldValue,'С');
+        tAttrDog.Cont_My_FIO := sFieldValue;
+        exit;
+      }
+
+      iehDogovor + 46 :
+      {
+        fun.Set_sCurFieldName('Контрагент1: ФИО подписавшего'+GetSrcAddres);
+        tAttrDog.cSign_My    := refImpDef.SetToPersons(sFieldValue,'С');
+        tAttrDog.Sign_My_FIO := sFieldValue;
+        exit;
+      }
+    end;
+  } //  if HeadOrSpec = ieHeader
+  else
+  if HeadOrSpec = ieSpec
+  {
+    case (Word(sCode)) of   // Код поля
+        iesDogovor + 4 ,//: tSpec.Kol   := Double(sFieldValue);  // Количество
+        iesDogovor + 5 : // Цена tSpec.Price := Double(sFieldValue);
+        {
+          sFieldValue := Replace(sFieldValue,' ','');  // Из Excel читается разделитель - ',' меняем на '.
+          sFieldValue := Replace(sFieldValue,',','.'); // Из Excel читается разделитель - ',' меняем на '.
+        }
+    end;
+  } //   if HeadOrSpec = ieSpec
+
+  DefineField := inherited::DefineField( sFieldValue, HeadOrSpec, sCode);
+
+// Дополнительные поля для импорта
+       Case ( Word(sCode) ) Of
+     iehDogovor + 113 :  if (sFieldValue != '')  // 'Внешний атрибут число да/нет логический (boolean)
+                      {
+                        Var bPos : word;
+                        var AttrValue: string;
+                        var bVal: boolean = false;
+                        bPos := Pos('"', SFieldValue);
+                        if bPos = 0 exit;
+                        AttrValue := UpCase(SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos));
+                        if AttrValue <> ''
+                        {
+                          if AttrValue = 'ДА'     bVal := true  else
+                          if AttrValue = 'ИСТИНА' bVal := true  else
+                          if AttrValue = 'НЕТ'  bVal := false   else
+                          if AttrValue = 'ЛОЖЬ' bVal := false   else
+                          { DefineField := false;
+                            exit;
+                          }
+                          iexAttr.bSetAttr(coIEHFlds,tHeader.Nrec, SubStr(SFieldValue,1,bpos-1), bVal );
+                          DefineField := true;
+                        }
+                      }
+
+     iehDogovor + 103 :  if (sFieldValue != '')  // Внешний атрибут число <- Номер записи источника' , 'N строки Excel
+                      {
+                        Var bPos : word;
+                        var AttrValue: string;
+                        bPos := Pos('"', SFieldValue);
+                        if bPos = 0 exit;
+                        AttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+                        if AttrValue <> ''
+                        iexAttr.doSetAttr(coIEHFlds,tHeader.Nrec, SubStr(SFieldValue,1,bpos-1), double(AttrValue));
+                        DefineField := true;
+                      }
+
+         iehDogovor + 104 : if (sFieldValue != '')  // Внешний атрибут строка
+                      {
+                        Var bPos : word;
+                        var AttrValue: string;
+                        bPos := Pos('"', SFieldValue);
+                        if bPos = 0 exit;
+
+                        AttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+                        if AttrValue <> ''
+                        iexAttr.sSetAttr(coIEHFlds,tHeader.Nrec, SubStr(SFieldValue,1,bpos-1),AttrValue);
+                        DefineField := true;
+                      }
+         iehDogovor + 105 : if (sFieldValue != '') //Внешний атрибут строка 255 символов
+                      if (sLastFieldValue != '')
+                      {
+                        Var bPos : word;
+                        var AttrNAME: string;
+                        bPos := Pos('"', IEHFlds.Value);
+                        if bPos > 0
+                        {
+                            AttrNAME := SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1);
+                            iexAttr.sSetAttr(coIEHFlds,tHeader.Nrec, AttrNAME, sLastFieldValue);
+                        }
+                      }
+         iehDogovor + 106 : if (sFieldValue != '')  // Внешний атрибут число
+                      {
+                        Var bPos : word;
+                        var AttrValue: string;
+                        bPos := Pos('"', SFieldValue);
+                        if bPos = 0 exit;
+                        AttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+                        AttrValue := Replace(AttrValue,',','.');
+                        if AttrValue <> ''
+                        iexAttr.doSetAttr(coIEHFlds,tHeader.Nrec, SubStr(SFieldValue,1,bpos-1), double(AttrValue));
+                      }
+
+         iehDogovor + 107: // Внешний атрибут ссылка
+          if (sFieldValue != '')
+          {
+            Var bPos : word;
+            var sAttrValue, sAttrName: string = '';
+            var cAttrValue: comp;
+            var sErrorStr : string = '';
+
+            bPos := Pos('"', SFieldValue);   //    sFieldValue = '[sAttrName]"[sAttrValue]'
+            sAttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+            if trim(sAttrValue) = '' exit; // пустое значение из источника
+
+            cAttrValue := comp(trim(sAttrValue));
+            sAttrName := SubStr(SFieldValue,1,bpos-1);
+
+            if (GetFirst AttrNam where (( sAttrName == AttrNam.Name and
+                                          word(5)   == AttrNam.AttrType and
+                                          coDogovor == AttrNam.wTable)) = tsOk)
+            {
+              case AttrNam.rObject of
+              2: {// подразделение / склад. влияет в дальнейшем для поиска МОЛ
+                   if (getFirst KATPODR where ((sAttrValue == KATPODR.NAME)) ) = tsOk
+                   {
+                     cLastPodr := KATPODR.nRec;
+                     cAttrValue := KATPODR.nRec;
+                   }
+                   sErrorStr := 'Подразделение / склад.';
+                 }
+             20:{ // Статья FPSTBUD
+                  sAttrValue := trim(sAttrValue);
+                  if (bPos:= Instr(' ',sAttrValue) ) > 0 sAttrValue := SubStr(sAttrValue,1,bPos-1);
+                  sErrorStr := 'Статья';
+                  cAttrValue := GetSt(sAttrValue);
+                  if cAttrValue <> comp(0) sAttrValue :=  vwFPBUD.FPSTBUD.NAME;
+
+             }
+             60:{ // МОЛ
+                  if cLastPodr <> Comp(0) // если ранее был поиск подразделения
+                  {
+                     if (getfirst KATMOL where ((cLastPodr == KATMOL.CSKL and sAttrValue == KATMOL.NAME)) = tsOk)
+                       cAttrValue := KATMOL.nRec;
+                  }
+                  else
+                  if (getfirst KATMOL where ((sAttrValue == KATMOL.NAME)) = tsOk)
+                    cAttrValue := KATMOL.nRec;
+
+                  sErrorStr := 'МОЛ';
+                }
+           3,25001:{
+                       if (getFirst Persons where (('С' == Persons.IsEmployee and sAttrValue == Persons.STRTABN (noindex) )) ) = tsOk
+                       {
+                         cAttrValue := Persons.nRec;
+                         sAttrValue := Persons.FIO;
+                       }
+                       else
+                       if (getFirst Persons where (('С' == Persons.IsEmployee and sAttrValue == Persons.FIO (noindex) )) ) = tsOk
+                       {
+                         cAttrValue := Persons.nRec;
+                         sAttrValue := Persons.FIO;
+                       }
+                      sErrorStr := 'Сотрудник';
+                   }
+              1502:
+                   if (getfirst BuhSchet where ((cAttrValue == Buhschet.Nrec)) = tsOk)
+                     sAttrValue := BuhSchet.Name;
+              1412:
+                  if (getfirst KatEd where ((cAttrValue == KatEd.Nrec)) = tsOk)
+                     sAttrValue := KatEd.Name;
+              1138:
+                  if (getfirst Dover where ((cAttrValue == Dover.Nrec)) = tsOk)
+                     sAttrValue := string(Dover.NoDoc);
+              1485:
+                  if (getfirst KatPayment where ((cAttrValue == KatPayment.Nrec)) = tsOk)
+                     sAttrValue := KatPayment.Name;
+              1418:
+                  if (getfirst KatOrg where ((cAttrValue == KatOrg.Nrec)) = tsOk)
+                     sAttrValue := KatOrg.Name;
+              1115:
+                  if (getfirst KlSkidka where ((cAttrValue == KlSkidka.Nrec)) = tsOk)
+                     sAttrValue := KlSkidka.Name;
+      10000..19999:
+                  cAttrValue := GetUserKauId(AttrNam.rObject,sAttrValue);
+              else
+                  {}
+              end; // case
+            }
+
+            if cAttrValue = comp(0)
+            {
+              if sErrorStr ='' sErrorStr := 'не определено';
+              else
+              if sAttrName <> '' sErrorStr := sErrorStr + '. Атрибут: ' + sAttrName;
+
+              fun.Set_sCurFieldName(sErrorStr + ' ' + +GetSrcAddres);
+              fun.LogError(0, constDocErrorCode, sAttrValue);
+            }
+            else
+            {
+
+              iexAttr.coSetAttr(coIEHFlds,tHeader.Nrec, sAttrName,cAttrValue,sAttrValue);
+
+              if (GetFirst AttrNam where ((sAttrName  == AttrNam.Name and
+                                            word(5)   == AttrNam.AttrType and
+                                            coIEHFlds == AttrNam.wTable)) = tsOk)
+              {
+                AttrNam.rType := word(100);
+                update current AttrNam;
+              }
+            }
+
+
+           } // iehDogovor + 107:  Внешний атрибут ссылка
+
+         iehDogovor + 108: tHeader.CDOGDSA := comp(SFieldValue);  // Ссылка на допсоглашение (атр) договора CDOGDSA
+         iehDogovor + 109: tHeader.CDOGDS  := comp(SFieldValue);  // Ссылка на допсоглашение договора CDOGDS
+         iehDogovor + 110: tHeader.CTENDER := comp(SFieldValue);  // Ссылка Тендер CTENDER
+         iehDogovor + 111: // Наименование Группы документов GROUPSCH.NAME
+                      {
+                         if GetFirst GROUPSCH where (( SFieldValue ==GROUPSCH.NAME )) <> tsOK
+                         {
+                           ClearBuffer(tnGROUPSCH);
+                           GROUPSCH.NAME := SFieldValue;
+                           insert current GROUPSCH;
+
+                           ClearBuffer(tnIERGRSCH);
+                           IERGRSCH.CUPREC := GROUPSCH.nRec;
+                           IERGRSCH.CREC   := GROUPSCH.nRec;
+                           IERGRSCH.ISLEAF := 1;
+                           insert current IERGRSCH;
+
+                         }
+
+                         tHeader.CLANG1  := GROUPSCH.nRec; // Здесь CLANG1 для временного хранения ссылки на Группу договоров.
+                      } // iehDogovor + 111: Наименование Группы документов GROUPSCH.NAME
+         iehDogovor + 112: tHeader.CPROG := GetKATNAZNA(SFieldValue); // 'Наименование или код назначения KATNAZNA.NAME или KATNAZNA.NAZCODE
+
+       End; // Case ( Word(sCode) ) Of\
+
+} // Function DefineField( sFieldValue : String; HeadOrSpec : Byte; sCode : String ) : Boolean;
+
+Function ImportField( IsHeader : Boolean; wNumber : Word; Var sFieldValue : String ) : Boolean;
+{
+
+  if IsHeader
+    if IEHFlds.CODE = String(iehDogovor + 103)
+    {
+      result := true;
+      sFieldValue := string(lCurRow);
+      exit;
+    }
+
+  var sFieldName : string = if (IsHeader, IEHFlds.DbfName, IESFlds.DbfName);
+  if substr(sFieldName,1,1) = '=' // Значение указано в настройках импорта
+  {
+    sFieldValue := substr(sFieldName,2,255);
+    result := true;
+    exit;
+  }
+
+  ImportField := inherited::ImportField( IsHeader, wNumber, sFieldValue );
+
+ // Function DefineField вызывается только есть sFieldValue не пустое
+ // Пришлось пустой номер договора и дату договора менять тут
+
+  if IsHeader
+  {
+      if sFieldValue = ''
+      if IEHFlds.CODE = String(iehDogovor + 1)
+      {
+        sFieldValue := 'Б/Н'; // tHeader.NoDoc := sFieldValue; // Номер обязательное поле.
+      }
+      else
+      if IEHFlds.CODE = String(iehDogovor + 2)
+      {
+       sFieldValue := DateToSTR(dAbstractBiGDATE,IEHead.dFormat) ; // Дата заключения обязательное поле.
+      }
+      else
+      if IEHFlds.CODE = String(iehDogovor + 60) //  : sNote              := sFieldValue;
+      {
+        if sFieldValue = '' or sFieldValue = 'Действующий'
+        sFieldValue := 'Импортирован';
+
+
+      }
+/*
+      if IEHFlds.CODE = String(iehDogovor + 103)
+      {
+        result := true;
+        sFieldValue := string(lCurRow);
+        exit;
+      }
+      */
+  }
+
+  sLastFieldValue := sFieldValue ;
+
+} // Function ImportField
+
+Function ImportExcelField( sFieldName : string; iRow : longInt; Var sFieldValue : String ) : Boolean;
+{
+  lCurColumn := iFileStruct.GetIndexFieldByName(sFieldName);
+  result := xlGetCellValue(iRow, lCurColumn, sFieldValue);
+  sLastFieldValue := sFieldValue ;
+}
+
+// Добавление во временную таблицу импортированного документа
+procedure AddDocument(IsHeader : Boolean);
+{
+  if (IsHeader)
+  {
+    // в UpdateHeaderLinks SetToKatVidD вызывается в конце, нужен раньше для tHeader.Direct,
+    // иначе Direct будет 1, и, если позже он будет 2
+    // значения полей cPol, cBankPol, cGrOtp, cPlat, cBankPlat, cGrPol будет не правильным 
+    fun.Set_sCurFieldName( 'Вид договора');
+    tHeader.cVidDog := SetToKatVidD(strKatVidD, tHeader.Direct, tHeader.VidDog);
+
+    UpdateHeaderLinks; // тут могут быть ошибки, которые должны регестрироваться в текущий документ, т.е. до вызова fun.LogDocument
+    fun.LogDocument(tHeader.NRec, ieImportedInTemp,
+                '№:' + tHeader.NoDoc + DateToStr(tHeader.dDoc, ' от DD/MM/YYYY'), IEHead.nRec);
+    // Устанавливаю ссылки
+    Update ExImLogE Where((0 == ExImLogE.cLogR)) Set ExImLogE.cLogR := ExImLogR.nRec, ExImLogE.rStr := string(lCurRow);
+    if (Insert current tHeader = tsOk)
+    {
+      lDocumentsImported++;
+
+      tPlanDog.cDogovor := tHeader.NRec;
+      insert current tPlanDog;
+
+      tAttrDog.cDogovor := tHeader.NRec;
+      tAttrDog.NRec     := Comp(0);
+      Insert current tAttrDog;
+    }
+  }
+  else
+  {
+    // Устанавливаю ссылки
+    UpdateSpecLinks;
+    Update ExImLogE where((0 == ExImLogE.cLogR)) Set ExImLogE.cLogR := ExImLogR.NRec;
+    tSpec.TiDk := tHeader.TiDk;
+    tSpec.cDoc := cCurrentHeader;
+    if(Insert current tSpec = tsOK)
+    {
+      if tSpecMtr.cSaldtune <> 0
+      {
+        tSpecMTR.NRec    := comp(0);
+        tSpecMTR.cSpec   := tSpec.NRec;
+        tSpecMTR.coTable := coSpDocs;
+        insert current tSpecMTR;
+      }
+    }
+  }
+}
+
+// Проверка, не импортировался ли документ с такой сигнатурой
+// переделан на поиск документа по Код1C, который в tHeader.CDOGDS
+function CheckDocumentSignature(var cDocument : Comp) : Boolean;
+{
+  CheckDocumentSignature := True;
+
+  if (fun.DuplicatesImportType = ieDontFindDuplicates)
+    Exit; // Если не задана проверка в настройке
+
+  if tHeader.CDOGDS <> comp(0)
+  if tHeader.CDOGDSA <> comp(0) // значит есть вышестоящий, значит ищем Товарный ПКП
+  {
+     if getfirst CALPLAN where (( tHeader.CDOGDS == CALPLAN.nRec)) = tsOK
+     {
+        cDocument := CALPLAN.nRec;
+        wWarningResult := cmOkAll;
+        CheckDocumentSignature := False;
+     }
+  }
+  else
+  if getfirst Dogovor where (( tHeader.CDOGDS == Dogovor.CDOGDS)) = tsOK
+  {
+    cDocument := Dogovor.nRec;
+    wWarningResult := cmOkAll;
+    CheckDocumentSignature := False;
+    Exit;
+  }
+//  result := inherited::CheckDocumentSignature(cDocument);
+} // function CheckDocumentSignature(var cDocument : Comp) : Boolean;
+
+procedure UpdateDocument(cTempDocument, cExistingDocument : Comp);
+{
+  Var bPos : word;
+  var AttrNAME: string;
+
+  if (GetFirst FastFirstRow tHeader where((cTempDocument == tHeader.NRec)) <> tsOk)
+    Exit;
+
+
+  tHeader.NODOC_EXT :=  GetDocNUM_and_NewDDOC(tHeader.NODOC_EXT);
+  if New_DDOC <> Zerodate
+  if (tHeader.DBEG = Zerodate) or (tHeader.DBEG = dAbstractBiGDATE)
+  {
+     tHeader.DDOC   := New_DDOC;
+     tHeader.DInput := New_DDOC;
+     tHeader.DBEG   := New_DDOC;
+  }
+  UpDate current tHeader;
+
+  if tHeader.CDOGDSA <> comp(0) // значит есть вышестоящий, значит ищем Товарный ПКП
+  {
+     var UP_cNote: comp = cMYNotes;
+LogStrToFile('#Up_CalPlan.txt', '1for ' + cExistingDocument + ' ' + tHeader.CDOGDSA );
+     if getfirst CALPLAN where (( cExistingDocument == CALPLAN.nRec)) <> tsOK
+       Exit;
+
+LogStrToFile('#Up_CalPlan.txt', '2for ' + cExistingDocument + ' ' + tHeader.CDOGDSA + ' ' + tHeader.DIRECT + '  CALPLAN.DIRECTMC = ' + CALPLAN.DIRECTMC  );
+     FillCALPLAN; //
+
+         if getfirst DogovorUP = tsOK
+         {
+             UP_cNote := DogovorUP.cNote;
+             CALPLAN.cDogovor := DogovorUP.nRec;
+             if bo_UpDATE_ONLY_IMPORT and (not bo_UpDATE_ATTR_Need)
+             if UP_cNote <> cMYNotes
+             {
+
+                 fun.Set_sCurFieldName('Договор изменён пользователем. Пропускаю '+ String(DogovorUP.nRec,0,0) );//+GetSrcAddres);
+                 fun.LogErrorDetail(0, 2, DogovorUP.NODOC, DogovorUP.nRec ); // 2 - Warning
+
+                 fun.UpdateImportLog(tHeader.NRec, CALPLAN.nRec , ieImported, ExImLogT.nRec);
+               exit;
+             }
+         }
+         else
+           CALPLAN.cDogovor := tHeader.CDOGDSA;
+
+
+LogStrToFile('#Up_CalPlan.txt', '3for ' + cExistingDocument + ' ' + tHeader.CDOGDSA + ' ' + tHeader.DIRECT + '  CALPLAN.DIRECTMC = ' + CALPLAN.DIRECTMC  );
+     if (not bo_UpDATE_ONLY_IMPORT)  or (UP_cNote = cMYNotes)
+     {
+     if UpDate current CALPLAN = tsOK {}
+     fun.UpdateImportLog(tHeader.NRec, CALPLAN.nREC, ieImported, ExImLogT.nRec);
+
+LogStrToFile('#Up_CalPlan.txt', '4for ' + cExistingDocument + ' ' + tHeader.CDOGDSA );
+LogStrToFile('#Up_CalPlan.txt', '5for tHeader.NRec =' + tHeader.NRec + ' CALPLAN.nREC =' + CALPLAN.nREC + ' CALPLAN.directmc='  + CALPLAN.directmc);
+     }
+
+     if bo_UpDATE_ATTR_Need
+     {
+
+      // Удаляем значения атрибутов, которые есть в настройке импорта
+      _LOOP IEHFlds Where((IEHead.nRec == IEHFlds.cHead  And true == IEHFlds.isLeaf )) Ordered By Number
+      if iFileStruct.GetIndexFieldByName(IEHFlds.DbfName) > 0 // Это поле есть в файле импорта
+      Case GetIEHFldsCODE of 
+        iehDogovor + 103, //'Внешний атрибут число <- Номер записи источника' ))'
+        iehDogovor + 104, //'Внешний атрибут строка'               ))'Введите имя
+        iehDogovor + 105, //'Внешний атрибут строка 255 символов'  ))'Имя атрибут
+        iehDogovor + 106, //'Внешний атрибут число'   ))'Введите имя атрибута'
+        iehDogovor + 107: //'Внешний атрибут ссылка'  ))'Введите имя атрибута'
+        {
+            bPos := Pos('"', IEHFlds.Value);
+            if bPos > 0
+            {
+                AttrNAME := SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1);
+                if iexAttr.DeleteValue (coCALPLAN, CALPLAN.nRec, AttrNAME) > 0 {}
+            }
+        }
+      end; // CASE
+
+
+      // Копирование внешних атрибутов для заголовка
+      iExAttr.CopyAllAttrEx1(coIEHFlds, tHeader.nRec, coCALPLAN, CALPLAN.nRec, false);
+      oExtClass.CopyAllClassValEx(coIEHFlds, tHeader.nRec, coCALPLAN, CALPLAN.nRec);
+
+     } // if bo_UpDATE_ATTR_Need
+
+
+      Delete all NoVisual tSpec Where ((tHeader.TiDk == tSpec.TiDk  and
+                                        tHeader.NRec == tSpec.cDoc));
+      Delete all NoVisual tAttrDog where((tHeader.NRec == tAttrDog.cDogovor));
+      Delete all NoVisual tPlanDog where((tHeader.NRec == tPlanDog.cDogovor));
+      Delete current tHeader;
+
+      exit;
+  } // if tHeader.CDOGDSA <> comp(0) // значит есть вышестоящий, значит ищем Товарный ПКП
+
+  if (GetFirst FastFirstRow Dogovor where((cExistingDocument == Dogovor.NRec)) <> tsOk)
+    Exit;
+
+   if bo_UpDATE_ONLY_IMPORT and (not  bo_UpDATE_ATTR_Need)
+   if Dogovor.cNote <> cMYNotes
+   {
+
+       fun.Set_sCurFieldName('Договор изменён пользователем. Пропускаю '+ String(Dogovor.nRec,0,0) );
+       fun.LogErrorDetail(0, 2, Dogovor.NODOC, Dogovor.nRec ); // 2 - Warning
+
+       fun.UpdateImportLog(tHeader.NRec, Dogovor.nRec , ieImported, ExImLogT.nRec);
+     exit;
+   }
+
+  if (not bo_UpDATE_ONLY_IMPORT) or (Dogovor.cNote = cMYNotes)
+  {
+        if (fun.ThisCodePresentInTune(iehDogovor + 101)) // ' Номер в архиве DOGOVOR.ARCHNUM' DOGOVOR.ARCHNUM
+          DOGOVOR.ARCHNUM := tHeader.ARCHNUM;
+        if (fun.ThisCodePresentInTune(iehDogovor + 102)) // 'Пользовательское наименование'   DOGOVOR.NAME
+          DOGOVOR.NAME := tHeader.NAME ;
+
+        if (fun.ThisCodePresentInTune(iehDogovor + 109)) // Ссылка на допсоглашение договора  DOGOVOR.CDOGDS
+          DOGOVOR.CDOGDS := tHeader.CDOGDS ;
+
+        if (fun.ThisCodePresentInTune(iehDogovor + 108)) // Ссылка на допсоглашение (атр) договора DOGOVOR.CDOGDSA
+        {
+          DOGOVOR.CDOGDSA := tHeader.CDOGDSA ;
+        }
+
+        if (fun.ThisCodePresentInTune(iehDogovor + 110)) // Ссылка Тендер DOGOVOR.CTENDER
+          DOGOVOR.CTENDER := tHeader.CTENDER ;
+
+        // импорт одного проекта в единственную группу. для Несколько групп НЕ РАБОТАЕТ!!!
+        if (fun.ThisCodePresentInTune(iehDogovor + 111)) // Наименование Группы документов GROUPSCH.NAME
+        {
+           if tHeader.CLANG1 = comp(0)
+           {
+             if getfirst SPGRSCH where(( 1 == SPGRSCH.wList and Dogovor.nREC == SPGRSCH.CBASEDOC )) = tsOK
+             Delete current SPGRSCH;
+           }
+           else // tHeader.CLANG1 <> comp(0)
+           {
+              if getfirst SPGRSCH where(( 1 == SPGRSCH.wList and Dogovor.nREC == SPGRSCH.CBASEDOC )) = tsOK
+              {
+                 SPGRSCH.CGROUPSCH := tHeader.CLANG1;
+                 UpDate Current SPGRSCH;
+              }
+              else
+              {
+                ClearBuffer(tnSPGRSCH);
+                SPGRSCH.CGROUPSCH := tHeader.CLANG1;
+                SPGRSCH.WLIST :=1;
+                SPGRSCH.CBASEDOC := Dogovor.nREC;
+
+                Insert Current SPGRSCH;
+              }
+           }
+        }// if (fun.ThisCodePresentInTune(iehDogovor + 111)) // Наименование Группы документов GROUPSCH.NAME
+
+        if (fun.ThisCodePresentInTune(iehDogovor + 112)) // Наименование или код назначения KATNAZNA.NAME','KATNAZNA.NAME или KATNAZNA.NAZCODE', 'C120', i
+          Dogovor.CPROG := tHeader.CPROG;
+
+        if (fun.ThisCodePresentInTune(iehDogovor + 11)) // Валюта: Тип документа по валюте
+          Dogovor.TipMoney := tHeader.TipMoney;
+  } //
+
+  if bo_UpDATE_ATTR_Need
+  {
+      // Удаляем значения атрибутов, которые есть в настройке импорта
+      _LOOP IEHFlds Where((IEHead.nRec == IEHFlds.cHead  And true == IEHFlds.isLeaf )) Ordered By Number
+      if iFileStruct.GetIndexFieldByName(IEHFlds.DbfName) > 0 // Это поле есть в файле импорта
+      if (IEHFlds.CODE = String(iehDogovor + 103)) or //'Внешний атрибут число <- Номер записи источника' ))'
+         (IEHFlds.CODE = String(iehDogovor + 104)) or //'Внешний атрибут строка'               ))'Введите имя
+         (IEHFlds.CODE = String(iehDogovor + 105)) or //'Внешний атрибут строка 255 символов'  ))'Имя атрибут
+         (IEHFlds.CODE = String(iehDogovor + 106)) or //'Внешний атрибут число'   ))'Введите имя атрибута'
+         (IEHFlds.CODE = String(iehDogovor + 107))    //'Внешний атрибут ссылка'  ))'Введите имя атрибута'
+      {
+          bPos := Pos('"', IEHFlds.Value);
+          if bPos > 0
+          {
+              AttrNAME := SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1);
+              if iexAttr.DeleteValue (coDogovor, Dogovor.nRec, AttrNAME) > 0 {}
+          }
+      }
+
+      iExAttr.CopyAllAttrEx1(coIEHFlds, tHeader.nRec, coDogovor, Dogovor.nRec, false);
+      oExtClass.CopyAllClassValEx(coIEHFlds, tHeader.nRec, coDogovor, Dogovor.nRec);
+
+  }
+
+  if bo_UpDATE_ONLY_IMPORT exit;
+
+  if (Update current Dogovor = tsOk) {}
+
+  tHeader.DESGR := '';
+  if (Update current tHeader = tsOk) {}
+
+  inherited::UpdateDocument(cTempDocument, cExistingDocument);
+
+} // procedure UpdateDocument(cTempDocument, cExistingDocument : Comp);
+
+
+// добавлена Постобработка документов.
+// Обновление ДАТ и номера вышестоящего по подчинённым договорам=CALPLAN
+// Создаются CALPLAN для одиночных договоров
+// Soprhoz и IERDOG к CALPLAN
+Procedure ImportMarkedDocuments;
+{
+   var cLogTMP : comp = ExImLogT.nRec;
+   inherited::ImportMarkedDocuments;
+
+StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Постобработка документов...', 1);
+
+// ПостОбработка после импрта всех документов
+  PushPos(#ExImLogT);
+  PushPos(#ExImLogE);
+// message('MY ImportMarkedDocuments cLogTMP = ' + string(cLogTMP,0,0) );
+       _Loop ExImLogR where ((cLogTMP == ExImLogR.cLogT))
+       and (ExImLogR.rComp < minNRec1) // календарный план nRec = Kod 1C
+       {
+         LogStrToFile('#L_CalPlan.txt', 'ExImLogR.rComp='+ ExImLogR.rComp + ' find dogovor...' );
+         if getfirst CalPlan where ((ExImLogR.rComp == CalPlan.nrec)) = tsOK
+         {
+         LogStrToFile('#L_CalPlan.txt', 'CalPlan.nRec='+ CalPlan.nRec + ' find dogovor...' ) ;
+           if CalPlan.cDogovor = comp(0)
+             LogStrToFile('#L_CalPlan.txt', 'CalPlan.nRec='+ CalPlan.nRec + ' No Dogovor ZERRO. нет Договора' )
+           else
+           {
+         LogStrToFile('#L_CalPlan.txt', 'CalPlan.nRec='+ CalPlan.nRec + ' x1 CalPlan.cDogovor ='  + CalPlan.cDogovor + ' CalPlan.DIRECTMC=' + CalPlan.DIRECTMC) ;
+             if CalPlan.cDogovor < minNRec1
+             {
+                tHeader.CDOGDSA := CalPlan.cDogovor;
+                tHeader.DIRECT  := CalPlan.DIRECTMC  ;
+                if getfirst DogovorUP = tsOK
+                {
+                  CalPlan.cDogovor := DogovorUp.nRec;
+                  Update current CalPlan;
+                }
+                else
+                {
+                  // Создаём договор с направлением как у CalPlan
+
+
+                 ClearBuffer(#Dogovor);
+                   Dogovor.CDOGDS    := CALPLAN.nRec      ;
+                   Dogovor.DESGR     := CALPLAN.DESGR     ;
+                   Dogovor.DESCR     := CALPLAN.DESCR     ;
+                   Dogovor.CGRPOL    := CALPLAN.CGRPOL    ;
+                   Dogovor.CORG      := CALPLAN.CORG      ;
+                   Dogovor.CPLAT     := CALPLAN.CPLAT     ;
+                   Dogovor.CBANKPLAT := CALPLAN.CPLATBANK ;
+                   Dogovor.CPOL      := CALPLAN.CPOL      ;
+                   Dogovor.CBANKPOL  := CALPLAN.CPOLBANK  ;
+                   Dogovor.DBEG      := CALPLAN.DFROM     ;
+                   Dogovor.DEND      := CALPLAN.DTO       ;
+                   Dogovor.DINPUT    := CALPLAN.DINPUT    ;
+                   Dogovor.NODOC     := CALPLAN.NODOC_EXT ;
+                   Dogovor.NODOC_EXT := CALPLAN.NODOC     ;
+                   Dogovor.VHODNAL   := CALPLAN.VHODNAL   ;
+                   Dogovor.CVAL      := CALPLAN.CVAL      ;
+                   DOGOVOR.SUMMA     := CALPLAN.SUMMASPEC ;
+                   DOGOVOR.SUMNDS    := CALPLAN.SUMNDS    ;
+                   Dogovor.cProg     := CalPlan.cNazna    ;
+                   DOGOVOR.direct    := CALPLAN.DIRECTMC  ;
+                   DOGOVOR.cviddog   := CALPLAN.CMARAVT   ;
+                   Dogovor.CDOGDSA   := CALPLAN.CDOGOVOR  ;
+                   Dogovor.DIRECT  := CalPlan.DIRECTMC  ;
+
+                  insert current Dogovor;
+                  CalPlan.cDogovor := Dogovor.nRec;
+                  Update current CalPlan;
+
+                  sql Update CalPlan set CalPlan.cDogovor = :(Dogovor.nRec) where CalPlan.CPREDPLAN = :(CalPlan.nRec);
+
+                  if  CalPlan.CPREDPLAN <> Comp(0)
+                  sql Update CalPlan set CalPlan.cDogovor = :(Dogovor.nRec) where CalPlan.nrec = :(CalPlan.CPREDPLAN);
+
+ // тут возможна засада. Добавляем запись в ExImLogR, по которой _LOOP, но при этом ExImLogR.rComp < minNRec1
+  PushPos(#ExImLogR);
+    ClearBuffer(#ExImLogR);
+    ExImLogR.cLogT    := cLogTMP;
+    ExImLogR.rComp    := DOGOVOR.NRec;
+    ExImLogR.Status   := ieImportedInTemp;
+    ExImLogR.Value    := 'Для №:' + ' ' + Dogovor.CDOGDS + ' ' + Dogovor.NoDoc + DateToStr(Dogovor.dDoc, ' от DD/MM/YYYY');
+    ExImLogR.rStr     := String(IEHead.TipDoc);
+    Insert Current ExImLogR;
+  PopPos(#ExImLogR);
+
+
+    // не уверен, что fun. тут ещё живой
+//    fun.LogDocument(DOGOVOR.NRec, ieImportedInTemp,
+//                'Для №:' + ' ' + Dogovor.CDOGDS + ' ' + Dogovor.NoDoc + DateToStr(Dogovor.dDoc, ' от DD/MM/YYYY'), IEHead.nRec);
+LogStrToFile('#L_CalPlan.txt', 'Добавлен договор Для №:' + ' ' + Dogovor.CDOGDS + ' ' + Dogovor.NoDoc + DateToStr(Dogovor.dDoc, ' от DD/MM/YYYY'));
+
+                }
+             }
+             else
+             if getfirst Dogovor where ((CalPlan.cDogovor == Dogovor.nrec)) <> tsOK
+             {
+               LogStrToFile('#L_CalPlan.txt', 'CalPlan.nRec=' + CalPlan.nRec + ' битая ссылка на договор CalPlan.cDogovor=' + CalPlan.cDogovor );
+             }
+           }
+         }
+       }
+//    NextVisual;
+
+       _Loop ExImLogR where ((cLogTMP == ExImLogR.cLogT))
+       and ( ExImLogR.rComp > minNRecF ) // по Договорам c нормальными nRec
+       if getfirst Dogovor where ((ExImLogR.rComp == Dogovor.nrec)) = tsOK
+       {
+         Var wUpKey: word =0;
+         Var boMinCPExist: boolean = false;
+          Var  Total : decimal(31,15) = 0;
+          Var SumNal : decimal(31,15) = 0;
+
+             _loop CalPlan where ((Dogovor.nrec == CalPlan.cDogovor and 0 << CalPlan.DIRECTMC))
+             and (CalPlan.nrec < minNRec1) // Это CalPlan из подчинённого договора
+             {
+                 boMinCPExist := true;
+
+                 Total  := Total + CalPlan.SUMMASPEC;
+                 SumNal := SumNal+ CalPlan.SUMNDS   ;
+                 dogovor.cviddog:= calplan.cmaravt;
+
+!                 if getfirst katvidd where ((dogovor.cviddog == katvidd.nrec)) = tsok then
+!                 dogovor.direct:= katvidd.direct;
+
+                 if CalPlan.DFROM <> ZeroDate
+                 if (Dogovor.DBEG = ZeroDate) or (Dogovor.DBEG > CalPlan.DFROM)
+                 {
+                   DOGOVOR.DBEG := CalPlan.DFROM;
+                   Dogovor.dDoc := DOGOVOR.DBEG;
+                   DOGOVOR.DINPUT := DOGOVOR.DBEG;
+                   wUpKey++;
+                 }
+
+                 if CalPlan.DTO <> ZeroDate
+                 if (Dogovor.DEND = ZeroDate) or (CalPlan.DTO > Dogovor.DEND)
+                 {
+                   Dogovor.DEND := CalPlan.DTO;
+                   wUpKey++;
+                 }
+
+                 if CalPlan.NODOC_EXT <> sNullNoDoc
+                 if (wUpKey > 0) // or (sNullNoDoc = Dogovor.NoDoc)
+                 {
+                   Dogovor.NoDoc := CalPlan.NODOC_EXT;
+                   wUpKey++;
+                 }
+
+                 if (RecordExists IERCALPL <> tsOK)
+                   iIerCP.CreateIerCalPlanOnDoc(CalPlan.cDogovor, CalPlan.cCalPlan, CalPlan.NRec);
+                UpdateCalPlanSoprHoz;
+
+             } // _loop CalPlan (CalPlan.nrec < minNRec1) // по CalPlan из подчинённого договора
+
+             if boMinCPExist
+             if (wUpKey > 0) or (Dogovor.Summa <> Total)  or (Dogovor.SumNDS <> SumNal)
+             {
+               Dogovor.Summa  := Total;
+               Dogovor.SumNDS := SumNal;
+
+               if (DOGOVOR.DINPUT = ZeroDate) or (DOGOVOR.DBEG < DOGOVOR.DINPUT)
+               DOGOVOR.DINPUT := DOGOVOR.DBEG;
+
+               Update current Dogovor;
+             }
+
+             if not boMinCPExist // У Договора нет подчинённых договоров - создаём Товарный ПКП на основе его самого
+             if Dogovor.CDOGDS <> comp(0)
+             {
+               var isExistPCP: boolean;
+               Var nRecPCP: comp = (Dogovor.CDOGDS + minNRec1);
+               isExistPCP := Getfirst CALPLAN where (( nRecPCP == CALPLAN.nRec)) = tsOK;
+
+               if not isExistPCP
+                 ClearBuffer(#CALPLAN);
+
+      //         CALPLAN.nRec := Dogovor.CDOGDS + minNRec1;
+               CALPLAN.DESGR     := Dogovor.DESGR     ;
+               CALPLAN.DESCR     := Dogovor.DESCR     ;
+               CALPLAN.CGRPOL    := Dogovor.CGRPOL    ;
+               CALPLAN.CORG      := Dogovor.CORG      ;
+               CALPLAN.CPLAT     := Dogovor.CPLAT     ;
+               CALPLAN.CPLATBANK := Dogovor.CBANKPLAT;
+               CALPLAN.CPOL      := Dogovor.CPOL      ;
+                CALPLAN.CPOLBANK  := Dogovor.CBANKPOL  ;
+               CALPLAN.DFROM     := Dogovor.DBEG;
+               CALPLAN.DTO       := Dogovor.DEND;
+                CALPLAN.DINPUT    := Dogovor.DINPUT;
+               CALPLAN.NODOC_EXT := Dogovor.NODOC;     // Это не перепутано такой фокус
+               CALPLAN.NODOC     := Dogovor.NODOC_EXT;
+               CALPLAN.VHODNAL   := Dogovor.VHODNAL   ;
+               CALPLAN.CVAL      := Dogovor.CVAL ;
+               CALPLAN.SUMMASPEC := DOGOVOR.SUMMA;
+               CALPLAN.SUMNDS    := DOGOVOR.SUMNDS;
+               CalPlan.cNazna    := Dogovor.cProg;
+               CALPLAN.DIRECTMC := DOGOVOR.direct;
+               CALPLAN.DIRECTPLAT := 0;
+               CALPLAN.CDOGOVOR  := Dogovor.nRec;
+               CALPLAN.CMARAVT:= tHeader.cviddog;
+
+               refImpDef.SetToKatNotes(403 , 'оформляемый', CalPlan.Status, CalPlan.cNote); // Статус документа
+
+               if (GetFirst AttrDog where((Dogovor.NRec == AttrDog.cDogovor)) = tsOk)
+               CALPLAN.COTVPODR := AttrDog.cPodr;
+
+               if isExistPCP
+               { update current CalPlan;
+               }
+               else
+               {
+                 CALPLAN.nRec := nRecPCP;
+                 Insert current CalPlan;
+               }
+
+               if (RecordExists IERCALPL <> tsOK)
+                 iIerCP.CreateIerCalPlanOnDoc(CalPlan.cDogovor, CalPlan.cCalPlan, CalPlan.NRec);
+
+               UpdateCalPlanSoprHoz;
+             }
+
+       } //_Loop ExImLogR where ((cLogTMP == ExImLogR.cLogT)) по Договорам
+
+  PopPos(#ExImLogE);
+  PopPos(#ExImLogT);
+    StopVisual('', 0);
+}// Procedure ImportMarkedDocuments;
+HandleEvent
+cmINIT:
+{
+  bo_UpDATE_ATTR_Need := true;
+  bo_UpDATE_ONLY_IMPORT := true;
+
+  if not bo_UpDATE_ONLY_IMPORT then bo_UpDATE_ATTR_Need := true;
+
+  cMYNotes := 0;
+  refImpDef.SetToKatNotes(400, 'Импортирован', tHeader.Status, cMYNotes); // Статус документа
+  if cMYNotes = comp(0)  cMYNotes := 000B0000000000A2h;
+
+  if bo_UpDATE_ONLY_IMPORT
+  message('Импорт с блокировкой по статусу'#13 + 'Изменение договоров только в статусе "Импортирован"');
+
+  inherited::HandleEvent(cmInit);
+}
+end;
+end.
+//   InsertIEIncFld( 0, iesDO + 34, 'Статья затрат: Код', 'AddSumTune.Code', 'C020', ieDO  , ieSpec, ieBoth);
+  //fun.Set_sCurFieldName('Статья бюджета: центр ответственности');
+//  tSpec.cHashAn := refImpDef.SetToFpCO(strFPCONameSp, strFPCOKodSP); // Центр ответственности: Наименование

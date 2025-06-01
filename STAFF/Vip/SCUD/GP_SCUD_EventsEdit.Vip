@@ -1,0 +1,1486 @@
+/*************************************************************************************************\
+* Наименование: Скуд - события                                                                    *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: GP_SCUD_Events.wResource = REG_EVENTS.type_Pass - 1 вход, 0 выход                   *
+* Сделаем по GP_SCUD_AREAS.wType=1 -вход, 0 - выход + Need_UCHET                                  *
+* при импорте жестко вшит - завод=вход, не контролируемая Сделаем по GP_SCUD_AREAS.wType=1 -вход, *
+*0 - выход + Need_UCHET                                                                           *
+* Учет часов по 92 и 91 приказу (№1941)                                                           *
+* 1. Часы по графику считать как часы из 92 приказа - часы на кормление из 91.                    *
+* 2. Время окончания смены  отражать как                                                          *
+*   План по графику - (часы по графику - часы из 92)                                              *
+* 3. Время окончания обеда = время по графику + часы на кормление по 91.                          *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#175          |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#1574         |05/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#1941         |05/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Доработка   |#89424        |22/01/25|Андреев С.И.             |СКУД, Гибкий график              *
+\*************************************************************************************************/
+// убрать NO для отладки
+#DEFINE GP_SCUD_EventsEdit_DEBUG
+#DEFINE GP_SCUD_EventsEdit_DEBUG_MIS
+/*
+удаление дубликатов
+SQL delete from GP_SCUD_EVENTS where GP_SCUD_EVENTS.Nrec in
+(  select GP_SCUD_EVENTS.Nrec From GP_SCUD_EVENTS
+inner join GP_SCUD_EVENTS GP_SCUD_EVENTS_D on GP_SCUD_EVENTS_D.NPP = GP_SCUD_EVENTS.NPP and GP_SCUD_EVENTS_D.Nrec > GP_SCUD_EVENTS.NRec
+and GP_SCUD_EVENTS_D.wsystem = GP_SCUD_EVENTS.wsystem
+);
+SQL delete from GP_SCUD_EV_ALL where GP_SCUD_EV_ALL.Nrec in
+(  select GP_SCUD_EV_ALL.Nrec From GP_SCUD_EV_ALL
+inner join GP_SCUD_EV_ALL GP_SCUD_EVENTS_D on GP_SCUD_EVENTS_D.NPP = GP_SCUD_EV_ALL.NPP and GP_SCUD_EVENTS_D.Nrec > GP_SCUD_EV_ALL.NRec
+and GP_SCUD_EVENTS_D.wsystem = GP_SCUD_EVENTS.wsystem
+);
+
+отбор в скуде
+//--------
+ select  min(re.time_ev) as time_ev --время выхода
+       , min(dpt.display_name) dcode
+       , min(re.id_reg)
+       , min(ip.ip_addr) , min(ip.id_configs_tree_ip) ,min(ip.configs_tree_id),  min(re.type_pass), min(re.inner_number_ev)
+    ,re.date_ev,re.areas_id ,re_o2.time_ev--,re_o2.areas_id, re_o4.time_ev,re_o4.areas_id
+    ,st.last_name,st.first_name name, st.middle_name fathership, st.id_staff
+
+ from REG_EVENTS re
+    inner join staff st on st.id_staff = re.staff_id
+    inner join AREAS_TREE ar
+           on (ar.ID_AREAS_TREE = re.AREAS_ID)
+    left outer join STAFF_REF sr on sr.staff_id        = st.id_staff
+    left outer join SUBDIV_REF dpt on dpt.id_ref = sr.subdiv_id
+    left outer join CONFIGS_TREE ct on ct.id_configs_tree = re.configs_tree_id_controller
+    left outer join CONFIGS_TREE_IP ip on ip.configs_tree_id=ct.id_configs_tree
+    left outer join  REG_EVENTS re_o2
+    on re_o2.staff_id = re.staff_id and re_o2.type_pass=1
+       and (re_o2.areas_id=1 or re_o2.areas_id=125937)
+       and (re_o2.areas_id<>re.areas_id)
+       and re_o2.date_ev=re.date_ev and re_o2.time_ev<re.time_ev
+  where ( re.date_ev='10.10.2017'
+         or re.date_ev='20.02.2017'
+         )
+        and re.type_pass=1
+       and (re.areas_id =125937)
+       and (5098 =re.staff_id
+       or 5897 =re.staff_id
+       or  st.last_name='РўРчР>РчР?РєР?Р?'
+       )
+       and ((re_o2.id_reg is null) or
+       re_o2.time_ev=
+     ( select max(case when re_o1.time_ev is null
+       then '0:00' else re_o1.time_ev end ) as time_ev
+          from REG_EVENTS re_o1
+          where   re_o1.type_pass=1
+          and (re_o1.areas_id=1 or re_o1.areas_id=125937)
+          and re_o1.staff_id = re.staff_id
+          and (re_o1.areas_id<>re.areas_id)
+          and re_o1.date_ev=re.date_ev and re_o1.time_ev<re.time_ev
+          group by re_o1.staff_id,re_o1.date_ev,re_o1.areas_id
+          )
+      )
+ group by   re.date_ev,re.areas_id ,re_o2.time_ev--,re_o2.areas_id, re_o4.time_ev,re_o4.areas_id
+    ,st.last_name ,st.first_name, st.middle_name, st.id_staff
+
+  -- //----------------------- выходы
+   union
+ select distinct  max(re.time_ev)
+       , max(dpt.display_name) dcode
+       , max(re.id_reg)
+       , max(ip.ip_addr)
+       , max(ip.id_configs_tree_ip)
+       , min(ip.configs_tree_id)
+       , min(re.type_pass), min(re.inner_number_ev)
+    ,re.date_ev,re.areas_id ,re_o2.time_ev--,re_o2.areas_id, re_o4.time_ev,re_o4.areas_id
+    ,st.last_name,st.first_name name, st.middle_name fathership, st.id_staff
+
+  from REG_EVENTS re
+    inner join staff st on st.id_staff = re.staff_id
+    inner join AREAS_TREE ar
+           on (ar.ID_AREAS_TREE = re.AREAS_ID)
+    left outer join STAFF_REF sr on sr.staff_id        = st.id_staff
+    left outer join SUBDIV_REF dpt on dpt.id_ref = sr.subdiv_id
+    left outer join CONFIGS_TREE ct on ct.id_configs_tree = re.configs_tree_id_controller
+    left outer join CONFIGS_TREE_IP ip on ip.configs_tree_id=ct.id_configs_tree
+    left outer join  REG_EVENTS re_o2
+    on re_o2.staff_id = re.staff_id and re_o2.type_pass=1
+       and (re_o2.areas_id=125937)
+       and (re_o2.areas_id<>re.areas_id)
+       and re_o2.date_ev=re.date_ev and re_o2.time_ev>re.time_ev
+
+  where (re.date_ev='10.10.2017'-- '20.02.2017'  --and re.time_ev>'8:00'
+         or re.date_ev='20.02.2017'
+         or re.date_ev>CURRENT_DATE-30
+         )
+        and re.type_pass=1
+       and (re.areas_id =1)
+       and (5098 =re.staff_id
+       or 5897 =re.staff_id
+       or  st.last_name='РўРчР>РчР?РєР?Р?'
+       )
+
+    and ((re_o2.id_reg is null) or
+       re_o2.time_ev =
+       ( select min(re_o1.time_ev) as time_ev
+          from REG_EVENTS re_o1
+          where   re_o1.type_pass=1
+          and (re_o1.areas_id=1 or re_o1.areas_id=125937)
+          and re_o1.staff_id = re.staff_id
+          and (re_o1.areas_id<>re.areas_id)
+          and re_o1.date_ev=re.date_ev and re_o1.time_ev>re.time_ev
+          group by re_o1.staff_id,re_o1.date_ev,re_o1.areas_id
+          )
+      )
+   group by   re.date_ev,re.areas_id ,re_o2.time_ev
+          ,st.last_name,st.first_name , st.middle_name, st.id_staff
+*/
+#include marker.vih // описание объекта и объявление интерфейса
+                    // marker c реализацией по умолчанию
+
+#include Query.vih
+#Include GetKau.Vih
+
+#include CatFunc.Vih
+#include FRRecordDefinition.vih
+//---------------------------------
+#include CLSFUNCS.VIH // ф-ии пересканирования текущих л/с
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+//---------------------------------
+
+#include GP_VisibleHidden.vih //KBU
+#include GP_Protector.Vih
+#include GP_QueryBuilder.vih
+#include GP_Log.Vih
+#include GP_SCUD_Order.Vih
+#include GP_Field_Flt.vih
+#include GP_StatusAccessEdit.vih
+#include GP_UserAccessService.vih
+#include GP_SCUD_KategEdit.Vih
+#include GP_SCUD_GrupEdit.Vih
+#include GP_SCUD_PersEdit.Vih
+#include GP_SCUD_Report.Vih
+#include GP_SCUD_Order.Vih
+#include GP_SCUD_SaldoEdit.Vih
+#include GP_SCUD_ExClusionPeriod.Vih
+#include GP_SCUD_MisConDuctEdit.Vih
+#include GP_SCUD_StateMentOnAbsent.Vih
+#include GP_SCUD_Function.Vih
+//-----------------------
+#include GP_SCUD_EV_AllEdit.Vih
+#include GP_SCUD_EventsEdit.Vih
+
+#doc
+ Скуд - события
+
+#end
+Interface GP_SCUD_EventsEdit ' Скуд - события'    ('', hcNoContext,) EscClose;
+  Show at (,,,30);
+//----------------------------------------
+#include ShowKau.Vpp
+//------------------------------------
+// декларация сложного фильтра
+//------------------------------------
+function isFilterAnCorrect(ww_nrec:comp): boolean;forward;
+Function GetPlanTime(_pScud_Events:comp;_DT:date ):time;forward;
+Function GetMisConDuct(_pScud_Events:comp;_Plan_time:time;_DT:date;_tp:word=0):word;Forward;
+Function GetNextEventsTime(ww_nrec:comp):string;Forward;
+Function GetDiffTime(ww_nrec:comp; _Plan_time:time):time;Forward;
+Function GetEndBreak1(D:word):time;Forward;
+//----------------------------------------
+Table Struct tmp_period
+(   EventDate:date  "Дата события"
+  , EventTmB :time  "Время события с"
+  , EventTmE :time  "Время события по"
+  , PlanTime :time  "Плановое время"
+  , wType    :word  "1-личные невыходы,2-служебные,3-прочие"
+  , cGP_SCUD_PERS:comp
+  , cStatement :comp //ссылка на заявление
+)
+with index
+( tmp_period01 = cGP_SCUD_PERS+ EventDate + EventTmB
+);
+
+//--- для регистрации событий по приказу
+Table Struct tmp_period_Order
+(   EventDate:date //   : date "Дата события"
+  , EventTmB :time //  : time "Время события с"
+  , EventTmE :time //  : time "Время события по"
+  , cGP_SCUD_PERS:comp
+  , wType    :word //  GP_iSC_OrderOver               = 1014;//Приказ на сверхурочные
+                   //  GP_iSC_OrderOver2              = 1015;//Приказ на оплату переработки
+                   //  GP_iSC_OrderHoliday            = 1016;//Приказ на работу в выходной день
+  , diff:double
+  , wOpl:word  //1 - за отгул, иначе за оплату
+)
+with index
+( tmp_period01 = cGP_SCUD_PERS+ wType + EventDate + EventTmB
+);
+
+//----------------------------------------
+// Рабочие периоды
+Table Struct tmp_period_work =tmp_period;
+
+//------- Для отчетов
+Table struct tmp_Rep_Vib
+(  cGP_Scud_Pers :comp
+  ,cLschet:comp
+  ,cPersons:comp
+  ,Fio     :string[100]
+)
+with index
+( tmp_Rep_Vib01 = cGP_Scud_Pers
+ ,tmp_Rep_Vib02 = cLschet
+);
+
+Table Struct tmp_Rep_Ev
+(  FIO:string[50] "Сотрудник (Посетитель)"
+  ,cGP_Scud_Pers:comp
+  ,EnterDate:date "Дата"
+  ,PlanTime:time "Начало/окончание рабочего дня"
+  ,EnterTime:time "Время"
+  ,Podr_Kod:string[20] "Подразделение"
+  ,Post :string[100]
+  ,Event_Type:string[150]  "Событие"
+  ,wResource :word "Ресурс устройства"
+  ,Areal:string[100] "Помещение"
+  ,Zauv:string[100]  "Наличие контрольной карты"
+  ,ColorEV  :longint
+  ,Diff     :time
+  ,MisConDuct:string[50]
+)
+With index
+( tmp_Rep_Ev01 =Fio+cGP_Scud_Pers+EnterDate+EnterTime
+);
+
+table struct tAgileCache (cEvent: comp, PlanTime: time, DiffColor: longint, wMisConduct: word, absenseTime: time) (i1 = cEvent(unique));
+table struct tAgileCacheDay (cScudPers: comp, eventDate: date, startWork: time, endWork: time, workTime: time, dinnerTime: time, absenseTime: time, planStartWork: time, planEndWork: time, planWorkTime: time, planDinnerTime: time) (i1 = cScudPers + eventDate);
+
+//----------------------------------------
+#include GetKau.var
+#include GP_SCUD_GrupEdit.Var
+#include GP_SCUD_KategEdit.Var
+#include GP_SCUD_MisConDuctEdit.Var
+#include GP_SCUD_Order.Var
+#include GP_SCUD_Function.Var
+//--------------------------------------------
+var
+  cRec    :Comp   ; // ссылка на группу
+  oGP_Log : GP_LOG;
+  pMarker:IMarker(Marker) new;
+  Marker:longint;
+  iCatFunc            : CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+  //-----------------------------------
+  iGP_SCUD_ExClusionPeriod  :GP_SCUD_ExClusionPeriod; // Проверить периоды
+  iGP_SCUD_StateMentOnAbsent:GP_SCUD_StateMentOnAbsent;//
+  iGP_SCUD_SaldoEdit :GP_SCUD_SaldoEdit;
+  iGP_SCUD_EV_AllEdit:GP_SCUD_EV_AllEdit; //посмотреть все события скуд
+  iQBuilder:GP_QueryBuilder new;
+  pStatus_DM: Array [1..4] of comp;
+   //'01','СКУД');
+   //'02','СКУД, корректировка');
+   //'03','Добавлен вручную',True);
+   //'04','Исключено из учета');
+  //--------------------------------------------------
+  //-- ДЛЯ РАСЧЕТОВ
+  wYearRas,wMonthRas :word;
+  Calc_Rejim:boolean;
+  //------------------------------
+  pGP_SCUD_SALDO    :TGP_SCUD_SALDO;//для обмена всей информацией и сохранения в сальдо
+  // из графика         //---- статусы
+  pGRAFF_WorkPeriod :TGRAFF_WorkPeriod;//период работ
+  pGP_SCUD_DOC_SP_O:comp; // ссылка на входящий приказа
+  //------------------------
+  pGP_SCUD_S_D: TGP_SCUD_S_D ;// дополнительные массивы
+
+  //------------------------
+  Calc_Date     :date;// День расчета
+  //----------- остатки
+  //Ost_Over:tSumma;Ost_Over2:tSumma; Ost_Holiday:tSumma; - все в pGP_SCUD_Saldo.
+  boLoadZar:boolean;//признак загрузки функций по работе с табелем
+  //-- ДЛЯ РАСЧЕТОВ
+  //--------------------------------------------------
+  #include Excel_Var.Vpp
+  //--------------------------------------------------
+  // -- VA
+  pVA_SalScale_TMB :comp; // Время начала отклонения
+  pVA_SalScale_TME :comp; // Время окончания отклонения
+
+  //-- Настройки
+  UP_ZAR_WT_PROTECTUPTODATE:date;//Управление персоналом \ Табельный учет \ Формирование \ Окончание диапазона защиты табелей от обновления
+  NPOEM_OWN_SCUD_Vactions_Control:word;// Настройки НПО Энергомаш \ СКУД \Способ ограничения работы в выходной день "
+  NPOEM_OWN_SCUD_DELAY_ALLOW     :word;//', 'Считать опозданием при входе позже времени начала графика, секунд
+  tNPOEM_OWN_SCUD_DELAY_ALLOW    :time;
+  NPOEM_OWN_SCUD_OVER2_Type      :word;//', 'Способ расчета переработки
+  NPOEM_OWN_SCUD_ZAbsent_STATUS_M:comp;//'Статус "утвержден" в заявлении на отсутствие'
+  NPOEM_OWN_SCUD_Pers_Other      :boolean;//'Отображать сторонних лиц
+  DatOtch      : date; // dGetTune('UP.DATOTCH');
+  DatOtch_Next : date; // Add_Month(DatOtch,1);
+  //-- Настройки
+  //--------------------------------------------------
+
+  // для информации по режиму
+  StartWorkDay,EndWorkDay,
+  StartBreak1,EndBreak1,
+  StartBreak2,EndBreak2,
+  StartShift2,EndShift2:time;
+  Graf_Time  :time;
+  //-- пометка подразделения
+//-----------------------------------------
+// Фильтры
+//-----------------------------------------
+   wFilter:word;
+   Marker_Count :longint;
+    wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   KauMarkerName:string;
+   Marker_Tmp :longint;
+
+   #mrkfld_(KatPodr)
+   #mrkfld_(KatOrg)
+   #mrkfld_(GP_SCUD_Pers)
+
+
+   sFio_Flt      ,sFio_Flt_A       : string;
+   sPropusk_Flt  ,sPropusk_Flt_A   : string;
+   wType_Flt     ,wType_Flt_A      : word;
+//----------------------------------------
+Create View
+var
+   pGP_SCUD_Pers :comp;
+   pGP_SCUD_Pers_Prev:comp;
+   pKatOrg :comp;
+   pKatPodr :comp;
+   DTB,DTE,DTB_A,DTE_A:date;
+   TMB,TME,TMB_A,TME_A:time;
+
+as select GP_SCUD_Events.Nrec
+,  if(Calc_Rejim,wYearRas ,year (GP_SCUD_Events.EnterDate)) (FieldName=wYear)
+,  if(Calc_Rejim,wMonthRas,month(GP_SCUD_Events.EnterDate)) (FieldName=wMonth)
+//вроде не нужно,  if(Calc_Rejim,Calc_Date,GP_SCUD_Events.EnterDate)        (FieldName=dRas)
+//,  GetRejimDay(GP_SCUD_Events.cGP_SCUD_Pers
+//     ,GP_SCUD_Events.EnterDate) (FieldName=wRejim)
+
+, GetPlanTime(GP_SCUD_Events.Nrec,GP_SCUD_Events.EnterDate) (FieldName=Plan_Time)
+, GetMisConDuct(GP_SCUD_Events.Nrec,Plan_Time,GP_SCUD_Events.EnterDate) (FieldName=wMisConDuct_V)
+, iGP_SCUD_MisConDuctEdit.GetMisConDuctTypeName(wMisConDuct_V) (FieldName=sMisConDuct)
+, GetNextEventsTime(GP_SCUD_Events.Nrec) (Fieldname=Next_Event)
+/*
+, IF(Plan_Time=ZeroTime,ZeroTime,If(Plan_Time<=GP_SCUD_Events.EnterTime
+     ,Sub_Time(GP_SCUD_Events.EnterTime,Plan_Time)
+     ,Sub_Time(Plan_Time,GP_SCUD_Events.EnterTime)
+     ))   (FieldName=Plan_Diff)
+*/
+, GetDiffTime(GP_SCUD_Events.Nrec,Plan_Time) (FieldName=Plan_Diff)
+From
+  GP_SCUD_Events
+, GP_SCUD_Events GP_SCUD_Events_Next
+, GP_SCUD_Events GP_SCUD_Events_Prev
+, GP_SCUD_Events GP_SCUD_Events_Free
+//--------- Заявление на отсутствие
+, GP_SCUD_DOC_SP GP_SCUD_DOC_SP_A
+, GP_SCUD_DOC    GP_SCUD_DOC_A
+, GP_Status      GP_Status_A
+, GP_SCUD_Reason GP_SCUD_Reason_A
+//------------------------
+, GP_SCUD_Pers
+, GP_SCUD_Pers_Hist(GP_SCUD_PERS_HIST08)
+//-----------------------
+, KatOrg
+, Katpodr
+, GP_SCUD_MisConDuct
+, GP_SCUD_MisCon_D
+, tmp_period
+, tmp_period_work
+, tmp_period_work tmp_period_work_d
+, tmp_period_Order
+
+//-------- для хранения нарушений при расчете
+, Tmp_Scud_MisConDuct
+, Tmp_Scud_MisConDuct Tmp_Scud_MisConDuct_F
+//--------- исключения периодов
+, tmp_ExClusPeriod
+//------- для формирования приказов
+, tmp_scud_order_new
+//-------- для отчетов
+, tmp_Rep_Ev(tmp_Rep_Ev01)
+, tmp_Rep_Vib
+//------- фильтры
+ , KatPodr    KatPodr_Flt
+ , KatOrg     KatOrg_Flt
+ , GP_SCUD_Pers    GP_SCUD_Pers_Flt
+ , tAgileCache, tAgileCache tAgileCache2
+ , tAgileCacheDay
+where ((
+      DTB_A <<= GP_SCUD_Events.EnterDate
+and   DTE_A >>= GP_SCUD_Events.EnterDate
+and ((DTB_A < GP_SCUD_Events.EnterDate
+      or  TMB_A<= GP_SCUD_Events.EnterTime)
+     and (DTE_A > GP_SCUD_Events.EnterDate
+          or  TME_A>= GP_SCUD_Events.EnterTime or TME_A=ZeroTime)
+   )
+and GP_SCUD_Events.cGP_SCUD_Pers /== GP_SCUD_Pers.Nrec
+and GP_SCUD_Pers.Nrec  == tmp_period.cGP_Scud_Pers
+and GP_SCUD_Pers.Nrec  == tmp_period_order.cGP_Scud_Pers
+//----------------------- нарушения
+and  GP_SCUD_Pers.Nrec  == Tmp_Scud_MisConDuct.cGP_SCUD_PERS
+and  GP_SCUD_Pers.Nrec  == Tmp_Scud_MisConDuct_F.cGP_SCUD_PERS
+and  Tmp_Scud_MisConDuct.cGP_SCUD_PERS  == GP_SCUD_MisCon_D.cGP_Scud_Pers
+and  Tmp_Scud_MisConDuct.YearN          == GP_SCUD_MisCon_D.YearN
+and  Tmp_Scud_MisConDuct.MesN           == GP_SCUD_MisCon_D.MesN
+and  Tmp_Scud_MisConDuct.DT_Ev          == GP_SCUD_MisCon_D.DT_Ev
+and  Tmp_Scud_MisConDuct.TM_Ev          == GP_SCUD_MisCon_D.TM_Ev
+and  Tmp_Scud_MisConDuct.wMisConDuct    == GP_SCUD_MisCon_D.wMisConDuct(noindex)
+
+
+and GP_SCUD_Pers.cGp_Scud_Kateg == Gp_Scud_Kateg.Nrec
+and GP_SCUD_Events.cKatPodr == Katpodr.Nrec
+and GP_SCUD_Events.cArea == GP_SCUD_AREAS.Nrec // копия таблицы из скуда
+//and GP_SCUD_Events.cKatOrg  == KatOrg.Nrec
+and GP_SCUD_Events.cStatus  == GP_Status.Nrec
+and GP_SCUD_Events.cControler  == GP_SCUD_Controler.Nrec
+//and GP_SCUD_Events.cGP_SCUD_Pers == GP_SCUD_Pers_Hist.cGP_SCUD_Pers
+and GP_SCUD_Pers.Nrec == GP_SCUD_Pers_Hist.cGP_SCUD_Pers
+//and GP_SCUD_Pers.Fio == GP_SCUD_Pers_Hist.Fio // надо индекс добавить
+and Calc_Date   >>= GP_SCUD_Pers_Hist.DTIZM
+//Заявление на отсутствие
+and GP_SCUD_Events.cGP_SCUD_Pers == GP_SCUD_DOC_SP_A.cGP_SCUD_Pers
+and GP_iSC_statement_on_absence  == GP_SCUD_DOC_SP_A.wType(Noindex)
+and GP_SCUD_Events.EnterDate     == GP_SCUD_DOC_SP_A.EventDate
+and (  GP_SCUD_Events.EnterTime>= GP_SCUD_DOC_SP_A.EventTMB // будет ловить все.
+   and Sub_Time(GP_SCUD_Events.EnterTime,time(0,1,0,0))<= GP_SCUD_DOC_SP_A.EventTME
+   )
+and GP_SCUD_DOC_SP_A.cGP_SCUD_DOC == GP_SCUD_DOC_A.Nrec
+and GP_SCUD_DOC_A.cStatus == GP_Status_A.nrec
+and GP_SCUD_DOC_A.cReason == GP_SCUD_Reason_A.Nrec
+// следующая запись
+and GP_SCUD_Events.cGP_SCUD_Pers == GP_SCUD_Events_Next.cGP_SCUD_Pers
+and GP_SCUD_Events.EnterDate <<= GP_SCUD_Events_Next.EnterDate
+and Add_Day(GP_SCUD_Events.EnterDate,1)>>=GP_SCUD_Events_Next.EnterDate
+and ( (GP_SCUD_Events.EnterDate < GP_SCUD_Events_Next.EnterDate
+     or GP_SCUD_Events.EnterTime<GP_SCUD_Events_Next.EnterTime
+     ) and GP_SCUD_Events_Next.cStatus<>pStatus_DM[04]
+  )
+// предыдущая запись
+and GP_SCUD_Events.cGP_SCUD_Pers == GP_SCUD_Events_Prev.cGP_SCUD_Pers
+and GP_SCUD_Events.EnterDate >>= GP_SCUD_Events_Prev.EnterDate
+and Sub_Day(GP_SCUD_Events.EnterDate,1)<<=GP_SCUD_Events_Prev.EnterDate
+and ( (GP_SCUD_Events.EnterDate > GP_SCUD_Events_Prev.EnterDate
+     or GP_SCUD_Events.EnterTime>GP_SCUD_Events_Prev.EnterTime
+     ) and GP_SCUD_Events_Prev.cStatus<>pStatus_DM[04]
+  )
+//Для подсчета плана часов
+//нарушения
+and wMisConDuct_V == GP_SCUD_MisConDuct.wType
+//------- фильтры
+and wc_nrec == KatPodr_Flt.Nrec
+and wc_nrec == KatOrg_Flt.Nrec
+and wc_nrec == GP_SCUD_Pers_Flt.Nrec
+
+))
+Bounds byGP_SCUD_Pers  pGP_SCUD_Pers == GP_SCUD_Events.cGP_SCUD_Pers(noindex) ordered by TableOrder
+Bounds byGP_SCUD_PersM pGP_SCUD_Pers == GP_SCUD_PERS.Nrec
+
+//Bounds byKatOrg  pKatOrg  == GP_SCUD_Events.cKatOrg (noindex) ordered by TableOrder
+Bounds byKatPodr pKatPodr == GP_SCUD_Events.cKatPodr(noindex) ordered by TableOrder
+//Bounds byType    wType_Flt== GP_SCUD_Events.wType   (noindex) ordered by TableOrder
+Bounds ByPers pGP_SCUD_Pers == GP_SCUD_Events.cGP_SCUD_Pers//(noindex)
+    and  DTB_A <<= GP_SCUD_Events.EnterDate
+and   DTE_A >>= GP_SCUD_Events.EnterDate
+and ((DTB_A < GP_SCUD_Events.EnterDate
+      or  TMB_A<= GP_SCUD_Events.EnterTime)
+     and (DTE_A > GP_SCUD_Events.EnterDate
+          or  TME_A>= GP_SCUD_Events.EnterTime or TME_A=ZeroTime)
+   )
+
+condition FilterAn = // использование сложного фильтра
+  (isFilterAnCorrect(GP_SCUD_Events.Nrec))
+;
+Parameters
+  wIntMode
+#doc
+#end
+,  cRec
+#doc
+ возвращаемый параметр
+#end
+,  Marker
+#doc
+ маркер пометки
+#end
+;
+
+//***********************************************
+create view vSpr
+var
+  pKateg :comp;
+as select Gp_Scud_Kateg.wType
+From Gp_Scud_Kateg
+where
+(( pKateg==Gp_Scud_Kateg.Nrec
+));
+
+//***********************************************
+create view vKatPodr
+var pKatPodr:comp;
+as select KatPodr.Name
+From KatPodr
+where ((
+  pKatPodr == KatPodr.Nrec
+));
+//***********************************************
+create view vPersons
+var
+  pPersons:comp ;
+as select
+  Persons.Nrec
+from
+   Persons, Appointments
+  ,Catalogs CatPost
+where
+((  pPersons == Persons.Nrec
+and if(Persons.AppointCur=0,Persons.AppointLast,Persons.AppointCur) == Appointments.Nrec
+and Appointments.Post == CatPost.Nrec
+
+))
+;//create view vPers
+
+create view vGP_SCUD_Pers
+var
+  pGP_SCUD_Pers:comp;
+From
+  GP_SCUD_Pers
+where
+(( pGP_SCUD_Pers == GP_SCUD_Pers.Nrec
+));
+
+//***********************************************
+//-------------------------------------
+//---- Для поиска по табелю
+//-------------------------------------
+create view vTabel
+var pPersons:comp;
+    wRejim  :word;
+    wYear   :integer;
+    wMonth  :integer;
+    dtEvent :date;
+    DtBeg   :date;
+    DtEnd   :date;
+//    dRas    :date;
+as select Klndr.nrec,GP_KlndrExt.nrec
+From
+//-- табель
+  KLNDR
+, GP_KlndrExt
+, Lschet
+, LsTab
+, Perexod
+, KlRejim
+, GP_TIMETABLE (GP_TIMETABLE02)
+// 92 РПД - работа во время отпуска
+// ContDoc.WDop=1 - смена режима, 0 - сокращение дня.
+, ContDoc
+, InfPsn1//..cPers cRef2
+// 91 РПД - Время кормления ребенка
+, ContDoc ContDoc91
+, UOWrkTabel UO_91
+
+
+where
+((
+   pPersons == Lschet.tPerson
+and (3 <> Lschet.Sovm //// не будем смотреть по совместителям
+   and (Lschet.DatUV=ZeroDate or Lschet.DatUV>=Date(1,wMonth,wYear))
+//пока не будем - а вдруг повторный прием на тот же ЛС
+//  and (Lschet.DatPos<Add_month(Date(1,wMonth,wYear),1))
+   ) // не будем смотреть по совместителям
+// табель
+and Lschet.Nrec == LsTab.cLschet
+and wYear  == LsTab.YearN
+and wMonth == LsTab.MesN
+// корректировочный табель
+and Lschet.Nrec == GP_TIMETABLE.cLschet
+and wYear  == GP_TIMETABLE.YearN
+and wMonth == GP_TIMETABLE.MonthN
+//---------------------
+and wRejim  == KLNDR.Rejim
+and wYear   == Klndr.YearK
+and wMonth  == Klndr.MonthK
+//---------------------
+and wRejim  == GP_KlndrExt.Rejim
+and wYear   == GP_KlndrExt.YearK
+and wMonth  == GP_KlndrExt.MonthK
+//----------------------
+and wRejim  == KlRejim.Rejim
+
+//---- переходы
+and Lschet.Nrec == Perexod.CLSCH
+and dtEvent>>=Perexod.DatIzm
+and (  (Perexod.Flags2 and 16)>0 //pchRejim=16 - 5 бит,а 1000b=8 - 4 бит,
+  and  ( Perexod.DATOK=ZeroDate
+        or Perexod.DATOK>=dtEvent//dRas//GP_SCUD_Events.EnterDate
+       )
+   and (
+     //   (month(Perexod.DatIzm)=wMonth
+     //and year(Perexod.DatIzm)=wYear
+        (DtBeg<=Perexod.DatIzm
+     and DtEnd>=Perexod.DatIzm
+        )
+        //если вдруг временный начался в прошлом месяце
+        or
+        (month(Perexod.DatOk)=wMonth
+     and year(Perexod.DatOk)=wYear
+        )
+     )
+  )
+//--- Корзина следующего периода с изменением периода
+and Lschet.Nrec == ZarSignal.CLSCHETZPL
+and 'И'         == ZARSIGNAL.WORD4_M(noindex)
+and DtBeg  <<= ZARSIGNAL.DATE1(noindex)
+and dtEvent>>= ZARSIGNAL.DATE1(noindex)
+//--- 92 РПД -----------------------
+and pPersons == ContDoc.PERSON
+and 92       == ContDoc.TypeOper
+and dtEvent  >>=ContDoc.Dat1(Noindex)
+and dtEvent  <<=ContDoc.Dat2(Noindex)
+//ContDoc.wDop=0
+and ContDoc.nRec == infPsn1.cPers
+and comp(skkRPD92) == InfPsn1.cRef2
+//--- 91 РПД ----------------------
+and pPersons == ContDoc91.PERSON
+and 91       == ContDoc91.TypeOper
+and 0              == SalScale.wTblCode
+and ContDoc91.NRec == SalScale.cUnit
+and comp(SalScale.LastUser) == UO_91.Nrec
+
+//  and ContDoc.cNew1 == KlRejim.NRec
+));
+
+
+
+//***********************************************
+//---------------------------
+Procedure MyInsertEvents;
+{  //if (wIntMode and cgiNotEdit)>0 exit;
+  //if isFilterRun exit;
+  timelog('GP_EventsEdit->cmInsert:pStatus_DM[03]='+string(pStatus_DM[03],0,0));
+  ClearBuffer(#GP_SCUD_Events);
+  GP_SCUD_Events.cStatus:=pStatus_DM[03];
+
+  if BoundActive(tbbyKatPodr)
+    GP_SCUD_Events.cKatPodr:=pKatPodr;
+  GP_SCUD_Events.EnterDate:=Cur_date;
+  if GP_SCUD_Events.EnterDate<DTB_A and DTB_A<>ZeroDate
+    GP_SCUD_Events.EnterDate:=DTB_A;
+  if GP_SCUD_Events.EnterDate>DTE_A and DTE_A<>ZeroDate
+    GP_SCUD_Events.EnterDate:=DTE_A;
+  GP_SCUD_EVENTS.WRESOURCE:=1;
+  if DTB_A=DTE_A
+  if getlast GP_SCUD_Events_Prev=tsok
+  { if GP_SCUD_Events_Prev.EnterDate=GP_SCUD_Events.EnterDate
+    { GP_SCUD_EVENTS.WRESOURCE:=1-GP_SCUD_EVENTS_Prev.WRESOURCE
+
+    }
+
+  }
+
+  if BoundActive(tbbyGP_SCUD_Pers)
+  or BoundActive(tbbyGP_SCUD_PersM)
+  or BoundActive(tbByPers)
+  or IsBitCtW(wFilter,2)
+  { set GP_SCUD_Events.cGP_SCUD_Pers:=pGP_SCUD_Pers ;
+    if getfirst GP_SCUD_Pers=tsok
+      GP_SCUD_EVENTS.STRTABN:=GP_SCUD_Pers.Code;
+  }
+  else
+  { set GP_SCUD_Events.cGP_SCUD_Pers:=0;
+  }
+  set GP_SCUD_Events.EnterTime:=Cur_time;
+
+  insert current GP_SCUD_Events;
+  SetNew(false);
+}
+
+//*************************************************8
+
+//*************************************************8
+
+//******************************************************************************
+// Функции
+//******************************************************************************
+#include Excel_Fun.Vpp
+#include GP_SCUD_EventsEdit.Vpp
+#include GP_SCUD_EventsEditRep.Vpp
+
+
+//========================================================
+// Визуальная часть
+//========================================================
+Window wnFilter 'Установите фильтры'  Cyan, EscClose;
+  Show at (,,50,14);
+Screen scrFilter 'Фильтры' ('Фильтры',,sci13Esc);
+Table KatPodr_Flt;
+Fields
+  DTB : NoProtect;
+  TMB : NoProtect;
+  DTE : NoProtect;
+  TME : NoProtect;
+
+  wFilter :NoProtect;
+  Filtr_Katpodr  : PickButton,Protect;
+  Filtr_GP_SCUD_Pers  : PickButton,Protect;
+  sFio_Flt       : NoProtect;
+  sPropusk_Flt   : NoProtect;
+  //wType_Flt      : [List     0 'Вход '    ,1 'Выход' ], Protect;
+  //  Filtr_KatOrg   : PickButton,Protect;
+  // [.] организации`   .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+Buttons
+  cmOk    ,,, 'продолжить выполнение', hcAllBOk, scGalDial;
+  cmCancel,,, 'Отмена', hcAllBCancel, scGalDial;
+<<
+ Период событий c  .@@@@@@@@@@.@@@@@@
+                по .@@@@@@@@@@.@@@@@@
+  `Фильтр по`
+ [.] подразделению` .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ [.] Сотруднику`    .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ [.] по части фио`  .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ [.] номер карты`   .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ [.] ошибки пары`
+
+
+ <. Продолжить .>  <.   Отмена   .>
+>>
+end; //Screen scrFilter (,,sci13Esс);
+HandleEvent
+cmInit:
+{ isProtect2:=isProtect;
+  if isProtect
+  { SetEditMode(True)
+  }
+
+}
+cmDone:
+{ if isProtect2
+  { SetEditMode(false);
+    SetDocFieldsState;
+  }
+}
+cmOk:
+{ CloseWindowEx(wnFilter,cmDefault)
+
+}
+end;// HandleEvent
+end; //Windows wnFilter 'Установите фильтры' , Cyan, EscClose;
+//**********************************************************************
+
+Window wnEditEvents 'Редактирование записи';
+show at (,,75,17);
+Tabbedsheet top tsEvent;
+Screen ScrEditEvents 'Событие' ;
+Table GP_SCUD_Events ;
+Fields
+   [EV_NPP] if(GP_SCUD_Events.sNPP<>'',GP_SCUD_Events.sNPP,string(GP_SCUD_Events.NPP))     ('Порядковый Номер',,):Protect,NoDel;
+   GP_SCUD_Events.StrTabn   : PickButton,Protect,NoDel;
+   GP_SCUD_Pers.Fio         : PickButton,Protect,NoDel;
+   GP_SCUD_Events.EnterDate : NoProtect,NoDel;
+   GP_SCUD_Events.EnterTime : ['HH:MM:SS'], NoProtect,NoDel;
+   GP_SCUD_Events.Card      : Protect,NoDel;
+   Plan_Time                : Protect,NoDel;
+   Plan_Diff                : ['HH:MM:SS'], Protect,NoDel, {Font={Color=GetColorDiffEvents(GP_SCUD_Events.Nrec) }};
+   Next_Event               : Protect,NoDel;
+   GP_SCUD_MisConDuct.Name  : Protect,NoDel;
+   [Podr] KatPodr.Kod+' '+Katpodr.name   (,,):Protect,NoDel;
+   GP_SCUD_Events.wEvents_Type    : [List 0 '-','РВ','П','СВ'],Protect,NoDel;
+   GP_SCUD_Events.wResource       : [List 0 'Выход','Вход'],Protect;
+   GP_Status.Name                 : PickButton,NoDel;
+   GP_SCUD_Controler.Name         : PickButton, Protect,NoDel;
+   GP_SCUD_AREAS.DISPLAY_NAME     : Protect,NoPickButton,NoDel;
+   GP_SCUD_DOC_A.DocNMB           : Protect, NoDel,NoPickButton;
+   GP_SCUD_DOC_A.DocDate          : Protect, NoDel,NoPickButton;
+   GP_Status_A.Name               : Protect, NoDel,NoPickButton;
+   GP_SCUD_Reason_A.Name          : Protect, NoDel,NoPickButton;
+Buttons
+   cmValue31,,, 'Сформировать заявление', hcAllBOk, scGalDial;
+   cmValue32,,, 'Все События в СКУД', hcAllBOk, scGalDial;
+//   cmValue33,,, 'Приказ на работу в выходной день', hcAllBOk, scGalDial;
+//  <.Приказ на работу в вых.день.>
+
+//<.Сформировать приказ.>   cmValue32,,, 'Сформировать приказ', hcAllBOk, scGalDial;
+<<
+ п/п  .@@@@@@@@@@@ Таб.№  .@@@@@@@@@@@ Фио  .@@@@@@@@@@@@@@@@@@@@@@@
+ Дата .@@@@@@@@@@ Время  .@@@@@@@@     Карта.@@@@@@@@@@@@@@@@@@@@@@@
+ План .@@@@@@@@@@ Разница.@@@@@@@@ Следующее.@@@@@@@@@@@@@@@@@@@@@@@
+ Нарушение     .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Подразделение .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ Событие .@@@@@@@@@@@@@@@ Ресурс устройства .@@@@@@@@@@@@@@@@@@@@@@@
+ Статус  .@@@@@@@@@@@@@@@ Устройство        .@@@@@@@@@@@@@@@@@@@@@@@
+ Ареал   .@@@@@@@@@@ Заявление .@@@@@@@@@ от.@@@@@@@@@@ .@@@@@@@@@@@
+                     .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  <.Сформировать заявление.>  <.Все События в СКУД.>
+
+>>
+end;//Scrren ScrEditEvents
+Screen ScrEditRejim 'Режим';
+Table GP_SCUD_Events;
+Fields
+  vTabel.wRejim :Protect,NoDel;
+  vTabel.KlRejim.NRejim:Protect,NoDel;
+  Graf_Time    :[11,'HH:MM'],Protect,NoDel;
+  StartWorkDay :[11,'HH:MM'],Protect,NoDel;
+  EndWorkDay   :[11,'HH:MM'],Protect,NoDel;
+  StartBreak1  :[11,'HH:MM'],Protect,NoDel;
+  EndBreak1    :[11,'HH:MM'],Protect,NoDel;
+  StartBreak2  :[11,'HH:MM'],Protect,NoDel;
+  EndBreak2    :[11,'HH:MM'],Protect,NoDel;
+  StartShift2  :[11,'HH:MM'],Protect,NoDel;
+  EndShift2    :[11,'HH:MM'],Protect,NoDel;
+//  WorkPatternStr 'Шаблон рабочего дня':[20],Protect,PickButton;
+
+<<
+  `Режим`   .@@@@@@@@@@
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Часы по графику`   .@@@@@@@@@@
+
+  `Начало раб. дня`   .@@@@@@@@@@  `Окончание раб. дня`   .@@@@@@@@@@
+
+  `Начало перерыва`   .@@@@@@@@@@  `Окончание перерыва`   .@@@@@@@@@@
+  `Начало перерыва 2` .@@@@@@@@@@  `Окончание перерыва 2` .@@@@@@@@@@
+
+  `Начало смены 2`    .@@@@@@@@@@  `Окончание смены 2`    .@@@@@@@@@@
+>>
+end;
+end;//Tabbedsheet top tsEvent;
+
+HandleEvent
+cmInit:
+{
+  SetEditMode(CanEditTbl);
+  StartWorkDay:=ZeroTime;
+  EndWorkDay  :=ZeroTime;
+  StartBreak1 :=ZeroTime;
+  EndBreak1   :=ZeroTime;
+  StartBreak2 :=ZeroTime;
+  EndBreak2   :=ZeroTime;
+  StartShift2 :=ZeroTime;
+  EndShift2   :=ZeroTime;
+  if GP_SCUD_Events.EnterDate<>ZeroDate
+  { var D:word=0;
+    vTabel.pPersons:=GP_SCUD_Pers.cPersons;
+    if vTabel.GetFirst Lschet=tsok {}
+    vTabel.wMonth:=Month(GP_SCUD_Events.EnterDate);
+    vTabel.wYear :=Year (GP_SCUD_Events.EnterDate);
+    var boTable:boolean=false;
+    boTable:=vTabel.GetFirst LsTab=tsok;
+
+    set vTabel.wRejim:=GetRejimDay(GP_SCUD_Pers.Nrec,GP_SCUD_Events.EnterDate);
+    vTabel.wMonth:=Month(Calc_Date);
+    vTabel.wYear :=Year(Calc_Date);
+    D:=Day(GP_SCUD_Events.EnterDate);
+    if D>0
+    { if vTabel.getfirst GP_KlndrExt=tsok
+      { StartWorkDay:=vTabel.GP_KlndrExt.StartWorkDay[D];
+        EndWorkDay  :=GetEndWorkDay(D);//vTabel.GP_KlndrExt.EndWorkDay[D];
+        StartBreak1 :=vTabel.GP_KlndrExt.StartBreak1[D];
+        EndBreak1   :=GetEndBreak1(D);//vTabel.GP_KlndrExt.EndBreak1[D];
+        StartBreak2 :=vTabel.GP_KlndrExt.StartBreak2[D];
+        EndBreak2   :=vTabel.GP_KlndrExt.EndBreak2[D];
+        StartShift2 :=vTabel.GP_KlndrExt.StartShift2[D];
+        EndShift2   :=GetEndShift2(D);//vTabel.GP_KlndrExt.EndShift2[D];
+      } //if vTabel.getfirst GP_KlndrExt=tsok
+      if vTabel.getfirst Klndr=tsok
+      { Graf_Time   :=GetTimeFromDouble(double(vTabel.KLNDR.DAYCHAS[D]) + vTabel.KLNDR.DAYMIN[D] / 60);
+        if EndWorkDay<GetEndWorkDay(D) //vTabel.GP_KlndrExt.EndWorkDay[D]
+        { Graf_Time:=Sub_Time(Graf_Time,Sub_time(GetEndWorkDay(D),EndWorkDay))
+        }
+        if EndBreak1>vTabel.GP_KlndrExt.EndBreak1[D]
+        { Graf_Time:=Sub_Time(Graf_Time,Sub_time(EndBreak1,vTabel.GP_KlndrExt.EndBreak1[D]))
+        }
+      } //if vTabel.getfirst Klndr=tsok
+    } //if D>0
+    if vTabel.getfirst KlRejim=tsok {}
+  } //if GP_SCUD_Events.EnterDate<>ZeroDate
+  if getfirst GP_SCUD_DOC_SP_A=tsok
+  { cfsSetProp('b_SCREDITEVENTS_Сформировать_заявление',cfpTitle,'Просмотр заявления')
+  }
+  else
+  { cfsSetProp('b_SCREDITEVENTS_Сформировать_заявление',cfpTitle,'Сформировать заявление');
+  }
+} //cmInit
+cmValue31:
+{ if GetColorDiffEvents(GP_SCUD_Events.Nrec)<>ColorSysRed
+  or Graf_Time=ZeroTime
+  { message('Нет нарушений');
+    Exit;
+  }
+
+  if getfirst GP_SCUD_DOC_SP_A=tsok
+  { /*if message('Заявление уже есть'
+      +chr(13)+' открыть?',YesNo)=cmYes
+    { iGP_SCUD_StateMentOnAbsent.EditDoc(GP_SCUD_DOC_SP_A.cGP_SCUD_DOC)
+
+    }*/
+    if pGP_SCUD_DOC_SP_O=GP_SCUD_DOC_SP_A.Nrec
+    { message('Вы и так просматриваете это заявление');
+    }
+    else
+    { iGP_SCUD_StateMentOnAbsent.EditDoc(GP_SCUD_DOC_SP_A.cGP_SCUD_DOC);
+    }
+    ClearFuncCache;
+    ReReadREcord(#GP_SCUD_Events);
+    Exit;
+  }
+  if TimeLog_Status>0 timelog('GP_SCUD_EventsEdit->MakeDoc:cmValue31');
+  var _TMB,_TME:time;
+  if Plan_Time<GP_SCUD_Events.EnterDate
+  { _TMB:=GP_SCUD_Events.EnterTime;
+    _TME:=Plan_Time;
+    if length(Next_Event)=5//только время не следующее
+      if Plan_Time>Next_Event
+        _TME:=StrToTime(Next_Event,'HH:MM');
+  }
+  else
+  { _TME:=GP_SCUD_Events.EnterTime;
+    _TMB:=Plan_Time;
+  }
+  var _sDescription:string='';
+  if isValid(#GP_SCUD_MisConDuct)
+   _sDescription:=GP_SCUD_MisConDuct.Name;
+  iGP_SCUD_StateMentOnAbsent.MakeDoc(GP_SCUD_Pers.Nrec
+                     ,GP_SCUD_Events.Nrec
+                     ,GP_SCUD_Events.EnterDate
+                     ,_TMB
+                     ,TimeToStr(_TME,'HH:MM')
+                     ,Plan_Time
+                     ,0
+                     ,pGP_SCUD_DOC_SP_O
+                     ,_sDescription
+                     );
+
+  ClearFuncCache;
+  ReReadRecord(#GP_SCUD_DOC_SP_A);
+  ReReadRecord(#GP_SCUD_Events);
+  if pGP_SCUD_DOC_SP_O>0
+  { Event_ReReadContainer;
+    CloseWindow(wnEditEvents);
+  }
+}
+cmValue32: //Все События в СКУД
+{ //message('Не реализовано');
+  iGP_SCUD_EV_AllEdit.InitParam(cgiMultiEdit,0,GP_SCUD_Events.cGP_SCUD_PERS,0,0,DTB,DTE,false);
+}
+cmValue33:
+{  if GetDoubleFromtime(Graf_Time)=0
+   { message('День не является выходным');
+     Exit;
+   }
+   MakeOrder(1);
+}
+end;//HandleEvent
+end;//Window wnEdit
+
+
+//**********************************************************************
+#declare wnEventsPers  (wn_name)
+Window wn#(wn_name) (,,sci14Esc);
+Screen scr#(wn_name) (,,sci1Esc);
+Show at (,,,2);
+Table GP_SCUD_Events;
+Fields
+  DTB : NoProtect;
+  TMB : NoProtect;
+  DTE : NoProtect;
+  TME : NoProtect;
+<<
+ Период c.@@@@@@@@@@.@@@@@ по.@@@@@@@@@@.@@@@@
+>>
+end;//Screen scrDatFilter ;
+Browse br#(wn_name) '' (,,sci147Esc) ;
+Show at (,3,,);
+Table GP_SCUD_Events;
+recMarker=pMarker;
+Fields
+   {Font ={Color=GetColorEvents(GP_SCUD_Events.Nrec)}};
+   GP_SCUD_Events.EnterDate    'Дата' (,,sci147Esc) :[12], Protect, NoAutoSize;
+   GP_SCUD_Events.EnterTime    'Время' (,,sci147Esc):[6] ,Protect, NoAutoSize;
+   GP_SCUD_Events.wEvents_Type   'Тип' : [List 0 '-','РВ','П','СВ'],Protect,NoDel, NoAutoSize;
+   GP_SCUD_Events.wResource      'Ресурс','устройства' :[5],[List 0 'Выход','Вход'],Protect, NoAutoSize,NoPickButton,Skip,NoDel;
+   Plan_Time  'План'  :[5],Protect, NoAutoSize;
+   //GP_SCUD_MisConDuct.Name
+   Plan_Diff  'Разница' :[10],Protect,CustomSorting, NoAutoSize, {Font={Color=GetColorDiffEvents(GP_SCUD_Events.Nrec) }};
+   sMisConDuct 'Нарушение' :[15],Protect,CustomSorting, NoAutoSize;
+   Next_Event              'Следующее' :[10],Protect,CustomSorting;
+   GP_SCUD_Events.wEvents_Type   'Тип' : [List 0 '-','РВ','П','СВ'],Protect,NoDel,Skip;
+   GP_Status.Name                'Статус','события' : [7], Protect, NoDel,NoPickButton;
+   GP_Status_A.Name              'Статус','док-нта' : [7], Protect, NoDel,NoPickButton;
+
+ end;//Browse brScudPers
+ HandleEvent
+ cmDefault:
+ { PutCommand(cmValue41);
+ }
+ cmInsert:
+ { MyInsertEvents;
+   PutCommand(cmEdit);
+   Abort;
+ }
+ cmHotKeys:
+ { var _wCommnand:word;
+   _wCommnand:=RunMenu('GP_SCUD_EventsEditEdit_Main_HotKey_Wn');
+   // если нажать мимо, закрывает интерфейс
+   case _wCommnand of
+   0,cmDone,cmCancel:
+   {
+   }
+   else PutCommand(_wCommnand);
+   end;
+ }
+ cmPrintDoc: PrintRep;
+ cmEdit:
+ { PutCommand(cmValue41);
+ }
+ cmValue41:
+ { RunWindowModal(wnEditEvents);
+ }
+ end;
+end;//Window wnEventsPers
+#END
+// Для двойного использования в окнах документов надо два экземпляра
+#wnEventsPers(EventsPers)
+#wnEventsPers(EventsPers01)
+//**********************************************************************
+Screen scrDatFilter ;
+Show at (,,,2);
+Table GP_SCUD_Events;
+Fields
+  DTB : NoProtect;
+  TMB : NoProtect;
+  DTE : NoProtect;
+  TME : NoProtect;
+<<
+ Период событий c  .@@@@@@@@@@.@@@@@@ по .@@@@@@@@@@.@@@@@@
+>>
+end;//Screen scrDatFilter ;
+Browse brScudEvents '' (,,sci17Esc);
+Show at (,3,,);
+Table GP_SCUD_Events;
+recMarker=pMarker;
+Fields
+   {Font ={Color=GetColorEvents(GP_SCUD_Events.Nrec)}};
+   //GP_SCUD_Events.NPP
+   EV_NPP      'п/п' ('Порядковый Номер',,):[10],Protect,NoDel;
+   GP_SCUD_Events.StrTabn  'Таб.№' :[10],NoPickButton,Protect;
+   GP_SCUD_Pers.Fio         'Сотрудник/Посетитель' :[20], NoPickButton,Protect;
+   GP_SCUD_Events.wResource    'Ресурс','устройства' :[5],[List 0 'Выход','Вход'],Protect,Skip;
+   GP_SCUD_Events.EnterDate    'Дата' :[12],Protect,NoDel;
+   GP_SCUD_Events.EnterTime    'Время':[6] ,Protect,NoDel;
+   Plan_Time  'План'    :[5],Protect, NoAutoSize;
+   Plan_Diff  'Разница' :[5],Protect, NoAutoSize, {Font={Color=GetColorDiffEvents(GP_SCUD_Events.Nrec) }};
+   GP_SCUD_Events.Card         'Карта':[12],Protect,NoDel;
+   Podr  'Подразделение' (,,):[15],Protect,NoDel;
+   GP_SCUD_Events.wEvents_Type   'Тип' : [List 0 '-','РВ','П','СВ'],Protect,NoDel,Skip;
+   GP_Status.Name                'Статус' : [7], NoPickButton;
+   GP_SCUD_Controler.Name        'Контролер' : [10], NoPickButton, Protect,NoDel;
+   Next_Event/*GetNextEventsTime(GP_SCUD_Events.Nrec)*/ 'Следующее' :[10],Protect,CustomSorting;
+   GP_SCUD_AREAS.DISPLAY_NAME 'Ареал' :[15],Protect,NoPickButton;
+   GP_Status_A.Name              'Статус','док-та' : [7], Protect, NoDel,NoPickButton;
+ end;//Browse brScudPers
+
+
+ //-----------------------------------------
+//   Проинициализровать данные
+//-----------------------------------------
+Function InitParam(
+  _wIntMode  : word;  // режим запуска (cgiNo, cgiPick, ...) см.GLOCONST.INC
+  _cNrec     : comp;  // ссылка на "Ведомость"
+  _cGP_SCUD_Pers  : comp;   // выбранная запись
+  _cKatpodr  : comp;   // выбранная запись
+  _cKatOrg   : longint; // включить определенные форматы
+  _DTB       : Date; //период просмотра
+  _DTE       : Date; //период просмотра
+  _NoVisual  : boolean=false; //не перерисовывать экраны
+  _pGP_SCUD_DOC_SP_O:comp=0//для вызова из заявления
+  ) : boolean;
+{ Result:=False;
+  isFilterRun:=true;
+  if _DTB<>ZeroDate
+  { DTB:=_DTB;
+  }
+  if _DTE<>ZeroDate
+  { DTE:=_DTE;
+  }
+  set wIntMode:=_wIntMode;
+  if DTB=ZeroDate DTB:=Date(1,1,year(cur_date)-1);
+  if DTE=ZeroDate DTE:=Date(31,12,year(cur_date));
+  pGP_SCUD_DOC_SP_O:=_pGP_SCUD_DOC_SP_O;
+  TME:=Time(24,0,0,0);
+  TMB:=Time(0,0,0,0);
+  DTB_A:=DTB;
+  DTE_A:=DTE;
+  TME_A:=TME;
+  TMB_A:=TMB;
+  if TimeLog_Status>0
+   timelog('GP_SCUD_EventsEdit->InitParam:_cGP_SCUD_Pers='+string(_cGP_SCUD_Pers,0,0)
+            +',_DTB='+DatetoStr(_DTB,'DD/MM/YYYY - ')+', DTE='+DatetoStr(_DTE,'DD/MM/YYYY')   );
+  if _cGP_SCUD_Pers<>0
+  { pGP_SCUD_Pers_Prev:=pGP_SCUD_Pers;
+    set pGP_SCUD_Pers:=_cGP_SCUD_Pers;
+    if not BoundActive(tbByPers) PushBounds(tbByPers);
+    ReReadRecord(#GP_SCUD_Events) ;
+    if pGP_SCUD_Pers_Prev<>pGP_SCUD_Pers
+    { if getlast GP_SCUD_EVENTS<>tsok {}
+    }
+  }
+  //else
+  if _cNrec>0
+  { if getfirst GP_SCUD_Events where (( _cNrec == GP_SCUD_Events.Nrec)) <>tsok
+    { Exit; }
+    PositionChanged;
+  }
+  else
+  if _cKatOrg<>0
+  {
+
+  }
+  else
+  if _cKatpodr<>0
+  { set pKatPodr:=_cKatPodr;
+    if not BoundActive(tbByKatPodr) PushBounds(tbByKatPodr);
+
+  }
+  if _NoVisual {}
+  PositionChanged;
+  isFilterRun:=false;
+  if TimeLog_Status>0
+    timelog('GP_SCUD_EventsEdit->InitParam:final');
+  if (_wIntMode and cgiMultiEdit)>0
+  { if _Cnrec>0
+      RunWindowModal(wnEditEvents)
+    else
+      RunWindowModal(wnEventsPers)
+  }
+
+  Result:=True;
+} //Function InitParam(
+
+
+
+//******************************************************************************
+// HandleEvent таблиц
+//******************************************************************************
+TableEvent table GP_SCUD_Events ;
+cmSetDefault:
+{ Exit;
+}
+cmInsert:
+{ MyInsertEvents;
+  PutCommand(cmEdit);
+  Abort;
+}
+cmInsertRecord:
+{ if GP_SCUD_Events.cStatus=0
+  { GP_SCUD_Events.cStatus:=pStatus_DM[03];
+  }
+  Insert Current GP_SCUD_Events;
+}
+cmUpdateRecord:
+{ if GP_SCUD_Events.cStatus=pStatus_DM[01]
+    GP_SCUD_Events.cStatus:=pStatus_DM[03];
+  Update Current GP_SCUD_Events;
+}
+cmDeleteRecord:
+{ if message('Удаление события запрещено, аннулировать?',YesNo)=cmYes
+  { set GP_SCUD_Events.cStatus:=pStatus_DM[04];
+    update current GP_SCUD_Events;
+
+  }
+  //delete Current GP_SCUD_EventsEdit;
+  Exit;
+}
+cmPositionChanged:
+{ PositionChanged;
+}
+end; //GP_SCUD_EventsEdit
+
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+  HandleEvent
+    //-----------------------------
+    cmInit:
+    { LoadInterFace(true);
+      if Marker<>0
+        pMarker.ImportFrom(Marker)
+      else
+        pMarker.ImportFromName(pMarker.StoreName);
+      SetFilterBounds(0);
+      if cRec>0
+      { if getfirst GP_SCUD_Events where (( cRec == GP_SCUD_Events.nrec ))=tsok {}
+      }
+
+      ReScanPanel(#GP_SCUD_Events);
+    }
+    //-----------------------------
+    cmOnVipLoad:
+    { LoadInterFace(false);
+    }
+
+    //-----------------------------
+    cmDone:
+    { UnLoadInterFace(true);
+      SaveParam;
+    }
+    //-----------------------------
+    cmOnVipUnLoad:
+    { UnLoadInterFace(false);
+      SaveParam;
+    }
+    //-----------------------------
+    cmDefault:
+    { if (wIntMode and cgiPick)>0
+      {
+        if (wIntMode and cgiPickMult)=cgiPickMult
+        { if PMarker.Count=0
+          { pMarker.Mark;
+          }
+          if Marker<>0
+            pMarker.ExportTo(Marker);
+          else
+            pMarker.ExportToName(pMarker.StoreName);
+        }
+        else
+        { set cRec:=GP_SCUD_Events.Nrec;
+        }
+        CloseInterface(cmDefault)
+      }
+      else Putcommand(cmEdit);
+    }
+    //----------------------
+    cmEdit:
+    {  if GetCurrentFormat=brScudEvents
+       or GetCurrentFormat=brEventsPers
+       or GetCurrentFormat=brEventsPers01
+         RunWindow(wnEditEvents);
+    }
+    //----------------------
+    cmCheckField:
+    { case CurField of
+      #DTB,#DTE,#TMB,#TME:
+      { if GetCurrentFormat<>scrFilter
+        { CopyToA;
+          MTRetrieve(#tmp_period,mfFilters + mfClear);//+mfClearFilters
+          ReReadRecord(#GP_SCUD_Events);
+        }
+      }
+      else
+      { if CurTable=#GP_SCUD_Events
+        { if GP_SCUD_Events.cStatus=0
+          { set GP_SCUD_Events.cStatus:=pStatus_DM[3]
+          }
+          else
+          if GP_SCUD_Events.cStatus=pStatus_DM[1]
+          { set GP_SCUD_Events.cStatus:=pStatus_DM[2]
+          }
+        }
+
+      }
+      end;
+    }
+    //----------------------
+    cmPick:
+    { if IsProtect
+      { if CurField<>#GP_Status.Name
+        { Abort;
+          Exit;
+        }
+      }
+      case CurField of
+      #GP_Status.Name:
+      { if (StatusChange.PickStatus(GP_SCUD_Events.cStatus))
+         {
+            pTmp:=ChangeStatus(GP_SCUD_Events.NRec,StatusChange.StatusChangeLog);
+            if PTmp<>0
+            { set GP_SCUD_Events.cStatus:=StatusChange.StatusChangeLog.cStatusTo;
+              update current GP_SCUD_Events;
+              ClearFuncCache;
+              SetEditMode(CanEditTbl);
+            }
+         }
+      }
+      //------------------------------
+      #KatPodr.Name:
+      { pTmp:= GP_SCUD_Events.cKatPodr;
+        If (iGetKau.GetCodeKau(cgiPick,cgKau_KatPodr,pTmp) <> 0)
+        { set GP_SCUD_Events.cKatPodr:=pTmp;
+        }
+      }
+      //------------------------------
+      #GP_SCUD_Pers.Fio:
+      { if GP_SCUD_Events_Next.cStatus<>pStatus_DM[03]
+        { message('Изменение доступно только для вручную добавленных записей ')
+        }
+        else
+        { pTmp:=GP_SCUD_Events.cGP_SCUD_Pers;
+          if RunInterface(GP_SCUD_PersVib,cgiPick,pTmp,0)<>cmCancel
+          { set GP_SCUD_Events.cGP_SCUD_Pers:=pTmp;
+            if getfirst GP_SCUD_Pers=tsok
+            { set GP_SCUD_Events.cKatPodr:=GP_SCUD_Pers.cKatPodr;
+              set GP_SCUD_Events.StrTabn:=GP_SCUD_Pers.Code;
+            }
+          }
+        } //if GP_SCUD_Events_Next.cStatus<>pStatus_DM[03]
+      } //#GP_SCUD_Pers.Fio:
+      /*
+      //------------------------------
+      #KatOrg.Name:
+      { pTmp:= GP_SCUD_Events.cKatOrg;
+        If (iGetKau.GetCodeKau(cgiPick,cgKau_KatOrg,pTmp) <> 0)
+        { set GP_SCUD_Events.cKatOrg:=pTmp;
+        }
+      }*/
+      //------------------------------
+      #Filtr_Katpodr:
+      { //_PodrMArkerPointer := CLSF.LoadFullCurrentDepartmentList;
+        //CopyMarker(_PodrMArkerPointer,Marker_KatPodr);
+        if RunInterface('GetPodaLN',12, Marker_KatPodr, 1)=cmDefault
+        { //_PodrMArkerPointer := CLSF.LoadFullCurrentDepartmentList;
+          //CopyMarker(Marker_KatPodr,_PodrMArkerPointer);
+          SetFilterNm(#Filtr_Katpodr);
+          BitOnW(wFilter,1);
+        }
+      }
+      //------------------------------
+      #Filtr_KatOrg:
+      { KauMarkerName := iGetKau.GetMarkerName(cgKau_KatOrg);
+        StoreMarker(Marker_KatOrg,KauMarkerName);
+        If (iGetKau.GetCodeKau(cgiPickMult,cgKau_KatOrg,Comp(0)) <> 0)
+        { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+          CopyMarker(Marker_KatOrg,Marker_Tmp);
+          DoneMarker(Marker_Tmp,'');
+          SetFilterNm(#Filtr_KatOrg);
+          BitOnW(wFilter,2);
+        }
+      }
+      //------------------------------
+      #Filtr_GP_SCUD_Pers:
+      { if RunInterFace(GP_SCUD_PersVib,cgiPickMult,pTmp,Marker_GP_SCUD_PERS)<>cmCancel
+        { SetFilterNm(#Filtr_GP_SCUD_PERS);
+          BitOnW(wFilter,2);
+        }
+
+      }
+      end;
+      ReScanPanel(#GP_SCUD_Events);
+    } //cmPick
+    //----------------------
+    cmDelOnProtect:
+    { Case Curfield of
+      //------------------------------
+      #Filtr_KatPodr:
+      { ClearMarker(Marker_KatPodr);
+        BitOffW(wFilter,1);
+        SetFilterNm(#Filtr_KatPodr);
+      }
+      //------------------------------
+      #Filtr_KatOrg:
+      { ClearMarker(Marker_KatOrg);
+        BitOffW(wFilter,2);
+        SetFilterNm(#Filtr_KatOrg);
+      }
+      //------------------------------
+      #Filtr_GP_SCUD_Pers:
+      { ClearMarker(Marker_GP_SCUD_Pers);
+        BitOffW(wFilter,3);
+        SetFilterNm(#Filtr_GP_SCUD_Pers);
+      }
+      end;
+    }
+    cmPrintDoc: PrintRep;
+    cmValue20:
+    { Marker_Tmp  :=InitMarker('', 8, 50, 10, True);
+      UpdateTable;
+      StartNewVisual(vtNumericVisual,vfTimer + vfBreak + vfConfirm,'Подготовка фильтров для отчета',0);
+      if pMarker.Count>0
+      { PushPos(#GP_SCUD_Events);
+        SubBounds(tbRmGP_SCUD_Events1);
+        AddBounds(tbRmGP_SCUD_Events2);
+        _Loop pMarker
+        { if not NextVisual break;
+          InsertMarker(Marker_Tmp,pMarker.pNRec )
+        }
+        SubBounds(tbRmGP_SCUD_Events2);
+        AddBounds(tbRmGP_SCUD_Events1);
+        PopPos(#GP_SCUD_Events);
+
+      }
+      else
+      { if message('Напечатать только текущую запись?'
+          +chr(13)+'если нет, то все по установленному фильтру(долго)',YesNo)=cmYes
+        { InsertMarker(Marker_Tmp,GP_SCUD_Events.Nrec )
+        }
+        else
+        { PushPos(#GP_SCUD_Events);
+          _Loop GP_SCUD_Events
+          { if not NextVisual break;
+            InsertMarker(Marker_Tmp,GP_SCUD_Events.NRec )
+          }
+          PopPos(#GP_SCUD_Events);
+
+        }
+      } //if pMarker.Count>0
+      ReScanPanel(#GP_SCUD_Events);
+      StopVisual('',0);
+      RunInterface(GP_SCUD_REPORT,GetTypeDoc,0,Marker_KatPodr,Marker_Tmp,DTB,DTE,0);
+      DoneMarker(Marker_Tmp,'');
+    }
+
+    //--------------------------
+    cmPickClass:// внешние классификаторы
+    {
+      if UpdateTable
+      case CurTable of
+      #GP_SCUD_Events: RunInterface('ExClassifier', coGP_SCUD_Events, GP_SCUD_Events.nRec);
+      end;
+    }
+    //--------------------------
+    cmFilterSave:
+    { UpdateTable;
+      if RunWindowModal(wnFilter)=cmDefault
+      { SetFilterBounds(0);
+      }
+      else RestFromA
+    }
+    //--------------------------
+    cmPickAttr:// внешние аттрибуты
+    {
+      if UpdateTable
+      case CurTable of
+      #GP_SCUD_Events: RunInterface('Attribute', coGP_SCUD_Events, GP_SCUD_Events.nRec);
+      end;
+    }
+    //--------------------------
+    cmHotKeys:
+    {
+      case CurTable of
+      #GP_SCUD_Events:
+      { ProcessCommand(RunMenu('GP_SCUD_EventsEditEdit_Main_HotKey'));
+      }
+      end;
+    }
+  end;
+end.
+
+GP_SCUD_EventsEditEdit_Main_HotKey Menu
+{
+- 'Фильтр на данные'       , cmFilterSave, 'Фильтр на данные', hcProc_NagrKaf, 'Alt+B',kbAltB, scMenuCtx;
+- 'Печать реестра событий' , cmPrintDoc  , 'Печать', hcProc_NagrKaf, 'Ctrl+P'  ,kbCtrlP, scMenuCtx;
+- 'Отчеты по СКУДУ '       , cmValue20   , 'Печать', hcProc_NagrKaf, 'Alt+P'   ,kbAltP , scMenuCtx;
+- 'Внешняя классификация'  , cmPickClass , 'Внешняя классификация', hcGkatalM1ExtClass, 'Alt+C', kbAltC, sci1Esc;
+- 'Внешние атрибуты'       , cmPickAttr  , 'Заполнение внешних атрибутов по данной позиции', hcGkatalM1Attr, 'Alt+A', kbAltA, sci1Esc;
+
+}
+
+GP_SCUD_EventsEditEdit_Main_HotKey_Wn Menu
+{
+- 'Печать реестра событий' , cmPrintDoc  , 'Печать', hcProc_NagrKaf, 'Ctrl+P'  ,kbCtrlP, scMenuCtx;
+//- 'Отчеты по СКУДУ '       , cmValue20   , 'Печать', hcProc_NagrKaf, 'Alt+P'   ,kbAltP , scMenuCtx;
+
+}

@@ -1,0 +1,420 @@
+/*************************************************************************************************\
+* Наименование:  Разработка функционала выгрузки данных для открытия карт-счетов                  *
+*                "Выгрузка данных для Промсвязьбанка (ЭМ)"                                          *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |-             |23/10/20|Брюнин В.П.              |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include UserReport.vih
+#include ComFiltr.vih
+#include CatFunc.vih
+#include AdrFunc.vih
+#include StrFunc.vih
+
+
+#define GPInt GP_ExpOpenCardVTB // #(GPInt)
+#define GPNam Выгрузка данных для ВТБ // #(GPNam)
+
+Interface #(GPInt) '#(GPNam) (ЭМ)' EscClose, Gray;
+  show (,,86,9);
+
+file efile;
+
+table struct ttPerFlt // для фильтра по персоналу
+(
+  cRecPers : comp
+)
+with index
+(
+  ttPerFlt01  = cRecPers
+);
+
+table struct ttResStr // статический набор данных
+(
+  nRec           : comp
+, cRecPers       : comp
+, sTabNmb        : string
+, sFIO           : string
+, sF             : string
+, sI             : string
+, sO             : string
+, sPol           : string
+, sBornDate      : string
+, sBornCity      : string
+, sSerPass       : string
+, sTypPass       : string
+, sNomPass       : string
+, dKtoPass       : string
+, sKtoPass       : string
+, sPodrPass      : string
+, sRegAdrIndex   : string
+, sRegAdrRegion  : string
+, sRegAdrCity    : string
+, sRegAdrStreet  : string
+, sRegAdrHouse   : string
+, sRegAdrKorpus  : string
+, sRegAdrRoom    : string
+, sRegAdrPhone   : string
+, sLivAdrIndex   : string
+, sLivAdrRegion  : string
+, sLivAdrCity    : string
+, sLivAdrStreet  : string
+, sLivAdrHouse   : string
+, sLivAdrKorpus  : string
+, sLivAdrRoom    : string
+, sLivAdrPhone   : string
+, sPhoneMob      : string
+, sPhoneWork     : string
+, sDoljn         : string
+, sOklad         : string
+, sHireDate      : string
+, sSnils         : string
+)
+with index
+(
+  ttResStr00 = nRec(Surrogate)
+, ttResStr01 = cRecPers
+, ttResStr02 = sFIO
+);
+
+var
+  VCommonFiltr  : CommonFiltr; // Для встраивания фильтра по подразделениям / сотрудникам
+  MadeReport    : boolean;
+  mPsn          : TPtr;
+  iCatFunc      : CatalogsFunctions;
+  iAdrFunc      : AddressFunc;
+  iStrFunc      : StringFunctions;
+  sFullName,
+  sFileName,
+  sDefaultPhone,
+  sTipOrg       : string;
+  lRB, lRE,
+  lCB, lCE,
+  lDB, lDE,
+  iNPP          : integer = 0;
+  sR, sL        : array[1..33] of string[4];
+  sShKl         : array [1..67] of string;
+  sShKlGPB      : array [1..67] of string;
+
+create view
+from
+  Persons
+, Passports
+, Passports Snils
+, Communications
+, ttPerFlt
+, ttResStr
+, appointments
+, catalogs app
+, catalogs Gr
+where
+((
+    ttPerFlt.cRecPers == Persons.nRec
+and Persons.Gr   == Gr.nrec
+and Persons.PasspRus  == Passports.nRec
+and Persons.nrec == Snils.person
+and 501 == Snils.syscode
+and Persons.nRec      == Communications.Person
+and persons.appointcur == appointments.nrec
+and appointments.post == app.nrec
+))
+;
+
+create view vAddress
+var _nrec:comp;
+as Select
+nrec
+from
+addressN
+where
+((_nrec == nrec));
+
+function sFPF : string; {sFPF := DateToStr(Cur_Date(),'_YYMMDD')+TimeToStr(Cur_Time(),'_HHMMSS');}
+
+
+function formatPhone(sAny : string) : string;
+{
+  result := sAny;
+  result := Replace(result, '+', '');
+  result := Replace(result, '-', '');
+  result := Replace(result, '(', '');
+  result := Replace(result, ')', '');
+}
+
+function sRepPhoneList(sAny : string) : string;
+{
+  result:='';
+  if isvalid(#Communications)
+  _loop Communications
+    if Pos(sAny,LoCase(iCatFunc.GetCatalogsName(Communications.ComType)))<>0
+      result+=if((Trim(result)<>''),'; ','')+formatPhone(Communications.Addr);
+
+  if(Trim(result) = '')
+    result:= sDefaultPhone;
+}
+
+function sRetEMailList(sAny : string) : string;
+{
+  result:='';
+  if isvalid(#Communications)
+  _loop Communications
+    if ( Pos(sAny, LoCase(iCatFunc.GetCatalogsName(Communications.ComType))) <> 0 )
+      result += if(Trim(result) <> '', '; ', '') + Communications.EMail;
+}
+
+
+
+
+
+procedure Run;
+var kol, i    : integer = 0;
+    cPersNRec : comp;
+    cAddrNeed : comp;
+{
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+  if (VCommonFiltr.GetPsnCount = 0)
+    VCommonFiltr.SelectAllPsn;
+
+  mPsn := InitMarker('#(GPInt)_PSN_'+UserName(),8,200,100);
+  mPsn := VCommonFiltr.GetPersonsMarker;
+  kol  := GetMarkerCount(mPsn);
+  RestartVisual('Формирование таблицы фильтров.',1);
+  while i < kol
+  {
+    GetMarker(mPsn, i++, cPersNRec);
+    insert ttPerFlt set ttPerFlt.cRecPers := cPersNRec;
+    If (not NextVisual) break;
+  }
+  
+  RestartVisual('Формирование данных для выгрузки.',1);
+  if IsValid(#ttPerFlt)
+  _loop ttPerFlt
+  {
+    if (not NextVisual) break;  
+    if IsValid(#Persons)
+    {
+      ClearBuffer(#ttResStr);
+
+      ttResStr.sTabNmb        := Persons.strtabn;
+      ttResStr.sFIO           := Persons.FIO;
+      ttResStr.sF             := iStrFunc.Get_LastName (Persons.FIO);
+      ttResStr.sI             := iStrFunc.Get_FirstName (Persons.FIO) ;
+      ttResStr.sO             := iStrFunc.GetPatronymic (Persons.FIO) ;
+      ttResStr.sPol           := Persons.Sex ;
+      ttResStr.sBornDate      := DateToStr(Persons.BornDate, 'DD.MM.YYYY');
+      ttResStr.sBornCity      := iAdrFunc.GetNamePlace_City(iAdrFunc.GetATDNrec(Persons.BORNADDR));
+      if IsValid(#Passports)
+      {
+        ttResStr.sSerPass := Passports.Ser;
+        ttResStr.sNomPass := Passports.Nmb;
+        ttResStr.sTypPass := '21';
+        ttResStr.sPodrPass:= Passports.GivenPodr;
+        ttResStr.sKtoPass := Passports.GivenBy;
+        ttResStr.dKtoPass := DateToStr(Passports.GivenDate, 'DD.MM.YYYY');
+      }
+      if IsValid(#Snils)
+      {
+         ttResStr.sSnils      := Snils.NMB;
+
+      }
+      ttResStr.sRegAdrIndex   := iAdrFunc.GetAddressInd(Persons.PasspAddr);
+      ttResStr.sRegAdrRegion  := iAdrFunc.GetNameRegion(iAdrFunc.GetATDNrec(Persons.PasspAddr));
+      ttResStr.sRegAdrCity    := iAdrFunc.GetNamePlace_City(iAdrFunc.GetATDNrec(Persons.PasspAddr));
+      ttResStr.sRegAdrStreet  := iAdrFunc.GetStreetName(Persons.PasspAddr);
+      ttResStr.sRegAdrHouse   := iAdrFunc.GetHouse(Persons.PasspAddr);
+      ttResStr.sRegAdrKorpus  := iAdrFunc.GetCorpus(Persons.PasspAddr);
+      ttResStr.sRegAdrRoom    := iAdrFunc.GetFlat(Persons.PasspAddr);
+      ttResStr.sRegAdrPhone   := '';
+      ttResStr.sLivAdrIndex   := iAdrFunc.GetAddressInd(Persons.LiveAddr);
+      ttResStr.sLivAdrRegion  := iAdrFunc.GetNameRegion(iAdrFunc.GetATDNrec(Persons.LiveAddr));
+      ttResStr.sLivAdrCity    := iAdrFunc.GetNamePlace_City(iAdrFunc.GetATDNrec(Persons.LiveAddr));
+      ttResStr.sLivAdrStreet  := iAdrFunc.GetStreetName(Persons.LiveAddr);
+      ttResStr.sLivAdrHouse   := iAdrFunc.GetHouse(Persons.LiveAddr);
+      ttResStr.sLivAdrKorpus  := iAdrFunc.GetCorpus(Persons.LiveAddr);
+      ttResStr.sLivAdrRoom    := iAdrFunc.GetFlat(Persons.LiveAddr);
+      ttResStr.sLivAdrPhone   := sRepPhoneList('дом');
+      ttResStr.sPhoneMob      := sRepPhoneList('моб');
+      if(Length(ttResStr.sPhoneMob) > 10)
+      {
+        ttResStr.sPhoneMob := substr(ttResStr.sPhoneMob, Length(ttResStr.sPhoneMob)-9, Length(ttResStr.sPhoneMob));
+      }
+      ttResStr.sPhoneWork     := sRepPhoneList('раб');
+      ttResStr.sHireDate      := DateToStr(Persons.APPDATE, 'DD.MM.YYYY');
+      if IsValid(#appointments)
+      {
+        ttResStr.sOklad := Appointments.TaxRate;
+        if IsValid(#app)
+        {
+           ttResStr.sDoljn := app.Name;
+           if(Length(ttResStr.sDoljn) > 30)
+           {
+              ttResStr.sDoljn := substr(ttResStr.sDoljn, 1, 30);
+           }
+        }
+      }
+      insert current ttResStr;
+    }
+  }
+  if isvalid(#ttResStr)
+  {
+    //    0000056894 - код, присвоенный организации,
+    RestartVisual('Выгрузка данных.',1);
+
+    var sOutFile: string = TranslatePath('%ClientStartPath%') +'XLS_ЭМ\ZP\EM_VTB_Cards.XLSM';
+    if not xlCreateExcelWithTemplate(sOutFile, True)
+    {
+      message('Проверьте наличие файла '+sOutFile);
+      StopVisual;
+      exit;
+    }
+
+  //  xlSetCellStringValue(KatOrg.Name, 7,  2, 7,  2);
+
+    var RowCounter: word = 13;
+    var CellCounter: word = 1;
+    _loop ttResStr ordered index ttResStr02
+    {
+
+      CellCounter:= 1;
+             /*Персональная информация*/
+       xlSetCellStringValue(ttResStr.sTabNmb, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;              //1. Табельный номер
+       xlSetCellStringValue(ttResStr.sF, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;                   //2. Фамилия
+       xlSetCellStringValue(ttResStr.sI, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;                   //3. Имя
+       xlSetCellStringValue(ttResStr.sO, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;                   //4. Отчество
+       xlSetCellStringValue(ttResStr.sPol, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;                 //5. Пол
+       xlSetCellStringValue(ttResStr.sBornDate, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;            //6. Дата рождения
+       xlSetCellStringValue(ttResStr.sBornCity, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;            //7. Место рождения
+
+             /*Паспортные данные*/
+       xlSetCellStringValue('РОССИЙСКАЯ ФЕДЕРАЦИЯ', RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;        //8. Гражданство
+       xlSetCellStringValue('Паспорт РФ', RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;                  //9. Код документа
+       xlSetCellStringValue(ttResStr.sSerPass , RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;            //10. Серия паспорта
+       xlSetCellStringValue(ttResStr.sNomPass, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;             //11. Номер паспорта
+       xlSetCellStringValue(ttResStr.dKtoPass, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;             //12. Дата выдачи паспорта
+       xlSetCellStringValue(ttResStr.sKtoPass, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;             //13. Кем выдан Паспорт
+       xlSetCellStringValue(ttResStr.sPodrPass, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;            //14. Код подразделения
+
+             /*Адрес регистрации*/
+       xlSetCellStringValue(ttResStr.sRegAdrIndex, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;         //15. Индекс
+       xlSetCellStringValue(ttResStr.sRegAdrRegion, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;        //16. Область
+       xlSetCellStringValue(ttResStr.sRegAdrCity, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;          //17. Город/населенный пункт
+       xlSetCellStringValue(ttResStr.sRegAdrStreet, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;        //18. Улица
+       xlSetCellStringValue(ttResStr.sRegAdrHouse, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;         //19. Дом
+       xlSetCellStringValue(ttResStr.sRegAdrKorpus, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;        //20. Корпус
+       xlSetCellStringValue(ttResStr.sRegAdrRoom, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;          //21. Кв.
+       //Телефон по месту регистрации
+       CellCounter++;                                                                                                       //22. Код ? 3 сим"
+       xlSetCellStringValue(ttResStr.sRegAdrPhone, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;         //23. "Телефон ?5 сим"
+
+              /*"Адрес места проживания*/
+
+       xlSetCellStringValue(ttResStr.sLivAdrIndex, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;         //24. Индекс
+       xlSetCellStringValue(ttResStr.sLivAdrRegion, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;        //25. Область
+       xlSetCellStringValue(ttResStr.sLivAdrCity, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;          //26. Город/населенный пункт
+       xlSetCellStringValue(ttResStr.sLivAdrStreet, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;        //27. Улица
+       xlSetCellStringValue(ttResStr.sLivAdrHouse, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;         //28. Дом
+       xlSetCellStringValue(ttResStr.sLivAdrKorpus, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;        //29. Корпус
+       xlSetCellStringValue(ttResStr.sLivAdrRoom, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;          //30. Кв.
+       //Телефон по месту жительства
+       CellCounter++;                                                                                                       //31. Код ? 3 сим"
+       xlSetCellStringValue(ttResStr.sLivAdrPhone, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;         //32. "Телефон ?5 сим"
+
+              /*"Укажите не менее 2 телефонов. Рабочий и на выбор: (мобильный или по месту жительства)"-*/
+       xlSetCellStringValue(ttResStr.sPhoneMob, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;            //33. "Мобильный телефон(10 символов: 9215552424)"
+       //Рабочий телефон
+       CellCounter++;                                                                                                       //34. Код ? 3 сим"
+       xlSetCellStringValue(ttResStr.sPhoneWork, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;           //35. "Телефон ?5 сим"
+
+             /*Сведения о сотруднике*/
+       xlSetCellStringValue(ttResStr.sDoljn, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;               //36. Название должности
+       xlSetCellStringValue(ttResStr.sOklad, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;               //37. "Среднемесячный доход
+       xlSetCellStringValue('MIR_Multicarta_Salary', RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;       //38. Тип карты
+       CellCounter++;//xlSetCellStringValue(ttResStr.sSnils, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;               //39. СНИЛС в формате ХХХ-ХХХ-ХХХ-ХХ	"Латинскими буквами, как в загран. паспорте
+       xlSetCellStringValue(ttResStr.sHireDate, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;            //40. Дата приема на работу
+       xlSetCellStringValue(ttResStr.sSnils, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;               //42. СНИЛС в формате ХХХ-ХХХ-ХХХ-ХХ	"Латинскими буквами, как в загран. паспорте
+       CellCounter++;//xlSetCellStringValue('Cпециалист', RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;                  //41. Код должности
+
+
+            /*       Информация по карте
+            "Можно не заполнять для граждан РФ
+            (предусмотрено автозаполнение)"*/
+        //"Латинскими буквами, как в загран. паспорте
+        CellCounter++;//42. Фамилия
+        xlSetCellStringValue(ttResStr.sF, RowCounter, CellCounter, RowCounter, CellCounter);CellCounter++;                   //2. Фамилия
+        CellCounter++;//43. Имя
+        //CellCounter++;//44. Кодовое слово (пароль)
+
+        CellCounter++;//45. Адрес электронной почты сотрудника организации (при отсутствии оставлять пустым поле)
+
+        CellCounter++;//46. "Название компании латинскими символами(предусмотрено автозаполнение)"
+
+
+      RowCounter := RowCounter + 1;
+    }
+      //END;1
+    RestartVisual('Вставка данных в файл.',1);
+
+  }
+  else
+  {
+    message('Нет данных для формирования отчета!');
+  }
+
+
+  xlKillExcel;
+
+  StopVisual;
+}
+
+embedded ComFiltrEmbedded 'Фильтры' interface VCommonFiltr;
+  show (,,85,6);
+end
+Screen s2(,,sci1Esc);
+  show (,7,85,8);
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+  <<
+     <. ~С~формировать .>                         <. ~З~акрыть .>
+  >>
+end;
+
+handleevent
+  cmInit:
+  {
+    delete all from ttPerFlt;
+    delete all from ttResStr;
+    MadeReport:= false;
+  }
+  cmOk:
+  {
+    Run;
+    MadeReport:= true;
+    VCommonFiltr.IntClose(MadeReport);
+    VCommonFiltr.StoreAllParams;
+    Notify(cmEvaluateAndModify, 0);
+    DoneMarker(mPsn, '#(GPInt)_PSN_' + UserName());
+    closeinterface(cmDefault);
+  }
+  cmCancel:
+  {
+    VCommonFiltr.IntClose(MadeReport);
+    DoneMarker(mPsn, '#(GPInt)_PSN_' + UserName());
+  }
+end;
+end.
+
+
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+Procedure Run;                                  {runinterface(#(GPInt));}
+Function  GetReportName               : String; {GetReportName := '#(GPNam) (ЭМ)';}
+Function  GetGroupName (Level : Word) : String; {Level:=Level;GetGroupName := '';}
+function  GetPriority                 : Integer;{GetPriority := 3;}
+function  VisibleInModule(Ind : Byte) : String; {Ind:=Ind; VisibleInModule := 'STAFFMAINMENU';} // для Пушковой Перенесено из MENUZARP';}
+End.

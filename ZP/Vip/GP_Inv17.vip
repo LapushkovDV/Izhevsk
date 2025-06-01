@@ -1,0 +1,281 @@
+/*************************************************************************************************\
+* Наименование:  Справка к акту ИНВ-17                                                            *
+* Контур/Модуль: Заработная плата / Отчеты пользователя                                           *
+* Примечание:                                                                                     *
+* Вид работы  |Номер          |Дата    |Исполнитель              |Проект                          *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#0000          |24/01/19|Евдокимов М.А.           |НПО Энергомаш                   *
+\*************************************************************************************************/
+
+#include userreport.vih
+#include PsnFuncs.vih
+#include XlReport.vih
+#include Query.vih
+
+#component "GP_ZP"
+
+interface GP_Inv17 'Справка к акту ИНВ-17' escClose;
+show(,,36,5);
+
+table struct TmpInv17 (
+  cLSchet      : comp,
+  cPerson      : comp,
+  StrTabN      : string[20],
+  FIO          : string[80],
+  PodrKod      : string[3],
+  cPodr        : comp,
+  cPost        : comp,
+  sPost        : string,
+  dDolgZaRab   : double,
+  dSummaNaRuki : double,
+  dDolgZaPred  : double
+) with index (
+  i01 = StrTabN
+);
+
+var
+  _year: word;
+  _month: byte;
+  pXL: XLSRepBuilder;
+  _psnFuncs: PersonsFunctions;
+
+create view
+as select
+  TmpInv17.cLSchet
+from
+  TmpInv17
+;
+
+//#region Query
+sql query qInv17 =
+  select
+    LSchet.Nrec as cLSchet,
+    Persons.Nrec as cPerson,
+    Persons.StrTabN as StrTabN,
+    Persons.FIO as FIO,
+    KatPodr.Kod as PodrKod,
+    KatPodr.Nrec as cPodr,
+    LSchet.cAppoint as cPost,
+    CatPost.Name as sPost,
+    t.dDolgZaPred as dDolgZaPred: double,
+    t.dSummaNaRuki as dSummaNaRuki: double,
+    t.dDolgZaRab as dDolgZaRab: double
+  from (select
+          cLSch,
+          Sum(DolgPredpr)  as dDolgZaPred: double,
+          Sum(NaRuki)      as dSummaNaRuki: double,
+          Sum(DolgRab)     as dDolgZaRab: double
+        from (select
+                PrMonth.cLSch       as cLSch,
+                sum(PrMonth.Depon)  as DolgPredpr: double,
+                sum(PrMonth.Summa9) as NaRuki: double,
+                sum(PrMonth.Dolg)   as DolgRab: double
+              from PrMonth
+              join KatPodr
+                on KatPodr.Nrec = PrMonth.Cex
+              where
+                PrMonth.YearN = :YearNext and
+                PrMonth.MesN = :MonthNext and
+                KatPodr.Kod not in ('446')
+              group by
+                PrMonth.cLSch
+
+              union all
+
+              select
+                s.clsch,
+                0: double, sum(s.sumud): double, 0: double
+              from sumvidud s
+              left join katpodr
+                on s.cex=katpodr.nrec
+              where
+                s.yearn = :Year and
+                s.mesn  = :Month and
+                s.vidudp in (500,501) and
+                katpodr.kod not in ('446')
+              group by
+                s.cLSch
+             ) t
+        group by
+          cLSch
+       ) t
+  join LSchet
+    on LSchet.Nrec = t.cLSch
+  join KatPodr
+    on KatPodr.Nrec = LSchet.Cex
+  join Persons
+    on Persons.Nrec = LSchet.TPerson
+  left join Catalogs CatPost
+    on CatPost.Nrec = LSchet.cAppoint
+  where
+    t.dDolgZaPred <> 0 or
+    t.dSummaNaRuki <> 0 or
+    t.dDolgZaRab <> 0
+;
+//#endregion Query
+
+function PrepareData: boolean;
+{
+  result := false;
+  var d: date = Add_Months(To_Date(1, _month, _year), 1);
+  var yearNext: word = Year(d);
+  var monthNext: byte = Month(d);
+  mtClear(tnTmpInv17, mfNormal);
+  var q: IQuery = queryManager.createQuery(qInv17)
+                              .setParam('Year', _year)
+                              .setParam('Month', _month)
+                              .setParam('YearNext', yearNext)
+                              .setParam('MonthNext', monthNext);
+  if q.execute.errorCode != tsOk
+  {
+    Message('Ошибка выполнения запроса выборки данных: ' + q.errorCode, error);
+    exit;
+  }
+  sqlCopyInto(q, tnTmpInv17, true);
+  result := true;
+}
+
+procedure ShowExcelReport;
+{
+  StartNewVisual(vtIndicatorVisual, vfBreak + vfTimer, 'Формирование отчета', RecordsInTable(tnTmpInv17));
+  var d: date = To_Date(1, _month, _year);
+  d := To_Date(Last_Day(d), _month, _year);
+  var sXLTFileName: string = TranslatePath('%StartPath%XLS_ЭМ\ZP\gp_Inv17.xltm');
+  //var sXLSFileName: string = pXL.CreateXLT(sXLTFileName, true);
+  var sXLSFileName: string = pXL.CreateReport(sXLTFileName, true);
+  pXL.CreateVar(sXLSFileName);
+  pXL.SetDateVar('DRep', d);
+  pXL.SetStringVar('DRepStr', LoCase(DateToStr(d, 'DD Mon YYYY')));
+  pXL.SetNumberVar('Year', _year);
+  pXL.SetNumberVar('Month', _month);
+  pXL.PublishVar;
+
+  pXL.CreateTbls(sXLSFileName);
+  pXL.CreateTbl('Main');
+  pXL.CreateTblFld('cLSchet');
+  pXL.CreateTblFld('Npp');
+  pXL.CreateTblFld('cPerson');
+  pXL.CreateTblFld('StrTabN');
+  pXL.CreateTblFld('FIO');
+  pXL.CreateTblFld('FirstName');
+  pXL.CreateTblFld('LastName');
+  pXL.CreateTblFld('Patronymic');
+  pXL.CreateTblFld('PodrKod');
+  pXL.CreateTblFld('cPodr');
+  pXL.CreateTblFld('cPost');
+  pXL.CreateTblFld('sPost');
+  pXL.CreateTblFld('dDolgZaRab');
+  pXL.CreateTblFld('dSummaNaRuki');
+  pXL.CreateTblFld('dDolgZaPred');
+
+  var i: longint = 0;
+
+  _loop TmpInv17
+  {
+    i++;
+    pXL.ClearTblBuffer;
+    pXL.SetTblStringFldValue('Npp', i);
+    pXL.SetTblStringFldValue('cLSchet', String(TmpInv17.cLSchet, 0, 0));
+    pXL.SetTblStringFldValue('cPerson', String(TmpInv17.cPerson, 0, 0));
+    pXL.SetTblStringFldValue('StrTabN', TmpInv17.StrTabN);
+    pXL.SetTblStringFldValue('FIO', TmpInv17.FIO);
+    pXL.SetTblStringFldValue('FirstName', _psnFuncs.Get_FirstName(TmpInv17.cPerson));
+    pXL.SetTblStringFldValue('LastName', _psnFuncs.Get_LastName(TmpInv17.cPerson));
+    pXL.SetTblStringFldValue('Patronymic', _psnFuncs.GetPatronymic(TmpInv17.cPerson));
+    pXL.SetTblStringFldValue('PodrKod', TmpInv17.PodrKod);
+    pXL.SetTblStringFldValue('cPodr', String(TmpInv17.cPodr, 0, 0));
+    pXL.SetTblStringFldValue('cPost', String(TmpInv17.cPost, 0, 0));
+    pXL.SetTblStringFldValue('sPost', TmpInv17.sPost);
+    pXL.SetTblNumberFldValue('dDolgZaRab', TmpInv17.dDolgZaRab);
+    pXL.SetTblNumberFldValue('dSummaNaRuki', TmpInv17.dSummaNaRuki);
+    pXL.SetTblNumberFldValue('dDolgZaPred', TmpInv17.dDolgZaPred);
+    pXL.InsTblRow;
+    if not NextVisual break;
+  }
+
+  pXL.PublishTbl('Main');
+
+  pXL.LoadReport(sXLSFileName);
+  pXL.DisConnectExcel;
+  StopVisual('', 0);
+}
+
+screen sc1 (,,sci1EnEsc);
+  fields
+    _year: NoProtect, SpinButton [1, 1900, 2100];
+    _month: [List 1  'Январь',
+                  2  'Февраль',
+                  3  'Март',
+                  4  'Апрель',
+                  5  'Май',
+                  6  'Июнь',
+                  7  'Июль',
+                  8  'Август',
+                  9  'Сентябрь',
+                  10 'Октябрь',
+                  11 'Ноябрь',
+                  12 'Декабрь'];
+  buttons
+    cmOk, default;
+    cmCancel;
+<<
+
+`Год`.@@@@@@@@ `Месяц`.@@@@@@@@@@@@
+
+       <. Продолжить .> <. Отмена .>
+>>
+end;
+
+handleevent
+  cmOk:
+  {
+    if PrepareData
+      ShowExcelReport;
+  }
+  cmInit:
+  {
+    if not ReadMyDSK(_year, 'GP_Inv17_year', false) _year := Year(Cur_Date);
+    if not ReadMyDSK(_month, 'GP_Inv17_month', false) _month := Month(Cur_Date);
+  }
+  cmDone:
+  {
+    SaveMyDSK(_year, 'GP_Inv17_year');
+    SaveMyDSK(_month, 'GP_Inv17_month');
+  }
+end;
+end.
+
+
+VipInterface UserReport_GP_Inv17 Implements IUserReport;
+Interface UserReport_GP_Inv17;
+
+Procedure Run;
+Begin
+  RunInterfaceNoModal(GP_ZP::GP_Inv17);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Справка к акту ИНВ-17';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  #__UNUSED__(Level)
+  GetGroupName := '';
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'menuzarp';
+  end;
+end;
+
+End.

@@ -1,0 +1,362 @@
+/*************************************************************************************************\
+* Наименование: Корзина. Формирование ведомостей на выплату в операции - начисления и выплаты     *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#224         |19/01/18|Евдокимов М.А.           |НПО Энергомаш                    *
+* Разработка  |#219         |19/01/18|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include macrosch.vpp
+#include Query.vih
+#include ExtAttr.vih
+#include PMNTENTS.VIH
+
+#Component "GP_ZP"
+
+#include GP_PrVidOplHelper.vih
+#doc
+Корзина. Формирование ведомостей на выплату в операции - начисления и выплаты
+#end
+interface GP_PrVidOplHelper;
+
+var
+  _extAttr: IExtAttr;
+  _pe: PaymentEnterings;
+
+create view
+as select *
+from Zar_User, VALZAR, SYS_MBF, LSCHET, PRVIDOPL, KLVIDOPL
+where ((
+  UserName == Zar_User.OwnName
+));
+
+//*****************************************************************************
+//#region Вспомогательные функции
+
+//TODO: код взял из Basket.vip. Проверить правильность выполнения
+function GetKursValut(cKodValut: comp) : double;
+{
+  var lastKursDate : date;
+  var kursValut : double;
+  lastKursDate := Date(1, 1, 1500);
+  kursValut := 0;
+  _loop VALZAR where ((cKodValut == VALZAR.KodValut))
+  {
+    if VALZAR.DATVAL > lastKursDate
+    {
+      lastKursDate := VALZAR.DATVAL;
+      kursValut := VALZAR.SUMRUBL;
+    }
+  }
+  result := kursValut;
+}
+
+function GetParentMNREC : word;
+{
+  var tmp : word;
+  tmp := wGetTune('UP.ZAR.MEGPERIOD.Offset');
+
+  for (; tmp <= 65535; tmp := tmp + 1)
+    if recordexists SYS_MBF where (( tmp == SYS_MBF.MNREC )) <> tsOk
+      break;
+
+  result := tmp;
+}
+
+//#endregion Вспомогательные функции
+//*****************************************************************************
+
+//*****************************************************************************
+//#region Реализация GP_IPrVidOplHelper
+
+//#region query queryFindSysMbfNrec
+sql query queryFindSysMbfNrec =
+
+  select sys_mbf.nrec as sysmbfNrec,
+         coalesce(attrval.vcomp, #comp(0)) as titledocNrec
+
+  from sys_mbf
+
+  left join attrnam on attrnam.wtable   = :wtable and
+                       attrnam.name     = 'cTitleDoc'
+
+  left join attrval on attrval.wtable   = :wtable and
+                       attrval.crec     = sys_mbf.nrec and
+                       attrval.cattrnam = attrnam.nrec
+
+  where sys_mbf.choice   = :choice and
+        sys_mbf.cex      = :cex and
+        sys_mbf.nmnem    = :nmnem and
+        sys_mbf.datan    = :datan and
+        sys_mbf.datok    = :datok and
+        sys_mbf.kodvalut = :kodvalut
+;
+//#endregion
+
+function FindSysMbfNrec(wChoice: word; dBeg: date; dEnd: date; sNmnem: string; cCex: comp;
+                        cKodValut: comp; cTitleDoc: comp): comp;
+{
+  var rs: IResultSet;
+  rs := queryManager.createQuery(queryFindSysMbfNrec)
+                    .setParam('wtable'   , coSYS_MBF)
+                    .setParam('choice'   , wChoice)
+                    .setParam('nmnem'    , sNmnem)
+                    .setParam('cex'      , cCex)
+                    .setParam('datan'    , dBeg)
+                    .setParam('datok'    , dEnd)
+                    .setParam('kodvalut' , cKodValut)
+                    .getResultSet;
+
+  var cLastWithoutAttr: comp = 0;
+  var cTitleDoc: comp = 0;
+
+  if rs.getFirst = tsOk do
+  {
+
+    cTitleDoc := rs.row.Val('titledocNrec');
+    if cTitleDoc = 0
+      cLastWithoutAttr := rs.row.Val('sysmbfNrec');
+    else
+    {
+      result := rs.row.Val('sysmbfNrec');
+      exit;
+    }
+
+  } while rs.getNext = tsOk;
+
+  result := cLastWithoutAttr;
+}
+
+function CreateSysMbf(wChoice: word; dBeg: date; dEnd: date; sNmnem: string; cCex: comp;
+                      cKodValut: comp; cTitleDoc: comp): comp;
+{
+  ClearBuffer(#SYS_MBF);
+
+  SYS_MBF.CEX     := cCex;
+  SYS_MBF.NMPODR  := if(cCex = 0, 'все подразделения', ShowKau(cgKau_KatPodr, cCex));
+  // наименование файла перечня
+  SYS_MBF.NMNEM   := sNmnem;
+  // суммы начислений и удержаний
+  SYS_MBF.SUMMANC := 0;
+  SYS_MBF.SUMMAUD := 0;
+  // признаки удержания налога и расчета
+  SYS_MBF.NALFLAG := '-';
+  SYS_MBF.RASFLAG := '-';
+  // код и курс валюты
+  SYS_MBF.KODVALUT   := cKodValut;
+  if cKodValut != 0
+    SYS_MBF.KURSVAL  := GetKursValut(cKodValut);
+
+  SYS_MBF.KASSIR := if(getfirst fastfirstrow ZAR_USER = tsOk, ZAR_USER.CKASSIR, 0);
+  SYS_MBF.DATAN  := dBeg;
+  SYS_MBF.DATOK  := dEnd;
+  SYS_MBF.MNREC  := GetParentMNREC;
+  SYS_MBF.CHOICE := wChoice;
+
+  var buf: type$sys_mbf;
+  buf := type$sys_mbf(sys_mbf.buffer);
+  OnBeforeInsertSysMbf(buf);
+  sys_mbf.buffer := buf;
+
+  if insert current SYS_MBF = tsOk
+  {
+    result := SYS_MBF.NREC;
+    _extAttr.coSetAttr(coSYS_MBF, SYS_MBF.NRec, 'cTitleDoc', cTitleDoc, '');
+  }
+  else
+    result := 0;
+}
+
+function FindOrCreateSysMbf(wChoice: word; dBeg: date; dEnd: date; sNmnem: string; cCex: comp;
+                            cKodValut: comp; cTitleDoc: comp): comp;
+{
+  var sysmbfNrec: comp;
+  sysmbfNrec := FindSysMbfNrec(wChoice, dBeg, dEnd, sNmnem, cCex, cKodValut, cTitleDoc);
+  if sysmbfNrec = 0
+    sysmbfNrec := CreateSysMbf(wChoice, dBeg, dEnd, sNmnem, cCex, cKodValut, cTitleDoc);
+  result := sysmbfNrec;
+}
+
+function CreatePrVidOpl(cSysMbf: comp; cLschet: comp; wVidOpl: word; wVidUd: word; dSum: double; cContDoc: comp = 0; wSumType: word = 0): comp;
+{
+  result := 0;
+
+  if getfirst LSCHET where ((cLschet == LSCHET.NREC)) != tsOk
+    exit;
+
+  if getfirst SYS_MBF where ((cSysMbf == SYS_MBF.NREC)) != tsOk
+    exit;
+
+  ClearBuffer(#PRVIDOPL);
+
+  PRVIDOPL.MNREC    := SYS_MBF.NREC;
+  PRVIDOPL.CHOICE   := SYS_MBF.CHOICE;
+
+  // Для получения параметров ЛС на дату начала выплаты
+  PA_Assign(LSCHET.NREC);
+
+  // Персональные данные
+  PRVIDOPL.CLSCH    := LSCHET.NREC;
+  PRVIDOPL.TABN     := LSCHET.TABN;
+  PRVIDOPL.STRTABN  := LSCHET.STRTABN;
+  PRVIDOPL.TPERSON  := LSCHET.TPERSON;
+  PRVIDOPL.CEX      := PA_Department(SYS_MBF.DATAN);
+  PRVIDOPL.CEXOZ    := PA_Department(SYS_MBF.DATAN);
+
+  PRVIDOPL.DATAN    := SYS_MBF.DATAN;
+  PRVIDOPL.DATOK    := SYS_MBF.DATOK;
+  PRVIDOPL.MES      := AD_Month(SYS_MBF.DATAN);
+  PRVIDOPL.LASTDATE := SYS_MBF.DATAN;
+
+  var shpzfrom : word;
+  shpzfrom := 0;
+
+  PRVIDOPL.VIDUD  := wVidUd;
+  PRVIDOPL.VIDOPL := wVidOpl;
+
+  if getfirst fastfirstrow KLVIDOPL where ((wVidOpl == KLVIDOPL.VIDOPL)) = tsOk
+  {
+
+    if (KLVIDOPL.VHVOE[36] = '2') or  //из лицевого счета надо тянуть по КВО
+       ((KLVIDOPL.VHVOE[36] <> '1') and (wGetTune('UP.ZAR.ZU.Need_34') = asPersonalAccount)) //или по настройке
+      shpzfrom := 0;
+    else
+      shpzfrom := 1;
+  }
+
+  // По настройке "Приоритет формирования дебета по начислениям" и тому что в КВО
+  if (shpzfrom = 0) // из лицевого счета
+  {
+    var info1, info2: longint;
+    info1 := info2 := 0;
+
+    // если есть входимость "Для затрат не учитывать переходы с датой окончания":
+    if (_pe.HasEnteringEx(PRVIDOPL.VIDOPL, 34, info1, info2))
+    {
+      if (info1 <> 0) // без принадлежности к периоду
+        PA_IgnoreNonPermanentPerexods(true);
+      else
+      {
+        // в текущем периоде
+        if ((Month(PRVIDOPL.DATAN) = MonthRas) and (Year(PRVIDOPL.DATAN) = YearRas))
+          PA_IgnoreNonPermanentPerexods(true);
+      }
+    }
+
+    PRVIDOPL.CEXOZ    := PA_Department(SYS_MBF.DATAN);
+    PRVIDOPL.CSCHETD  := PA_Account(SYS_MBF.DATAN);
+    PRVIDOPL.CSUBSCHD := PA_ControlAccount(SYS_MBF.DATAN);
+    PA_GetAllAnalytics(SYS_MBF.DATAN, PRVIDOPL.TBLD, PRVIDOPL.CKAUD);
+    PRVIDOPL.CHOZOPER := PA_StandardBusinessTransaction(SYS_MBF.DATAN);
+    PRVIDOPL.PARAM    := PA_StandardBusinessTransactionParameter(SYS_MBF.DATAN);
+
+    PA_IgnoreNonPermanentPerexods(false);
+  }
+  else // из КВО
+  {
+    #CopyInfo_ (PRVIDOPL, KLVIDOPL);
+    PRVIDOPL.CHOZOPER := KLVIDOPL.CHOZOPER;
+    PRVIDOPL.PARAM    := KLVIDOPL.PARAM;
+  }
+
+  PRVIDOPL.KATEG    := PA_Category(SYS_MBF.DATAN);
+  PRVIDOPL.CAPPOINT := PA_Appointment(SYS_MBF.DATAN);
+
+  // Устанавливаем сумму выплаты
+  case wSumType of
+    0: // национальная валюта
+    {
+      PRVIDOPL.SUMMA  := dSum;
+      PRVIDOPL.SUMMAR := dSum;
+      PRVIDOPL.SUMUD  := dSum;
+    }
+    1: // иностранная валюта
+    {
+      PRVIDOPL.SUMMA1 := dSum;
+      PRVIDOPL.SUMMA   := PRVIDOPL.SUMMA1 * SYS_MBF.KURSVAL;
+      PRVIDOPL.SUMMAR  := PRVIDOPL.SUMMA;
+      PRVIDOPL.SUMUD   := PRVIDOPL.SUMMA;
+    }
+    2: // проценты
+    {
+      PRVIDOPL.PROC   := dSum;
+    }
+  end;
+
+  // Ссылка на спецификацию приказа
+  PRVIDOPL.CPODR := cContDoc;
+
+  var buf: type$prvidopl;
+  buf := type$prvidopl(PRVIDOPL.buffer);
+  OnBeforeInsertPrvidopl(buf);
+  PRVIDOPL.buffer := buf;
+
+  if insert current PRVIDOPL = tsOk
+  {
+    SYS_MBF.SUMMANC := SYS_MBF.SUMMANC + PRVIDOPL.SUMMA;
+    SYS_MBF.SUMMAUD := SYS_MBF.SUMMAUD + PRVIDOPL.SUMMA;
+    SYS_MBF.PRKAUOT := shpzfrom;
+    update current SYS_MBF;
+
+    result := PRVIDOPL.NREC;
+  }
+
+}
+
+//#region query queryFindPrVidOpl
+sql query queryFindPrVidOpl =
+  select PrVidOpl.Nrec
+  from PrVidOpl
+  where (clsch  = :clsch  or :clsch  = #comp(0)) and
+        (vidopl = :vidopl or :vidopl = 0) and
+        (vidud  = :vidud  or :vidud  = 0) and
+        (datan  = :datan  or :datan  = 0) and
+        (datok  = :datok  or :datok  = 0) and
+        (cpodr  = :cpodr  or :cpodr  = #comp(0))
+;
+//#endregion query queryFindPrVidOpl
+
+function FindPrVidOpl(cLschet: comp; wVidOpl: word; wVidUd: word;
+                      dBeg: date; dEnd: date; cContDoc: comp): comp;
+{
+  var rs: IResultSet;
+  rs := queryManager.createQuery(queryFindPrVidOpl)
+                    .setParam('clsch' , cLschet)
+                    .setParam('vidopl', wVidOpl)
+                    .setParam('vidud' , wVidUd)
+                    .setParam('datan' , dBeg)
+                    .setParam('datok' , dEnd)
+                    .setParam('cpodr' , cContDoc)
+                    .getResultSet;
+  if rs.getfirst = tsOk
+    result := rs.row.valAt(1)
+  else
+    result := 0;
+}
+
+function DeletePrVidOpl(cPrVidOpl: comp): boolean;
+{
+  result := false;
+
+  if getfirst fastfirstrow PrVidOpl where ((cPrVidOpl == PrVidOpl.Nrec)) = tsOk
+  {
+    if getfirst fastfirstrow SYS_MBF where ((PrVidOpl.MNrec == SYS_MBF.NREC)) = tsOk
+    {
+      SYS_MBF.SUMMANC := SYS_MBF.SUMMANC - PRVIDOPL.SUMMA;
+      SYS_MBF.SUMMAUD := SYS_MBF.SUMMAUD - PRVIDOPL.SUMMA;
+      update current SYS_MBF;
+    }
+    result := delete Current PrVidOpl = tsOk;
+    if isValid(tnSYS_MBF)
+      if getfirst PrVidOpl where ((SYS_MBF.Nrec == PrVidOpl.MNrec)) != tsOk
+        delete current SYS_MBF;
+  }
+}
+
+//#endregion Реализация GP_IPrVidOplHelper
+//*****************************************************************************
+
+
+end.

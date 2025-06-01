@@ -1,0 +1,306 @@
+/*************************************************************************************************\
+* Наименование:  Ведение заказов/проектов - Распределение ФОТ работников по заказам               *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Расчет зарплаты                                                                  *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#798          |10/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#2067         |16/03/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#component "Z_RESERV"
+#doc
+Резерв по отпускам.
+Кол-во дней считаем как отношщение количества положеных дней деленное на 12
+колво положенных дней = ВА к лицевому "Положено дней отпуска за год"
+#end
+alter interface RESERV_Param;
+
+  var _log : string = '';
+
+overload
+
+ procedure prMakeNewArxShtrf(dAppDate, dDisDate: date; DurPlan: double; cPlOtp: comp);
+end;
+procedure MyLog(_str: string);
+{
+  exit;
+ if _log = '' then _log := GetStringParameter('Files', 'OutputFilesDirectory', 0)+'REZERV_Param_DEBUG_'+Username+'_'+datetostr(cur_date,'YYYYMMDD')+timetostr(cur_time,'HHMMSS')+'.log';
+ logstrtofile(_log,_str);
+}
+procedure prMakeNewArxShtrf(dAppDate, dDisDate: date; DurPlan: double; cPlOtp: comp);
+{
+  inherited::prMakeNewArxShtrf(dAppDate, dDisDate,DurPlan,cPlOtp);
+
+  if wGettUne('NPOEM_OWN.ZP.Z_REZERV_CALDAYSOTPUSK_VA_12') = 1
+   {
+     Update current ArxShtrf set
+        ArxShtrf.SUMMA1 := DoGetAttr(15001, ArxShtrf.cLsch,'Положено дней отпуска за год')/12
+      , ArxShtrf.KOLDN  := DoGetAttr(15001, ArxShtrf.cLsch,'Положено дней отпуска за год')/12
+     ;
+   }
+}
+
+
+handleevent
+cmOK:
+{
+  if wGettUne('NPOEM_OWN.ZP.Z_REZERV_CALDAYSOTPUSK_VA_12') = 0
+   {
+   inherited::handleevent(cmOK)
+   }
+   else
+      {
+        _log := '';
+        if not UpdateTable
+          exit;
+
+        if not Paf.CheckPersonalAccountFilter(0)
+        {
+          SelectField(#PersonalAccountFilterStr);
+          Message('Не задан фильтр по лицевым счетам', Error + OkButton);
+          exit;
+        }
+        if ( KLVIDOPL_NVIDOPL = 0 )
+        {
+          Message('Не задан вид оплаты.'#13 +
+                  'Формирование оценочных обязательств по отпускам невозможно.', Information);
+          exit;
+        }
+        Marker_KlOtpusk := InitMarker('Otpusk_Rez_KlOtpusk', 8, 200, 10);
+
+        var Duration_plan    : double;
+
+        var bCalcWPYet       : boolean;
+        var bCheckOstNullOO  : boolean;
+        var cKlOtpNRec       : comp;
+
+        IntInit;
+
+        StartNewVisual( vtRotateVisual, vfTimer, 'Формирование записей', 1);
+        if not NullVipRef(WTR)
+          WTR.Clear;
+
+        // очистка таблицы, хранящей ссылки записей ОО, созданных данным запуском формирования
+        delete all mtbl_MadeArxShtrf;
+
+        PopBounds(tbByWorkPCon);
+        PopBounds(tbByWorkPeriod);
+
+        if ( wPlanOrWP = 0 )
+          PushBounds(tbByWorkPCon);
+        else
+          PushBounds(tbByWorkPeriod);
+
+        if ( GetMarkerCount(Marker_KlOtpusk) = 0 )
+          insert mt_KlOtpusk
+          select KlOtpusk.NRec, KlOtpusk.KOtpus, KlOtpusk.NOtpus, word(KlOtpusk.MaxZar), KlOtpusk.wFlag1, KlOtpusk.wFlag3, word(KlOtpusk.cVacRem), KlOtpusk.isRabDn
+          from KlOtpusk;
+        else
+          for(cnt:=0; cnt<GetMarkerCount(Marker_KlOtpusk); cnt++)
+          {
+            GetMarker(Marker_KlOtpusk,cnt,cKlOtpNRec);
+            if GetFirst KlOtpusk where (( cKlOtpNRec == KlOtpusk.NRec )) = tsOk
+              insert mt_KlOtpusk set mt_KlOtpusk.NRec    := KlOtpusk.NRec,
+                                     mt_KlOtpusk.KOtpus  := KlOtpusk.KOtpus,
+                                     mt_KlOtpusk.NOtpus  := KlOtpusk.NOtpus,
+                                     mt_KlOtpusk.MaxZar  := word(KlOtpusk.MaxZar),
+                                     mt_KlOtpusk.wFlag1  := KlOtpusk.wFlag1,
+                                     mt_KlOtpusk.wFlag3  := KlOtpusk.wFlag3,
+                                     mt_KlOtpusk.cVacRem := word(KlOtpusk.cVacRem),
+                                     mt_KlOtpusk.isRabDn := KlOtpusk.isRabDn;
+          }
+
+        cnt:= 0;
+
+        dFirstJan     := to_date(1,1,Year(myFirstDayRas));
+        dLastDec      := to_date(31,12,Year(myFirstDayRas));
+        dPrevLastDec  := to_date(31,12,Year(myFirstDayRas)-1);
+        LastCurMonDay := to_date(Last_Day(myFirstDayRas), Month(myFirstDayRas), Year(myFirstDayRas));
+
+        // сохранения в MsgProtocol нет
+        iCC.SetMsgRec(comp(0));
+
+        var IsBreak: boolean = false;
+        StopVisual;
+        StartNewVisual(vtRotateVisual , vfBreak + vfTimer + vfConfirm, 'Формирование записей', 0);
+
+        _loop ForMarks
+        {
+          MyLog('ForMarks.cLSchet = ' + ForMarks.cLSchet);
+          if GetFirst LSchet <> tsOk
+            continue;
+          MyLog('GetFirst LSchet');
+          if (not NextVisual)
+          {
+            IsBreak := true;
+            break;
+          }
+
+          // определим подразделение на конец отчетного периода
+          PA_Assign(LSchet.NRec);
+          cCexOnEnd := PA_Department(LastCurMonDay);
+
+          // снимем флаг формирования записи ОО по остаткам на начало года при отсутствии ОО
+          // взводить его будем только если хотя бы 1 период работы пройдет проверку уволенных и даты приема, и будет содержать 1ое января
+          bCheckOstNullOO := false;
+
+          // назначение привязано к лицевому счету, а план отпуска к назначению
+          _loop Appointments
+          {
+          MyLog('Appointments.nrec = ' + Appointments.nrec);
+            if GetFirst Persons <> tsOk
+              continue;
+
+            case Appointments.lPrizn of
+              0,3:{
+                    dAppDateP := Persons.AppDate;
+                    dDisDateP := Persons.DisDate;
+
+                    // если карточка в л/с и в назначении совпали, это текущий период работы, дату берем прямо из л/с
+                    // иначе, поищем в истории увольнений период, куда приходится дата назначения
+                    // брать всегда из л/с нельзя т.к. для приема на новую карточку даты будут разные
+                    // брать из карточки тоже нельзя, потому как теоретически даты приема в карточке и л/с может различаться, а в историю увольнений она потом попадает из л/с
+                    if ( LSchet.tPerson = Persons.NRec )
+                      dAppDateLS := LSchet.DatPos;
+                    else
+                      _loop MoveLsc_LS
+                        if ( MoveLsc_LS.DatUv > Appointments.AppointDate or Day(MoveLsc_LS.DatUv) = 0 )
+                        {
+                          dAppDateLS := MoveLsc_LS.DatPos;
+                          break;
+                        }
+                  }
+              100:{
+                    dAppDateP := dDisDateP := dAppDateLS := ZeroDate;
+
+                    // пройдем по истории увольнений с той же карточкой
+                    // и поищем период работы, в который попадает назначение
+                    _loop MoveLsc_Pers
+                      if ( MoveLsc_Pers.tPerson = MoveLsc_Pers.cRefP ) and
+                         ( MoveLsc_Pers.DatUv > Appointments.AppointDate or Day(MoveLsc_Pers.DatUv) = 0 )
+                      {
+                        dAppDateP  := MoveLsc_Pers.DatPos;
+                        dDisDateP  := MoveLsc_Pers.DatUv;
+                        dAppDateLS := MoveLsc_Pers.DatPos;
+
+                        break;
+                      }
+
+                    // если дата приема в истории увольнений пустая - это неправильно, пропускаем
+                    // или не нашли записей в истории увольнений
+                    if ( Day(dAppDateP) = 0 )
+                      continue;
+                  }
+              else
+                continue;
+            end;
+
+            // для уволенных не формируем
+            if not bUvol
+              if dDisDateP > 0 and to_date(1, month(dDisDateP), year(dDisDateP)) < myFirstDayRas
+                continue;
+
+            if dAppDateP >= Add_Months( myFirstDayRas, 1)
+            {
+              displ('[!] Сотрудник '+Persons.FIO+' еще не принят.');
+              continue;
+            }
+
+            // если дошли до сюда, значит период работы входит в отчетный период, проверим пересекается ли период работы с началом года
+            // (даты увольнения не проверяем, т.к. если стоит не формировать по уволенным, то сюда не дойдем, а если формировать - то и будет формироваться)
+            bCheckOstNullOO := ( bCheckOstNullOO or ( dAppDateLS <= dPrevLastDec ) );
+
+              bCalcWPYet := false;
+
+              if ( Appointments.lPrizn = word(3) ) and ( getfirst PlanOtpusk <> tsOk )
+                prMakeArxShtrfForSovmByDetPlanOtp;
+
+                           //цикл по видам отпуска
+                _loop mt_KlOtpusk
+                {
+                  if funIsArxShtrfForLSOtpMonth // проверка наличия уже созданной записи
+                    continue;
+
+                  // считаем плановое количество дней
+                  prMakeNewArxShtrf(dAppDateP, dDisDateP, 28, 0h); //собстваенно риади чего все и делаем, т.е. принудитально по всем выбранным лицевым идем, плановые отпуска игнорироуем
+
+                }
+          }
+
+          // поиск остатков по отпускам и формирование ОО только с остатком в случае, если нет ничего в тек. месяце
+          if ( bCheckOstNullOO )
+            _loop mt_KlOtpusk
+            {
+              if (GetFirst ArxShtrf where (( LSchet.Nrec        == ArxShtrf.cLsch   and
+                                             mt_KlOtpusk.KOtpus == ArxShtrf.VidUd   and
+                                             Persons.Nrec       == ArxShtrf.tPerson and
+                                             dPrevLastDec       == ArxShtrf.DataN   )) = tsOk)
+              {
+                if ( ArxShtrf.Summa1 <> 0 )
+                {
+                  var tmpOstat : double;
+
+                  tmpOstat := ArxShtrf.Summa1;
+
+                  if (GetFirst ArxShtrf where (( LSchet.Nrec        == ArxShtrf.cLsch   and
+                                                 mt_KlOtpusk.KOtpus == ArxShtrf.VidUd   and
+                                                 Persons.Nrec       == ArxShtrf.tPerson and
+                                                 myFirstDayRas      == ArxShtrf.DataN   )) <> tsOk)
+                  {
+                    ClearBuffer(#ArxShtrf);
+                    ArxShtrf.cLsch      := LSchet.Nrec;
+                    ArxShtrf.tPerson    := Persons.Nrec;
+                    ArxShtrf.DataN      := myFirstDayRas;
+                    ArxShtrf.KolDn      := 0;
+
+                    // если установлен флаг, определим подразделение на дату окончания отчетного периода,
+                    // иначе возьмем как раньше из л/с (где значение на 1ое число отчетного месяца)
+                    ArxShtrf.CEX        := if( wDeptOnEnd = 1, cCexOnEnd, LSchet.CEX);
+
+                    ArxShtrf.cSchetK    := LSchet.cSchetD;
+                    ArxShtrf.cSubSchK   := LSchet.cSubSchD;
+                    ArxShtrf.cKauK      := LSchet.cKauD;
+                    ArxShtrf.TblK       := LSchet.TblD;
+                    ArxShtrf.Param      := LSchet.Param;
+
+                    ArxShtrf.FilialNo   := KLVIDOPL_NVIDOPL;
+                    ArxShtrf.SUMMA0     := 0;
+                    ArxShtrf.SUMMA1     := tmpOstat;
+                    ArxShtrf.PayNum     := DoubleToStr(tmpOstat,'[|-]3666.\2p88');
+
+                    ArxShtrf.VidUd      := mt_KlOtpusk.KOtpus;
+                    ArxShtrf.cBankPol   := 0;
+                    ArxShtrf.sw1        := YEAR(myFirstDayRas);
+                    ArxShtrf.sw2        := 1 + word((wRoundFlag xor 1)*100);
+                    ArxShtrf.Procpsb    := 0;
+
+                    ArxShtrf.Arhiv      := chlActual;
+                    ArxShtrf.RecType    := chlFundRes;
+
+                    insert current ArxShtrf;
+                    cnt++;
+                  }
+                }
+              }
+            }
+        }
+
+        StopVisual('',0);
+        DoneMarker(Marker_KlOtpusk, '');
+        displ('--------------------------------------------------------------------------------');
+
+        if ( IsBreak )
+          displ('Формирование оценочных обязательств по отпускам прервано!');
+        else
+          displ('Формирование оценочных обязательств по отпускам завершено.');
+
+        displ('Добавлено записей - ' + string(cnt) + '.');
+        ShowErrors;
+        ExitProc;
+        if RecordsInTable(#ArxShtrf) > 0
+          CloseInterface(cmDefault);
+      }
+}
+end;
+end.

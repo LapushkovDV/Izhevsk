@@ -1,0 +1,119 @@
+/*************************************************************************************************\
+* Наименование: Интерфейс приказа на Изменение режима работы                                      *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+* 175 - Доработки для учета в СКУД                                                                *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#347          |14/07/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Разработка  |#175          |23/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Доработка   |#2018         |07/03/18|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include Contexts.vih
+#include Func_AppHist.vih // объект для получения состояния назначения на указанную дату
+
+#include GP_RepLaborContract.vih
+#include GP_SCUD_PersEdit.Vih
+
+#component "Z_StaffOrders"
+alter interface RPD_60;
+overload
+  procedure prFillMenu(_menuID: longint);
+  function IRPD_Base.ChildCheckOneOrder(cNrec: comp = 0): boolean;
+  function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+end;
+
+var
+  CS : IContextSession;
+  iGP_SCUD_PersEdit:GP_SCUD_PersEdit;//для работы с картотекой в СКУД
+
+//******************************************************************************
+//  Процедура утверждения индивидуального приказа по текущему работнику (по таблице ContDoc)
+//******************************************************************************
+function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+{ Result:=Inherited::ChildConfirmOneOrder(cNrec);
+  if Result
+  { iGP_SCUD_PersEdit.MakeBufferPers(Persons.Nrec, ContDoc.cStr,TitleDoc.Nrec,Contdoc.Nrec,PartDoc.TypeOper)
+  }
+} //function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+
+function CheckWT: boolean;//по мотивам RPD_42
+{
+  result:=false;
+  if (not IsValidAll(tnAppointments)) exit;
+
+  if (LoadWorkingTable(Appointments.cAddNrec2, Month(AppHist.dRec), Year(AppHist.dRec)) = 0)
+    result:=WT_IsProtectedBwDates(AppHist.dRec, AppHist.dEnd);
+}
+
+function ChildCheckOneOrder(cNrec: comp = 0): boolean;
+{
+  result:=inherited::ChildCheckOneOrder(cNrec);
+
+  if (boGetTune('UP.ZAR.WT.PROTECTSYSTEMVARIANCEMODIFICATION'))//Запретить ввод системных неявок на период защищенных табелей
+    if (CheckWT) {
+      SetErrorOrder('Табель защищен от редактирования.');
+      result := false;
+    }
+}
+
+//включение стандартных пунктов контекстного меню приказа
+procedure prFillMenu(_menuID: longint);
+{
+  inherited::prFillMenu(_menuID);
+
+  if (NOAA.GetFirstAgreementByLink(GetCo4Agreement(), GetNRec4Agreement()) <> 0)
+    AddMenuItem(_menuID, 'Печать доп. соглашения (Word)', cmValue17);
+
+  AddMenuItem(_menuID, 'separator', 1);
+  ConcatMenu(_menuID, LoadMenu('GP_RPD60_MenuCopy'));
+}
+
+HandleEvent
+cmOnVipLoad:{
+  if inherited::handleEvent(cmOnVipLoad) = heAbort
+    abort;
+
+  var CL: ContextList;
+  if  not CL.Add(CS, 'WorkingTable') {
+    abort;
+    exit;
+  }
+}
+cmCheckField:{
+  case inherited::handleEvent(cmCheckField) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  //Исправление ошибки в стандартном коде
+  if (CurField = #AppHist.dRec)
+    if (not iAH.InfIsMarked(AppHist.cInf1, AH_WorkRegime))
+      AppHist.cInf1 := iAH.InfGetMarked(AppHist.cInf1, AH_WorkRegime);
+}
+cmValue17:{//Печать доп. соглашения (Word)
+  if (not UpDateTable) exit;
+
+  var Rep:GP_RepLaborContract;
+  Rep.Run(ContDoc.TypeOper,0,ContDoc.NRec,ContDoc.Person,0);
+}
+cmCalc:{//Копировать данные
+  if UpdateTable
+    if not funIsOrderConfirm
+    {
+      RunInterFace(GroupOrderCreator, ContDoc.Nrec, TitleDoc.DocDate);
+      ReReadRecords;
+    }
+    else
+      Message('Приказ уже утвержден. Добавление сотрудников невозможно!', mfInformation);
+}
+end;
+end.
+
+GP_RPD60_MenuCopy menu
+{
+  - 'Копировать данные', cmCalc
+      , 'Создание группового приказа с однотипным содержанием по выбранным сотрудникам'
+      ,, 'Ctrl+Q', kbCtrlQ,,,,, bmpCopyDoc16;
+}

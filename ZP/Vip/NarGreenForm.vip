@@ -1,0 +1,1188 @@
+#include Query.vih
+#include GetKau.Vih
+#include Marker.Vih
+#include IGK_Dog.vih
+#include StrFunc.vih // Функции работы со строками
+#include PMNTENTS.VIH // для PE
+#include AttrTablePick.vih
+#include ExtAttr.Vih
+
+VipInterface NarGreenForm Licensed(free);
+
+Interface NarGreenForm 'Формирование нарядов (зеленой полосой)' EscClose;
+//Show At(,,66,8);
+
+#include GetKau.var
+Procedure Fill_tmpVPlan; Forward;
+Procedure Fill_tmpMnPlan; Forward;
+
+Const
+  //раскраска
+  xlGreenCol = 0C1F7ADh;
+  AnBankSch = 'Банковские счета';
+  IndGroup  = 000A00000000000Fh;
+ coDecimalPoint = 2; //до какого округляем проценты в БД
+// coDecimalPointNDFL = 0;   не будем по НДФЛ до рубля округлоять, это только портит общшие суммы и не имеет отнощшения к реальности в данном контексте.
+ coVirtualcVPlan = 999999999;
+  //для еще одного фильтра
+  notSelected = 'не установлен';
+  selected = 'установлен';
+End;
+
+table struct tmpVPlan
+(
+  Name          : string
+, cVPlan        : comp
+, cBankSch      : comp
+, dSumRaspPlan  : double
+, dSumRaspFactS : double
+, dSumRaspFactO : double
+, dPercent      : double
+)
+with index
+(
+  i01 = cVPlan
+);
+
+table struct tmpMnPlan
+(
+  Number         : string
+  ,ownname       : string
+  ,Name          : string
+  ,KatNotesName  : string
+  ,vPlanName     : string
+  ,StartDate     : date
+  ,EndDate       : date
+  ,cMnPlan       : comp
+  ,cVPlan        : comp
+  ,SchDt         : string
+  ,SubSchDt      : string
+  ,dSummRaspr    : double
+)
+with index
+(
+  i01 = ownname + cMnPlan
+  ,i02 = ownname + cVPlan
+);
+Table Struct tmpHrs
+(
+    cPodr   : comp
+  , cMnPlan : comp
+  , ownname : string
+  , clSchet : comp
+  , sTabN   : string
+  , sFIO    : string
+  , dTabHrs : double
+  , dNarHrs : double
+  , SummZP         : double
+  , SummRaspr      : double
+  , SummItogZP     : double
+  , SummItogRaspr  : double
+  , SummR          : double
+  , dTabHrsItog    : double
+  , wOtkuda        : word
+)
+with index
+(
+    i01 = ownname + cMnPlan + cPodr
+  , i02 = ownname + clSchet + cMnPlan
+);
+
+Create View rView
+
+var
+  oIGK_Dog         : iIGK_Dog;
+  iStrFunc         : StringFunctions;
+  PE               : IPaymentEnterings;    // проверго входимоздей
+  refAttrTablePick : AttrTablePick;
+  iExAttr          : iExtAttr;
+  CS               : IContextSession;
+  _log           : string = '';
+  _dOtch         : date;
+  _dEnd          : date;
+  _sPeriod       : string;
+  _sPodr, _sMnPlan  : string;
+  _cPodr, _cMnPlan  : comp;
+  KL_code   : word;
+  KL_on     : string;
+  DliaTest  : word;
+  _getKau : GetKau;
+cgrplan : comp;
+  Filter_mPodr,
+  Filter_Marker   : TPtr;
+  tmpMarker:                    TPtr;
+As
+
+//select
+//  if(GetMarkerCount(KategMarker) > 0,selected,notSelected) (FieldName = FiltrKateg),
+//  if( tmpVPlan.cVPlan = comp(coVirtualcVPlan), 'Прямые, не ГОЗ', vPlanItog.Name)        (FieldName = svPlanItog)
+from
+  KatPodr
+, KatPodr KatPodrName
+, MnPlan
+, FpPeriod
+, tmpHrs
+, tmpHrs tmpHrsLsch
+, tmpVPlan
+, tmpMnPlan
+, tmpMnPlan tmpMnPlanLsch
+//, tmpMnPlan tmpMnPlanSch
+, lSchet
+, Persons
+, Sys_Nar
+, PrNaryad
+, LastNumD
+//, BuhSchet
+//, vplan
+//, KLKATEGO
+//, vPlan     vPlanItog
+//, vPlan     vPlanFiltr
+, KatNotes
+, KatLink   KatLinkPodr
+, KatLink   KatLinkPodrAll
+, KatLink   KatLinkMnPlan
+, tmpMnPlan tmpMnPlanAll
+, KatLink   KatLinkLsch
+, tmpHrs    tmpHrsSumm
+, tmpHrs    tmpHrsItogZP
+, tmpMnPlan tmpMnPlanItogRaspr
+, tmpHrs    tmpHrsItogRaspr
+, tmpVPlan  tmpVPlanI
+, tmpMnPlan tmpMnPlanI
+, tmpHrs    tmpHrsI
+, sumvidop
+, nachisl
+, katlink
+where((
+comp(2814749767106805) == mnplan.CSTATUS (noIndex)//Утвержден
+and             KL_on == tmpMnPlan.ownname
+and tmpVPlan.cVPlan   == tmpMnPlan.cVPlan
+
+and         coKatPodr == KatLinkPodr.codeTable
+and           KL_code == KatLinkPodr.code
+and             KL_on == KatLinkPodr.ownname
+and tmpMnPlan.cMnPlan == KatLinkPodr.CUSER (noIndex)
+
+and KatLinkPodr.CREC  == KatPodrName.Nrec
+
+and          coMnPlan == KatLinkMnPlan.codeTable
+and           KL_code == KatLinkMnPlan.code
+and             KL_on == KatLinkMnPlan.ownname
+and tmpMnPlan.cMnPlan == KatLinkMnPlan.CUSER (noIndex)
+
+AND KL_on             == tmpHrs.ownname
+and KatLinkPodr.CUSER == tmpHrs.cMnPlan
+and KatLinkPodr.CREC  == tmpHrs.cPodr
+
+and KL_on             == KatLinkLsch.ownname
+AND KL_on             == tmpMnPlanLsch.ownname
+AND KL_on             == tmpHrsLsch.ownname
+
+AND KL_on                == tmpMnPlanAll.ownname
+
+and            coKatPodr == KatLinkPodrAll.codeTable
+and              KL_code == KatLinkPodrAll.code
+and                KL_on == KatLinkPodrAll.ownname
+and tmpMnPlanAll.cMnPlan == KatLinkPodrAll.CUSER (noIndex)
+
+//AND KL_on                == tmpMnPlanAll.ownname
+//and KatLinkPodrAll.CUSER == tmpMnPlanAll.cMnPlan
+
+AND KL_on                == tmpHrsSumm.ownname
+
+AND tmpHrsSumm.ownname   == tmpHrsItogZP.ownname
+AND tmpHrsSumm.clSchet   == tmpHrsItogZP.clSchet
+AND tmpHrsSumm.cMnPlan   == tmpHrsItogZP.cMnPlan
+
+and             KL_on    == tmpMnPlanItogRaspr.ownname
+AND             KL_on    == tmpHrsItogRaspr.ownname
+AND tmpHrsSumm.clSchet   == tmpHrsItogRaspr.clSchet
+AND tmpMnPlanItogRaspr.cMnPlan  == tmpHrsItogRaspr.cMnPlan
+
+and             KL_on    == tmpMnPlanI.ownname
+and tmpVPlanI.cVPlan     == tmpMnPlanI.cVPlan
+AND             KL_on    == tmpHrsI.ownname
+and tmpMnPlanI.cMnPlan   == tmpHrsI.cMnPlan
+))
+;
+
+Screen scr1 'Наряды с зеленой полосой' (,,sci13Esc);
+Show At(,,,3);
+
+Fields
+
+  _dOtch    ('Текущий период')          : [7,'MM/YYYY'], NoProtect;
+
+Buttons
+  cmOk    ,,,'Сформировать',,sci1Esc;
+  cmValue1,,,'Сформировать',,sci1Esc;
+  cmValue2,,,'Удалить',,sci1Esc;
+  cmCancel,,,'Отмена'      ,,sci1Esc;
+<<
+ Текущий период.@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ <. Сформировать расчет по сотрудникам.> <. Сформировать наряды.> <. Удалить наряды.> <. Отмена .>
+>>
+End; //scr1
+Browse tmpVPlanBr;
+  Show at (, 4,,6);
+  Table tmpVPlan;
+Fields
+  tmpVPlan.Name                                   'Тема'                            ('Наименование темы'               ,,sci1Esc)  : [50], Protect;
+//  tmpVPlan.dSumRaspFactS + tmpVPlan.dSumRaspFactO 'Итоговая сумма выплаты'              ('Итоговая сумма выплаты'          ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpVPlan.dSumRaspPlan                           'Плановая сумма распределения'        ('Плановая сумма распределения'    ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], noProtect;
+//  tmpVPlan.dSumRaspFactS                          'Факт. сумма распределения прямых'    ('Фактическая сумма распределения' ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpVPlan.dSumRaspFactO                          'Факт. сумма распределения накладных' ('Фактическая сумма распределения' ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect,
+                                                  {Font = {BackColor = if(tmpVPlan.dSumRaspFactO > tmpVPlan.dSumRaspPlan, ColorError, 0)}};
+//  tmpVPlan.cVPlan                      'tmpVPlan.cVPlan'                       ('Nrec темы'               ,,sci1Esc)  : [20], Protect;
+End;
+
+PANEL tmpMnPlanPan;
+  Show at (, 7,,11);
+  Table tmpMnPlan;
+Browse tmpMnPlanBr;
+Fields
+    tmpMnPlan.Number       'Номер'                             : [10], Protect;
+    tmpMnPlan.Name         'Производственные заказы ...'       : [35], Protect;
+    tmpMnPlan.KatNotesName 'Статус'                            : [15], Protect;
+    tmpMnPlan.vPlanName    'Группа'                            : [15], Protect;
+    tmpMnPlan.StartDate    'Дата начала'('Дата начала',,)      :[10], Protect, NoDel;
+    tmpMnPlan.EndDate      'Дата окончания'('Дата окончания',,):[10], Protect, NoDel;
+    tmpMnPlan.dSummRaspr   'Сумма к распределению'('Сумма к распределению',,scint):[10, '\2p[|-]36`666`666`666`666`666.88'], noProtect, NoDel;
+//    tmpMnPlan.cVPlan                      'tmpMnPlan.cVPlan'                       ('Nrec темы'               ,,sci1Esc)  : [20], Protect;
+//    tmpMnPlan.cMnPlan                      'tmpMnPlan.cMnPlan'                   ('Nrec темы'               ,,sci1Esc)  : [20], Protect;
+End;
+HandleEvent     // панель
+cmUpdateRecord:
+  {
+  }
+cmDeleteRecord :
+{
+}
+
+end; // of HandleEvent panMemoTbl
+End;
+
+Browse KatLinkPodrBr;
+  Show at (, 12,,16);
+  Table KatLinkPodr;
+Fields
+  KatPodrName.KOD                       'Код подразделения'               ('Код подразделения'           ,,sci13Esc)  : [10], Protect, PickButton;
+  KatPodrName.Name                      'Подразделение'                   ('Подразделение'               ,,sci13Esc)  : [50], Protect, PickButton;
+//  KatLinkPodr.CUSER                     'KatLinkPodr.CUSER(cMnPlan)'                       ('Nrec темы'               ,,sci1Esc)  : [20], Protect;
+//  KatLinkPodr.CREC                      'KatLinkPodr.CREC(cPodr)'                       ('Nrec темы'               ,,sci1Esc)  : [20], Protect;
+//  KatPodrName.Code                      'KatPodrName.Code'                       ('Nrec темы'               ,,sci1Esc)  : [20], Protect;
+End;
+
+Browse tmpHrsBr;
+  Show at (, 17,,);
+  Table tmpHrs;
+Fields
+  tmpHrs.sTabN                      'Табельный номер'               ('Табельный номер'          ,,sci1Esc)  : [10], Protect;
+  tmpHrs.sFIO                       'ФИО'                           ('ФИО'                      ,,sci1Esc)  : [35], Protect;
+  tmpHrs.SummZP                     'Сумма ЗП'                      ('Сумма ЗП'                 ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpHrs.SummRaspr                  'Сумма к распр.'                ('Сумма к распределению'    ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpHrs.SummItogZP                 'Итого сотр. на зак.'           ('Итого сотрудник на заказе',,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpHrs.SummItogRaspr              'Сумма ЗП к распр. зак.'        ('Сумма ЗП к распр заказов' ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpHrs.SummR                      'Расч. значение'                ('Расчетное значение'       ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpHrs.dTabHrs                    'Раб. часы'                     ('Раб. часы'                ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+  tmpHrs.dTabHrsItog                'Раб. часы по зак.'             ('Раб. часы по зак.'        ,,sci1Esc)  : [10, '\2p[|-]36`666`666`666`666`666.88'], Protect;
+//  tmpHrs.cPodr                      'tmpHrs.cPodr'                  ('Подразделение'               ,,sci1Esc)  : [50], Protect;
+End;
+
+Function GetBuhschetByMnPlan:comp;
+{  Result:=0;
+   if MNPLAN.WKODGR1=5063
+   { Result :=MNPLAN.CANVAL1;
+   }
+   else
+   if MNPLAN.WKODGR2=5063
+   { Result :=MNPLAN.CANVAL2;
+   }
+} //Function GetBuhschetByMnPlan:comp;
+
+Procedure MyLog(_str: string);
+{
+  if _log = '' then _log := 'GreenForm' + DateToStr(cur_date,'_YYYYMMDD') + timetostr(cur_time,'_HHMMSS') + '.log';
+  LogStrToFile(_log, _str);
+}
+
+Procedure MysqlAddStr(var query_handle: longInt; add_query_str: string);
+{
+  sqlAddStr(query_handle, add_query_str);
+  MyLog('sql: ' + add_query_str);
+}
+
+Procedure DelPick(_w : word; _s : string);
+{
+  var objQuery: iQuery;
+  var strID   : LongInt;
+
+  sqlFreeStr(strID);
+  strID := 0;
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Очистка фильтра', 0);
+
+  MysqlAddStr(strID, ' delete from ' + _s + ' where wKau = ' + string(_w));
+
+  objQuery := queryManager.createQuery(strID);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка очистки ' + _s + ' (DelPick) ' + objQuery.errorCode,error);
+    StopVisual;
+    Exit;
+  }
+  StopVisual;
+}
+
+Procedure InsPick(_w : word; _s : string; _c : comp);
+{
+  var objQuery: iQuery;
+  var strID   : LongInt;
+
+  sqlFreeStr(strID);
+  strID := 0;
+
+  MysqlAddStr(strID, ' insert ' + _s + ' (wKau, cRec)                                                                         ');
+  MysqlAddStr(strID, ' select ' + string(_w) + ', #comp(' + string(_c) + ')                                                   ');
+  MysqlAddStr(strID, ' where #comp(' + string(_c) + ') not in (select cRec from ' + _s + ' where wKau = ' + string(_w) + ' )  ');
+
+  objQuery := queryManager.createQuery(strID);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка заполнения ' + _s + ' (InsPick) ' + objQuery.errorCode,error);
+    Exit;
+  }
+  sqlFreeStr(strID);
+}
+
+Procedure CreateTmpFlt();
+{
+  var objQuery: iQuery;
+  var strID   : LongInt;
+
+  strID := 0;
+  sqlFreeStr(strID);
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Создание временной таблицы для фильтров', 0);
+
+  MysqlAddStr(strID, ' table tmpFlt21');
+  MysqlAddStr(strID, ' (                      ');
+  MysqlAddStr(strID, '     wKau : word        ');
+  MysqlAddStr(strID, '   , cRec : comp        ');
+  MysqlAddStr(strID, ' )                      ');
+  MysqlAddStr(strID, ' with index             ');
+  MysqlAddStr(strID, ' (                      ');
+  MysqlAddStr(strID, '     i01 = wKau + cRec  ');
+  MysqlAddStr(strID, ' );                     ');
+
+  sqlDropTmpTable('tmpFlt21');
+
+  if sqlCreateTmpTable(strID, ctmNormal) <> tsOk
+  {
+    Message('Ошибка создания временной таблицы (CreateTmpFlt) tmpFlt21', error);
+    StopVisual;
+    Exit;
+  }
+
+  sqlFreeStr(strID);
+  StopVisual;
+}
+
+Function GetNarHrs(_c : comp) : double;
+{
+  var dNar : double = 0.0;
+  var qStr : longint = 0;
+  var oResultSet : IResultSet;
+
+  sqlFreeStr(qStr);
+
+  MysqlAddStr(qStr, ' select                                                                                             ');
+  MysqlAddStr(qStr, '   sum(prnaryad.chasf) as dNar                                                                      ');
+  MysqlAddStr(qStr, ' from sys_nar                                                                                       ');
+  MysqlAddStr(qStr, ' inner join prnaryad on sys_nar.nrec = prnaryad.mnrec                                               ');
+  MysqlAddStr(qStr, ' where prnaryad.tperson = #comp(' + string(_c) + ')                                                 ');
+  MysqlAddStr(qStr, '       and sys_nar.datan >= #date(' + Day(_dOtch) + ', ' + Month(_dOtch) + ', ' + Year(_dOtch) + ') ');
+  MysqlAddStr(qStr, '       and sys_nar.datok <= #date(' + Day(_dEnd)  + ', ' + Month(_dEnd)  + ', ' + Year(_dEnd)  + ') ');
+  MysqlAddStr(qStr, '       and sys_nar.choice = 3                                                                       ');
+
+  var objQuery: iQuery;
+      objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка определения часов по нарядам '+ objQuery.errorCode,error);
+    sqlFreeStr(qStr);
+    result := 0.0;
+  }
+  else
+  {
+    oResultSet := objQuery.getResultSet;
+    if (oResultSet.getFirst = tsOk) then
+    {
+      dNar := oResultSet.row.val('dNar');
+    }
+    sqlFreeStr(qStr);
+    result := dNar;
+  }
+}
+//  верхний брауз интерфейса. Собран из уникальных vplan
+//  при условии наличия у них ссылки на счет, который имеет ИГК
+Procedure Fill_tmpVPlan;
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Сбор тем гос. заказов', 0);
+  delete all tmpVPlan;
+//  _loop vPlanFiltr
+//  {
+//    if FoundMarker(GrPlMarker, vPlanFiltr.Nrec)
+//    {
+      ClearBuffer(#tmpVPlan);
+      tmpVPlan.Name          := 'Тематический заказ по 20 счету (утвержден)';
+      tmpVPlan.cVPlan        := comp(coVirtualcVPlan);
+      Insert Current tmpVPlan;
+//    }
+//  }
+/*
+  _Loop tmpVPlan
+  {
+    if (tmpVPlan.cVPlan = comp(coVirtualcVPlan)) then
+    {
+      continue;
+    }
+    if ( oIGK_Dog.GetFullIGKByBank(tmpVPlan.cBankSch) = '' ) then
+    {
+      Delete Current tmpVPlan;
+    }
+  }
+*/
+  StopVisual;
+}
+
+Procedure GetItog();
+{
+  _loop tmpHrsSumm
+  {
+    _loop tmpHrsItogZP
+    {
+      tmpHrsSumm.SummItogZP     += tmpHrsItogZP.SummZP;
+    }
+
+    _loop tmpMnPlanItogRaspr
+    {
+      if getfirst fastfirstrow tmpHrsItogRaspr = tsok
+        tmpHrsSumm.SummItogRaspr  += tmpMnPlanItogRaspr.dSummRaspr;
+    }
+
+    tmpHrsSumm.SummR             += tmpHrsSumm.SummZP*tmpHrsSumm.SummZP/tmpHrsSumm.SummItogZP*tmpHrsSumm.SummRaspr/tmpHrsSumm.SummItogRaspr;
+
+    tmpHrsSumm.dTabHrsItog := tmpHrsSumm.SummR/tmpHrsSumm.SummZP*tmpHrsSumm.dTabHrs;
+
+    update Current tmpHrsSumm;
+  }
+  
+  _loop tmpVPlanI
+  {
+    tmpVPlanI.dSumRaspPlan := 0; 
+  //  tmpVPlanI.dSumRaspFactS
+    tmpVPlanI.dSumRaspFactO := 0;  
+  
+    _loop tmpMnPlanI
+    {
+      tmpVPlanI.dSumRaspPlan += tmpMnPlanI.dSummRaspr; 
+  
+      _loop tmpHrsI
+      {
+        tmpVPlanI.dSumRaspFactO += tmpHrsI.SummR;  
+      }
+    }
+    update Current tmpVPlanI;
+  }
+}
+
+Procedure Fill_tmpMnPlan;
+{
+  StartNewVisual(vtIndicatorVisual, vfTimer+vfBreak+vfConfirm, 'Сбор заказов', RecordsInTable(#mnplan));
+  delete all tmpMnPlanLsch;
+/*
+  var qStr : longint = 0;
+
+  sqlFreeStr(qStr);
+
+  MysqlAddStr(qStr, ' select                                                        ');
+  MysqlAddStr(qStr, '   MnPlan.nrec  as cMnPlan                                ');
+  MysqlAddStr(qStr, '   ,tmpVPlan.cVPlan  as сVPlan                                 ');
+  MysqlAddStr(qStr, ' from MnPlan                                                   ');
+  MysqlAddStr(qStr, ' inner join tmpVPlan on MnPlan.cvplan = tmpVPlan.cVPlan        ');
+
+  var objQuery: iQuery;
+      objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка поиска заказов (Fill_MnPlan) '+ objQuery.errorCode, Error);
+    sqlFreeStr(qStr);
+    StopVisual;
+    Exit;
+  }
+  else
+  {
+    sqlCopyInto(objQuery, tntmpMnPlan, true);
+  }
+*/
+  ClearMarker(tmpMarker);
+
+    _loop MnPlan
+    {
+       if not NextVisual break;
+//       if mnplan.CSTATUS=comp(3096224743817243) or mnplan.CSTATUS=comp(2814749767106996)// or mnplan.CSTATUS=comp(2814749767106805)//завершенный и Завершен Утвержден
+    
+       if GetBuhschetByMnPlan != comp(00010000000002BCh)
+         continue;
+
+       if not iStrFunc.isCrossPeriod(if(Day(MnPlan.StartDate)>0,MnPlan.StartDate,date(1,Month(_dOtch),Year(_dOtch)))
+                                     , if(Day(MnPlan.EndDate)>0,MnPlan.EndDate,Date(Last_Day(date(1,Month(_dOtch),Year(_dOtch))),Month(_dOtch),Year(_dOtch)))
+                                     , date(1,Month(_dOtch),Year(_dOtch)), Date(Last_Day(date(1,Month(_dOtch),Year(_dOtch))),Month(_dOtch),Year(_dOtch)))
+         continue;
+    
+       ClearBuffer(#tmpMnPlan);
+       tmpMnPlan.ownname       := KL_on;
+       tmpMnPlan.Number        := MnPlan.Number;
+       tmpMnPlan.Name          := MnPlan.Name  ;
+       tmpMnPlan.Name          := MnPlan.Name  ;
+    
+       if getfirst fastfirstrow KatNotes where((mnplan.CSTATUS == KatNotes.NRec))=tsOk
+         tmpMnPlan.KatNotesName  := KatNotes.Name;
+    
+//       if getfirst fastfirstrow vplan where((mnplan.cvplan  == vplan.nrec))=tsOk
+       tmpMnPlan.vPlanName     := 'Тематический заказ по 20 счету (утвержден)';//vPlan.Name   ;
+    
+       tmpMnPlan.StartDate      := MnPlan.StartDate;
+       tmpMnPlan.EndDate        := MnPlan.EndDate;
+    
+       tmpMnPlan.cVPlan        := tmpVPlan.cVPlan;
+       tmpMnPlan.cMnPlan       := MnPlan.Nrec;
+
+//       if GetBuhschetByMnPlan = comp(00010000000002BCh)
+       tmpMnPlan.SchDt         := '20';
+       tmpMnPlan.SubSchDt      := '';
+
+       if getfirst fastfirstrow KatLinkMnPlan =tsOk
+         tmpMnPlan.dSummRaspr := double(KatLinkMnPlan.Name);
+
+       Insert Current tmpMnPlan;
+
+       if not FoundMarker(tmpMarker, tmpMnPlan.cMnPlan)
+         InsertMarker(tmpMarker, tmpMnPlan.cMnPlan);
+    }
+
+  _loop tmpMnPlan
+  {
+    _loop KatLinkMnPlan
+    {
+      if not FoundMarker(tmpMarker, KatLinkMnPlan.CUSER)
+      {
+        delete Current KatLinkMnPlan;
+      }
+    }
+  }
+
+  _loop KatLinkLsch
+  {
+    if not FoundMarker(tmpMarker, KatLinkPodrAll.CUSER)
+      delete Current KatLinkLsch;
+  }
+
+  _loop tmpHrsLsch
+  {
+    if not FoundMarker(tmpMarker, tmpHrs.cMnPlan)
+      delete Current tmpHrsLsch;
+  }
+
+  GetItog();
+
+  StopVisual;
+}
+
+Procedure GetTabHrs();
+{
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Сформирование расчета по сотрудникам', RecordsInTable(#tmpMnPlanAll));
+  delete all tmpHrsLsch;
+
+intinit;
+
+  var dH : double = 0.0;
+  if (InitWorkingTable)
+  {
+  _Loop tmpMnPlanAll
+  {
+
+    if not NextVisual
+      break;
+
+    _Loop KatLinkPodrAll
+    {
+//      if (getFirst KatPodr where ((KatLinkPodrAll.CREC == KatPodr.nRec)) = tsOk) {}
+
+      StartNewVisual(vtRotateVisual, vfTimer, 'Обработка лицевых счетов'#13 +
+                                              'Подразделение ' + KatLinkPodrAll.NAME  , 0);
+
+      _Loop lSchet where ((KatLinkPodrAll.CREC == lSchet.Cex))
+      {
+
+//        if getfirst klkatego where((Lschet.Kateg == klkatego.Kod)) = tsOk
+//          if not FoundMarker(KategMarker, klkatego.Nrec)
+        if LSCHET.CSCHETD = ''
+          displ('[-] У табельного номера '+lSchet.StrTabn+' в ЛС отсутствует счет отнесения затрат');
+
+        if LSCHET.CSCHETD != '20'
+          continue;
+
+        if lschet.datuv = date(0, 0, 0) or lschet.datuv >= _dOtch
+        {
+        dH := 0.0;
+        if (LoadWorkingTable(lSchet.nRec, Month(_dOtch), Year(_dOtch)) = 0)
+        {
+//          dh := GetNarHrs(lSchet.tPerson);
+//          if (dH = 0.0) then
+//          {
+//            continue;
+//          }
+//          else
+//          {
+//message(lSchet.StrTabN+'/'+KatLinkPodrAll.Name)
+            ClearBuffer(#tmpHrs);
+              tmpHrs.ownname := KatLinkPodrAll.ownname;
+              tmpHrs.cPodr   := KatLinkPodrAll.CREC;
+              tmpHrs.cMnPlan := KatLinkPodrAll.CUSER;
+
+              tmpHrs.clSchet := lSchet.nRec;
+              tmpHrs.sTabN   := lSchet.StrTabN;
+
+              if getfirst fastfirstrow Persons where((lSchet.tPerson  == Persons.nrec))=tsOk
+                tmpHrs.sFIO  := Persons.FIO;
+
+              tmpHrs.dTabHrs := WT_GetHoursBwDates(hkWorking, 0, 0, stActual, _dOtch, _dEnd);
+//              tmpHrs.dNarHrs := dH;
+
+              tmpHrs.SummZP  := 0;
+_loop sumvidop where((Year(_dOtch)  == sumvidop.YearV
+                  and Month(_dOtch) == sumvidop.MesV 
+                  and lSchet.nRec   == sumvidop.CLSCH
+                  and lSchet.Cex    == sumvidop.CEXOZ))
+{
+  if PE.HasEntering(SUMVIDOP.VIDOPL, PE.GetEntering(egCalculations, peShareCosts))// Разбивать по затратным счетам
+    tmpHrs.SummZP += SUMVIDOP.SUMMA;
+  tmpHrs.wOtkuda := 0;
+}
+_loop Nachisl where((Year(_dOtch)  == Nachisl.YearV
+                  and Month(_dOtch) == Nachisl.MesV 
+                  and lSchet.nRec   == Nachisl.CLSCH
+                  and lSchet.Cex    == Nachisl.CEXOZ))
+{
+  if PE.HasEntering(Nachisl.VIDOPLS, PE.GetEntering(egCalculations, peShareCosts))// Разбивать по затратным счетам
+    tmpHrs.SummZP += Nachisl.SUMMA;
+  tmpHrs.wOtkuda := 1;
+}
+
+              tmpHrs.SummRaspr := tmpMnPlanAll.dSummRaspr;
+
+if tmpHrs.SummZP != 0
+            Insert Current tmpHrs;
+//          }
+        }
+        }//if lschet.datuv = date(0, 0, 0) or lschet.datuv >= _dOtch
+      }
+      StopVisual;
+    }
+  }
+  }
+  DoneWorkingTable;
+
+exitProc;
+
+  GetItog();
+  StopVisual;
+}
+
+Procedure CreateHead();
+{
+  var _s : string = '';
+
+  if (getFirst LastNumD where ((2003 == LastNumD.LndType)) = tsOk) then
+  {
+    _s := LastNumD.LndNum;
+  }
+
+  Update Current LastNumD Set LastNumD.LndNum := '0' + String(LongInt(_s) + 1);
+
+
+  ClearBuffer(#Sys_Nar);
+    Sys_Nar.nRec    := 0h;
+    Sys_Nar.MNREC   := LongInt(_s) + 1;
+    Sys_Nar.NMNEM   := 'Наряд №' + String(LongInt(_s) + 1);
+    Sys_Nar.NMPODR  := TimeToStr(Cur_Time(), 'HH:MM:SS');
+//    Sys_Nar.CEX     := KatLinkPodrAll.CREC;
+    Sys_Nar.PRKAUOT := 3;
+    Sys_Nar.CHOICE  := 3;
+    Sys_Nar.DATAN   := _dOtch;
+    Sys_Nar.DATOK   := _dEnd;
+  Insert Current Sys_Nar;
+
+//  coSetAttr(coSys_Nar, Sys_Nar.nRec, '.Причина несоответствия' , 000A00000000037Ah, 'Указание причины не требуется');
+//  coSetAttr(coSys_Nar, Sys_Nar.nRec, '.Шифр затрат на качество', 000A000000000F12h, 'Затраты на качество отсутствуют');
+//  coSetAttr(coSys_Nar, Sys_Nar.nRec, 'Общий код брака'         , 0001000000000948h, 'Указание кода брака не требуется');
+
+  sSetAttr(coSys_Nar, Sys_Nar.nRec, '.СистемаИсточник', 'Отчет');
+  dSetAttr(coSys_Nar,SYS_NAR.nrec,'Дата создания наряда',cur_date)
+}
+
+Procedure CreateBody();
+{
+  if ((tmpHrs.dTabHrs - tmpHrs.dNarHrs) <= 0.0) then
+  {
+    Exit;
+  }
+  ClearBuffer(#PrNaryad);
+    PrNaryad.nRec       := 0h;
+    if tmpHrs.wOtkuda = 1
+    {
+//      PrNaryad.CHOICE     := 3;
+      Sys_Nar.CHOICE      := 3;
+      update current Sys_Nar;
+    }
+    else
+    {
+//      PrNaryad.CHOICE     := 203;
+      Sys_Nar.CHOICE      := 203;
+      update current Sys_Nar;
+    }
+    PrNaryad.CEXOZ      := KatLinkPodrAll.CREC;
+    PrNaryad.CPODR      := lSchet.cAppoint;
+    PrNaryad.MNREC      := Sys_Nar.nRec;
+    PrNaryad.VIDOPL     := 7;
+    PrNaryad.VIDPREM    := 7;
+    PrNaryad.MES        := Month(_dOtch);
+    PrNaryad.DATAN      := _dOtch;
+    PrNaryad.DATOK      := _dEnd;
+    PrNaryad.CHASF      := tmpHrs.dTabHrsItog;
+//    PrNaryad.CHASF      := tmpHrs.dTabHrs - tmpHrs.dNarHrs;
+    PrNaryad.SISOPL     := lSchet.SisOpl;
+    PrNaryad.TARIF      := lSchet.Tarif;
+
+//    if (getFirst tmpMnPlanSch where((                KL_on == tmpMnPlanSch.ownname
+//                                  and KatLinkPodrAll.CUSER == tmpMnPlanSch.cMnPlan)) = tsOk) 
+//      PrNaryad.CSCHETD  := tmpMnPlanSch.SchDt;
+PrNaryad.CSCHETD   := tmpMnPlanAll.SchDt;
+PrNaryad.CSUBSCHD  := tmpMnPlanAll.SubSchDt;
+
+    PrNaryad.CKAUD[1]	:= KatLinkPodrAll.CUSER;
+    PrNaryad.TBLD[1]	:= 7;
+    PrNaryad.TBLD[2]	:= 13;
+    PrNaryad.TBLD[3]	:= 5017;
+    PrNaryad.TBLD[4]	:= 10044;
+    PrNaryad.TBLD[5]	:= 10000;
+//    PrNaryad.NRMTIME	:= tmpHrs.dTabHrs - tmpHrs.dNarHrs;
+    PrNaryad.NRMTIME	:= tmpHrs.dTabHrsItog;
+    PrNaryad.CLSCH	:= lSchet.nRec;
+    PrNaryad.TPERSON	:= lSchet.tPerson;
+    PrNaryad.STRTABN	:= lSchet.strTabN;
+
+  Insert Current PrNaryad;
+
+  Update Current PrNaryad Set PrNaryad.CKAUD[6] := PrNaryad.nRec;
+}
+
+Procedure FullClearBody();
+{
+
+        StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Создание нарядов', RecordsInTable(#tmpMnPlanAll));
+        _Loop tmpMnPlanAll
+        {
+          if not NextVisual
+            break;
+        
+          if isValid(#KatLinkPodrAll)
+            CreateHead();
+          _Loop KatLinkPodrAll
+          {
+            StartNewVisual(vtRotateVisual, vfTimer, 'Создание нарядов'#13 +
+                                                    'Подразделение ' + KatLinkPodrAll.Name  , 0);
+            _Loop tmpHrs where (( KatLinkPodrAll.ownname == tmpHrs.ownname
+                              and KatLinkPodrAll.CUSER   == tmpHrs.cMnPlan
+                              and KatLinkPodrAll.cRec    == tmpHrs.cPodr))
+            {
+              if (getFirst lSchet where ((tmpHrs.clSchet == lSchet.nRec)) = tsOk)
+              {
+                CreateBody();
+              }
+            }
+            StopVisual;
+          
+          }
+        }
+        StopVisual;
+
+}
+
+Procedure DeleteBody();
+{
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Удаление нарядов', RecordsInTable(#Sys_Nar));
+  _loop Sys_Nar
+  {
+
+    if not NextVisual
+      break;
+
+    if 3 != Sys_Nar.CHOICE and 203 != Sys_Nar.CHOICE
+      continue;
+
+    if not (sGetAttr(coSys_Nar, Sys_Nar.nRec, '.СистемаИсточник') = 'Отчет')
+      continue;
+
+    if not iStrFunc.isCrossPeriod(Sys_Nar.DATAN, Sys_Nar.DATOK, _dOtch, _dEnd)
+      continue;
+
+    _loop PrNaryad where((Sys_Nar.nRec == PrNaryad.MNREC))
+    {
+      delete current PrNaryad;
+    }
+
+    DeleteAllAttr(coSys_Nar, Sys_Nar.nRec);
+    delete current SYS_NAR;
+
+  }
+  StopVisual('',0);
+
+}
+
+HandleEvent
+cmInit:
+{
+  DliaTest := 0;
+
+  GetVipRef(PE, 'PaymentEnterings');
+
+  var CL: ContextList;
+  if not CL.Add(CS, 'WorkingTable')
+  {
+    abort;
+    exit;
+  }
+  Filter_mPodr := InitMarker('', 8, 100, 10);
+  tmpMarker    := InitMarker('', 8, 100, 10);
+  _sPeriod := sGetTune('NPOEM_OWN.ZP.DATOTCHZAK');
+  _dOtch := dGetTune('NPOEM_OWN.ZP.DATOTCHZAK');
+
+  KL_code   := 35184;
+  KL_on     := 'SR00035184('+DateToStr(_dOtch, 'MM/YYYY')+')';
+
+
+  if (getFirst FpPeriod where ((_dOtch == FpPeriod.dBeg and 4h == FpPeriod.ctPer)) = tsOk) then
+  {
+    set _dEnd := FpPeriod.dEnd;
+  }
+
+  if day(_dEnd)=0
+    set _dEnd := date(Last_Day(_dOtch),Month(_dOtch),year(_dOtch));
+
+  Fill_tmpVPlan;
+
+  Fill_tmpMnPlan;
+
+  if (getFirst tmpVPlan = tsOk) {}
+  if (getFirst tmpMnPlan = tsOk) {}
+}
+
+cmCheckField :
+{
+  case curField of
+   #_dOtch:
+   {
+     KL_on     := 'SR00035184('+DateToStr(_dOtch, 'MM/YYYY')+')';
+     Fill_tmpMnPlan;
+     if (getFirst tmpVPlan = tsOk) {}
+     if (getFirst tmpMnPlan = tsOk) {}
+   }
+   #tmpMnPlan.dSummRaspr:
+   {
+    Update Current tmpMnPlan;
+    RereadRecord(#tmpMnPlan);
+    if (getFirst KatLink where ((     coMnPlan         == KatLink.codeTable
+                                  and KL_code           == KatLink.code     
+                                  and KL_on             == KatLink.ownname  
+                                  and tmpMnPlan.cMnPlan == KatLink.CUSER(NoIndex))) != tsOk)
+    {
+      ClearBuffer(#KatLink);
+      KatLink.codeTable := coMnPlan         ;
+      KatLink.code      := KL_code          ;
+      KatLink.ownname   := KL_on            ;
+      KatLink.CUSER     := tmpMnPlan.cMnPlan;
+//      KatLink.CREC      := KatPodr.nRec     ;
+      KatLink.Name      := string(tmpMnPlan.dSummRaspr);
+      Insert Current KatLink;
+    }
+    else
+    {
+      KatLink.Name      := string(tmpMnPlan.dSummRaspr);
+      Update Current KatLink;
+    }
+   }
+  end;
+
+  ReReadRecord;
+  ReReadRecord(#tmpHrs);
+  ReReadRecord(#KatLinkPodr);
+  ReReadRecord(#tmpMnPlan);
+  ReReadRecord(#tmpVPlan);
+
+  ReDrawPanel(#tmpVPlan);
+  ReDrawPanel(#tmpMnPlan);
+  ReDrawPanel(#KatLinkPodr);
+  ReDrawPanel(#tmpHrs);
+}           // curfield
+
+cmPick:
+{
+  var _i : longint;
+  case CurField of
+/*
+    #FiltrKateg:
+    {
+      runinterface(Z_ZAR::PickKat1,0,KategMarker,vfMultipleSelection);
+    }
+*/
+    #KatPodrName.Kod,#KatPodrName.Name:
+    {
+
+      _cPodr := KatLinkPodr.CREC;
+      ClearMarker(Filter_mPodr);
+      PushPos(tnKatLinkPodr);
+      _loop KatLinkPodr
+      {
+        if not FoundMarker(Filter_mPodr, KatLinkPodr.CREC)
+          InsertMarker(Filter_mPodr, KatLinkPodr.CREC);
+      }
+      PopPos(tnKatLinkPodr);
+
+      var lMarker : TPtr;
+      lMarker := InitMarker(iGetKau.GetMarkerName(cgKau_KatPodr), 8, 100, 100);
+      CopyMarker(lMarker, Filter_mPodr);
+      DoneMarker(lMarker, iGetKau.GetMarkerName(cgKau_KatPodr));
+
+      if (iGetKau.GetCodeKau(cgiMulti + cgiNotClear + cgiNotEdit, cgKau_KatPodr, _cPodr) > 0)
+      {
+        lMarker := InitMarker(iGetKau.GetMarkerName(cgKau_KatPodr), 8, 100, 100);
+        CopyMarker(Filter_mPodr, lMarker);
+
+        _i             := 0;
+        while getmarker(lMarker, _i, _cPodr)
+        {
+          //InsPick(cgKau_KatPodr, 'tmpFlt21', _cPodr);
+          if (getFirst KatPodr where ((_cPodr == KatPodr.nRec)) = tsOk) then
+          {
+            if (getFirst KatLink where ((     coKatPodr         == KatLink.codeTable
+                                          and KL_code           == KatLink.code     
+                                          and KL_on             == KatLink.ownname  
+                                          and tmpMnPlan.cMnPlan == KatLink.CUSER(NoIndex)
+                                          and KatPodr.nRec      == KatLink.CREC(NoIndex))) != tsOk)
+            {
+              ClearBuffer(#KatLink);
+              KatLink.codeTable := coKatPodr        ;
+              KatLink.code      := KL_code          ;
+              KatLink.ownname   := KL_on            ;
+              KatLink.CUSER     := tmpMnPlan.cMnPlan;
+              KatLink.CREC      := KatPodr.nRec     ;
+              KatLink.Name      := KatPodr.Name     ;
+              Insert Current KatLink;
+            }
+          }
+          _i++;
+        }
+
+        _loop KatLinkPodr
+        {
+          if not FoundMarker(lMarker, KatLinkPodr.CREC)
+          {
+            _Loop tmpHrs
+              delete Current tmpHrs;
+
+            delete Current KatLinkPodr;
+          }
+        }
+
+        if (getFirst KatLinkPodr = tsOk) {}
+
+        ClearMarker(lMarker);
+        DoneMarker(lMarker, iGetKau.GetMarkerName(cgKau_KatPodr));
+      }
+
+    }
+  end;
+
+  ReReadRecord;
+  ReReadRecord(#tmpHrs);
+  ReReadRecord(#KatLinkPodr);
+  ReReadRecord(#tmpMnPlan);
+  ReReadRecord(#tmpVPlan);
+
+  ReDrawPanel(#tmpVPlan);
+  ReDrawPanel(#tmpMnPlan);
+  ReDrawPanel(#KatLinkPodr);
+  ReDrawPanel(#tmpHrs);
+}
+
+cmDelOnProtect:
+{
+  case CurField of
+  end;
+
+
+  ReReadRecord;
+/*
+  ReReadRecord(#tmpVPlan);
+  ReReadRecord(#tmpMnPlan);
+  ReReadRecord(#KatLinkPodr);
+  ReReadRecord(#tmpHrs);
+
+  ReDrawPanel(#tmpVPlan);
+  ReDrawPanel(#tmpMnPlan);
+  ReDrawPanel(#KatLinkPodr);
+  ReDrawPanel(#tmpHrs);
+
+  RescanPanel(#tmpVPlan);   
+  RescanPanel(#tmpMnPlan);  
+  RescanPanel(#KatLinkPodr);
+  RescanPanel(#tmpHrs);     
+*/
+}
+
+cmOk:
+{
+  GetTabHrs();
+//  ReReadRecord;
+  ReReadRecord(#tmpVPlan);
+  ReReadRecord(#tmpMnPlan);
+  ReReadRecord(#KatLinkPodr);
+  ReReadRecord(#tmpHrs);
+//  ReDrawPanel(#tmpHrs);
+}
+
+cmValue1:
+{
+  var Flag:boolean=false;
+
+  PushPos(#tmpVPlan);
+  _loop tmpVPlan
+    if tmpVPlan.dSumRaspPlan < (tmpVPlan.dSumRaspFactS+tmpVPlan.dSumRaspFactO)
+      Flag := true;
+  PopPos(#tmpVPlan);
+
+  if Flag
+  {
+    Message('Превышение фактической над плановой суммой распределения!', Error);
+  }
+  else
+  {
+    var FlagNar : boolean=false;
+   
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Проверка нарядов', RecordsInTable(#Sys_Nar));
+    _loop Sys_Nar
+    {
+  
+      if not NextVisual
+        break;
+  
+      if 3 != Sys_Nar.CHOICE and 203 != Sys_Nar.CHOICE
+        continue;
+  
+      if not (sGetAttr(coSys_Nar, Sys_Nar.nRec, '.СистемаИсточник') = 'Отчет')
+        continue;
+  
+      if not iStrFunc.isCrossPeriod(Sys_Nar.DATAN, Sys_Nar.DATOK, _dOtch, _dEnd)
+        continue;
+   
+      FlagNar:=true;
+      break;
+    }
+    StopVisual('',0);
+  
+    if FlagNar
+    {
+      if (message(''#3'Удалить ранее сформированные наряды и создать новые?',confirmation+YesNo) = cmYes)
+      {
+        DeleteBody();
+  
+        FullClearBody();
+        
+        Message('Наряды созданы')
+      }
+    }
+    else
+    {
+      FullClearBody();
+      
+      Message('Наряды созданы')
+    }
+
+  }
+
+}
+
+cmValue2:
+{
+  DeleteBody();
+  Message('Наряды удалены')
+}
+
+cmDone:
+{
+//  DoneMarker(GrPlMarker, 'NarGreenForm_GrPlMarker');
+//  DoneMarker(KategMarker,'NarGreenForm_KategMarker');
+  DoneMarker(Filter_mPodr,   '');
+  DoneMarker(tmpMarker,   '');
+}
+end;
+
+End.
+
+#include UserReport.vih
+
+vipinterface UserReport_NarGreenForm implements IUserReport;
+
+interface UserReport_NarGreenForm;
+
+create view
+  var
+    Dummy: Byte;
+;
+
+procedure Run;
+begin
+  RunInterface('NarGreenForm');
+end;
+
+function GetReportName: String;
+begin
+  GetReportName := 'Формирование нарядов (зеленой полосой)';
+end;
+
+function GetGroupName(Level: Word): String;
+begin
+  GetGroupName := '';
+  case Level of
+    1: GetGroupName := '';
+  end;
+end;
+
+function GetPriority: Integer;
+begin
+  GetPriority := 0;
+end;
+
+function VisibleInModule(Ind: Byte): String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1: VisibleInModule := 'MENUZARP';
+  end;
+end;
+
+end.

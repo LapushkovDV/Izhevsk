@@ -1,0 +1,559 @@
+/*************************************************************************************************\
+* Наименование: Вывод в Excel протокола операции экспорта-импорта                                 *
+* Контур/Модуль: Обмен бизнес-документами                                                         *
+* Примечание:                                                                                     *
+*            запуск по кнопке <.Печать протокола в Excel.> добавлена в штатный просмотр протокола *
+* Вид работы  |Номер         |Дата      |Исполнитель              |Проект                         *
+* ---------------------------------------------------------------------------------------------   *
+* Разработка  |#2515         |18/06/2018|Шунин А.Г.               |НПО Энергомаш                  *
+* Разработка  |#3260         |18/08/2018|Шунин А.Г.               |НПО Энергомаш                  *
+* Разработка  |#3006         |18/08/2018|Шунин А.Г.               |НПО Энергомаш                  *
+\*************************************************************************************************/
+#component "C_EXPIMP"
+#doc
+Вывод в Excel протокола операции экспорта-импорта
+Используя в качестве шаблона файла импорта, создаёт файл, где:
+- Выделяет фоном ячейки с ошибками
+- Заполняет nRec импортированной записи, например, KATMC.NREC, в крайнем правом столбце
+#end
+Interface ExpImpJournXl;
+var
+hMarker : longint; OnlyBad:word;
+ lMarker : longint;
+ bMarker : longint;
+ nIndex  : longint;
+ cRec    : Comp;
+ sKOD, sEXIMLOGE_NOREFFLD, sR1C1, sExImLogR_Status: string;
+ wPos: word;
+ countermatrix: longint;
+// Для вывода в Excel
+ExcelFileName, ExcelCurrentFileName : string;
+Counter, lDocErrorCount : longint;
+xlStatus : boolean;
+
+// для Внешний атрибут число <- Номер записи источника
+sXLRowCode, sAttrNAME : string;
+wTableKOD : word;
+
+table struct mtErrors
+(
+   cRec: comp, // ExImLogE.nRec
+  rCOMP: comp,
+   tRec: comp,
+   R1C1: string,
+   xlRow: longint,
+   xlCol: longint,
+   lColor: longint
+
+) with index (i1=tRec+rCOMP);
+
+Create view JournLog
+
+as select ExImLogT.cLog
+from
+  IEHead,
+  ExImLogT,
+  ExImLogR,
+  ExImLogE,
+  UsersDoc
+  ,mtErrors // , mtErrors mtErrorsFree
+  ,AttrNam AN_Ext_nRec
+  ,AttrVal Av_Ext_nRec
+  ,IEHFLDS, IESFLDS
+where
+((
+  ExImLogT.cLog     == IEHead.NRec        and
+  IEHead.SubTipDoc  == UsersDoc.TipUsers  and
+  ExImLogT.NRec     == ExImLogR.cLogT     and
+  ExImLogR.NRec     == ExImLogE.cLogR     and
+  OnlyBad           <<= ExImLogR.Status(noindex)
+
+and root ==  mtErrors.cRec
+
+and
+   ExImLogT.cLog == IEHFLDS.CHEAD // для поиска внешнего атрибута - номер записи источника
+// and   sXLRowCode == IEHFLDS.CODE
+and 'Внешний атрибут число <- Номер записи источника' == IEHFLDS.NAME (noindex)
+
+and  ExImLogT.cLog == IESFLDS.CHEAD // для поиска внешнего атрибута - номер записи источника
+and 'Внешний атрибут число <- Номер записи источника' == IESFLDS.NAME (noindex)
+
+
+ and wTableKOD == AN_Ext_nRec.wTable and sAttrNAME == AN_Ext_nRec.Name
+//  and       wTableKOD == Av_Ext_nRec.wTable
+//  and AN_Ext_nRec.nRec == Av_Ext_nRec.CATTRNAM
+//  and  ExImLogR.rCOMP == Av_Ext_nRec.CREC
+
+))
+bounds _Doc =
+          wTableKOD == Av_Ext_nRec.wTable
+ and AN_Ext_nRec.nRec == Av_Ext_nRec.CATTRNAM
+ and   ExImLogR.rCOMP == Av_Ext_nRec.CREC
+
+bounds _Error=
+          wTableKOD == Av_Ext_nRec.wTable
+ and AN_Ext_nRec.nRec == Av_Ext_nRec.CATTRNAM
+and ExImLogE.rCOMP == Av_Ext_nRec.CREC
+;
+Parameters hMarker ,OnlyBad;
+
+
+var lCol, lRow: longint;
+var wR1C1Key: word; // Если 0, то адрес ячейки есть
+var AN_Ext_nRec_OK, nRecBy_R : boolean;
+
+
+var bErrorByDOC: boolean; // true -tb_Doc, false-tb__Error
+procedure SetBoundsMy;
+{
+   if bErrorByDOC
+   {
+      if     BoundActive(tb_Error) SubBounds(tb_Error);
+      if not BoundActive(tb_Doc  ) AddBounds(tb_Doc   );
+   }
+   else
+   {
+      if     BoundActive(tb_Doc  ) SubBounds(tb_Doc   );
+      if not BoundActive(tb_Error) AddBounds(tb_Error);
+   }
+
+}
+
+procedure AddR1C1Error;
+{
+  if wR1C1Key = 0
+  {
+    lRow := Instr('R',sR1C1);
+    if lRow = 0  wR1C1Key++;
+
+    lCol := Instr('C',sR1C1);
+    if lCol < lRow wR1C1Key++;
+
+    if wR1C1Key = 0
+    {
+      mtErrors.xlRow := longint(substr(sR1C1, lRow+1 , lCol-lRow-1) ); // if mtErrors.xlRow = 0 exit;
+      mtErrors.xlCol := longint(substr(sR1C1, lCol+1 ,  255     ) ); // if mtErrors.xlCol = 0 exit;
+      mtErrors.R1C1  := sR1C1; // тут адрес ячейки с ошибкой
+
+      if mtErrors.xlRow = 0 wR1C1Key++ // ошибка в адресе строки
+    }
+  }
+
+  if wR1C1Key > 0
+  {
+    if getfirst Av_Ext_nRec <> tsOK   exit;
+
+    mtErrors.xlRow := longint(Av_Ext_nRec.VDOUBLE);
+    if mtErrors.xlRow < 1 exit;
+    mtErrors.xlCol := 0;
+    mtErrors.R1C1  := sR1C1; // тут содержание ошибка
+  }
+
+  mtErrors.cRec  := ExImLogE.nRec;
+  mtErrors.tRec  := ExImLogT.nRec;
+  mtErrors.rCOMP := if(bErrorByDOC,EXIMLOGR.rCOMP,EXIMLOGE.rCOMP);
+  insert current mtErrors;
+}
+
+procedure xlOut1(pCol:longint;pStr: string);
+{
+  xlStWriteToMatrix(countermatrix, pCol, pStr);
+}
+procedure xlSaveLastWorkBook;
+{
+   var _wCount:longint=0;
+   xlGetWorkBooksCount(_wCount);
+   xlSaveWorkBook(_wCount);
+}
+Handleevent
+cmInit:
+{
+  OnlyBad := 0;
+  if( GetMarkerCount(hMarker) < 1 ) CloseInterface(cmDONE);;
+  else nIndex := 0;
+
+sXLRowCode := String(iehMC + 67);
+StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+
+While GetMarker(hMarker, nIndex, cRec) do
+{
+ nIndex++;
+  if( GetFirst ExImLogT where((cRec == ExImLogT.NRec)) = tsOK )
+  {
+      wTableKOD := 0 ;
+      sAttrNAME := '';
+      nRecBy_R := (EXIMLOGT.rStr = 'lCurRow');
+
+         wTableKOD := if(IEHead.TipDoc =  1, coBASEDOC,//'Документы-Основания',
+                      if(IEHead.TipDoc =  2, coSpSopr, // coKatsopr,//'Накладные',
+                      if(IEHead.TipDoc =  3, coSCHFACT,//'Счета-Фактуры',
+                      if(IEHead.TipDoc =  4, coPlPOR,  //'Платёжные документы',
+                      if(IEHead.TipDoc =  5, coKlPrice, //'Прайс листы',
+                      if(IEHead.TipDoc =  6, coKatParty,//'Партии',
+                      if(IEHead.TipDoc =  7, coValutDoc,//'Валютные документы',
+                      if(IEHead.TipDoc =  9, coKatORG,  //'Каталог контрагентов',
+                      if(IEHead.TipDoc = 10, coKATMC,   //'Каталог матценностей',
+                      if(IEHead.TipDoc = 11, coVAGON,   //'Каталог вагонов',
+                      if(IEHead.TipDoc = 12, coSERTIFIC,  //'Сертификаты качества', == Каталог удостоверений качества
+                      if(IEHead.TipDoc = 13, coValPokaz,  //'Значения показателей качества',
+                      if(IEHead.TipDoc = 14, coLIMZAPH,   //'Лимитно заправочные ведомости',
+                      if(IEHead.TipDoc = 15, coOborot,    //'Проводки',
+                      if(IEHead.TipDoc = 16, coPLATVED,   //'Платежные ведомости',
+                      if(IEHead.TipDoc = 17, coVEDDEPONIR,//'Ведомости депонирования',
+                      if(IEHead.TipDoc = 19, coMOVEOS,    //'Операции ОС',
+                      if(IEHead.TipDoc = 20, coMoveOS,    //'Нематериальные активы',
+                      if(IEHead.TipDoc = 21, coPUTLST,    //'Путевые листы',
+                      if(IEHead.TipDoc = 22, coAkcizKatForm,    //'Типы акцизных марок',
+                      if(IEHead.TipDoc = 23, coAKCIZHINOUTCOME, //'Акцизные марки',
+                      if(IEHead.TipDoc = 24, coAkcizHRequest,   //'Заявки на производство акцизных марок',
+                      if(IEHead.TipDoc = 25, coDogovor,   //'Договор,
+                      if(IEHead.TipDoc = 32, coDOCREQ, //'Заявки на расходование средств',
+                      if(IEHead.TipDoc = 33, coRZDOC,  //'Документы розничной торговли',
+                      if(IEHead.TipDoc = 34, coINVTAB, //'Инвентаризация',
+                                             0))))))))))))))))))))))))))  ;
+
+
+      if wTableKOD = coSpSopr
+      {
+        if ( GetFirst IESFLDS = tsOk )
+        {
+          sAttrNAME := GetBoundedSubString(IESFLDS.Value, '"', '"', 1);
+
+        }
+
+      }
+      else
+      if ( GetFirst IEHFLDS = tsOk )
+         sAttrNAME := GetBoundedSubString(IEHFLDS.Value, '"', '"', 1);
+
+  //     message('wTableKOD = ' + wTableKOD +''#13' sAttrNAME='+ sAttrNAME);
+
+
+    if sAttrNAME<>''
+    AN_Ext_nRec_OK  :=  (getfirst AN_Ext_nRec = tsOK );
+
+    bErrorByDOC := not (wTableKOD = coSpSopr);
+    if bErrorByDOC nRecBy_R := False;
+
+    SetBoundsMy;
+
+    ExcelFileName := 'Protokol_'+DateToStr(ExImLogT.FDATE, 'DD_MM_YYYY_') + TimeToStr(ExImLogT.FTIME , 'HHMMSS');
+    if instr(IEHEAD.MESSAGEDIR, ExImLogT.FNAME) > 0
+    ExcelFileName := IEHEAD.MESSAGEDIR + ExcelFileName ; // IEHEAD.MESSAGEDIR  - путь на файл импорта с "\" в конце
+
+    wPos := 0;
+    while ExistFile(ExcelFileName + if(wPos=0,'','_'+String(wPos))+ '.xlsx') do wPos++;
+
+    ExcelFileName := ExcelFileName + if(wPos=0,'','_'+String(wPos));
+
+    xlStatus := true;
+    xlStatus := xlCreateExcel(ExcelFileName+ '.xlsx',true);
+
+    countermatrix:= 0; counter := 1;
+    xlCreateMatrix(100, 10);
+    xlClearMatrix;
+
+    if not xlStatus
+    { message('Ошибка создания нового файла в Excel"'+ExcelFileName+'".',error);
+    }
+    else
+    {
+
+      countermatrix++;
+       xlOut1( 1,'Статус поля');
+       xlOut1( 2,'КОД');
+       xlOut1( 3,'Адрес ячейки');
+       xlOut1( 4,'Наименование поля');
+       xlOut1( 5,'Значение источника');
+       xlOut1( 6,'Ошибка по полю');
+       xlOut1( 7,'Доп1');
+       xlOut1( 8,'Обозначение и наименование');
+       xlOut1( 9,'Статус документа');
+
+       xlOut1(10,ExImLogT.FNAME + '  Импортирован: ' + ExImLogT.FDATE + ' в ' + ExImLogT.FTIME );
+    }
+
+
+  _loop ExImLogR
+  {
+
+       lDocErrorCount := 0;
+       sExImLogR_Status :=  if ( ExImLogR.Status = ieNotDefined,     'Не определен',
+                            if ( ExImLogR.Status = ieImportedInTemp, 'Прочитан',
+                            if ( ExImLogR.Status = ieExported,       'Экспортирован',
+                            if ( ExImLogR.Status = ieImported,       'Импортирован',
+                            if ( ExImLogR.Status = ieSkip,           'Уже импортировался',
+                            if ( ExImLogR.Status = ieAbsentFields,   'Не заполнены обязательные поля','')))))) ;
+
+
+      sKOD := '';
+      wPos := Instr('Обозн.:',EXIMLOGR.VALUE);
+      if wPos > 0
+      {
+        sKOD := trim(SubStr(EXIMLOGR.VALUE, wPos+7, Instr(' ',EXIMLOGR.VALUE)-7) );
+      }
+
+      _Loop ExImLogE
+      {
+
+          sR1C1 := '';   wR1C1Key := 0;
+          sEXIMLOGE_NOREFFLD := EXIMLOGE.NOREFFLD;
+          wPos := Instr(' R',sEXIMLOGE_NOREFFLD); //  тут 'пробел + R'
+          if wPos > 0
+          {
+             sR1C1 := SubStr(sEXIMLOGE_NOREFFLD, wPos+1, 255);
+             sEXIMLOGE_NOREFFLD:= SubStr(sEXIMLOGE_NOREFFLD, 1, wPos-1);
+
+             AddR1C1Error; // добавляет ошибку в mtErrors c sR1C1;
+          }
+          else
+          if AN_Ext_nRec_OK
+          {
+             wR1C1Key++;
+             sR1C1 := if(ExImLogE.Status = 1, 'Ссылка не определена ', if (ExImLogE.Status = 2 , 'Детализация : ', '')) +
+                      EXIMLOGE.NOREFFLD + ' ' +EXIMLOGE.VALUE + ' '+ ExImLogE.rStr;
+             AddR1C1Error; // добавляет ошибку в mtErrors;
+          }
+
+          if xlStatus
+          {
+             countermatrix++;  lDocErrorCount++;
+
+             xlOut1( 1,'Ошибка');
+             xlOut1( 2, sKOD);
+             xlOut1( 3, sR1C1);
+             xlOut1( 4, sEXIMLOGE_NOREFFLD);
+             xlOut1( 5, ''''+ExImLogE.Value);
+             xlOut1( 6,if(ExImLogE.Status = 1, 'Ссылка не определена', if (ExImLogE.Status = 2 , 'Детализация : ', ''))   );
+             xlOut1( 7,ExImLogE.rStr);
+             xlOut1( 8,ExImLogR.Value);
+             xlOut1( 9,sExImLogR_Status);
+
+       // при импорте сначала идёт чтение в память. На этом этапе в ExImLogR.RCOMP - nRec записи в памяти, а не nRec ,будущей записи в базе
+             if (ExImLogR.Status <> ieImportedInTemp) and (ExImLogR.Status <> ieExported)
+             xlOut1(10,String(if(bErrorByDOC,EXIMLOGR.rCOMP,EXIMLOGE.rCOMP),0,0));
+
+              if countermatrix = 100
+              {
+                xlWriteMatrixToExcel(counter, 1);
+                counter:= counter + countermatrix;
+                xlClearMatrix;
+                countermatrix:= 0;
+              }
+          }
+      }//_Loop ExImLogE
+
+      if xlStatus
+      if lDocErrorCount = 0 // У документа нет ошибок импорта из файла
+      {
+          wPos := Instr('Обозн.:',EXIMLOGR.VALUE);
+          if wPos > 0
+          {
+            sKOD := trim(SubStr(EXIMLOGR.VALUE, wPos+7, Instr(' ',EXIMLOGR.VALUE)-7) );
+          }
+
+          countermatrix++;
+           xlOut1( 2, sKOD);
+           xlOut1( 8,ExImLogR.Value);
+           xlOut1( 9,sExImLogR_Status);
+
+           if (ExImLogR.Status <> ieImportedInTemp) and (ExImLogR.Status <> ieExported)
+           xlOut1(10,String(ExImLogR.RCOMP,0,0));
+
+          if countermatrix = 100
+          {
+            xlWriteMatrixToExcel(counter, 1);
+            counter:= counter + countermatrix;
+            xlClearMatrix;
+            countermatrix:= 0;
+          }
+      }
+
+  }//_loop ExImLogR
+
+    if countermatrix > 0
+    {
+      xlWriteMatrixToExcel(counter, 1);
+      counter:= counter + countermatrix;
+    }
+
+    xlFreeMatrix;
+
+    xlframecells(1+2+4+8+16+32, 2, 1, 1, 2, 1, counter, 10);
+
+    xlframecells(1+2+4+8+16+32, 3, 1, 1, 1, 1, 1, 10);
+
+    StopVisual('',0);
+
+    xlSaveLastWorkBook;
+    xlkillExcel;
+
+  //  LogStrTofile('#XL_LOG.txt',' --- BEGIN -- ');
+    // JournLog.PutTableToDBF (#mtErrors,'mtErrors.xls',0);
+  //    If getfirst mtErrors where (( ExImLogT.nRec == mtErrors.tRec)) = tsOK
+  //  LogStrTofile('#XL_LOG.txt',' --- END -- getfirst mtErrors where (( ExImLogT.nRec == mtErrors.tRec)) = tsOK');
+
+  //    if ExistFile(ExImLogT.FNAME)  LogStrTofile('#XL_LOG.txt','ExistFile('+ExImLogT.FNAME+')');
+      Var iOutLog: integer = 0;
+
+      if ExistFile(ExImLogT.FNAME)
+      {
+
+        If getfirst mtErrors where (( ExImLogT.nRec == mtErrors.tRec)) = tsOK
+        if Yes=message('Показать коментарии и ошибки цветом фона в файле Импорта?',YesNo)
+          iOutLog++
+        else
+          iOutLog := -10;
+
+        if iOutLog = 0
+        if AN_Ext_nRec_OK
+        if Yes=message('Вывести nRec в файл Импорта?',YesNo)
+          iOutLog++;
+      }
+  /*
+      If getfirst mtErrors where (( ExImLogT.nRec == mtErrors.tRec)) = tsOK
+      if ExistFile(ExImLogT.FNAME)
+      if Yes=message('Показать ошибки цветом фона в файле Импорта?',YesNo)
+  */
+      if iOutLog > 0
+      {
+        var MaxLine,MaxCol: longint=0;
+        var LastCOMP: comp =comp(0);
+        var bErrStringOut: boolean = false;
+
+
+        xlCreateExcelWithTemplate(ExImLogT.FNAME, True);
+
+        xlGetUsedRange(0,0,MaxLine,MaxCol);
+
+        MaxCol++;
+  //      xlSetBackColor(16777215, 1,1, MaxLine,MaxCol);
+
+        _LOOP mtErrors where (( ExImLogT.nRec == mtErrors.tRec))
+        {
+          if mtErrors.xlCol > 0
+            xlSetBackColor(49407, mtErrors.xlRow, mtErrors.xlCol  , mtErrors.xlRow, mtErrors.xlCol)
+          else
+          {
+            xlSetBackColor(49407, mtErrors.xlRow, MaxCol          , mtErrors.xlRow, MaxCol+1      );
+            xlAddCellStringValue(mtErrors.R1C1, mtErrors.xlRow, MaxCol+1);
+            bErrStringOut := true;
+          }
+
+          if LastCOMP <> mtErrors.rCOMP
+          {
+             LastCOMP := mtErrors.rCOMP;
+
+             if mtErrors.xlCol > 0
+             xlSetBackColor(49407, mtErrors.xlRow, MaxCol, mtErrors.xlRow, MaxCol);
+
+             if (ExImLogR.Status <> ieImportedInTemp) and (ExImLogR.Status <> ieExported)
+             xlSetCellStringValue(String(LastCOMP,0,0), mtErrors.xlRow, MaxCol, mtErrors.xlRow, MaxCol);
+          }
+        }
+var lValue: longint;
+
+        if nRecBy_R
+        {
+          _loop ExImLogR
+          {
+             lValue := longint(ExImLogR.RSTR);
+             if ExImLogR.STATUS = ieImported
+             {
+               LastCOMP := ExImLogR.rCOMP;
+               xlSetCellStringValue(String(LastCOMP,0,0), lValue, MaxCol, lValue, MaxCol);
+               _Loop ExImLogE
+               {
+                 xlSetCellStringValue(EXIMLOGE.NOREFFLD, lValue, MaxCol+1, lValue, MaxCol+1);
+                 xlSetCellStringValue(EXIMLOGE.VALUE   , lValue, MaxCol+2, lValue, MaxCol+2);
+                 xlSetCellStringValue(EXIMLOGE.RSTR    , lValue, MaxCol+3, lValue, MaxCol+3);
+               }
+             }
+          }
+        }
+        else
+        if AN_Ext_nRec_OK 
+        {
+          _loop ExImLogR
+          {
+              if nRecBy_R
+              {
+                lValue := longint(ExImLogR.RSTR);
+              }
+
+              if bErrorByDOC
+              _Loop Av_Ext_nRec
+              {
+                 if not nRecBy_R lValue := longint(Av_Ext_nRec.VDOUBLE);
+                 if lValue > 0
+                 {
+                   LastCOMP := ExImLogR.rCOMP;
+                   if ExImLogR.STATUS = ieImported
+                   xlSetCellStringValue(String(LastCOMP,0,0), lValue, MaxCol, lValue, MaxCol);
+
+                   _Loop ExImLogE
+                   {
+                     xlSetCellStringValue(EXIMLOGE.NOREFFLD, lValue, MaxCol+1, lValue, MaxCol+1);
+                     xlSetCellStringValue(EXIMLOGE.VALUE   , lValue, MaxCol+2, lValue, MaxCol+2);
+                     xlSetCellStringValue(EXIMLOGE.RSTR    , lValue, MaxCol+3, lValue, MaxCol+3);
+                   }
+                 }
+
+              }
+              else
+              _Loop ExImLogE
+              _Loop Av_Ext_nRec
+              {
+                 if not nRecBy_R lValue := longint(Av_Ext_nRec.VDOUBLE);
+
+                 if lValue > 0
+                 if true // wTableKOD = coKatParty
+                 {
+                   LastCOMP := ExImLogE.rCOMP;
+                   if ExImLogR.STATUS = ieImported
+                   xlSetCellStringValue(String(LastCOMP,0,0), lValue, MaxCol, lValue, MaxCol);
+
+                   xlSetCellStringValue(EXIMLOGE.NOREFFLD, lValue, MaxCol+1, lValue, MaxCol+1);
+                   xlSetCellStringValue(EXIMLOGE.VALUE   , lValue, MaxCol+2, lValue, MaxCol+2);
+                   xlSetCellStringValue(EXIMLOGE.RSTR    , lValue, MaxCol+3, lValue, MaxCol+3);
+                 }
+                 else
+                 {
+                   LastCOMP := ExImLogE.rCOMP;
+                   xlSetCellStringValue(String(LastCOMP,0,0), lValue, MaxCol, lValue, MaxCol);
+                 }
+
+              }
+
+          }
+
+        }
+
+        if LastCOMP <> comp(0)
+        {
+          xlSetCellStringValue('nRec', 1, MaxCol, 1,MaxCol);
+          xlAutoFit( 1, MaxCol,   MaxLine, MaxCol);
+        }
+        if bErrStringOut
+        {
+          xlSetCellStringValue('Содержание ошибки', 1, MaxCol+1, 1,MaxCol+1);
+          xlAutoFit( 1, MaxCol+1, MaxLine, MaxCol+1);
+        }
+
+
+        xlGetActiveWorkBookName(ExcelCurrentFileName); // Узнать текущее имя Excel-файла
+        xlSaveAsWorkBookByName(ExcelCurrentFileName,ExcelFileName + 'C.xlsx');
+
+
+        xlkillExcel;
+      }
+
+  } //  GetFirst ExImLogT where((cRec == ExImLogT.NRec)) = tsOK )
+} // While GetMarker(hMarker, nIndex, cRec) do
+
+CloseInterface(cmDONE);
+
+}// cmInit
+
+end;
+end.

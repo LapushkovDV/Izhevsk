@@ -1,0 +1,435 @@
+/*************************************************************************************************\
+* Наименование:  Доработка отчетной формы "Отчет по изменениям ШР"                                *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:    Управление персоналом -> Штатное расписание -> Приказы по штатному расписанию    *
+*                         -> Реестр приказов по штатному расписанию                               *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#200          |03/05/17|Валента А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#component "Z_STAFFSHR"
+#include GP_StatusChange.vih
+#include GP_Status.vih
+#include GP_UserAccessService.vih
+#include GP_EmailRun.Vih
+#include SHR_RPD.vih
+
+alter interface SHROrdersList;
+overload
+  function GetDopStatusName: string;
+end;
+ExtendFormats brwDoc;
+var
+  StatusChange: GP_StatusChange NoAuto;
+  wTypeDoc: word;
+  Status: GP_Status NoAuto;
+  UserAccessService: GP_UserAccessService NoAuto;
+  pGP_EmailRun: GP_EmailRun;
+  NPOEM_OWN_EMAIL_TYPE: word = wGetTune('NPOEM_OWN.EMAIL_TYPE');
+
+const
+   // тип документа  "Приказы по ШР(20,123)"
+  coSHRRPD20         = 125;
+  // индекс таблицы
+  coSTRTITLEIDX      = 25091;
+  // Статус "Согласовано ОТ"
+  coSTATUSSOGLOT     = 000A0000000000BAh;
+  // Статус "Проект"
+  coSTATUSPROG       = 000A0000000000B9h;
+  coRoleOOPOT        = 000A000000000043h; // Пользователь ООПиОТ
+  coRoleUOT          = 000A000000000044h; // Пользователь УОТ
+  coRoleMessageOT    = 000A000000000042h; // Получение сообщений от ОТ
+
+end;
+
+create view OrdersList
+from
+GP_StatusChangeLog
+,Gp_status
+,GP_USERROLES;
+
+
+Create View vTypeDocs
+as select Gp_TypeDocs_Find.nrec
+From
+   Gp_TypeDocs Gp_TypeDocs_Find
+where ((
+   wTypeDoc == Gp_TypeDocs_Find.wType(noindex)
+));
+
+/*Create View vStatus
+as select *
+From
+   Gp_status sts
+; */
+
+// Функция проверки роли пользователя
+Function userInRole(_userID: comp; _roleID: comp) : boolean; cacheable; {
+  Result := False;
+  if (RecordExists GP_USERROLES where ((_UserID == GP_USERROLES.CUSER and _roleID == GP_USERROLES.CROLE)) = tsOK) {
+    Result := True;
+  }
+}
+
+function SendEmailToUsersGroup(textmessage:string; _cRole:comp):boolean;
+{
+  var emailuser:string;
+  var f:boolean = true;
+  StartNewVisual(vtRotateVisual, vfTimer, 'Отправка писем...', 0);
+  _loop GP_USERROLES where ((_cRole == GP_USERROLES.CROLE))
+  {
+    if STRTITLE.ATL_OWNER = GP_USERROLES.CUSER f:=false;
+    emailuser := pGP_EmailRun.GetEmailByUserID(GP_USERROLES.CUSER,'');
+    pGP_EmailRun.EmailSend
+    (
+       NPOEM_OWN_EMAIL_TYPE // : word ;
+     , emailuser // _email_addr :string ;
+     , 'Приказ по штатному расписанию' // _email_subject :string ;
+     , textmessage //_email_text :string ;
+     , '' //_email_attach1 :string ;
+     , '' //_email_attach2 :string ;
+     , '' //_email_attach3 :string ;
+     , '' //_email_attach4 :string ;
+     , ''//'"INTERFACE Z_StaffOrders::OrdersList('+string(TitleDoc.Nrec,0,0)+')"' //_email_attach5 :string ;
+     , '' //_email_addr_copy :string='';
+     , '' //_email_addr_from :string=''
+    );
+  }
+  StopVisual;
+  result:=f;
+}
+
+Function Status_Init(_wType: word): boolean;
+{
+  if _wType = 0 then exit;
+  Result := false;
+  if (wTypeDoc <> _wType) or (Status = NullRef)
+  {
+    wTypeDoc := _wType;
+    if vTypeDocs.getfirst Gp_TypeDocs_Find <> tsok then
+    {
+      Message('Не нашли запись в справочнике документов для типа ' + string(_wType));
+      exit;
+    }
+    Status := new(GP_Status,
+      InitForTypeDoc(vTypeDocs.GP_TypeDocs_Find.Name));
+  }
+  else Result:=True;
+} // Function Status_Init;
+
+function GetRPD20: boolean;
+{
+  if (
+       getfirst StrPart where ((20 == StrPart.WCODOPER and StrTitle.nrec == StrPart.CDOC)) = tsOK
+       //or getfirst StrPart where ((123 == StrPart.WCODOPER and StrTitle.nrec == StrPart.CDOC)) = tsOK
+     )
+    result := true;
+  else
+    result := false;
+}
+
+function GetDopStatusName: string;
+{
+  if GetRPD20()
+    if getfirst Gp_status where ((StrTitle.CATTR1 == Gp_status.nrec)) = tsOk
+      result := Gp_status.Name;
+    else
+      result := '';
+  else
+    result := '';
+}
+
+//-------------------------------------
+// Установить статус (возвращает Nrec для установки статуса)
+//-------------------------------------
+function ChangeStatus(pDoc:comp; StatusChangeLog:type$GP_StatusChangeLog): comp;
+var Rez:integer;
+{
+  result := 0;
+  //if not Check_Status_Change_Before(StatusChangeLog.cStatusFrom) exit;
+  Status_Init(wTypeDoc);
+  //Начало транзакции
+  Rez:=BeginConcurrentTransaction(trNoLock);
+  if (Rez<>tsok)
+    message('Ошибка открытия транзакции - ' + string(Rez), error);
+  else {
+    GP_StatusChangeLog.buffer  := StatusChangeLog;
+    GP_StatusChangeLog.NRec    := 0;
+    GP_StatusChangeLog.wTbl    := coSTRTITLEIDX;
+    GP_StatusChangeLog.cDoc    := pDoc;
+    GP_StatusChangeLog.DateOper:= _CurDateTime;
+    GP_StatusChangeLog.cUser   := UserId;
+    Rez:=insert current GP_StatusChangeLog;
+    if (Rez<>tsok)
+      message('Ошибка вставки записи в таблицу GP_StatusChangeLog - ' + string(Rez), error);
+    if (Rez=tsok) {
+      Result:=StatusChangeLog.cStatusTo;
+      if (Rez<>tsok)
+        message('Ошибка модификации записи в таблице GP_KPI_Statements - ' + string(Rez), error);
+    }
+    if (Rez=tsok) {//Запись в БД
+      Rez:=EndTransaction;
+      if (Rez<>tsOK)
+      {  message('Ошибка завершения транзакции - ' + string(Rez), error);
+         result := 0;
+      }
+    } else {//Откат
+      Rez:=AbortTransaction;
+      if (Rez<>tsOK)
+      { message('Ошибка отката транзакции - ' + string(Rez), error);
+        Result := 0
+      }
+    }
+  }
+} // Function ChangeStatus():comp;
+
+//----------------------------------------
+// нажали кнопку выбора статуса
+//----------------------------------------
+Function OnPickStatus: boolean;
+{
+  var StatusChangeLog:type$GP_StatusChangeLog;
+  ClearAdvRecord(StatusChangeLog);
+  Result := false;
+  // выбор значения из списка
+  if (StatusChange.PickStatus(StrTitle.CATTR1))
+  {
+    StatusChangeLog.cStatusFrom := StrTitle.CATTR1;
+    var pTmp: comp;
+    pTmp := ChangeStatus(StrTitle.CATTR1, StatusChange.StatusChangeLog);
+    if (PTmp <> 0) then
+    { set StrTitle.CATTR1 :=  StatusChange.StatusChangeLog.cStatusTo;
+      update current StrTitle;
+
+      if StrTitle.CATTR1 = coSTATUSPROG
+        SendEmailToUsersGroup(('Прошу обеспечить заполнение атрибутов ставки в части охраны труда по приказу № ' + STRTITLE.DOCNMB + ' ' + STRTITLE.DOCDATE), coRoleUOT);
+      if StrTitle.CATTR1 = coSTATUSSOGLOT
+      {
+         if SendEmailToUsersGroup(('Прошу обеспечить утверждение приказа № ' + STRTITLE.DOCNMB + ' ' + STRTITLE.DOCDATE), coRoleMessageOT)
+         {
+         pGP_EmailRun.EmailSend
+          (
+             NPOEM_OWN_EMAIL_TYPE // : word ;
+           , pGP_EmailRun.GetEmailByUserID(STRTITLE.ATL_OWNER,'') // _email_addr :string ;
+           , 'Приказ по штатному расписанию' // _email_subject :string ;
+           , 'Прошу обеспечить утверждение приказа № ' + STRTITLE.DOCNMB + ' ' + STRTITLE.DOCDATE //_email_text :string ;
+           , '' //_email_attach1 :string ;
+           , '' //_email_attach2 :string ;
+           , '' //_email_attach3 :string ;
+           , '' //_email_attach4 :string ;
+           , ''//'"INTERFACE Z_StaffOrders::OrdersList('+string(TitleDoc.Nrec,0,0)+')"' //_email_attach5 :string ;
+           , '' //_email_addr_copy :string='';
+           , '' //_email_addr_from :string=''
+          );
+         }
+      }
+      LoadDisLoadNeedRealization;
+      ISHR_RPD_Base(SHR_RPD).SetMsgBox(vMBox);
+      SHR_RPD.SetRelation(StrPart.nRec);
+    }
+  }
+  Result := true;
+}
+
+
+
+Function InitPodr : boolean;
+{
+  var DeptMarker_T3     : TPtr; DeptMarker_T3     := InitMarker('CatalogsMarkerT3'    , 8, 200, 10);
+  var copyDeptMarker_T3 : TPtr; copyDeptMarker_T3 := InitMarker('copyCatalogsMarkerT3', 8, 200, 10);
+  
+  ClearMarker(copyDeptMarker_T3);
+  CopyMarker(copyDeptMarker_T3, DeptMarker_T3);
+
+  _LOOP StrPart
+    _LOOP StrCont
+      if (NOT FoundMarker(DeptMarker_T3, StrCont.cCatStr))
+        if (StrCont.cCatStr <> comp(0))  
+          InsertMarker(DeptMarker_T3, StrCont.cCatStr);
+
+  result := GetMarkerCount(DeptMarker_T3) > 0;
+
+  DoneMarker( DeptMarker_T3    , 'CatalogsMarkerT3'    );
+  DoneMarker( copyDeptMarker_T3, 'copyCatalogsMarkerT3');
+}
+
+
+procedure DonePodr;
+{
+  var DeptMarker_T3     : TPtr; DeptMarker_T3     := InitMarker('CatalogsMarkerT3', 8, 200, 10) ;
+  var copyDeptMarker_T3 : TPtr; copyDeptMarker_T3 := InitMarker('copyCatalogsMarkerT3', 8, 200, 10) ;
+  
+  ClearMarker(DeptMarker_T3);
+  CopyMarker(DeptMarker_T3, copyDeptMarker_T3);
+
+  DoneMarker( DeptMarker_T3    , 'CatalogsMarkerT3'    );
+  DoneMarker( copyDeptMarker_T3, 'copyCatalogsMarkerT3');
+}
+
+browse brwDoc(, hcStaffStrPr);
+  show at (,,,12);
+Fields
+  sTXOGetField('X$USERS','XU$FULLNAME',StrTitle.ATL_OWNER) 'Создал приказ' (,,sci13Esc):[20],Protect,NoPickButton;
+  fDopStatus 'Доп. статус' ('Доп. статус'): [12], Protect;
+end; //browse
+
+window WhatIsInOrder '' EscClose;
+  show at (80,, 180, 37);
+
+HandleEvent
+cmPick:
+{
+  case CurField of
+
+  #fDopStatus:
+  {
+    if GetRPD20()
+       {
+          //message('Смена Status');
+          OnPickStatus();
+       }
+       else
+       {
+        message('У данного документа нет доп. статусов');
+       }
+
+  }
+
+  end;
+}
+end;
+
+end;
+
+
+TableEvent Table tempStrTitle;
+cmInsertRecord:
+{
+  case inherited :: handleEvent (cmInsertRecord) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+    end;
+
+  if GetRPD20()
+    {
+      StrTitle.CATTR1 := Status.GetDefault();
+      update current StrTitle;
+      ReScanPanel(tnTempStrTitle);
+    }
+}
+end;
+
+
+HandleEvent
+cmInit:
+  {
+    case inherited :: handleEvent (cmInit) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+    end;
+
+    SetFieldAndLabelVisible(#fDopStatus, true);
+
+    wTypeDoc := coSHRRPD20;
+    Status_Init(wTypeDoc);
+
+    var RoleGroupName: string   =  'Приказы по штатному расписанию';
+    UserAccessService := new(
+    GP_UserAccessService, InitForRoleGroup(RoleGroupName));
+    if (UserAccessService = NullRef) {
+    message('UserAccessService не загружен');
+    abort; exit;
+    }
+    StatusChange := new(GP_StatusChange, InitForRoleGroup(
+                                             UserAccessService.RoleGroup));
+  }
+
+//-------------Alt+U------------------
+cmLegend: // утверждение приказа
+{
+   if GetRPD20()
+   {
+     if StrTitle.CATTR1 <> coSTATUSSOGLOT
+     {
+       message('Доп. статус должен быть "Согласовано ОТ"', error);
+       abort;
+       exit;
+     }
+     if (userInRole(UserID(), coRoleUOT))
+     {
+       message('Нет прав', error);
+       abort;
+       exit;
+     }
+   }
+  case inherited :: handleEvent (cmLegend) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+    end;
+
+  if getfirst StrPart where ((123 == StrPart.WCODOPER and StrTitle.nrec == StrPart.CDOC)) = tsOK
+    SendEmailToUsersGroup(('Внесены изменения в атрибуты ставки в части условий труда на рабочем месте приказом № ' + STRTITLE.DOCNMB + ' ' + STRTITLE.DOCDATE), coRoleMessageOT);
+
+}
+
+cmHotKeys:
+  {
+    var iTmp : longint=0;
+
+    if not IfAccess(StrTitle.Nrec)
+    {
+      DisableCommand(cmStaffPrOk);
+      DisableCommand(cmStaffPrPrint);
+    }
+    else
+    {
+      EnableCommand(cmStaffPrOk);
+      EnableCommand(cmStaffPrPrint);
+    }
+
+    var v1, v2, v3, v4: word;
+
+    VersionGet(false, 'Z_GTP', v1, v2, v3, v4);
+
+    if v1 <> 0 and v2 <> 0 and v4 >= 1
+      iTmp := LoadMenu('menustr_prikaz_hotkeyGTP1');
+    else
+      iTmp := LoadMenu('menustr_prikaz_hotkey1');
+
+    AddMenuItem(iTmp,'Отчет об изменениях в штатном расписании', cmValue13);
+    AddMenuItem(iTmp,'"Штатное расписание" ЭМ'                 , cmValue17);
+    AddMenuItem(iTmp,'"Штатная расстановка" ЭМ'                , cmValue18);
+
+    if ((iTmp <> cmCancel) AND (iTmp <> cmClose)) 
+      PutHotCommand(RunLoadMenu(iTmp));
+  }
+
+cmValue17: 
+  {
+    if (NOT InitPodr)
+      {
+        Message('По приказу отсутствуют структурные подразделения!');
+        Exit;
+      }
+
+    RunInterface(EMStaffStructReport, 0, tempStrTitle.DocDateCopy, tempStrTitle.DocNmb, tempStrTitle.DocDateCopy, 1);
+    DonePodr;
+  }
+
+cmValue18: 
+  {          
+
+    if (NOT InitPodr)
+      {
+        Message('По приказу отсутствуют структурные подразделения!');
+        Exit;
+      }
+
+    RunInterface(EMStaffStructReport, 1, tempStrTitle.DocDateCopy, tempStrTitle.DocNmb, tempStrTitle.DocDateCopy, 1);
+    DonePodr;
+  }
+
+end;
+end.

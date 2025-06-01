@@ -1,0 +1,1447 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                "График отпусков"                                                                *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Печать графика отпусков. Группировка по месяцам                                  *
+*                + Отчет в excel c группировкой по отделам и месяцам                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#180          |07/11/17|Потапов А.В.             |НПО Энергомаш                    *
+* Разработка  |#180          |22/08/18|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#component "Z_StaffReports"
+
+#include StrFunc.vih
+#include WorkPeriods.vih
+#include APPFUNCS.VIH
+#include XLReport.vih
+#include GP_StructHierarchy.vih
+#include GP_DepFunc.vih
+
+alter interface GrafikOtpusk;
+
+overload
+  DataStream dsReport;
+  procedure ReportForm(_HierarchyLevel : word);
+end;
+
+table struct ttDetDet
+(
+  cRec      : comp
+, cPers     : comp
+, cPlan     : comp
+, wPlFc     : word
+, dFact     : date
+)
+with index
+(
+  ttDetDet01 = cRec
+);
+
+table struct gp_OtpByMonths (
+  Year    : word,
+  Month   : byte,
+  Duration: double,
+  Fact    : string,
+  DocNmb  : string,
+  MoveDate: string
+) with index (
+  i01 = Year + Month
+);
+
+var
+  iStrFunc   : StringFunctions;
+  iWPFunc    : WorkPeriods;
+  iAppFunc   : AppointmentsFunctions;
+  pXL        : XlsRepBuilder;
+  _structHier: GP_StructHierarchy; //используется для построения нестандартной иерархии подразделений для ЭМ (123 / 123-1, 123-2, ...)
+  oGP_DepFunc: GP_DepFunc;
+  _showStatus: word;
+
+create view
+var 
+  wSortMonth    : word;
+  cRecDet  : comp;
+  gp_TypeReport: byte;
+  gp_Year: word;
+  gp_Month: byte;
+from
+  ttDetDet
+, persons     pers2det
+, planotpusk  plan2det
+, vacations   fact4det 
+, klotpusk    kotp4det
+, klotpusk    klotpuskPlan
+, WorkPeriod  WP4Det
+, GrafiksTmp ttGrafEM
+, GrafiksTmp ttGrafEMIns
+, tmpPlanOtpusk ttPlOtEM
+, tmpPlanOtpusk ttPlOtEMIns
+, tmpFactOtpusk ttFaOtEM
+, tmpPlanOtpusk ttWPEM
+, persons PnsEM
+, appointments AppEM
+, gp_OtpByMonths
+, gp_OtpByMonths gp_OtpByMonthsCur
+, vacations gp_vacations
+, PlanOtpusk gp_PlanOtpusk
+where
+((
+       ttGrafEM.cApp == ttPlOtEM.cApp
+and ttGrafEM.PlanBeg == ttPlOtEM.DatePacket
+and    ttPlOtEM.nRec == ttFaOtEM.ctmpPlOtp
+
+and ttPlOtEMIns.Person == PnsEM.nRec
+and   ttPlOtEMIns.cApp == AppEM.nRec
+and ttPlOtEMIns.Person == ttGrafEMIns.Person
+and   ttPlOtEMIns.cApp == ttGrafEMIns.cApp and (ttGrafEMIns.PlanBeg=ttPlOtEMIns.DatePacket)
+
+and        cRecDet == ttDetDet.crec
+and ttDetDet.cpers == pers2det.nrec
+and ttDetDet.cPlan == Plan2det.nrec
+and ttDetDet.cPers == Fact4det.PERSON
+and ttDetDet.dFact == Fact4det.FACTYEARBEG
+and Fact4det.VACTYPE == kotp4det.nrec
+and ttDetDet.cpers == ttWPEM.Person
+and ttDetDet.cPlan == ttWPEM.cPlanOtp
+
+and gp_Year == gp_OtpByMonthsCur.Year
+and gp_Month == gp_OtpByMonthsCur.Month
+and GrafiksTmp.Person == gp_vacations.Person
+and tmpFactOtpusk.FactYearBeg == gp_vacations.FactYearBeg
+
+and tmpPlanOtpusk.cPlanOtp == gp_PlanOtpusk.Nrec
+))
+;
+
+ExtendFormats SelectRecord;
+screen SelectRecord;
+  fields
+    wSortMonth('Выберите отчет ',hcStaffGrafOtp_f7,sci13Esc) : noprotect;
+    _showStatus ('Отображать графики в статусе',hcStaffGrafOtp_f7,sci13Esc) : [list 0 'Активный', word(-1) 'Первоначальный, при наличии переносов'];
+  buttons
+    cmGP_ExcelReport;
+<<
+
+                                                                              
+
+                                                               
+
+
+                                                                         
+                                                        [.] Группировка по месяцам`
+
+                                                      `Выводить графики в статусе`
+                                                       .@@@@@@@@@@@@@@@@@@@@
+
+                                                
+
+                                                      
+                                               
+                                         
+                     <.График отпусков Энергомаш (Excel).>
+
+>>
+end; // screen SelectRecord
+HandleEvent
+cmCheckField:
+{
+  case inherited :: handleEvent (cmCheckField) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+  case CurField of
+    #VidOtch:
+    {
+      if ( VidOtch = 0)
+      {
+        SetFieldOption(#Sort, ofSelectable);
+      }
+      else
+      {
+        ClearFieldOption(#Sort, ofSelectable);
+        set wSortMonth := 0;
+      }
+      SetFieldOption(#DetPlan, ofSelectable);
+      SetFieldOption(#Fotp   , ofSelectable);
+      SetFieldAndLabelVisible(#Level, (VidOtch<>0));
+      SetEnableCommand(cmGP_ExcelReport, (VidOtch and 1) = 1);
+    }
+    #wSortMonth:
+    {
+      if wSortMonth = 1 
+      {
+        set Fotp = 3;
+        if VidOtch = 1
+          set VidOtch := 0;
+        ClearFieldOption(#Sort   , ofSelectable);
+        ClearFieldOption(#DetPlan, ofSelectable);
+        ClearFieldOption(#Fotp   , ofSelectable);
+      }
+      if wSortMonth = 0
+      {
+        SetFieldOption(#Sort   , ofSelectable);
+        SetFieldOption(#DetPlan, ofSelectable);
+        SetFieldOption(#Fotp   , ofSelectable);
+      }
+      SetFieldAndLabelVisible(#Level, (VidOtch<>0));
+      DisableCommand(cmGP_ExcelReport);
+    }
+  end; //case
+}
+end;
+
+procedure GP_AddOtpByMonths(wYear: word; bMonth: byte; dDuration: double; sFact: string = '');
+{
+  gp_Year := wYear;
+  gp_Month := bMonth;
+
+  if getfirst gp_OtpByMonthsCur != tsOk
+    insert gp_OtpByMonths set gp_OtpByMonths.Year := gp_Year,
+                              gp_OtpByMonths.Month := gp_Month,
+                              gp_OtpByMonths.Duration := dDuration,
+                              gp_OtpByMonths.Fact := sFact;
+  else
+  {
+    gp_OtpByMonthsCur.Duration += dDuration;
+    if sFact != ''
+      gp_OtpByMonthsCur.Fact += if(gp_OtpByMonthsCur.Fact != '', ', ', '') + sFact;
+    update current gp_OtpByMonthsCur;
+  }
+}
+
+procedure GP_ReportFormXLS(isCreateXLT: boolean;
+                           sXLTFileName: string = '%StartPath%XLS_ЭМ\Staff\GP_GrafikOtpuskov.xltm');
+{
+  sXLTFileName := TranslatePath(sXLTFileName);
+  var sXLSFileName: string = if(isCreateXLT,
+                                pXL.CreateXLT(sXLTFileName, true),
+                                pXL.CreateReport(sXLTFileName, true));
+  pXL.CreateVar(sXLSFileName);
+  pXL.SetStringVar('Name_Org' , Trim(IOrganizationNamingV2(TOA1.GetNaming).GetFullNameEx('ShortName')));
+  pXL.SetStringVar('OKPO_Org' , Trim(TOA.GetJuridicalInfo.GetOkpoCode));
+  pXL.SetStringVar('Post_Boss', Trim(IDepartIer.GetBossPost));
+  pXL.SetStringVar('Name_Boss', Trim(IDepartIer.GetBossName));
+  pXL.SetStringVar('N_Doc'    , Trim(NDOC));
+  pXL.SetDateVar  ('D_Doc'    , DATADOC);
+  pXL.SetNumberVar('Y_Doc'    , YEARDOC);
+  pXL.PublishVar;
+
+  pXL.CreateTbls(sXLSFileName);
+  pXL.CreateTbl('Main');
+  pXL.CreateTblFld('Type');
+  pXL.CreateTblFld('Level');
+  pXL.CreateTblFld('Podr');
+  pXL.CreateTblFld('Post');
+  pXL.CreateTblFld('FIO');
+  pXL.CreateTblFld('TabN');
+  pXL.CreateTblFld('Duration');
+  pXL.CreateTblFld('PlanMonth');
+  pXL.CreateTblFld('FactMonth');
+  pXL.CreateTblFld('DocNmb');
+  pXL.CreateTblFld('MoveDate');
+  if (not IsCreateXLT) and GetMarkerCount(_SearchMarker) > 0
+  {
+    //Построение иерархии
+    _structHier.SH_CreateHierarchy(DATADOC, _SearchMarker, false);
+    //очищаем итоги по всем уровням
+    objSHierarchy.SH_ClearValueOnLevel(-1, -1);
+    //сортируем по иерархии
+    SetOrder(tiSHierarchyTableSortKey);
+    //цикл по табличке с построенной иерархией
+    _loop SHierarchyTable
+    {
+      //если запись иерархии вне фильтра - пропускаем
+      if not(SHierarchyTable.actual)
+        continue;
+
+      //проверяем, есть ли хоть один график отпусков в тек. подр. по основным рабочим (не совместителям)
+      if getfirst GrafiksTmp where ((SHierarchyTable.cPodr == GrafiksTmp.cPodr and (GrafiksTmp.lPrizn = 0))) != tsOk
+        continue;
+
+      //Выводим элемент иерархии
+      if (SHierarchyTable.levelIer <= 1)
+      {
+        pXL.ClearTblBuffer;
+        pXL.SetTblNumberFldValue('Type' , 1);
+        pXL.SetTblNumberFldValue('Level', SHierarchyTable.levelIer);
+        pXL.SetTblStringFldValue('Podr' , SHierarchyTable.Name);
+        pXL.InsTblRow;
+      }
+
+
+
+      //цикл по графикам отпусков (GrafiksTmp формируется базовым интерфейсом)
+      PushBounds(tbOrd0);
+      _loop GrafiksTmp
+      {
+        if GrafiksTmp.lPrizn != 0 Continue; //исключаем совместителей
+        var isOnlyOneYear: boolean = true; //признак, что выводим данные только за 1 год
+        var tmpYear: word = 0;
+        //заполняем временную таблицу с плановыми и фактическими отпусками по тек. сотруднику
+        //с группировкой год / месяц
+        delete all gp_OtpByMonths;
+        _loop tmpPlanOtpusk
+        {
+
+          if getfirst gp_PlanOtpusk = tsOk
+            if gp_PlanOtpusk.wStatus != _showStatus continue;
+
+          var woState: word = 0;    // новый план-график, вывод переносов с первого
+          gp_Year  := Year(tmpPlanOtpusk.PlanYearBeg);
+          gp_Month := Month(tmpPlanOtpusk.PlanYearBeg);
+          //добавляем/обновляем запись в таблице
+          if getfirst gp_OtpByMonthsCur != tsOk
+          {
+            ClearBuffer(tngp_OtpByMonthsCur);
+            gp_OtpByMonthsCur.Year     := gp_Year;
+            gp_OtpByMonthsCur.Month    := gp_Month;
+            gp_OtpByMonthsCur.Duration := tmpPlanOtpusk.Duration;
+            insert current gp_OtpByMonthsCur;
+          }
+          else
+          {
+            gp_OtpByMonthsCur.Duration += tmpPlanOtpusk.Duration;
+            update current gp_OtpByMonthsCur;
+          }
+          //вычисляем признак что выводим данные только за 1 год
+          if tmpYear = 0
+            tmpYear := gp_Year;
+          else
+            isOnlyOneYear := isOnlyOneYear and (gp_Year = tmpYear);
+          //если выставлен флаг отображать фактические отпуска - заполняем gp_OtpByMonths.Fact
+          _loop tmpFactOtpusk
+          {
+            if getfirst tmpHistPlanOtp where ((tmpPlanOtpusk.cPlanOtp == tmpHistPlanOtp.cTable and
+                                               coPlanOtpusk           == tmpHistPlanOtp.wTable and
+                                               word(39)               == tmpHistPlanOtp.wCodOper and
+                                               woState                << tmpHistPlanOtp.wState)) = tsOk
+            {
+              if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+                if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+                  if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                    gp_OtpByMonthsCur.DocNmb += if(gp_OtpByMonthsCur.DocNmb = '', '', ', ') +
+                                                TitleDoc.DocNmb;
+
+              gp_OtpByMonthsCur.MoveDate += if(gp_OtpByMonthsCur.MoveDate = '', '', ', ') +
+                                               DateToStr(tmpHistPlanOtp.PlanYearBeg, 'DD.MM.YY');
+
+              woState := tmpHistPlanOtp.wState;
+            }
+
+            if getfirst gp_vacations = tsOk
+              gp_OtpByMonthsCur.Fact += if(gp_OtpByMonthsCur.Fact = '', '', ', ') +
+                                        DateToStr(gp_vacations.FactYearBeg, 'DD.MM.YY') + ' - ' +
+                                        DateToStr(gp_vacations.FactYearEnd, 'DD.MM.YY');
+
+            update current gp_OtpByMonthsCur;
+          }
+        }
+        //вывод записи по году / месяцу
+        _loop gp_OtpByMonths
+        {
+          pXL.ClearTblBuffer;
+          pXL.SetTblNumberFldValue('Type'     , 0);
+          pXL.SetTblNumberFldValue('Level'    , SHierarchyTable.levelIer);
+          pXL.SetTblStringFldValue('Podr'     , iCatFunc.GetCatalogsCode(GrafiksTmp.Department));
+          pXL.SetTblStringFldValue('Post'     , GrafiksTmp.Post1);
+          pXL.SetTblStringFldValue('FIO'      , GrafiksTmp.FIO);
+          pXL.SetTblStringFldValue('TabN'     , GrafiksTmp.TabNmb1);
+          pXL.SetTblNumberFldValue('Duration' , gp_OtpByMonths.Duration);
+          pXL.SetTblStringFldValue('PlanMonth', DateToStr(Date(1,gp_OtpByMonths.Month, gp_OtpByMonths.Year),
+                                                          if(isOnlyOneYear,'Month', 'YYYYг. Month')));
+          pXL.SetTblStringFldValue('FactMonth', gp_OtpByMonths.Fact);
+          pXL.SetTblStringFldValue('DocNmb'   , gp_OtpByMonths.DocNmb);
+          pXL.SetTblStringFldValue('MoveDate' , gp_OtpByMonths.MoveDate);
+          pXL.InsTblRow;
+        } //_loop gp_OtpByMonths
+      } //_loop GrafiksTmp
+      PopBounds(tbOrd0);
+    } //_loop SHierarchyTable
+  } //if not IsCreateXLT
+  pXL.PublishTbl('Main');
+
+  pXL.LoadReport(sXLSFileName);
+  pXL.DisConnectExcel;
+}
+
+#declare AddDetDetInfo
+//++++++++++++++++++++++++++++++++++++++++++++++++
+          clearbuffer(#ttDetDet);
+          if getfirst ttDetDet where ((tpReportDetail.nrec == ttDetDet.crec)) <> tsOk
+          {
+            ttDetDet.crec  := tpReportDetail.nrec;
+            ttDetDet.cpers := ttGrafEM.Person;
+            ttDetDet.cPlan := ttPlOtEM.cPlanOtp;
+            if isFactV
+            {
+              ttDetDet.wPlFc := 1;
+              ttDetDet.dFact := ttFaOtEM.FactYearBeg;
+            }
+// Можно не присваивать при вставке новой записи
+//            else
+//            {
+//              ttDetDet.wPlFc := 0;
+//              ttDetDet.dFact := 0;
+//            }
+            insert current ttDetDet;
+          }
+//++++++++++++++++++++++++++++++++++++++++++++++++
+#end
+
+procedure ReportForm(_HierarchyLevel : word);
+var  InAlllRec : boolean;
+      TotalRec : boolean;
+      InAlllRecCount : integer;
+      TecAlllRecHierarchy : integer;
+      _tmpInt : integer;
+      woState : word;
+      isFactV : boolean;
+      sGraphTmp : string;
+{
+
+  if gp_TypeReport = 1
+  {
+    GP_ReportFormXLS(false);
+    exit;
+  }
+
+  if VidOtch = 1 and wSortMonth = 0
+    if _HierarchyLevel = 0 message('Не заданы уровни иерархии отчета с группировкой по подразделениям!');
+  if wSortMonth = 1
+  {
+//***********************************************************************************
+    Mode := 3;
+
+    Name_Org := Trim(TOA1.GetNaming.GetFullName());//Наименование организации
+    OKPO_ORG := Trim(TOA.GetJuridicalInfo.GetOkpoCode);//ОКПО
+    Post_Boss := Trim(IDepartIer.GetBossPost);
+    Name_Boss := Trim(IDepartIer.GetBossName);
+    N_Doc := Trim(NDOC);
+    Data_Doc := Trim(datetostr(DATADOC,'DD.MM.YYYY'));
+    Year_Doc := Trim(YEARDOC);
+
+//Удалить из выборки кривые отпуска (ERPPROD) Включить если будет необходимость   
+//    delete all from tmpPlanOtpusk where tmpPlanOtpusk.PlanYearBeg = 0 or tmpPlanOtpusk.PlanYearEnd = 0
+
+    //для альтернативной сортировки и группировки (ЭМ)
+    RestartVisual('Формирую иерархию по месяцам',1);
+    delete all from tpReportSHierarchy;
+    delete all from GrafiksTmp;
+    _loop ttPlOtEMIns
+    {
+      if (not NextVisual) break;
+      if not isvalid(#ttGrafEMIns)
+      {
+        if isvalid(#PnsEM)
+        if isvalid(#AppEM)
+        {
+          ClearBuffer(#ttGrafEMIns);
+          ttGrafEMIns.Department:= AppEM.Department;
+          ttGrafEMIns.Depart1:= iCatFunc.GetCatalogsCode(AppEM.Department);
+          if ( boGetTune('UP.STAFF.USE_LONGNAME_TBL') )
+            ttGrafEMIns.Post1:= iCatFunc.GetCatalogsLongName(AppEM.Post);
+          else
+            ttGrafEMIns.Post1:= iCatFunc.GetCatalogsName(AppEM.Post);
+          ttGrafEMIns.FIO    := PnsEM.FIO;
+          ttGrafEMIns.TabNmb1:= if(AppEM.lPrizn = 0, GetStrTabn(PnsEM.TabNmb, PnsEM.StrTabN), GetStrTabn(AppEM.AppTabNmb, AppEM.StrTabn));
+          ttGrafEMIns.Person := PnsEM.Nrec;
+          ttGrafEMIns.cApp   := AppEM.nRec;
+          ttGrafEMIns.lPrizn := AppEM.lPrizn;
+          ttGrafEMIns.PlanBeg := ttPlOtEMIns.PlanYearBeg;
+          insert current ttGrafEMIns;
+        }
+      }
+    }
+
+    sGraphTmp     := '';//информация по периоду еще не выводилась
+
+    RestartVisual('Формирую данные для отчета',1);
+    _loop ttGrafEM ordered index GrafiksTmp06
+    {
+      if (not NextVisual) break;
+      
+      if sGraphTmp <> DateToStr(ttGrafEM.PlanBeg,'YYYY г. Month')
+      {
+        sGraphTmp := DateToStr(ttGrafEM.PlanBeg,'YYYY г. Month');
+        ClearBuffer(#tpReportSHierarchy);
+        tpReportSHierarchy.NameSE := sGraphTmp;
+        insert current tpReportSHierarchy;
+      }
+
+      _loop ttPlOtEM
+      {
+        woState := 0;
+
+        if (ttPlOtEM.cPlanOtp = 0) and ((FOtp and 1) <> 1)
+            continue;
+
+        // если к записи нет не одного фактического отпуска
+        if not isvalid(#ttFaOtEM)
+        {
+          isFactV := false;
+          ClearBuffer(#tpReportDetail);
+          //привязка к иерархии "по месяцам"
+          tpReportDetail.cSE := tpReportSHierarchy.NRec;
+
+          tpReportDetail.Department := iCatFunc.GetCatalogsCode(ttGrafEM.Department);
+          tpReportDetail.Post := ttGrafEM.Post1;
+          tpReportDetail.FIO := ttGrafEM.FIO;
+          tpReportDetail.TabNmb := ttGrafEM.TabNmb1;
+
+          tpReportDetail.Duration := Integer(ttPlOtEM.Duration);
+
+          tpReportDetail.PlanBeg := datetostr(ttPlOtEM.PlanYearBeg,'DD.MM.YYYY'); // плановый отпуск есть, иначе записи в факт отпуске были бы
+
+          //отсутствует информация о фактическом отпуске
+
+          if getfirst tmpHistPlanOtp where ((ttPlOtEM.cPlanOtp == tmpHistPlanOtp.cTable and coPlanOtpusk == tmpHistPlanOtp.wTable and
+             word(39) == tmpHistPlanOtp.wCodOper and woState  << tmpHistPlanOtp.wState)) = tsOk
+          {
+            if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+            {
+              if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+              {
+                if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                  tpReportDetail.DocNmb := TitleDoc.DocNmb;
+              }
+            }
+
+            tpReportDetail.MoveBeg := datetostr(tmpHistPlanOtp.PlanYearBeg,'DD.MM.YYYY');
+
+            woState := tmpHistPlanOtp.wState;
+          }
+
+          if (Fotp = 3)
+          {
+            if (ttPlOtEM.Duration > 0.01 )
+              tpReportDetail.Describe := Integer(ttPlOtEM.Duration);
+          }
+          else
+            if (Fotp > 3)
+            {
+              if (VInter.SummMainder(ttPlOtEM.Nrec) <> 0)// and (NrecPerson = 0)
+                tpReportDetail.Describe := integer(VInter.SummMainder(ttPlOtEM.Nrec));
+            }
+
+          insert current tpReportDetail;
+//++++++++++++++++++++++++++++++++++++++++++++++++
+#AddDetDetInfo
+//++++++++++++++++++++++++++++++++++++++++++++++++
+        }
+
+        // проход по факт отпускам планового
+        _loop ttFaOtEM
+        {
+          isFactV := true;
+          ClearBuffer(#tpReportDetail);
+          //привязка к иерархии "по месяцам"
+          tpReportDetail.cSE := tpReportSHierarchy.NRec;
+
+          tpReportDetail.Department := iCatFunc.GetCatalogsCode(ttGrafEM.Department);
+          tpReportDetail.Post := ttGrafEM.Post1;
+          tpReportDetail.FIO := ttGrafEM.FIO;
+          tpReportDetail.TabNmb := ttGrafEM.TabNmb1;
+
+          //Если информация о плановом отпуске существует и еще не выводилась
+// комментарим блок вывода только в первой строке до указаний тестировщика
+//          if (NrecPlanOtp = 0) and (tmpPlanOtpusk.cPlanOtp <> 0) 
+          if ttPlOtEM.cPlanOtp <> 0
+          {
+            tpReportDetail.Duration := Integer(ttPlOtEM.Duration);
+            tpReportDetail.PlanBeg := datetostr(ttPlOtEM.PlanYearBeg,'DD.MM.YYYY');
+          }
+
+          tpReportDetail.FactBeg := datetostr(ttFaOtEM.FactYearBeg,'DD.MM.YYYY');
+
+          if getfirst tmpHistPlanOtp where ((ttPlOtEM.cPlanOtp == tmpHistPlanOtp.cTable and coPlanOtpusk == tmpHistPlanOtp.wTable and
+             word(39) == tmpHistPlanOtp.wCodOper and woState  << tmpHistPlanOtp.wState)) = tsOk
+          {
+            if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+            {
+              if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+              {
+                if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                  tpReportDetail.DocNmb := TitleDoc.DocNmb;
+              }
+            }
+
+            tpReportDetail.MoveBeg := datetostr(tmpHistPlanOtp.PlanYearBeg,'DD.MM.YYYY');
+            woState := tmpHistPlanOtp.wState;
+          }
+
+          if (Fotp = 3)  // остаток может выводиться только если выводятся фактические отпуска
+          {              // и не включена детализация
+            if (ttPlOtEM.DurOstat <> 0)
+            {
+                tpReportDetail.Describe := integer(ttPlOtEM.DurOstat);
+            }
+          }
+          else
+            if (Fotp = 5)
+            {
+              if (VInter.SummMainder(ttPlOtEM.Nrec) <> 0)
+              { //Остаток за прошлые годы выводится по сотруднику
+                  tpReportDetail.Describe := integer(VInter.SummMainder(ttPlOtEM.Nrec));
+              }
+            }
+
+          insert current tpReportDetail;
+//++++++++++++++++++++++++++++++++++++++++++++++++
+#AddDetDetInfo
+//++++++++++++++++++++++++++++++++++++++++++++++++
+        }
+
+
+        _loop tmpHistPlanOtp where ((ttPlOtEM.cPlanOtp == tmpHistPlanOtp.cTable and coPlanOtpusk == tmpHistPlanOtp.wTable and
+             word(39) == tmpHistPlanOtp.wCodOper and woState  << tmpHistPlanOtp.wState))
+        {
+          isFactV := false;
+          ClearBuffer(#tpReportDetail);
+          //привязка к иерархии "по месяцам"
+          tpReportDetail.cSE := tpReportSHierarchy.NRec;
+
+          if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+          {
+            if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+            {
+              if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                tpReportDetail.DocNmb := TitleDoc.DocNmb;
+            }
+          }
+
+          tpReportDetail.MoveBeg := datetostr(tmpHistPlanOtp.PlanYearBeg,'DD.MM.YYYY');
+
+          insert current tpReportDetail;
+//++++++++++++++++++++++++++++++++++++++++++++++++
+#AddDetDetInfo
+//++++++++++++++++++++++++++++++++++++++++++++++++
+        }
+      }
+    }
+
+    RunFReportByGroup(dsReport, 'Group_1');
+//***********************************************************************************
+  }
+  else
+  {
+
+//    inherited :: ReportForm(_HierarchyLevel);
+//Погосский доработка для ЭМ
+  delete all tpReport;
+  delete all tpReportSHierarchy;
+
+  Mode                := 2;
+  InAlllRecCount      := 0;
+  TecAlllRecHierarchy := 0;
+  Name_Org            := Trim(TOA1.GetNaming.GetFullName());//Наименование организации
+  OKPO_ORG            := Trim(TOA.GetJuridicalInfo.GetOkpoCode);//ОКПО
+  Post_Boss           := Trim(IDepartIer.GetBossPost);
+  Name_Boss           := Trim(IDepartIer.GetBossName);
+  N_Doc               := Trim(NDOC);
+  Data_Doc            := Trim(String(DATADOC));
+  Year_Doc            := Trim(YEARDOC);
+  //  Надобно откоментарить код, наверно, а то потом и сам не разберешься.
+  //  Итак начнем:
+  //  SH_CreateHierarchy - строим иерархию подразделений , при этом раставляем признак
+  //                       того, нужно ли нам подразделение в этом отчете или нет.
+  //                       в маркере _SearchMarker и хранятся те, что нужны
+  objSHierarchy.SH_CreateHierarchy(DATADOC, _SearchMarker, false);
+
+  //  SH_ClearValueOnLevel - очищаем итоги по всем уровням
+  objSHierarchy.SH_ClearValueOnLevel(-1, -1);
+  SetOrder(tiSHierarchyTableSortKey); // Сортируем по иерархии
+
+  //  цикл по табличке с постоенной иерархией
+  _Loop SHierarchyTable
+  {
+    //  SHierarchyTable.actual - признак нужно ли нам это подразделение в этом отчете
+    if not(SHierarchyTable.actual)
+      continue;
+    //   Разберемся с уровнем иерархии, до которого необходимо выводить ИНФУ
+    //  InAlllRec - признак, является ли запись записью "ИТОГО..."
+    //  TotalRec  - признак, является ли запись записью "ВСЕГО..."
+    InAlllRec := false;
+    TotalRec  := false;
+    //  определяем тип записи в иерархии
+    if (objSHierarchy.SH_IsLevel_In_All(SHierarchyTable.Nrec))
+      InAlllRec := true;
+    else
+      if (objSHierarchy.SH_IsLevel_Total(SHierarchyTable.Nrec))
+        TotalRec := true;
+    //  получаем количество записей на конкретном уровне
+    _tmpInt := Integer(objSHierarchy.SH_GetValueOnLevel(SHierarchyTable.levelIer,1));
+
+    if (SHierarchyTable.levelIer <> TecAlllRecHierarchy)
+      InAlllRecCount := 0;
+
+    //  проверка для того, что бы не выводить 2 записи в случае, когда подряд идет "ИТОГО" и "ВСЕГО"
+    //  либо же на уровне 0 записей
+    if (InAlllRec) and (_tmpInt = 0)
+      continue;
+    if (TotalRec) and (_tmpInt = InAlllRecCount)
+    {
+      InAlllRecCount := 0;
+      objSHierarchy.SH_ClearValueOnLevel(SHierarchyTable.levelIer, 1);
+      continue;
+    }
+
+    if (SHierarchyTable.levelIer <= _HierarchyLevel)
+    {
+      ClearBuffer(#tpReportSHierarchy);
+      tpReportSHierarchy.NameSE := SHierarchyTable.Name;
+
+      insert current tpReportSHierarchy;
+    }
+
+    // =============================================================================
+    //  ну а дальше вообще все просто выводим все нужные записи с информацией для конкретного
+    //  подразделения, выбранного в иерерхии .... и так, пока не надоест!
+    if (not (TotalRec) and not (InAlllRec))
+    {
+      PushBounds(tbOrd0);
+
+      var NrecPerson  : comp;
+      var NrecPlanOtp : comp;
+      var NrecFactOtp : comp;
+
+      if (getfirst GrafiksTmp = tsOk)
+      {
+        do
+        {
+          NrecPerson:= 0;//информация о сотруднике еще не выводилась
+
+          _loop tmpPlanOtpusk
+          {
+            NrecPlanOtp:= 0; // информация о плановом отпуске еще не выводилась
+            woState := 0;    // новый план-график, вывод переносов с первого
+
+            if (tmpPlanOtpusk.cPlanOtp = 0) and ((FOtp and 1) <> 1)
+                continue;
+
+            // если к записи нет не одного фактического отпуска
+            if GetFirst tmpFactOtpusk <> tsOk
+            {
+              ClearBuffer(#tpReport);
+
+              tpReport.cSE := tpReportSHierarchy.NRec;
+
+              //Если информация о сотруднике еще не выводилась
+//              if (NrecPerson = 0)
+//                {
+//                  tpReport.Department := IDepartIer.GetLongNameHistOrSamPodr(GrafiksTmp.Department, DataDOC);
+//                  tpReport.Department := oGP_DepFunc.GetFullDepName(GrafiksTmp.Department, DF_FROM_ROOT, 1, ' / ', DataDOC);
+                  tpReport.Department := iCatFunc.GetCatalogsName(GrafiksTmp.Department);
+                  tpReport.Post := GrafiksTmp.Post1;
+                  tpReport.FIO := GrafiksTmp.FIO;
+                  tpReport.TabNmb := GrafiksTmp.TabNmb1;
+//                }
+
+              tpReport.Duration := Integer(tmpPlanOtpusk.Duration);
+              tpReport.Name := tmpPlanOtpusk.Name;
+
+              tpReport.PlanBeg := String(tmpPlanOtpusk.PlanYearBeg); // плановый отпуск есть, иначе записи в факт отпуске были бы
+
+              if getfirst tmpHistPlanOtp where ((tmpPlanOtpusk.cPlanOtp == tmpHistPlanOtp.cTable and coPlanOtpusk == tmpHistPlanOtp.wTable and
+                word(39) == tmpHistPlanOtp.wCodOper and woState  << tmpHistPlanOtp.wState)) = tsOk
+              {
+                if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+                {
+                  if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+                  {
+                    if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                      tpReport.DocNmb := TitleDoc.DocNmb;
+                  }
+                }
+
+                tpReport.MoveBeg := String(tmpHistPlanOtp.PlanYearBeg);
+
+                woState := tmpHistPlanOtp.wState;
+              }
+
+              if (Fotp = 3)
+              {
+                if (tmpPlanOtpusk.Duration > 0.01 )
+                  tpReport.Describe := Integer(tmpPlanOtpusk.Duration);
+              }
+              else
+                if (Fotp = 5)
+                {
+                  if (VInter.SummMainder(tmpPlanOtpusk.Nrec) <> 0) and (NrecPerson = 0)
+                    tpReport.Describe := integer(VInter.SummMainder(tmpPlanOtpusk.Nrec));
+                }
+
+              NrecPerson:= GrafiksTmp.Person;
+
+              insert current tpReport;
+            }
+
+            // проход по факт отпускам планового
+            _loop tmpFactOtpusk
+            {
+              ClearBuffer(#tpReport);
+
+              NrecFactOtp := 0;
+
+              tpReport.cSE := tpReportSHierarchy.NRec;
+
+              //Если информация о сотруднике еще не выводилась
+//              if (NrecPerson = 0)
+//              {
+//                tpReport.Department := IDepartIer.GetLongNameHistOrSamPodr(GrafiksTmp.Department, DataDOC);
+//                tpReport.Department := oGP_DepFunc.GetFullDepName(GrafiksTmp.Department, DF_FROM_ROOT, 1, ' / ', DataDOC);
+                tpReport.Department := iCatFunc.GetCatalogsName(GrafiksTmp.Department);
+                tpReport.Post := GrafiksTmp.Post1;
+                tpReport.FIO := GrafiksTmp.FIO;
+                tpReport.TabNmb := GrafiksTmp.TabNmb1;
+//              }
+
+              //Если информация о плановом отпуске существует и еще не выводилась
+              if (NrecPlanOtp = 0) and (tmpPlanOtpusk.cPlanOtp <> 0)
+              {
+                tpReport.Duration := Integer(tmpPlanOtpusk.Duration);
+                tpReport.Name     := tmpPlanOtpusk.Name;
+                tpReport.PlanBeg := String(tmpPlanOtpusk.PlanYearBeg);
+              }
+                tpReport.Name     := tmpPlanOtpusk.Name;
+
+              tpReport.FactBeg := String(tmpFactOtpusk.FactYearBeg);
+
+              if getfirst tmpHistPlanOtp where ((tmpPlanOtpusk.cPlanOtp == tmpHistPlanOtp.cTable and coPlanOtpusk == tmpHistPlanOtp.wTable and
+                 word(39) == tmpHistPlanOtp.wCodOper and woState  << tmpHistPlanOtp.wState)) = tsOk
+              {
+                if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+                {
+                  if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+                  {
+                    if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                      tpReport.DocNmb := TitleDoc.DocNmb;
+                  }
+                }
+
+                tpReport.MoveBeg := String(tmpHistPlanOtp.PlanYearBeg);
+
+                woState := tmpHistPlanOtp.wState;
+              }
+
+              if (Fotp = 3)  // остаток может выводиться только если выводятся фактические отпуска
+              {              // и не включена детализация
+                if (tmpPlanOtpusk.DurOstat <> 0)
+                {
+                  if (NrecFactOtp = 0)
+                    tpReport.Describe := integer(tmpPlanOtpusk.DurOstat);
+                }
+              }
+              else
+                if (Fotp = 5)
+                {
+                  if (VInter.SummMainder(tmpPlanOtpusk.Nrec) <> 0)
+                  { //Остаток за прошлые годы выводится по сотруднику
+                    if (NrecPerson = 0)
+                      tpReport.Describe := integer(VInter.SummMainder(tmpPlanOtpusk.Nrec));
+                  }
+                }
+
+              NrecPlanOtp := tmpPlanOtpusk.Nrec;
+              NrecFactOtp := tmpFactOtpusk.ctmpPlOtp;
+              NrecPerson  := GrafiksTmp.Person;
+
+              insert current tpReport;
+            }
+
+            _loop tmpHistPlanOtp where ((tmpPlanOtpusk.cPlanOtp == tmpHistPlanOtp.cTable and coPlanOtpusk == tmpHistPlanOtp.wTable and
+                 word(39) == tmpHistPlanOtp.wCodOper and woState  << tmpHistPlanOtp.wState))
+            {
+              ClearBuffer(#tpReport);
+
+              if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+              {
+                if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+                {
+                  if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                    tpReport.DocNmb := TitleDoc.DocNmb;
+                }
+              }
+
+              tpReport.cSE := tpReportSHierarchy.NRec;
+              tpReport.MoveBeg := String(tmpHistPlanOtp.PlanYearBeg);
+
+              insert current tpReport;
+            }
+          }
+        }
+        while (getnext GrafiksTmp = tsOk);
+      }
+
+      PopBounds(tbOrd0);
+      if (_HierarchyLevel = 0) break;
+    }// if (not (TotalRec) and not (InAlllRec))
+  }// _Loop SHierarchyTable
+
+  RunFReportByGroup(dsReport, 'Group_1');
+//------------------------------------------------------
+  }
+}
+
+function sRetWorkFrom(cFRec : comp) : string; cacheable;
+{
+  result := '';
+  set cRecDet := cFRec;
+  if isvalid(#ttDetDet)
+    if isvalid(#pers2det)
+      result := datetostr(pers2det.APPDATE,'DD.MM.YYYY'); 
+}
+
+function sRetWorkPer(cFRec : comp) : string;
+{
+  result := '';
+  set cRecDet := cFRec;
+  if isvalid(#ttDetDet)
+    if ttDetDet.wPlFc = 0
+    {
+      if isvalid(#Plan2det)
+        if Plan2det.WORKYEARBEG<>0 and Plan2det.WORKYEAREND<>0
+          result := 'с '+datetostr(Plan2det.WORKYEARBEG,'DD.MM.YYYY')+' по '+datetostr(Plan2det.WORKYEAREND,'DD.MM.YYYY');
+//        result := if(Plan2det.WORKYEARBEG=0,'','с '+datetostr(Plan2det.WORKYEARBEG,'DD.MM.YYYY'))+if(Plan2det.WORKYEAREND=0,'',' по '+datetostr(Plan2det.WORKYEAREND,'DD.MM.YYYY'));
+    }
+    else
+    {
+      if isvalid(#Fact4det)
+        if Fact4det.WORKYEARBEG<>0 and Fact4det.WORKYEAREND<>0
+          result := 'с '+datetostr(Fact4det.WORKYEARBEG,'DD.MM.YYYY')+' по '+datetostr(Fact4det.WORKYEAREND,'DD.MM.YYYY');
+//        result := if(Fact4det.WORKYEARBEG=0,'','с '+datetostr(Fact4det.WORKYEARBEG,'DD.MM.YYYY'))+if(Fact4det.WORKYEAREND=0,'',' по '+datetostr(Fact4det.WORKYEAREND,'DD.MM.YYYY'));
+    }
+  if result = ''
+    if isvalid(#ttWPEM)
+    {
+      if getfirst WP4Det where((iWPFunc.GetWPByDateAndApp(ttWPEM.Person,ttWPEM.cApp,ttWPEM.PlanYearBeg,false) == WP4Det.nRec)) = tsOk
+        result := 'с '+datetostr(WP4Det.dPerBeg,'DD.MM.YYYY')+' по '+datetostr(WP4Det.dPerEnd,'DD.MM.YYYY');
+      if result = ''
+        if getfirst WP4Det where
+        ((iWPFunc.GetWPByDateAndApp(ttWPEM.Person,iAppFunc.GetAppNrec_OnDate(ttWPEM.Person,dGetTune('UP.DATOTCH')),dGetTune('UP.DATOTCH'),false) == WP4Det.nRec
+        )) = tsOk
+          result := 'с '+datetostr(WP4Det.dPerBeg,'DD.MM.YYYY')+' по '+datetostr(WP4Det.dPerEnd,'DD.MM.YYYY');
+    }
+}
+
+function sRetTypeVac(cFRec : comp) : string;
+{
+  result := '';
+  set cRecDet := cFRec;
+  if isvalid(#ttDetDet)
+  {
+    if ttDetDet.wPlFc = 0
+    {
+      if isvalid(#Plan2det)
+        result := Plan2det.VACTYPE;
+    }
+    else
+    {
+      if isvalid(#Fact4det)
+        if isvalid(#kotp4det)
+          result := kotp4det.KOTPUS;
+    }
+  }
+}
+
+function sRetPerVac(cFRec : comp; wPlFcPer : word) : string;
+{
+  result := '';
+  set cRecDet := cFRec;
+  if isvalid(#ttDetDet)
+  {
+    if wPlFcPer = 0
+    {
+      if isvalid(#Plan2det)
+        result := 'с '+datetostr(Plan2det.PlanYEARBEG,'DD.MM.YYYY')+' по '+datetostr(Plan2det.PlanYEAREND,'DD.MM.YYYY');
+    }
+    else
+    {
+      if isvalid(#Fact4det)
+        result := 'с '+datetostr(Fact4det.FactYEARBEG,'DD.MM.YYYY')+' по '+datetostr(Fact4det.FactYEAREND,'DD.MM.YYYY');
+    }
+  }
+}
+/*
+  [sSignPost]    iAppFunc.GetAppPost(iAppFunc.GetAppNrec_OnDate(coGetTune('UP.STAFF.SIGNATORYAUTHORITY'),cur_date));
+  [sSignFIO]     iStrFunc.GetFIO(sGetTune('UP.STAFF.SIGNATORYAUTHORITY'));
+*/
+DataStream dsReport (
+  [sSignPost]    '';//VAppFunc.GetAppPost(VAppFunc.GetAppNrec_OnDate(coGetTune('UP.STAFF.SIGNATORYAUTHORITY'),cur_date));
+  [sSignFIO]     '';//iStrFunc.GetFIO(sGetTune('UP.STAFF.SIGNATORYAUTHORITY'));
+  Table inherited::tpReportDetail
+  (
+    [sWorkFrom]     sRetWorkFrom(tpReportDetail.nrec);
+    [sWorkPer]      sRetWorkPer(tpReportDetail.nrec);
+    [sTypeVac]      sRetTypeVac(tpReportDetail.nrec);
+    [sPerVacP]      sRetPerVac(tpReportDetail.nrec,0);
+    [sPerVacF]      sRetPerVac(tpReportDetail.nrec,1);
+  );
+)
+end;
+
+
+HandleEvent
+  cmInit: 
+  {
+    case inherited :: handleEvent (cmInit) of
+      heAbort:{abort;exit;}
+      heStop:{stop;exit;}
+    end;
+    if not (ReadMyDsk(wSortMonth ,'VacationGraf_wSortMonth' ,false))  set wSortMonth := 0;
+    if not (ReadMyDsk(_showStatus, 'VacationGraf_showStatus', false)) set _showStatus := 0;
+    if wSortMonth = 1 
+    {
+      ClearFieldOption(#Sort, ofSelectable);
+      set Fotp = 3;
+      if VidOtch = 1
+        set VidOtch := 0;
+      ClearFieldOption(#Sort   , ofSelectable);
+      ClearFieldOption(#DetPlan, ofSelectable);
+      ClearFieldOption(#Fotp   , ofSelectable);
+      DisableCommand(cmGP_ExcelReport);
+    }
+    if wSortMonth = 0
+    {
+      SetFieldOption(#Sort   , ofSelectable);
+      SetFieldOption(#DetPlan, ofSelectable);
+      SetFieldOption(#Fotp   , ofSelectable);
+      EnableCommand(cmGP_ExcelReport);
+    }
+    SetEnableCommand(cmGP_ExcelReport, (VidOtch and 1) = 1);
+  }
+
+  cmStaffAllDep:
+  {
+    if wSortMonth = 1 VidOtch := 1;
+
+//    case inherited :: handleEvent (cmStaffAllDep) of
+//      heAbort:{abort;exit;}
+//      heStop:{stop;exit;}
+//    end;
+//Погосский доработка для ЭМ
+  var woState: word;
+  var kol, i : integer;
+  var tmpPersNRec : comp;
+
+  delete all tpReport;
+
+  TOA.Bind(0); // связываем TOA с собственной организацией
+
+  if (VCommonFiltr.GetPsnCount = 0)
+    VCommonFiltr.SelectAllPsn;
+
+  _SearchMarker := InitMarker('', 8, 200, 10);
+  StartNewVisual(vtRotateVisual, vfTimer + vfBreak, 'Обработка информации', 1);
+  delete all GrafiksTmp; // Очищаем временные таблицы
+  ReSetBounds(#tmpPlanOtpusk);
+  delete all tmpPlanOtpusk;
+  SetBounds(#tmpPlanOtpusk);
+
+  PersMarker := InitMarker('',8,200,100);
+  PersMarker := VCommonFiltr.GetPersonsMarker;
+  kol:=  GetMarkerCount(PersMarker);
+  i := 0;
+  while i < kol
+  {
+    GetMarker (PersMarker, i, tmpPersNRec);
+
+    set cPersNRec := tmpPersNRec;
+
+    if (getfirst PlanOtpusk <> tsOk){}
+
+    delete all tmpSumOst;
+
+    _loop PlanOtpusk
+    {
+      if ( ( DetPlan and 1 ) > 0 and //Детализация планового отпуска
+           GetFirst DetPlanOtpusk = tsOk )
+          {
+            _loop DetPlanOtpusk
+              {
+                ClearBuffer(#tmpPlanOtpusk);
+
+                tmpPlanOtpusk.Nrec       := comp(0);
+                tmpPlanOtpusk.cPlanOtp   := PlanOtpusk.Nrec;
+                tmpPlanOtpusk.Person     := PlanOtpusk.Person;
+                tmpPlanOtpusk.cApp       := FillGrafiksTmp(PlanOtpusk.Person, PlanOtpusk.Appoint);
+                tmpPlanOtpusk.Duration   := DetPlanOtpusk.Duration;
+                tmpPlanOtpusk.Name        := KlDetPlOtp.NOtpus;
+                tmpPlanOtpusk.PlanYearBeg := DetPlanOtpusk.PlanYearBeg;
+                tmpPlanOtpusk.DatePacket := PlanOtpusk.PlanYearBeg;
+                tmpPlanOtpusk.PlanYearEnd := DetPlanOtpusk.PlanYearEnd;
+
+                if ( insert current tmpPlanOtpusk = tsOk ) and ( ( FOtp and 1 ) = 1 )
+                  {
+                    _loop Vacations
+                      {
+                        ClearBuffer(#tmpFactOtpusk);
+
+                        tmpFactOtpusk.ctmpPlOtp  := tmpPlanOtpusk.Nrec;
+                        tmpFactOtpusk.FactYearBeg:= Vacations.FactYearBeg;
+
+                        insert current tmpFactOtpusk;
+                      }
+                  }
+              }
+            FillTmpHistPlanOtp;
+
+          }
+        else //Без детализация планового отпуска
+          {
+            ClearBuffer(#tmpPlanOtpusk);
+
+            tmpPlanOtpusk.Nrec       := comp(0);
+            tmpPlanOtpusk.cPlanOtp   := PlanOtpusk.Nrec;
+            tmpPlanOtpusk.Person     := PlanOtpusk.Person;
+            tmpPlanOtpusk.cApp       := FillGrafiksTmp(PlanOtpusk.Person, PlanOtpusk.Appoint);
+            tmpPlanOtpusk.Duration   := PlanOtpusk.Duration;
+
+            if (GetFirst KlOtpuskPlan where ((PlanOtpusk.VacType == KlOtpuskPlan.KotPus )) = tsOk )
+              tmpPlanOtpusk.Name        := KlOtpuskPlan.NOtpus;
+
+            tmpPlanOtpusk.PlanYearBeg:= PlanOtpusk.PlanYearBeg;
+            tmpPlanOtpusk.DatePacket := PlanOtpusk.PlanYearBeg;
+            tmpPlanOtpusk.PlanYearEnd:= PlanOtpusk.PlanYearEnd;
+            tmpPlanOtpusk.DurOstat   := PlanOtpusk.Duration;
+
+            if ( insert current tmpPlanOtpusk = tsOk ) and ( ( FOtp and 1 ) = 1 )
+              {
+                _loop FactOtpusk
+                  {
+                    ClearBuffer(#tmpFactOtpusk);
+
+                    tmpFactOtpusk.ctmpPlOtp  := tmpPlanOtpusk.Nrec;
+                    tmpFactOtpusk.FactYearBeg:= FactOtpusk.FactYearBeg;
+
+                    insert current tmpFactOtpusk;
+
+                    tmpPlanOtpusk.DurOstat -= FactOtpusk.Duration;
+                  }
+
+              update current tmpPlanOtpusk;
+
+              AddOstatByApp(tmpPlanOtpusk.cApp, tmpPlanOtpusk.DurOstat);
+              }
+            FillTmpHistPlanOtp;
+          }
+    }
+
+    //Если выводится информация о всех отпусках...
+    if ((FOtp and 1) > 0)
+    {
+      _loop FactOtpuskOther
+      {
+        if (getfirst Vacations where ((FactOtpuskOther.Nrec == Vacations.cFactOtpusk)) <> tsOk)
+          continue;
+
+        if ( GetFirst KlOtpuskOther <> tsOk )
+          continue;
+
+        case KlOtpuskOther.TypeOtp of
+          3: if ( Day(FactOtpuskOther.dDateBegOld) <> 0 ) // компенсации при увольнении
+               continue;
+          0,1: {}
+          2:   continue;
+          else continue;
+        end;
+
+        if (FactOtpuskOther.cPlanOtpusk = 0)
+        {
+          ClearBuffer(#tmpPlanOtpusk);
+          tmpPlanOtpusk.Nrec       := comp(0);
+          tmpPlanOtpusk.cPlanOtp   := comp(0);
+          tmpPlanOtpusk.Person     := FactOtpuskOther.Person;
+          tmpPlanOtpusk.cApp       := FillGrafiksTmp(FactOtpuskOther.Person, FactOtpuskOther.Appoint);
+          tmpPlanOtpusk.Duration   := FactOtpuskOther.Duration;
+
+            if (GetFirst KlOtpuskPlan where ((FactOtpuskOther.VacType == KlOtpuskPlan.KotPus )) = tsOk )
+              tmpPlanOtpusk.Name        := KlOtpuskPlan.NOtpus;
+
+          tmpPlanOtpusk.PlanYearBeg:= FactOtpuskOther.FactYearBeg;
+          tmpPlanOtpusk.DatePacket := FactOtpuskOther.FactYearBeg;
+          tmpPlanOtpusk.PlanYearEnd:= FactOtpuskOther.FactYearEnd;
+
+          if (insert current tmpPlanOtpusk = tsOk) and ((FOtp and 1) = 1)
+          {
+            ClearBuffer(#tmpFactOtpusk);
+            tmpFactOtpusk.ctmpPlOtp  := tmpPlanOtpusk.Nrec;
+            tmpFactOtpusk.FactYearBeg:= FactOtpuskOther.FactYearBeg;
+
+            insert current tmpFactOtpusk;
+
+            AddOstatByApp(tmpPlanOtpusk.cApp, -FactOtpuskOther.Duration);
+          }
+        }
+        else
+          if (getfirst PlanOtpuskCheck <> tsOk) //Нет планового отпуска
+          {
+            ClearBuffer(#tmpPlanOtpusk);
+            tmpPlanOtpusk.Nrec       := comp(0);
+            tmpPlanOtpusk.cPlanOtp   := comp(0);
+            tmpPlanOtpusk.Person     := FactOtpuskOther.Person;
+            tmpPlanOtpusk.cApp       := FillGrafiksTmp(FactOtpuskOther.Person, FactOtpuskOther.Appoint);
+            tmpPlanOtpusk.Duration   := FactOtpuskOther.Duration;
+
+            if (GetFirst KlOtpuskPlan where ((FactOtpuskOther.VacType == KlOtpuskPlan.KotPus )) = tsOk )
+              tmpPlanOtpusk.Name        := KlOtpuskPlan.NOtpus;
+
+            tmpPlanOtpusk.PlanYearBeg:= FactOtpuskOther.FactYearBeg;
+            tmpPlanOtpusk.DatePacket := FactOtpuskOther.FactYearBeg;
+            tmpPlanOtpusk.PlanYearEnd:= FactOtpuskOther.FactYearEnd;
+
+            if (insert current tmpPlanOtpusk = tsOk) and ((FOtp and 1) = 1)
+            {
+              ClearBuffer(#tmpFactOtpusk);
+              tmpFactOtpusk.ctmpPlOtp  := tmpPlanOtpusk.Nrec;
+              tmpFactOtpusk.FactYearBeg:= FactOtpuskOther.FactYearBeg;
+
+              insert current tmpFactOtpusk;
+
+              AddOstatByApp(tmpPlanOtpusk.cApp, -FactOtpuskOther.Duration);
+            }
+          }
+      }
+
+      _loop tmpPlanOtpusk where (( cPersNRec == tmpPlanOtpusk.Person   and
+                                   comp(0)   == tmpPlanOtpusk.cPlanOtp ))
+        if GetFirst tmpSumOst where (( tmpPlanOtpusk.cApp == tmpSumOst.cPlanApp )) = tsOk
+          update current tmpPlanOtpusk set tmpPlanOtpusk.DurOstat := tmpSumOst.doSumOst;
+    }
+
+    i++;
+  }
+
+  if (VidOtch = 1)
+    ReportForm(Level)
+  else
+  {
+    Mode := 1;
+
+    Name_Org := Trim(TOA1.GetNaming.GetFullName());//Наименование организации
+    OKPO_ORG := Trim(TOA.GetJuridicalInfo.GetOkpoCode);//ОКПО
+    Post_Boss := Trim(IDepartIer.GetBossPost);
+    Name_Boss := Trim(IDepartIer.GetBossName);
+    N_Doc := Trim(NDOC);
+    Data_Doc := Trim(String(DATADOC));
+    Year_Doc := Trim(YEARDOC);
+
+    var NrecPerson  : comp;
+    var NrecPlanOtp : comp;
+    var NrecFactOtp : comp;
+
+    _loop GrafiksTmp
+    {
+      GrafiksTmp.PlanBeg := tmpPlanOtpusk.PlanYearBeg;
+      update current GrafiksTmp;
+    }
+
+    case sort of
+      0: PushBounds(tbOrd2);
+      1: PushBounds(tbOrd1);
+      2: PushBounds(tbOrd3);
+    end;
+
+    _loop GrafiksTmp
+    {
+      NrecPerson    := 0;//информация о сотруднике еще не выводилась
+
+      _loop tmpPlanOtpusk
+      {
+        woState := 0;
+        NrecPlanOtp:= 0; //информация о плановом отпуске еще не выводилась
+
+        if (tmpPlanOtpusk.cPlanOtp = 0) and ((FOtp and 1) <> 1)
+            continue;
+
+        // если к записи нет не одного фактического отпуска
+        if GetFirst tmpFactOtpusk <> tsOk
+        {
+          ClearBuffer(#tpReport);
+
+          //Если информация о сотруднике еще не выводилась
+//          if (NrecPerson = 0)
+//          {
+//            tpReport.Department := IDepartIer.GetLongNameHistOrSamPodr(GrafiksTmp.Department, DataDOC);
+//            tpReport.Department := oGP_DepFunc.GetFullDepName(GrafiksTmp.Department, DF_FROM_ROOT, 1, ' / ', DataDOC);
+            tpReport.Department := iCatFunc.GetCatalogsName(GrafiksTmp.Department);
+            tpReport.Post := GrafiksTmp.Post1;
+            tpReport.FIO := GrafiksTmp.FIO;
+            tpReport.TabNmb := GrafiksTmp.TabNmb1;
+//          }
+
+          tpReport.Duration := Integer(tmpPlanOtpusk.Duration);
+          tpReport.Name     := tmpPlanOtpusk.Name;
+          tpReport.PlanBeg := String(tmpPlanOtpusk.PlanYearBeg); // плановый отпуск есть, иначе записи в факт отпуске были бы
+
+          //отсутствует информация о фактическом отпуске
+
+          if getfirst tmpHistPlanOtp where ((tmpPlanOtpusk.cPlanOtp == tmpHistPlanOtp.cTable and coPlanOtpusk == tmpHistPlanOtp.wTable and
+             word(39) == tmpHistPlanOtp.wCodOper and woState  << tmpHistPlanOtp.wState)) = tsOk
+          {
+            if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+            {
+              if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+              {
+                if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                  tpReport.DocNmb := TitleDoc.DocNmb;
+              }
+            }
+
+            tpReport.MoveBeg := String(tmpHistPlanOtp.PlanYearBeg);
+
+            woState := tmpHistPlanOtp.wState;
+          }
+
+          if (Fotp = 3)
+          {
+            if (tmpPlanOtpusk.Duration > 0.01 )
+              tpReport.Describe := Integer(tmpPlanOtpusk.Duration);
+          }
+          else
+            if (Fotp > 3)
+            {
+              if (VInter.SummMainder(tmpPlanOtpusk.Nrec) <> 0) and (NrecPerson = 0)
+                tpReport.Describe := integer(VInter.SummMainder(tmpPlanOtpusk.Nrec));
+            }
+
+          NrecPerson:= GrafiksTmp.Person;
+
+          insert current tpReport;
+        }
+
+        // проход по факт отпускам планового
+        _loop tmpFactOtpusk
+        {
+          ClearBuffer(#tpReport);
+
+          NrecFactOtp := 0;
+
+          //Если информация о сотруднике еще не выводилась
+//          if (NrecPerson = 0)
+//          {
+//            tpReport.Department := IDepartIer.GetLongNameHistOrSamPodr(GrafiksTmp.Department, DataDOC);
+//            tpReport.Department := oGP_DepFunc.GetFullDepName(GrafiksTmp.Department, DF_FROM_ROOT, 1, ' / ', DataDOC);
+            tpReport.Department := iCatFunc.GetCatalogsName(GrafiksTmp.Department);
+            tpReport.Post := GrafiksTmp.Post1;
+            tpReport.FIO := GrafiksTmp.FIO;
+            tpReport.TabNmb := GrafiksTmp.TabNmb1;
+//          }
+
+          //Если информация о плановом отпуске существует и еще не выводилась
+          if (NrecPlanOtp = 0) and (tmpPlanOtpusk.cPlanOtp <> 0)
+          {
+            tpReport.Duration := Integer(tmpPlanOtpusk.Duration);
+            tpReport.Name     := tmpPlanOtpusk.Name;
+            tpReport.PlanBeg := String(tmpPlanOtpusk.PlanYearBeg);
+          }
+            tpReport.Name     := tmpPlanOtpusk.Name;
+
+          tpReport.FactBeg := String(tmpFactOtpusk.FactYearBeg);
+
+          if getfirst tmpHistPlanOtp where ((tmpPlanOtpusk.cPlanOtp == tmpHistPlanOtp.cTable and coPlanOtpusk == tmpHistPlanOtp.wTable and
+             word(39) == tmpHistPlanOtp.wCodOper and woState  << tmpHistPlanOtp.wState)) = tsOk
+          {
+            if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+            {
+              if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+              {
+                if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                  tpReport.DocNmb := TitleDoc.DocNmb;
+              }
+            }
+
+            tpReport.MoveBeg := String(tmpHistPlanOtp.PlanYearBeg);
+            woState := tmpHistPlanOtp.wState;
+          }
+
+          if (Fotp = 3)  // остаток может выводиться только если выводятся фактические отпуска
+          {              // и не включена детализация
+            if (tmpPlanOtpusk.DurOstat <> 0)
+            {
+              if (NrecFactOtp = 0)
+                tpReport.Describe := integer(tmpPlanOtpusk.DurOstat);
+            }
+          }
+          else
+            if (Fotp = 5)
+            {
+              if (VInter.SummMainder(tmpPlanOtpusk.Nrec) <> 0)
+              { //Остаток за прошлые годы выводится по сотруднику
+                if (NrecPerson = 0)
+                  tpReport.Describe := integer(VInter.SummMainder(tmpPlanOtpusk.Nrec));
+              }
+            }
+
+          NrecPlanOtp := tmpPlanOtpusk.Nrec;
+          NrecFactOtp := tmpFactOtpusk.ctmpPlOtp;
+          NrecPerson  := GrafiksTmp.Person;
+
+          insert current tpReport;
+        }
+
+
+        _loop tmpHistPlanOtp where ((tmpPlanOtpusk.cPlanOtp == tmpHistPlanOtp.cTable and coPlanOtpusk == tmpHistPlanOtp.wTable and
+             word(39) == tmpHistPlanOtp.wCodOper and woState  << tmpHistPlanOtp.wState))
+        {
+          ClearBuffer(#tpReport);
+
+          if getfirst ContDoc where ((tmpHistPlanOtp.cPrikaz == ContDoc.nRec)) = tsOk
+          {
+            if getfirst PartDoc where  ((ContDoc.cPart == PartDoc.nRec)) = tsOk
+            {
+              if getfirst TitleDoc where ((PartDoc.cDoc == TitleDoc.Nrec)) = tsOk
+                tpReport.DocNmb := TitleDoc.DocNmb;
+            }
+          }
+
+          tpReport.MoveBeg := String(tmpHistPlanOtp.PlanYearBeg);
+
+          insert current tpReport;
+        }
+      }
+    }
+
+    case sort of
+      0: PopBounds(tbOrd2);
+      1: PopBounds(tbOrd1);
+      2: PopBounds(tbOrd3);
+    end;
+
+    RunFReportByGroup(dsReport, 'Group_1');
+  }
+
+  StopVisual('', 0);
+  MadeReport:= true;
+  VCommonFiltr.IntClose(MadeReport);
+  VCommonFiltr.StoreAllParams;
+  Notify(cmEvaluateAndModify, 0);
+  DoneMarker(_SearchMarker , '' );
+  ReSetBounds(#tmpPlanOtpusk);
+  delete all tmpPlanOtpusk;
+  SetBounds(#tmpPlanOtpusk);
+  delete all GrafiksTmp; // Очищаем временные таблицы
+  delete all tmpHistPlanOtp;
+//--------------------------------------------------------------
+    if wSortMonth = 1 and VidOtch = 1 {set VidOtch := 0};
+
+  }
+  cmGP_ExcelReport:
+  {
+    gp_TypeReport := 1;
+    ProcessCommand(cmStaffAllDep);
+    gp_TypeReport := 0;
+  }
+  cmDone:
+  {
+    savemydsk(wSortMonth ,'VacationGraf_wSortMonth');
+    savemydsk(_showStatus, 'VacationGraf_showStatus');
+    case inherited :: handleEvent (cmDone) of
+      heAbort:{abort;exit;}
+      heStop:{stop;exit;}
+    end;
+  }
+end;
+end.

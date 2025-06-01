@@ -1,0 +1,350 @@
+#include GP_IUserFilter.obj
+#include GP_IUserFilterStore.obj
+#include GP_IOnCmDefault.obj
+#include GP_UserFilterEditViewFactory.vih
+
+#component "GP_Common"
+
+#include GP_UserFilterManager.vih
+interface GP_UserFilterManager;
+
+table struct tFilters (
+  Ind      : longint,
+  NoField  : longint,
+  Caption  : String
+) with index (
+  i00 = Ind (unique),
+  i01 = NoField (unique)
+);
+
+var
+  _store: GP_IUserFilterStore;
+  _arrFilters: array[0..0] of GP_IUserFilter;
+  _arrEditInterfaces: array[0..0] of GP_IOnCmDefault;
+  _count: longint;
+  _activeFiltersMarker: TPtr;
+  _editViewFactory: GP_IUserFilterEditViewFactory;
+
+create view
+var
+  _noField: longint;
+  _ind: longint;
+from tFilters, tFilters tFiltersByFld, tFilters tFiltersByInd
+where((
+  _noField == tFiltersByFld.NoField and
+  _ind == tFiltersByInd.Ind
+));
+
+window wEditFilter 'Установка фильтра' escClose doAccept;
+show (,,70, 5);
+
+embedded embEditFilter interface;
+show(,,69,2);
+end;
+
+screen scEdit;
+show(,3,69,);
+buttons
+  cmDoOk, default;
+  cmDeleteFilter;
+<<
+                                <. Продолжить .> <. Удалить фильтр .>
+>>
+end;
+
+handleevent
+  cmDoOk: PutCommand(cmDefault);
+  cmDeleteFilter: CloseWindowEx(wEditFilter, cmDeleteFilter);
+end;
+
+end; //window wEditFilter
+
+//*****************************************************************************
+//#region GP_UserFilterManager
+
+constructor Init;
+{
+  result := false;
+}
+
+constructor UserFilterManager(Store: GP_IUserFilterStore;
+                              EditViewFactory: GP_IUserFilterEditViewFactory = NullRef);
+{
+  _store := Store;
+  if EditViewFactory = NullRef
+    GetVipRef(_editViewFactory, 'GP_Common::GP_UserFilterEditViewFactory');
+  else
+    _editViewFactory := EditViewFactory;
+  _count := 0;
+  _activeFiltersMarker := InitMarker('', SizeOf(longint), 10, 10, true);
+  result := _store != NullRef and _editViewFactory != NullRef;
+}
+
+destructor Done;
+{
+  DoneMarker(_activeFiltersMarker, '');
+}
+
+//#endregion GP_UserFilterManager
+//*****************************************************************************
+
+procedure OnEditInterfaceCmDefault;
+{
+  CloseWindowEx(wEditFilter, cmDefault);
+}
+
+//*****************************************************************************
+//#region GP_IUserFilterManager
+
+//#region Методы для работы через индекс фильтра
+
+function  AddFilter(lNoField: longint; objUserFilter: GP_IUserFilter;
+                    sFieldCaption: String = ''; objEditInterface: GP_IOnCmDefault = NullRef): boolean;
+{
+  result := false;
+  if OnBeforeAddFilter(lNoField, objUserFilter, sFieldCaption, objEditInterface) != 0 exit;
+
+  ClearBuffer(tntFilters);
+  tFilters.Ind     := _count;
+  tFilters.NoField := lNoField;
+  tFilters.Caption := sFieldCaption;
+  result := (insert current tFilters) = tsOk;
+  if result
+  {
+    _arrFilters[_count] := objUserFilter;
+    if objEditInterface = NullRef
+      objEditInterface := _editViewFactory.GetEditViewForFilter(objUserFilter, sFieldCaption);
+    _arrEditInterfaces[_count] := objEditInterface;
+    BindEvent(OnEditInterfaceCmDefault, objEditInterface.OnCmDefault);
+    _count++;
+    OnAfterAddFilter(lNoField, objUserFilter, sFieldCaption, objEditInterface);
+  }
+}
+
+function  GetFilterCount: longint;
+{
+  result := _count;
+}
+
+procedure ActivateFilter(filterIndex: longint);
+{
+  if OnBeforeActivateFilter(filterIndex) != 0 exit;
+  InsertMarker(_activeFiltersMarker, filterIndex);
+  OnAfterActivateFilter(filterIndex);
+  OnFilterChanged(filterIndex);
+}
+
+procedure DeactivateFilter(filterIndex: longint);
+{
+  if OnBeforeDeactivateFilter(filterIndex) != 0 exit;
+  DeleteMarker(_activeFiltersMarker, filterIndex);
+  OnAfterDeactivateFilter(filterIndex);
+  OnFilterChanged(filterIndex);
+}
+
+function  EditFilter(filterIndex: longint): boolean;
+{
+  result := false;
+  if OnBeforeEditFilter(filterIndex) != 0 exit;
+  if filterIndex >= 0 and filterIndex < _count
+  {
+    if BindEmbeddedInterface(embEditFilter, _arrEditInterfaces[filterIndex])
+    {
+      result := true;
+      case RunWindowModal(wEditFilter) of
+        cmDefault:
+        {
+          ActivateFilter(filterIndex);
+          OnAfterEditFilter(filterIndex);
+          OnFilterChanged(filterIndex);
+        }
+        cmDeleteFilter:
+        {
+          DeactivateFilter(filterIndex);
+          OnAfterEditFilter(filterIndex);
+          OnFilterChanged(filterIndex);
+        }
+        else result := false;
+      end;
+    }
+  }
+}
+
+function  GetFilter(filterIndex: longint): GP_IUserFilter;
+{
+  result := NullRef;
+  if filterIndex >= 0 and filterIndex < _count
+    result := _arrFilters[filterIndex];
+}
+
+function  GetFilterStr(filterIndex: longint): string;
+{
+  result := '';
+  if filterIndex >= 0 and filterIndex < _count
+    result := _arrFilters[filterIndex].FilterStr;
+}
+
+function  GetFilterCaption(filterIndex: longint): string;
+{
+  _ind := filterIndex;
+  if getfirst tFiltersByInd = tsOk
+    result := tFiltersByInd.Caption;
+  else
+    result := '';
+}
+
+function  FilterIsActive(filterIndex: longint): boolean;
+{
+  result := FoundMarker(_activeFiltersMarker, filterIndex);
+}
+
+function  PickFilter(filterIndex: longint): boolean;
+{
+  result := false;
+  if OnBeforePickFilter(filterIndex) != 0 exit;
+  if filterIndex >= 0 and filterIndex < _count
+  {
+    _arrFilters[filterIndex].Pick;
+    result := true;
+    OnAfterPickFilter(filterIndex);
+    OnFilterChanged(filterIndex);
+  }
+}
+
+function  DelFilter(filterIndex: longint): boolean;
+{
+  result := false;
+  if OnBeforeDelFilter(filterIndex) != 0 exit;
+  if filterIndex >= 0 and filterIndex < _count
+  {
+    _arrFilters[filterIndex].Del;
+    result := true;
+    OnAfterDelFilter(filterIndex);
+    OnFilterChanged(filterIndex);
+  }
+}
+
+//#endregion Методы для работы через индекс фильтра
+
+//#region Методы для работы через номер поля
+
+procedure ActivateFilterForField(lNoField: longint);
+{
+  _noField := lNoField;
+  if getfirst tFiltersByFld = tsOk
+    ActivateFilter(tFiltersByFld.Ind);
+}
+
+procedure DeactivateFilterForField(lNoField: longint);
+{
+  _noField := lNoField;
+  if getfirst tFiltersByFld = tsOk
+    DeactivateFilter(tFiltersByFld.Ind);
+}
+
+function  EditFilterForField(lNoField: longint): boolean;
+{
+  result := false;
+  _noField := lNoField;
+  if getfirst tFiltersByFld = tsOk
+    result := EditFilter(tFiltersByFld.Ind);
+}
+
+function  GetFilterForField(lNoField: longint): GP_IUserFilter;
+{
+  result := NullRef;
+  _noField := lNoField;
+  if getfirst tFiltersByFld = tsOk
+    result := GetFilter(tFiltersByFld.Ind);
+}
+
+function  GetFilterStrForField(lNoField: longint): string;
+{
+  result := '';
+  var f: GP_IUserFilter;
+  f := GetFilterForField(lNoField);
+  if f != NullRef
+    result := f.FilterStr;
+}
+
+function  GetFilterCaptionForField(lNoField: longint): string;
+{
+  _noField := lNoField;
+  if getfirst tFiltersByFld = tsOk
+    result := tFiltersByFld.Caption;
+  else
+    result := '';
+}
+
+function  FilterForFieldIsActive(lNoField: longint): boolean;
+{
+  result := false;
+  _noField := lNoField;
+  if getfirst tFiltersByFld = tsOk
+    result := FilterIsActive(tFiltersByFld.Ind);
+}
+
+function  PickFilterForField(lNoField: longint): boolean;
+{
+  result := false;
+  _noField := lNoField;
+  if getfirst tFiltersByFld = tsOk
+    result := PickFilter(tFiltersByFld.Ind);
+}
+
+function  DelFilterForField(lNoField: longint): boolean;
+{
+  result := false;
+  _noField := lNoField;
+  if getfirst tFiltersByFld = tsOk
+    result := DelFilter(tFiltersByFld.Ind);
+}
+
+function AddMenuItemForField(menuId    : longint;
+                               lNoField  : longint;
+                               command   : word = cmNal;
+                               keyCode   : word = kbAltF;
+                               keyCodeHlp: string = 'Alt+F'): boolean;
+{
+  result := false;
+  _noField := lNoField;
+  if getfirst tFiltersByFld = tsOk
+    result := AddMenuItemWithHlp(menuID, 'Фильтр по полю "' + tFiltersByFld.Caption + '"', '',
+                                 hcNoHelp, command, keyCode, keyCodeHlp, '');
+  else
+    AddMenuItemWithHlp(menuID, 'Фильтр по полю', '', hcNoHelp, command, keyCode, keyCodeHlp, '');
+}
+
+//#endregion Методы для работы через номер поля
+
+procedure Load;
+{
+  var i: longint;
+  for(i := 0; i < _count; i++)
+    _arrFilters[i].Load(_store);
+}
+
+procedure Save(bSaveMode: byte = GP_IUserFilterManager_SaveAll);
+{
+  var i: longint;
+  for(i := 0; i < _count; i++)
+    if (bSaveMode = GP_IUserFilterManager_SaveAll) or
+       (bSaveMode = GP_IUserFilterManager_SaveOnlyActive and FilterIsActive(i)) or
+       (bSaveMode = GP_IUserFilterManager_SaveOnlyInactive and not FilterIsActive(i))
+      _arrFilters[i].Save(_store);
+}
+
+property Ind      : longint read tFilters.Ind;
+property NoField  : longint read tFilters.NoField;
+property Caption  : String  read tFilters.Caption;
+property IsActive : boolean read FilterIsActive(tFilters.Ind);
+property FilterStr: String  read GetFilter(tFilters.Ind).FilterStr;
+property Filter   : GP_IUserFilter read GetFilter(tFilters.Ind);
+
+index ByInd auto;
+
+//#endregion GP_IUserFilterManager
+//*****************************************************************************
+
+
+end.

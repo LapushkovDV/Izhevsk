@@ -1,0 +1,289 @@
+/*************************************************************************************************\
+* Наименование: РПД 190 Групповая форма приказа "Служебная записка на работу в выходные           *
+*               и праздничные дни"                                                                *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи |Дата    |Исполнитель             |Проект                             *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2656        |29/06/18|Евдокимов М.А.          |НПО Энергомаш                      *
+\*************************************************************************************************/
+
+#include GetKau.vih
+#include PsnFuncs.vih
+#include AppFuncs.vih
+#include Query.vih
+#include FRRecordDefinition.vih
+#include GP_RPD_90_Helper.vih
+
+#component "GP_Staff"
+
+interface GP_NFormRD90_Claim 'Служебная записка на работу в выходные и праздничные дни' DoAccept EscClose;
+show(,,50,8);
+
+table struct tRep (
+  DocNmb     : string[20],
+  DocDate    : date,
+  DepNrec    : comp,
+  DepCode    : string[100],
+  DepName    : string,
+  FIO        : string[60],
+  PostName   : string,
+  VidOpl     : string[10],
+  WorkDate   : date,
+  AllMemoNrec: comp
+) with index (
+  i01 = DepCode + FIO
+);
+
+table struct tAllMemo (
+  AllMemoNrec: comp,
+  Npp: longint,
+  txt: string
+) with index (
+  i01 = AllMemoNrec + Npp (unique)
+);
+
+var
+  _titleDocMarker: TPtr;
+  _workTimeBeg, _workTimeEnd: Time;
+  _restTimeBeg, _restTimeEnd: Time;
+  _personNrec: comp;
+  _getKau: GetKau;
+  _rpd90helper: GP_RPD_90_Helper;
+  _persFunc: PersonsFunctions;
+  _appFunc: AppointmentsFunctions;
+  _dataSetAllMemoIsFirst: boolean;
+  _dataSetAllMemoTxt: string;
+
+create view
+select ShowKau(cgKau_Persons, _personNrec) (FieldName=PersonFld)
+from tRep, AllMemo tRepAllMemo, tAllMemo, Persons, tRep tRep1, TitleDoc
+where ((
+  tRep.AllMemoNrec == tRepAllMemo.Nrec and
+  tRep.AllMemoNrec == tAllMemo.AllMemoNrec and
+  _personNrec == Persons.Nrec
+))
+;
+
+Parameters _titleDocMarker;
+
+file f;
+
+function GetWorkDates: string;
+{
+  result := '';
+  var datesArr: array[0..0] of date;
+  _loop tRep1
+    if FindItem(datesArr, tRep1.WorkDate) = -1
+    {
+      result += if(result = '', '', ', ') + DateToStr(tRep1.WorkDate, 'DD.MM.YYYY');
+      datesArr[Count(datesArr)] := tRep1.WorkDate;
+    }
+}
+
+DataStream DSRep
+  (
+    [DocNmb]         if(getfirst tRep = tsOk, tRep.DocNmb, '');
+    [DocDate]        if(getfirst tRep = tsOk, tRep.DocDate, 0);
+    [DepCode]        if(getfirst tRep = tsOk, tRep.DepCode, '');
+    [DepName]        if(getfirst tRep = tsOk, tRep.DepName, '');
+    [PersFIO]        _persFunc.GetFIO2(_personNrec, 4);
+    [PersName]       _persFunc.Get_FirstName(_personNrec);
+    [PersSurname]    _persFunc.Get_LastName(_personNrec);
+    [PersPatronymic] _persFunc.GetPatronymic(_personNrec);
+    [PersFIOShort]   _persFunc.GetFIO(_personNrec);
+    [PersSex]        if(getfirst Persons = tsOk, Persons.Sex, '');
+    [PersPost]       _appFunc.GetAppPost(_appFunc.GetAppNrec_OnDate(_personNrec, if(getfirst tRep = tsOk, tRep.DocDate, cur_date)));
+    [WorkTimeBeg]    _workTimeBeg;
+    [WorkTimeEnd]    _workTimeEnd;
+    [RestTimeBeg]    _restTimeBeg;
+    [RestTimeEnd]    _restTimeEnd;
+    [WorkDates]      GetWorkDates;
+    table tRep
+    (
+      [DocNmb]     tRep.DocNmb;
+      [DocDate]    tRep.DocDate;
+      [DepCode]    tRep.DepCode;
+      [DepName]    tRep.DepName;
+      [FIO]        tRep.FIO;
+      [FIOShort]   GetSurnameWithInitials(tRep.FIO);
+      [PostName]   tRep.PostName;
+      [VidOpl]     tRep.VidOpl;
+      [WorkDate]   tRep.WorkDate;
+      [AllMemoNrec]tRep.AllMemoNrec;
+    );
+    table tAllMemo
+    (
+      [AllMemoNrec]tAllMemo.AllMemoNrec;
+      [Npp]        tAllMemo.Npp;
+      [Txt]        tAllMemo.txt;
+    );
+  )
+end;
+
+procedure PrintReport;
+{
+  delete all tRep;
+  var titleDocNrec: comp = 0;
+  var i: longint = 0;
+  for(i := 0; GetMarker(_titleDocMarker, i, titleDocNrec); i++)
+  {
+    if getfirst TitleDoc where ((titleDocNrec == TitleDoc.Nrec)) = tsOk
+      update current TitleDoc set TitleDoc.DocText := _rpd90helper.CalcClaimDocText(titleDocNrec);
+
+    sql
+    select
+      TitleDoc.DocNmb,
+      TitleDoc.DocDate,
+      case when Length(Coalesce(CatDep.Code, '')) = 3
+           then CatDep.Nrec
+           else Coalesce(CatDep1.Nrec, #comp(0))
+      end as DepNrec,
+      case when Length(Coalesce(CatDep.Code, '')) = 3
+           then CatDep.Code
+           else Coalesce(CatDep1.Code, '')
+      end as DepCode,
+      CatDep.Name as DepName,
+      Persons.FIO as FIO,
+      Coalesce(CatPost.Name, '') as PostName,
+      Coalesce(UOWrkTabel.Num, '') as VidOpl,
+      Coalesce(SalScale.LastDate, 0) as WorkDate,
+      Coalesce(AllMemo.Nrec, #comp(0)) as AllMemoNrec
+    from
+      TitleDoc
+    join PartDoc
+      on PartDoc.cDoc = TitleDoc.Nrec
+    join ContDoc
+      on ContDoc.cPart = PartDoc.Nrec
+    left join Catalogs CatDep
+      on CatDep.Nrec = ContDoc.cDopRef
+    left join Catalogs CatDep1
+      on CatDep1.Nrec = CatDep.cParent
+    join Persons
+      on Persons.Nrec = ContDoc.Person
+    left join Appointments App
+      on App.Nrec = ContDoc.cStr
+    left join Catalogs CatPost
+      on CatPost.Nrec = App.Post
+    join SalScale
+      on SalScale.wTblCode = 0 and SalScale.cUnit = ContDoc.Nrec
+    left join UOWrkTabel
+      on UOWrkTabel.Nrec = Comp(SalScale.LastUser)
+    left join AllMemo
+      on AllMemo.wTable = :(coSalScale) and AllMemo.cRec = SalScale.Nrec and AllMemo.Npp = 0
+    where TitleDoc.Nrec = :(titleDocNrec)
+    into tRep byName;
+  }
+
+  _loop tRep
+    if getfirst tRepAllMemo = tsOk
+      if f.OpenMemo(tRepAllMemo.Mem)
+      {
+        var allMemoNpp: longint = 1;
+        while not f.EoF
+        {
+          ClearBuffer(#tAllMemo);
+          tAllMemo.AllMemoNrec := tRepAllMemo.Nrec;
+          tAllMemo.Npp := allMemoNpp++;
+          f.ReadLn(tAllMemo.txt);
+          insert current tAllMemo;
+        }
+        f.Close;
+      }
+
+  var fReport    : LongInt;
+  var reportNames: array [0..0] of String;
+#IFDEF _2019_02_13_
+  var ExportParam:String;
+#ELSE
+  var exportParam: frxRTFExportParam;
+#ENDIF
+  fReport := FRCreate(DSRep);
+  FRGetReportNames(fReport, reportNames);
+  if (count(reportNames)>0)
+    if (FROpenReport(fReport, reportNames[0]))
+    {
+#IFDEF _2019_02_13_
+      //'Pages=1-5;Picture=False;DeleteEmptyRows=True;OpenAfterExport=True'
+      ExportParam:='Picture=true;WISYWIG=true;ShowDialog=False;OpenAfterExport=True';
+#ELSE
+      ClearAdvRecord(exportParam);
+      FRGetDefaultParameters(frExportRTF, ExportParam);
+      exportParam.Pages                      := '';
+      exportParam.Picture                    := true;
+      exportParam.WISYWIG                    := true;
+      exportParam.PageBreaks                 := true;
+      exportParam.SuppressPageHeadersFooters := false;
+      exportParam.ShowDialog                 := False;
+      exportParam.OpenAfterExport            := True;
+#ENDIF
+      if (FRSetParameters(fReport, frExportRTF, exportParam))
+        FRExportReport(fReport, frExportRTF, '');
+    }
+  FRDestroy(fReport);
+  //RunFReport(DSRep, '', true);
+}
+
+screen sc1 (,,sci1EnEsc);
+fields
+  PersonFld : protect, pickbutton;
+  _workTimeBeg: noprotect;
+  _workTimeEnd: noprotect;
+  _restTimeBeg: noprotect;
+  _restTimeEnd: noprotect;
+buttons
+  cmOk, default;
+  cmCancel;
+<<
+
+`Кому` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ Рабочие часы`с`.@@@@@@@@`по`.@@@@@@@@
+ Перерыв     `c`.@@@@@@@@`по`.@@@@@@@@
+
+                     <. Продолжить .> <. Отмена .>
+>>
+end;
+
+handleevent
+
+cmOk:
+{
+  PrintReport;
+  PutCommand(cmDefault);
+}
+
+cmPick:
+{
+  case CurField of
+    #PersonFld:
+    {
+      var c: comp = _personNrec;
+      if _getKau.GetCodeKau(1, cgKau_Persons, c) > 0
+        set _personNrec := c;
+    }
+  end;
+}
+
+cmInit:
+{
+  if not ReadMyDsk(_workTimeBeg, 'GP_NFormRD90_Claim_Params_workTimeBeg', false) _workTimeBeg := Time(9, 0, 0, 0);
+  if not ReadMyDsk(_workTimeEnd, 'GP_NFormRD90_Claim_Params_workTimeEnd', false) _workTimeEnd := Time(18, 0, 0, 0);
+  if not ReadMyDsk(_restTimeBeg, 'GP_NFormRD90_Claim_Params_restTimeBeg', false) _restTimeBeg := Time(13, 0, 0, 0);
+  if not ReadMyDsk(_restTimeEnd, 'GP_NFormRD90_Claim_Params_restTimeEnd', false) _restTimeEnd := Time(14, 0, 0, 0);
+  if not ReadMyDsk(_personNrec , 'GP_NFormRD90_Claim_Params_personNrec' , false) _personNrec  := 0;
+}
+
+cmDone:
+{
+  SaveMyDsk(_workTimeBeg, 'GP_NFormRD90_Claim_Params_workTimeBeg');
+  SaveMyDsk(_workTimeEnd, 'GP_NFormRD90_Claim_Params_workTimeEnd');
+  SaveMyDsk(_restTimeBeg, 'GP_NFormRD90_Claim_Params_restTimeBeg');
+  SaveMyDsk(_restTimeEnd, 'GP_NFormRD90_Claim_Params_restTimeEnd');
+  SaveMyDsk(_personNrec , 'GP_NFormRD90_Claim_Params_personNrec');
+}
+
+end;
+
+end.

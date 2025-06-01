@@ -1,0 +1,321 @@
+/* ************************************************************************************************\
+* Наименование:  Пересчет доп. тарифов                                                            *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание: не подключен, оставил вдруг понадобится                                             *
+* Вид работы  |Номер          |Дата    |Исполнитель              |Проект                          *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#0000          |15/01/25|Dmitrii.Lapygin          |НПО Энергомаш                   *
+\*************************************************************************************************/
+
+#include userreport.vih
+#include XlReport.vih
+#include Query.vih
+#include staffstruct.vih
+#include CatFunc.vih  // Функции работы с каталогом
+
+interface GP_RepVacancy 'Список вакансий' escClose;
+show(,,44,6);
+
+table struct TmpShr(
+  cShr      : comp,
+  depnrec   : comp,
+  depcode   : string,
+  depname   : string,
+  npp       : string,
+  postname  : string,
+  dwork     : double,
+  snote     : string,
+  tariff    : double,
+  klkat     : string,
+  dinput    : date,
+  dvacancy  : date,
+  vac       : double,
+  vacmes    : double
+) with index (
+  i01 = cShr
+);
+
+var
+  dDate:date;
+  kv:double;
+  sExcelFname:string;
+  RowNo:longint;
+  StaffFunc: StaffStruct;
+  ICatFunc: CatalogsFunctions;
+  _sDepartment:string;
+  mDept: LongInt;
+
+
+create view
+as select *
+from TmpShr
+, appointments app
+, vacations vac
+;
+
+procedure UpdateFiltersState;
+{
+  var SelCnt: LongInt;
+  var cTemp: Comp;
+  _sDepartment := '';
+  SelCnt := GetMarkerCount(mDept);
+  if SelCnt > 0 then
+    if (SelCnt = 1) and GetMarker(mDept, 0, cTemp) then
+      _sDepartment := ICatFunc.GetCatalogsName(cTemp);
+    else
+      _sDepartment := 'Выбрано подразделений: ' + String(SelCnt);
+  ReReadRecord;
+}
+
+Procedure MyLog(_str: string);
+{
+  LogStrToFile('spis_vak.txt',_str);
+}
+
+Procedure MysqlAddStr(var query_handle: longInt; add_query_str: string);
+{
+  sqlAddStr(query_handle, add_query_str);
+  if timelog_status>1 then MyLog('sql: ' + add_query_str);
+}
+
+Procedure InsTables();
+{
+  delete all from TmpShr;
+
+  var qStr : longint = 0;
+  var objQuery : iQuery;
+  var cVac: comp;
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Сбор данных', 0);
+
+  sqlFreeStr(qStr);
+
+  MysqlAddStr(qStr, '    select                                                                                              ');
+  MysqlAddStr(qStr, '    shr.nrec                    as cShr                                                                 ');
+  MysqlAddStr(qStr, '  , dep.nrec                    as depnrec                                                              ');
+  MysqlAddStr(qStr, '  , dep.code                    as depcode                                                              ');
+  MysqlAddStr(qStr, '  , dep.name                    as depname                                                              ');
+  MysqlAddStr(qStr, '  , cast(shr.seqnmb as string)  as npp                                                                  ');
+  MysqlAddStr(qStr, '  , post.name                   as postname                                                             ');
+  MysqlAddStr(qStr, '  , shr.WORKSTATIONS            as dwork                                                                ');
+  MysqlAddStr(qStr, '  , gpnote.note                 as snote                                                                ');
+  MysqlAddStr(qStr, '  , shr.taxrate                 as tariff                                                               ');
+  MysqlAddStr(qStr, '  , cat.kod                     as klkat                                                                ');
+  MysqlAddStr(qStr, '  , shr.dinput                  as dinput                                                               ');
+  MysqlAddStr(qStr, '  from staffstruct shr                                                                                  ');
+  MysqlAddStr(qStr, '  join catalogs dep  on shr.department=dep.nrec                                                         ');
+  MysqlAddStr(qStr, '  join catalogs post on shr.post=post.nrec                                                              ');
+  MysqlAddStr(qStr, '  left join gp_manualnotes gpnote on 25018=gpnote.wtbl and shr.nrec=gpnote.crec and 1=gpnote.notenumber ');
+  MysqlAddStr(qStr, '  left join klkatego cat on shr.EMPCATEGORY=cat.nrec                                                    ');
+  MysqlAddStr(qStr, '  where                                                                                                 ');
+  MysqlAddStr(qStr, '      shr.dinput<=#date('+DateToStr(dDate, 'DD,MM,YYYY')+')                                             ');
+  MysqlAddStr(qStr, '  and (shr.dclose=0 or shr.dclose>=#date('+DateToStr(dDate, 'DD,MM,YYYY')+') )                           ');
+
+  objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk ) then
+  {
+    Message('Ошибка поиска данных (TmpShr) '+ objQuery.errorCode, Error);
+    sqlFreeStr(qStr);
+    StopVisual;
+    Exit;
+  }
+  else
+  {
+    sqlCopyInto(objQuery, tnTmpShr, true);
+  }
+  sqlFreeStr(qStr);
+
+  _loop TmpShr //убираем ненужные подразделения
+  {
+    if (_sDepartment <> '')
+      if not FoundMarker(mDept, TmpShr.depnrec) then delete current TmpShr;
+  }
+
+  //Заполняем кол вакансий
+  _loop TmpShr
+  {
+    cVac:=0;
+    kv:=0;
+    kv:=StaffFunc.GetWorkersStaff(TmpShr.cShr,dDate);
+    if kv<=0 then delete current TmpShr; //
+    else  //заполняем кол вакансий и дату возникновения
+    {
+      TmpShr.vac:=kv;
+      update current TmpShr;
+      if getlast app where ((TmpShr.cShr==app.STAFFSTR and (0=app.lprizn or 100=app.lprizn)))=tsOk
+      {
+        cVac := StaffFunc.GetLongVacationByDate(app.nrec, dDate);
+        if cVac=0
+        {
+          if app.DISMISSDATE=0
+          { //Дата ухода, если нет даты увольнения
+            TmpShr.dvacancy:=add_day(app.dateend,1);
+            update current TmpShr;
+          }
+          else
+          { //Дата увольнения
+            TmpShr.dvacancy:=add_day(app.DISMISSDATE,1);
+            update current TmpShr;
+          }
+        }
+        else
+        {
+          if getfirst vac where ((cVac==vac.nrec))=tsOk
+          { //Дата отпуска, для ставок кто в амд отпуске
+            TmpShr.dvacancy:=vac.FACTYEARBEG;
+            update current TmpShr;
+          }
+        }
+      }
+      else
+      {
+        TmpShr.dvacancy:=TmpShr.dinput;
+        update current TmpShr;
+      }
+      //заполняем кол мес вакансии
+      if TmpShr.dvacancy<>0
+      {
+        TmpShr.vacmes:=Months_Between(TmpShr.dvacancy, dDate);
+        update current TmpShr;
+      }
+    }
+  }
+  StopVisual;
+}//Procedure InsTables();
+
+
+
+Procedure PrintEx();
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Печать', 0);
+  sExcelFname:=TranslatePath('%ClientStartPath%')+'XLS_ЭМ\staff\GP_spisvac.xlsx';
+  xlCreateExcelWithTemplate(sExcelFname,true);
+
+  var _k : longint = 0;
+  _k := recordsintable(tnTmpShr);
+  var i : longint = 0;
+
+  xlCreateMatrix(_k, 11);
+  RowNo := 0;
+
+  _loop TmpShr
+  {
+    xlStWriteToMatrix(++RowNo, 1, chr(39) + TmpShr.depcode  );
+    xlStWriteToMatrix(  RowNo, 2, chr(39) + TmpShr.depname  );
+    xlStWriteToMatrix(  RowNo, 3, chr(39) + TmpShr.npp      );
+    xlStWriteToMatrix(  RowNo, 4, chr(39) + TmpShr.postname );
+    xlDoWriteToMatrix(  RowNo, 5, TmpShr.dwork              );
+    xlDoWriteToMatrix(  RowNo, 6, TmpShr.vac                );
+    xlDoWriteToMatrix(  RowNo, 7, TmpShr.tariff             );
+    xlStWriteToMatrix(  RowNo, 8, chr(39) + TmpShr.klkat    );
+    xlStWriteToMatrix(  RowNo, 9, chr(39) + TmpShr.snote    );
+    xldtWriteToMatrix(  RowNo, 10, TmpShr.dvacancy          );
+    xldoWriteToMatrix(  RowNo, 11, TmpShr.vacmes            );
+  }
+  XLWRITEMATRIXTOEXCEL(2, 1);
+  XLFREEMATRIX;
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0,
+                 1, 1, _k+1, 11);
+  xlKillExcel;
+  StopVisual;
+}//Procedure PrintEx();
+
+screen sc1 (,,sci1EnEsc);
+  fields
+    dDate: NoProtect;
+     _sDepartment, protect, pickbutton;
+  buttons
+    cmOk, default;
+    cmCancel;
+<<
+
+ `Вакансии на дату`.@@@@@@@@@@@@@
+  Подразделение    .@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ <. Продолжить .>        <. Отмена .>
+>>
+end;
+
+handleevent
+  cmInit:
+  {
+    dDate:=cur_Date;
+  }
+
+  cmOk:
+  {
+    if (_sDepartment = '')
+    {
+      message('Выберите подразделения!');
+      abort;
+      exit;
+    }
+    InsTables;
+    if recordsintable(tnTmpShr)<1
+    {
+      message('Нет данных');
+      abort;
+      exit;
+    }
+    PrintEx;
+  }
+  cmPick:
+  {
+    case CurField of
+      #_sDepartment:
+        {
+          DoneMarker(mDept, 'CatalogsMarker');
+          RunInterface('Z_STAFFCAT::PickCatalog2', -11, 0, 100, 0);
+          mDept := InitMarker('CatalogsMarker', 8, 30, 10);
+          UpdateFiltersState;
+        }
+    end;
+  }
+  cmDelOnProtect:
+  {
+    case CurField of
+      #_sDepartment:
+        {
+          ClearMarker(mDept);
+          UpdateFiltersState;
+        }
+    end;
+  }
+
+end;
+end.
+
+
+VipInterface UserReport_GP_RepVacancy Implements IUserReport;
+Interface UserReport_GP_RepVacancy;
+
+Procedure Run;
+Begin
+  RunInterfaceNoModal(GP_RepVacancy);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Список вакансий на дату';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  #__UNUSED__(Level)
+  GetGroupName := '';
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 0;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'staffmainmenu';
+  end;
+end;
+
+End.

@@ -1,0 +1,214 @@
+/*************************************************************************************************\
+* Наименование: Приказ "Заключение/продление контракта" (РПД-65)                                   *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+* 175 - Доработки для учета в СКУД                                                                *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2189         |31/03/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#44           |04/04/18|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include WorkWithContract.vih
+#include NumberOfAddAgreement.vih // работа с доп. соглашениями
+#include Func_AppHist.vih // объект для получения состояния назначения на указанную дату
+#include BasketFuncs.vih // функции для удаления записей из РК
+#include MsgToZarSignal.vih // объект для создания записи в РК
+#include TsFuncs.vih // объект для работы с тарифными ставками
+
+#include GP_RepLaborContract.vih
+#include GP_SCUD_PersEdit.Vih
+
+#component "Z_StaffOrders"
+#doc
+Приказ "Заключение/продление контракта" (РПД-65)
+<p>#2189 - РПД-65 продлить контракт можно и на определенный срок ,
+т.к. дата <по> указывается. А система не утверждает такой приказ.
+#end
+alter interface RPD_65;
+overload
+  function IRPD_Base.ChildCheckOneOrder(cNrec: comp = 0): boolean;
+  function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+  procedure prFillMenu(_menuID: longint);
+end;
+
+var
+  iGP_SCUD_PersEdit:GP_SCUD_PersEdit;//для работы с картотекой в СКУД
+
+//******************************************************************************
+//  Процедура утверждения индивидуального приказа по текущему работнику (по таблице ContDoc)
+//******************************************************************************
+function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+var ww_str:string;
+{ if (GetFirst AppHist = tsOk)
+  { if ((AppHist.dEnd <> ZeroDate) and (AppHist.dEnd > Persons.DisDate) and (Persons.DisDate <> ZeroDate))
+    or (AppHist.dEnd=ZeroDate and Persons.DisDate <> ZeroDate)
+    { update current Persons set Persons.DisDate:=AppHist.dEnd;
+      SetErrorOrder('Изменена дата увольнения ' + '( ' + DateToStr(Persons.DisDate,'') + ' )',Warning);
+    }
+    if Appointments.DISMISSDATE<>ZeroDate and Appointments.DISMISSDATE<AppHist.dEnd
+    { ww_str:='В назначении от "'+DateToStr(Appointments.AppointDate,'')+'", дата ухода "'+DateToStr(Appointments.DISMISSDATE,'')
+       +'" изменена на "'+DateToStr(AppHist.dEnd,'')+'"';
+      update current Appointments set Appointments.DISMISSDATE:=AppHist.dEnd;
+      SetErrorOrder(ww_str,Warning);
+    }
+  } //if (GetFirst AppHist = tsOk)
+  //--------------------------------
+  Result:=Inherited::ChildConfirmOneOrder(cNrec);
+  //--------------------------------
+  if Result
+  { iGP_SCUD_PersEdit.MakeBufferPers(Persons.Nrec, ContDoc.cStr,TitleDoc.Nrec,Contdoc.Nrec,PartDoc.TypeOper)
+  }
+} //function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+
+
+//******************************************************************************
+// Функция проверки корректности заполнения приказа
+//******************************************************************************
+//Берем целиком!!!  result:=inherited::ChildCheckOneOrder(cNrec);
+function ChildCheckOneOrder(cNrec: comp = 0): boolean;
+{ #__UNUSED__(cNrec)
+  result := false;
+
+  if getfirst Appointments <> tsOk
+  {
+    SetErrorOrder('Не выбрано назначение, на которое оформляется приказ!');
+    exit;
+  }
+
+  if getfirst AppHist <> tsOk
+  {
+    SetErrorOrder('Не введена информация об изменениях по приказу!');
+    exit;
+  }
+
+  if AppHist.dRec = ZeroDate
+  {
+    SetErrorOrder('Не указана дата начала изменений по приказу!');
+    exit;
+  }
+
+  if (AppHist.dRec > Persons.DisDate) and (Persons.DisDate <> ZeroDate)
+  {
+#IFDEF _GP_
+    SetErrorOrder('Дата начала изменений больше даты увольнения! ' + '( ' + DateToStr(Persons.DisDate,'') + ' )',Warning);
+#ELSE
+    SetErrorOrder('Дата начала изменений больше даты увольнения! ' + '( ' + DateToStr(Persons.DisDate,'') + ' )');
+    exit;
+#ENDIF
+  }
+
+  if (AppHist.dEnd <> ZeroDate) and (AppHist.dEnd > Persons.DisDate) and (Persons.DisDate <> ZeroDate)
+  {
+#IFDEF _GP_
+    SetErrorOrder('Дата окончания изменений больше даты увольнения! ' + '( ' + DateToStr(Persons.DisDate,'') + ' )',Warning);
+#ELSE
+    SetErrorOrder('Дата окончания изменений больше даты увольнения! ' + '( ' + DateToStr(Persons.DisDate,'') + ' )');
+    exit;
+#ENDIF
+  }
+
+  if (AppHist.dEnd <> ZeroDate) and (AppHist.dEnd < AppHist.dRec)
+  {
+    SetErrorOrder('Дата окончания изменений по приказу меньше даты начала изменений!');
+    exit;
+  }
+
+  if iAH.InfIsMarked(AppHist.cInf1, AH_Tariff)
+  {
+    if AppHist.coef1 < 0
+    {
+      SetErrorOrder('Количество занимаемых ставок не может быть отрицательным!');
+      exit;
+    }
+
+    if AppHist.coef1 > 1
+    {
+      SetErrorOrder('Количество занимаемых ставок не может быть больше единицы!');
+      exit;
+    }
+
+    if bCheckRate and (Abs(AppHist.coef1) < 0.00001)
+    {
+      SetErrorOrder('Количество занимаемых ставок не может быть нулевым!');
+      exit;
+    }
+  }
+
+  if Appointments.AppointDate > AppHist.dRec
+  {
+    SetErrorOrder('Назначение сотрудника начинается позже даты начала изменения!');
+    exit;
+  }
+
+  if Appointments.DismissDate <> ZeroDate
+  {
+    if Appointments.DismissDate < AppHist.dRec
+    {
+      SetErrorOrder('У сотрудника дата ухода с должности меньше даты начала изменения!');
+      exit;
+    }
+  }
+  else
+  {
+    if Appointments.DateEnd <> ZeroDate
+      if AppHist.wFld = CONTRACT_NONE
+      {
+        if Appointments.DateEnd < AppHist.dRec
+        {
+          SetErrorOrder('Дата окончания назначения меньше даты начала изменения!');
+          exit;
+        }
+      }
+      else
+        if Appointments.DateEnd < Sub_Day(AppHist.dRec, 1)
+        {
+          SetErrorOrder('У сотрудника дата окончания назначения не предшествует дате продления (заключения) контракта!');
+          exit;
+        }
+        else
+          if AppHist.wFld = CONTRACT_LONG
+            if Appointments.DateEnd > AppHist.dRec
+            {
+              SetErrorOrder('У сотрудника нельзя продлить контракт ранее даты его окончания!');
+              exit;
+            }
+  }
+
+  // если установлен флаг модификации поля "Характер работы" и до приказа значение пустое,
+  // то проверим выбрали ли что-то (иначе флаг бессмыслен)
+  if iAH.InfIsMarked(AppHist.cInf1, AH_JobNature)
+    if ( iAH.AH_GetJobOnDate(Appointments.NRec, AppHist.dRec) = 0 )
+      if GetFirst JobNatureCat <> tsOk
+      {
+        SetErrorOrder('Не указан характер работы!');
+        exit;
+      }
+
+  result := true;
+
+} //function ChildCheckOneOrder(cNrec: comp = 0): boolean;
+
+//включение стандартных пунктов контекстного меню приказа
+procedure prFillMenu(_menuID: longint);
+{
+  inherited::prFillMenu(_menuID);
+
+  if (NOAA.GetFirstAgreementByLink(GetCo4Agreement(), GetNRec4Agreement()) <> 0)
+    AddMenuItem(_menuID, 'Печать доп. соглашения (Word)', cmValue17);
+}
+
+HandleEvent
+cmOnVipLoad:{
+
+  if inherited::handleEvent(cmOnVipLoad) = heAbort
+    abort;
+
+}
+cmValue17:{//Печать доп. соглашения (Word)
+  if (not UpDateTable) exit;
+
+  var Rep:GP_RepLaborContract;
+  Rep.Run(ContDoc.TypeOper,0,ContDoc.NRec,ContDoc.Person,0);
+}
+end;
+end.

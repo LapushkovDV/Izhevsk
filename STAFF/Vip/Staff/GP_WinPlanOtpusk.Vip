@@ -1,0 +1,2923 @@
+/*************************************************************************************************\
+* Наименование: Планирование отпусков помесячно                                         *
+* Контур/Модуль: ЗП                                                                               *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2496         |28/09/18|Погосский К.В.         |НПО Энергомаш                      *
+\*************************************************************************************************/
+
+#include PAFilter.vih
+#include CatFunc.vih
+#include StrFunc.vih
+#include FactVacation.vih    // для расчета остатков отпусков
+#include WorkPeriods.vih
+#include APPFUNCS.VIH // объект для работы с назначениями
+#include Protector.vih
+#include MainLschetForPersons.vih // нахождение основного л\с (в vpр-ках)
+#include ExtAttr.vih
+#include Contexts.vih  // Контексты
+
+interface GP_WinPlanOtpusk 'Плановые отпуска' EscClose, Cyan;
+  Show at (,,80,27);
+
+const
+  // Константы значений поля WorkPeriod.wTypePeriod, определяющие тип периода
+  cnWP_Work        = word(0);   // обычные рабочий период
+  cnWP_Shift       = word(1);   // сдвиг рабочего периода
+  cnWP_Hidden      = word(2);   // скрытый внутренний рабочий период
+  cnWP_Accounting  = word(3);   // период учета
+  cnWP_FuturePVac  = word(4);   // рабочие периоды полагающихся отпусков, выданных авансом
+  cnWP_NeedCorrect = word(100); // РП подлежащие корректировке после установки связи совместительств
+end;
+
+var iCatFunc   : CatalogsFunctions;
+var iFV        : iFactVacation New;
+var iStrFunc   : StringFunctions;
+var VAppFuncs  : AppointmentsFunctions;
+var Protector  : IProtector; // для режима редактирования
+var MLFP       : MainLschetForPersons;  // нахождение основного л\с
+var CLSF       : CurLSFunctions;
+var soExtAttr  : iExtAttr;
+
+  table struct Tmp_WinPlanOtpusk
+  (
+    Nrec           :Comp,
+    cPerson        :Comp,
+    FIO            :String,
+    Tabn           :String,
+    Post           :Comp,
+    AppD           :Date,
+    DisD           :Date,
+    Appoint        :Comp,
+    Mon            :array[1..12] of double,
+    MonFact        :array[1..12] of boolean,
+    wDay           :Integer,
+    wDayDop        :Integer,
+    wDayOld        :Integer,
+    Day14          :Boolean,
+    Day28          :Boolean,
+    Day28Plus      :Boolean,
+    OtpUxod        :string,
+    WorkP          :Comp,
+    Dep            :Comp,
+    Prizn          :Integer,
+    WRESERVE       :Integer,
+    Cex            :Comp,
+    Prich          :string
+  )
+  with index
+  (
+    Tmp_WinPlanOtpusk01 = cPerson + Prizn,
+    Tmp_WinPlanOtpusk02 = FIO,
+    Tmp_WinPlanOtpusk03 = Nrec,
+    Tmp_WinPlanOtpusk04 = Appoint
+  )
+  ;
+
+  table struct Tmp_PlanOtpusk
+  (
+    Nrec           :Comp,
+    cPlOtp         :Comp,
+    cWinPlOtp      :Comp,
+    DURATION       :double,
+    Mon            :Integer,
+    DatBeg         :Date,
+    DatEnd         :Date,
+    Prizn          :Integer,
+    WRESERVE       :Integer
+  )
+  with index
+  (
+    Tmp_PlanOtpusk00 = Nrec,
+    Tmp_PlanOtpusk01 = cPlOtp,
+    Tmp_PlanOtpusk02 = cWinPlOtp + cPlOtp,
+    Tmp_PlanOtpusk03 = cWinPlOtp + Mon,
+    Tmp_PlanOtpusk04 = Mon,
+    Tmp_PlanOtpusk05 = cWinPlOtp + DatBeg + DatEnd
+  )
+  ;
+
+create view
+var
+  wYearPlanVac     ,
+  wTuneVacType     :word;
+  j,k,
+  SumPutVac        : integer;
+  wCalcMode,
+  cCur_WorkPeriod  : Comp;
+  dDateCalc:      date;
+  iWP       : WorkPeriods;
+  cWPRec  : comp;
+  FlagField: boolean;
+  FlagIntOpt: boolean;
+  FieldMon  : integer;
+  EditMode  : Boolean;
+  dPlanOtOld:Date;
+  p2             : double;
+  _PodrMArkerPointer: Longint; // сам маркер
+  mrkOuterClassfier : longInt;   //маркер с отмеченными классификаторами
+  MarkerNotNull     : boolean;   // флаг - маркер не пустой
+  Marker      : longint;
+  IndexMarker       : longint;
+  #include PAFilter.var
+(
+  FiltrPodr,
+  FiltrPublic
+)
+as select
+  #include GP_Podrfiltr1.vpp  // вычисляемые поля для фильтров по сотрудн. и подразд.
+  ,if(Tmp_WinPlanOtpusk.Prizn=0,'осн.',
+     if(Tmp_WinPlanOtpusk.Prizn=2,'зам.',
+       if(Tmp_WinPlanOtpusk.Prizn=3,'совм.',
+    'другое'))) 
+  ( FieldName = sPrizn)
+
+  ,if(Tmp_WinPlanOtpusk.WRESERVE = -4000,'Черновик',
+    if(Tmp_WinPlanOtpusk.WRESERVE = -32000,'На согласование',
+      if(Tmp_WinPlanOtpusk.WRESERVE = -16000,'Согласовано',
+        if(Tmp_WinPlanOtpusk.WRESERVE = -8000,'Отклонено',
+   'Утверждено'))))
+  ( FieldName = Utver)
+  ,if (Foundmarker(Marker,Tmp_WinPlanOtpusk.Nrec),'V',' ' )
+  (FieldName = picked)
+
+from
+ Zar_User
+ ,Lschet
+ ,Lschet Lschet1
+ ,Lschet LschetN
+ ,Persons PersonsN
+ ,Persons Persons1
+ ,Tmp_WinPlanOtpusk(Tmp_WinPlanOtpusk02)
+ ,Tmp_WinPlanOtpusk Tmp_WinPlanOtpuskSovm
+ ,Tmp_PlanOtpusk
+ ,Appointments
+ ,Appointments AppointmentsPlan
+ ,WorkPeriod                     (WorkPeriod08)
+ ,WorkPeriod WorkPeriodTMP
+ ,PlanOtpusk
+ ,WorkPeriod ForDate_WorkPeriod
+ ,WorkPeriod Find_WorkPeriod
+ ,PlanOtpusk PlanOtpuskD
+ ,CurLschet
+ ,WorkPCon
+ ,PutVacation
+ ,Vacations
+ ,KlOtpusk
+ ,Prazd
+ ,Tmp_PlanOtpusk Tmp_PlanOtpuskM (Tmp_PlanOtpusk05)
+ ,Tmp_PlanOtpusk Tmp_PlanOtpuskNO
+ ,Tmp_PlanOtpusk Tmp_PlanOtpuskSovm
+ ,Tmp_PlanOtpusk Tmp_PlanOtpuskTMP
+ ,Tmp_WinPlanOtpusk Tmp_WinPlanOtpuskM
+ ,Tmp_PlanOtpusk Tmp_PlanOtpuskDbl
+ ,Tmp_PlanOtpusk Tmp_PlanOtpuskPer
+ ,LSchet LSchetTabN
+ ,FactOtpusk
+ ,PlanOtpusk     PlanOtpuskSovm
+ ,PlanOtpusk     PlanOtpuskSave
+ ,Tmp_WinPlanOtpusk Tmp_WinPlanOtpuskItog
+// ,PlanOtpusk PlanOtpuskOld
+// ,WorkPeriod WorkPeriodOld
+// ,Vacations VacationsOld
+where 
+((
+  _cLSchet                == Formarks.Choice     
+  and Formarks.cLschet    == Lschet1.nrec
+  and LSchet1.tPerson     == Persons1.Nrec
+  and Persons1.Nrec       == Appointments.PERSON
+    and (
+     date(31, 12, wYearPlanVac)  >= Appointments.AppointDate   and
+     (date(31, 12, wYearPlanVac) <= Appointments.DismissDate or
+      Day(Appointments.DismissDate) = 0) and
+      2 <> Appointments.wAddWord1            //только по штатному
+      and
+      (
+        0 = Appointments.lPrizn
+//        or
+//        70 = Appointments.lPrizn
+        or
+        3 = Appointments.lPrizn
+      )
+      and Appointments.person <> 0
+    )
+  and Appointments.NRec   == WorkPeriod.cAppointment
+  and Appointments.Person == WorkPeriod.cPerson
+  and cnWP_Work           == WorkPeriod.wTypePeriod
+
+  and WorkPeriodTMP.NRec  == PutVacation.cWorkPeriod 
+
+
+  and cCur_WorkPeriod     == ForDate_WorkPeriod.nRec
+
+  and Appointments.NRec   == Find_WorkPeriod.cAppointment
+  and Appointments.Person == Find_WorkPeriod.cPerson
+  and cnWP_Work           == Find_WorkPeriod.wTypePeriod
+
+  and FieldMon                  == Tmp_PlanOtpuskM.Mon
+  and Tmp_PlanOtpuskM.cWinPlOtp == Tmp_WinPlanOtpuskM.Nrec
+
+  and #include GP_Podrfiltr2.vpp  // вычисляемые поля для фильтров по сотрудн. и подразд.
+))
+;
+
+#include GP_PODRPAFilter.vpp
+var IntInitSession: IContextSession;
+
+function CaptureIntInitContext: boolean;
+{
+  var CL: ContextList;
+  InitContextSessionOwner;
+  Result := CL.Add(IntInitSession, 'IntInit');
+}
+
+HandleEvent
+  cmInit:
+  {
+    if not CaptureIntInitContext
+      abort;
+  }
+
+  cmOnVipLoad:
+  {
+    if not CaptureIntInitContext
+      abort;
+  }
+end;
+
+//_________________________________________________________
+//  Расчет конечной даты с учетом праздников
+Function GetLastDate (var Datan: date; var Days: double) :date;
+  var pr: integer;  // количество праздничных дней в диапазоне
+  var tmpDatan: date;
+{
+
+    tmpDatan := Datan;
+    pr := 0;
+    do
+    {
+  
+      if (getfirst Prazd where ((tmpDatan == Prazd.Ddate)) <> tsOk)// or (PerenosDat = '0')
+        inc(pr);
+      else
+      {
+        if SubStr(Prazd.NAME, 1, 1) = '+' or SubStr(Prazd.NAME, 1, 1) = '-' or SubStr(Prazd.NAME, 1, 1) = '>'
+          inc(pr);
+      }
+  
+      tmpDatan := ADD_DAY(tmpDatan, 1);
+  
+    }
+    while Days > pr
+  
+    GetLastDate := Sub_day(tmpDatan, 1);
+
+}
+// согласно параметрам ищем
+function funCalcDateBeg(cPar_WorkPeriod: comp): date;
+var
+  dWorkDate: date;
+{
+  funCalcDateBeg  := ZeroDate;
+  cCur_WorkPeriod := cPar_WorkPeriod;
+  dWorkDate       := ZeroDate;
+
+  case wCalcMode of
+
+    word(0): //по истечении 11 месяцев
+      {
+        if (GetFirst ForDate_WorkPeriod = tsOk)
+          dWorkDate := Add_Months(ForDate_WorkPeriod.dPerBeg, 11);
+        funCalcDateBeg := if (dWorkDate < date(1, 1, wYearPlanVac), date(1, 1, wYearPlanVac), dWorkDate);
+      }
+
+    word(1): //по истечении 6 месяцев
+      {
+        if (GetFirst ForDate_WorkPeriod = tsOk)
+          dWorkDate := Add_Months(ForDate_WorkPeriod.dPerBeg, 6);
+        funCalcDateBeg := if (dWorkDate < date(1, 1, wYearPlanVac), date(1, 1, wYearPlanVac), dWorkDate);
+      }
+
+    word(2): //по истечении 3 месяцев
+      {
+        if (GetFirst ForDate_WorkPeriod = tsOk)
+          dWorkDate := Add_Months(ForDate_WorkPeriod.dPerBeg, 3);
+        funCalcDateBeg := if (dWorkDate < date(1, 1, wYearPlanVac), date(1, 1, wYearPlanVac), dWorkDate);
+      }
+
+    word(3): //на указанную дату
+      {
+        if ( ( GetFirst Find_WorkPeriod = tsOk ) and
+             ( Find_WorkPeriod.dPerBeg <= dDateCalc ) )
+          funCalcDateBeg := dDateCalc; //считаю так правильнее, хотя и планируем только на будущее
+      }
+
+    word(4): //
+      {
+        if (GetFirst ForDate_WorkPeriod = tsOk)
+          dWorkDate := Add_Day(ForDate_WorkPeriod.dPerEnd, 1);
+        funCalcDateBeg := if (dWorkDate < date(1, 1, wYearPlanVac), date(1, 1, wYearPlanVac), dWorkDate);
+      }
+
+
+  end; //case
+}
+// проверка перед созданием записи, врозвращает nRec самой ранней
+function funGetFirstPeriodInTune: comp;
+{
+  funGetFirstPeriodInTune := comp(0);
+
+  _loop WorkPeriod
+    {
+      if ( ( Year(WorkPeriod.dPerBeg) = wYearPlanVac ) or
+           ( Year(WorkPeriod.dPerEnd) = wYearPlanVac ) )
+        {
+          funGetFirstPeriodInTune := WorkPeriod.nRec;
+          exit;
+        }
+    }
+}
+
+Procedure Day14_28;
+{
+      Tmp_WinPlanOtpusk.Day14     := true;
+      Tmp_WinPlanOtpusk.Day28     := true;
+      Tmp_WinPlanOtpusk.Day28Plus := true;
+
+      var SummDay : longint = 0 ;
+
+      for(j:= 1; j<= 12; j++)
+      {
+        SummDay += Tmp_WinPlanOtpusk.Mon[j];
+
+        if Tmp_WinPlanOtpusk.Day14
+        {
+
+          if Tmp_WinPlanOtpusk.Mon[j] >= 14
+            Tmp_WinPlanOtpusk.Day14 := false;
+
+        }
+
+      }
+
+      if SummDay >= 28
+        Tmp_WinPlanOtpusk.Day28 := false;
+
+      if SummDay >= 28 + Tmp_WinPlanOtpusk.wDayOld
+        Tmp_WinPlanOtpusk.Day28Plus := false;
+}
+
+Procedure IncTMP;
+{
+
+  StartNewVisual(vtIndicatorVisual, 0, 'Загрузка плановых отпусков...', RecordsInTable(#Formarks));
+
+  mtClear(#Tmp_WinPlanOtpusk, mfNormal);
+  mtClear(#Tmp_PlanOtpusk, mfNormal);
+
+  IntInit;
+
+  _loop Formarks
+  {
+
+    if not NextVisual
+      break;
+
+    _loop LSchet1
+    {
+
+    if (LSchet1.DatPos > Date(31,12,wYearPlanVac))
+      continue;
+
+    if (Lschet1.DATUV > date(0,0,0) and Lschet1.DATUV < Date(1,1,wYearPlanVac))
+      continue;
+
+//message(Lschet1.TabN)
+
+    _loop Persons1
+    {
+    // обходим тех, кто еще не принят на работу
+    if (Persons1.AppDate > Date(31,12,wYearPlanVac))
+      continue;
+    // уволенных обходим
+    if (Persons1.DisDate > date(0,0,0) and Persons1.DisDate < Date(1,1,wYearPlanVac))
+      continue;
+
+//message(Persons1.TabNmb)
+
+//    if GetLast FastFirstRow Appointments = tsOk
+    _loop Appointments
+    {
+//message('Appointments.Nrec/'+Appointments.Nrec+'/'+Appointments.lPrizn+'/'+)
+
+      if (GetFirst FastFirstRow Tmp_WinPlanOtpusk where ((Appointments.NRec == Tmp_WinPlanOtpusk.Appoint)) = tsOk)
+        continue;
+
+      ClearBuffer(#Tmp_WinPlanOtpusk);
+      Tmp_WinPlanOtpusk.Nrec    := GetNextnRec(#Tmp_WinPlanOtpusk,0);
+      Tmp_WinPlanOtpusk.cPerson := Persons1.Nrec;
+      Tmp_WinPlanOtpusk.FIO     := Persons1.FIO;
+      Tmp_WinPlanOtpusk.Post    := Appointments.Post;
+      if (GetFirst LSchetTabN where ((APPOINTMENTS.cAddNrec2 == LSchetTabN.nRec)) = tsOk)
+      {
+        Tmp_WinPlanOtpusk.Cex   := LSchetTabN.Cex;
+        Tmp_WinPlanOtpusk.Tabn    := GetStrTabN(LSchetTabN.TabN,  LSchetTabN.StrTabN);
+      }
+
+      if appointments.lprizn=0
+      {
+        Tmp_WinPlanOtpusk.Cex   := persons1.galdep;
+      }
+      Tmp_WinPlanOtpusk.Appoint := Appointments.NRec;
+      Tmp_WinPlanOtpusk.Dep     := Appointments.Department;
+      Tmp_WinPlanOtpusk.Prizn   := Appointments.lPrizn;
+      Tmp_WinPlanOtpusk.AppD    := Persons1.AppDate;
+      Tmp_WinPlanOtpusk.DisD    := Persons1.DisDate;
+
+      Tmp_WinPlanOtpusk.OtpUxod := '';
+
+      _loop Vacations where ((
+                              Appointments.Person ==  Vacations.Person
+                            ))
+      {
+
+        if (GetFirst FastFirstRow  KlOtpusk where ((Vacations.VacType == KlOtpusk.NRec)) = tsOk)
+        {
+
+          if KlOtpusk.days = 'ОЖ' or KlOtpusk.days = 'Р'
+          {
+
+             if iStrFunc.isCrossPeriod(Date(1,1,wYearPlanVac),Date(31,12,wYearPlanVac), Vacations.FactYearBeg,Vacations.FactYearEnd)
+             {
+               Tmp_WinPlanOtpusk.OtpUxod := 'По уходу за ребенком';
+//               Tmp_WinPlanOtpusk.OtpUxod := substr(KLOTPUSK.NOTPUS,pos(' до ',KLOTPUSK.NOTPUS),length(KLOTPUSK.NOTPUS));
+               break;
+             }
+
+          }
+
+        }
+
+      }
+      
+      Tmp_WinPlanOtpusk.WRESERVE:= -4000;
+
+      for(j:= 1; j<= 12; j++)
+      {
+      
+        Tmp_WinPlanOtpusk.Mon[j]     := 0;
+        Tmp_WinPlanOtpusk.MonFact[j] := False;
+      
+        _loop PlanOtpusk where((Tmp_WinPlanOtpusk.cPerson == PlanOtpusk.Person
+                                 and wYearPlanVac == PlanOtpusk.Year_Vac
+                                 and wTuneVacType == PlanOtpusk.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpusk.Appoint(NoIndex)
+                                 and (j = Month(PlanOtpusk.PlanYearBeg) and PlanOtpusk.WSTATUS = 0
+                                 )))
+        {
+
+          if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpusk.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+            and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+            continue;
+
+          if Not Tmp_WinPlanOtpusk.MonFact[j]
+            if (GetFirst FastFirstRow FactOtpusk where ((PlanOtpusk.NRec == FactOtpusk.cPlanOtpusk)) = tsOk)
+              Tmp_WinPlanOtpusk.MonFact[j] := true;
+
+          Tmp_WinPlanOtpusk.Mon[j] += PlanOtpusk.DURATION;
+          Tmp_WinPlanOtpusk.WRESERVE   := PlanOtpusk.WRESERVE;
+
+          ClearBuffer(#Tmp_PlanOtpusk);
+          Tmp_PlanOtpusk.Nrec      := GetNextnRec(#Tmp_PlanOtpusk,0);
+          Tmp_PlanOtpusk.cPlOtp    := PlanOtpusk.Nrec;
+          Tmp_PlanOtpusk.cWinPlOtp := Tmp_WinPlanOtpusk.Nrec;
+          Tmp_PlanOtpusk.DURATION  := PlanOtpusk.DURATION;
+          Tmp_PlanOtpusk.Mon       := Month(PlanOtpusk.PlanYearBeg);
+          Tmp_PlanOtpusk.DatBeg    := PlanOtpusk.PlanYearBeg;
+          Tmp_PlanOtpusk.DatEnd    := PlanOtpusk.PlanYearEnd;
+          Tmp_PlanOtpusk.WRESERVE  := PlanOtpusk.WRESERVE;
+
+          if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpusk.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+            Tmp_PlanOtpusk.Prizn     := AppointmentsPlan.lPrizn;
+
+          if (insert current Tmp_PlanOtpusk != tsOk) {}
+
+        }
+      
+      }
+
+      // найдем РП для пересчета сдвигов, корректировка даты начала должна быть снаружи метода при изменении даты приема в карточке
+      cWPRec := iWP.GetWPByDateAndApp(Persons1.NRec, Appointments.NRec, date(31,12,wYearPlanVac), True);
+
+      if cWPRec = 0 
+      {
+        displ('-->'+ Tmp_WinPlanOtpusk.FIO + ' ('+Tmp_WinPlanOtpusk.Tabn+'), Долж.:'+iCatFunc.GetCatalogsName(Appointments.Post));
+        displ('[-] отсутствует период начинающийся в ' + wYearPlanVac + ' году');
+      }
+
+      if GetFirst FastFirstRow WorkPeriodTMP where((cWPRec == WorkPeriodTMP.Nrec)) = tsOk
+      {
+
+        Tmp_WinPlanOtpusk.WorkP := WorkPeriodTMP.Nrec;
+        Tmp_WinPlanOtpusk.Prich := sGetAttr(coWorkPeriod, Tmp_WinPlanOtpusk.WorkP, 'Причина отказа');
+
+        _loop PutVacation
+        {
+
+          if GetFirst FastFirstRow KlOtpusk where((PutVacation.cKlOtpusk == KlOtpusk.NRec)) = tsOk
+          {
+
+            if KlOtpusk.KOTPUS = 1
+            {
+              if PutVacation.wTypeVac = word(1)
+                Tmp_WinPlanOtpusk.wDay    += PutVacation.wDayCount;
+              else
+                Tmp_WinPlanOtpusk.wDay    += PutVacation.wDayCount*( (12-Month(WorkPeriodTMP.DPERBEG)+if(31-Day(WorkPeriodTMP.DPERBEG)>=15,1,0) )/12);
+
+            }
+            else
+            {
+              if PutVacation.wTypeVac = word(1)
+                Tmp_WinPlanOtpusk.wDayDop += PutVacation.wDayCount;
+              else
+                Tmp_WinPlanOtpusk.wDayDop += PutVacation.wDayCount*( (12-Month(WorkPeriodTMP.DPERBEG)+if(31-Day(WorkPeriodTMP.DPERBEG)>=15,1,0) )/12);
+            }
+
+          }
+
+        }
+
+      }
+/*
+      var PlanWDay : Integer = 0;
+      var FactWDay : Integer = 0;
+
+//MESSAGE('wTuneVacType/'+wTuneVacType+'/'+wYearPlanVac);
+      _loop PlanOtpuskOld where ((Persons1.Nrec == PlanOtpuskOld.Person 
+                     and wYearPlanVac - 1 == PlanOtpuskOld.Year_Vac
+                               and wTuneVacType == PlanOtpuskOld.VacType
+                               and (PlanOtpuskOld.WSTATUS = 0)	
+                                ))
+      {
+//message('PlanOtpuskOld/'+PlanOtpuskOld.PlanYearBeg
+//+'/'+PlanOtpuskOld.PlanYearEnd
+//+'/'+PlanOtpuskOld.Year_Vac+'/'+PlanOtpuskOld.VacType+'/'+PlanOtpuskOld.DURATION);
+        PlanWDay += PlanOtpuskOld.DURATION;
+      }
+
+      cWPRec := iWP.GetWPByDateAndApp(Persons1.NRec, Appointments.NRec, date(31,12,wYearPlanVac-1), True);
+
+      if cWPRec = 0 
+      {
+      }
+      else
+      {
+
+        if GetFirst FastFirstRow WorkPeriodOld where((cWPRec == WorkPeriodOld.Nrec)) = tsOk
+        {
+
+//         Vacations.cWorkPeriod == WorkPeriod.NRec       and
+//             Vacations.VacType == KlOtpusk.NRec         and  // отпуска
+//         Vacations.cFactOtpusk == FactOtpusk.NRec       and
+//                Vacations.NRec == Otpusk.cVacations     and
+//message('WorkPeriodOld/'+WorkPeriodOld.DPERBEG+'/'+WorkPeriodOld.DPEREND);
+
+          _loop VacationsOld where((cWPRec  == VacationsOld.cWorkPeriod))
+          {
+            FactWDay += VacationsOld.Duration;
+//message('VacationsOld/'+VacationsOld.Duration);
+          }
+
+        }
+
+      }
+      Tmp_WinPlanOtpusk.wDayOld := PlanWDay - FactWDay;
+*/
+
+      Tmp_WinPlanOtpusk.wDayOld := soExtAttr.doGetAttr(coWorkPeriod, cWPRec, 'Дополнительное количество дней');
+
+      var D : date = date(0,0,0);
+
+      PushPos(#PlanOtpusk);
+//      if dPlanOtOld < date(1,1,wYearPlanVac)
+//      for(D := dPlanOtOld; D < date(1,1,wYearPlanVac); D := Add_Months(D,1))
+//      {
+/*
+        _loop PlanOtpusk where((Tmp_WinPlanOtpusk.cPerson == PlanOtpusk.Person
+                                 and Year(dPlanOtOld) == PlanOtpusk.Year_Vac
+                                 and wTuneVacType == PlanOtpusk.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpusk.Appoint(NoIndex)
+                                 and ((dPlanOtOld <=  PlanOtpusk.PlanYearBeg   and
+                                      Date(31,12,Year(wYearPlanVac-1)) >= PlanOtpusk.PlanYearBeg
+                                 ) and PlanOtpusk.WSTATUS = 0)
+                                 ))
+        {
+
+          if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpusk.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+            and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+            continue;
+
+          Tmp_WinPlanOtpusk.wDay -= PlanOtpusk.DURATION;
+        }
+*/
+
+//      }
+      PopPos(#PlanOtpusk);
+      
+      Day14_28;
+
+      if (insert current Tmp_WinPlanOtpusk != tsOk) {}
+
+    }
+
+    }
+
+    }
+
+  }
+
+  ExitProc;
+
+  StopVisual('', 0);
+}
+
+Window wnFormTune;
+
+screen scrFormTune;
+  show at (,,,);
+  fields
+    wYearPlanVac  ('Установите год формирования отпуска',,sci1Esc): NoProtect, SpinButton [1,2019,2100];
+buttons
+  cmOK;
+  cmCancel;
+<<
+
+  Год формирования плана-графика отпусков:.@@@@@@@@@@@
+
+     <.Продолжить.>                           <.  Отмена  .>
+
+>>
+end; // screen scrFormTune
+
+HandleEvent
+cmOk:
+{
+
+  if wYearPlanVac < 2019
+  {
+      Message('Планирование отпусков начинается с 2019 года!', Warning + OkButton);
+      set wYearPlanVac := 2019;
+      exit;
+  }
+
+  CloseInterface(cmClose);
+
+}
+end;
+
+end; //Window FormTune;
+
+
+
+Window wnMess ;
+
+screen scr1;
+fields
+  Zar_User.GrupStN ('Выбор фильтра', hcNoContext): noprotect;
+  FiltrPodr  ('Фильтр по подразделению', hcNoContext): protect, pickbutton;
+  FiltrPublic('Фильтр по работникам', hcNoContext): protect,pickbutton;
+
+buttons
+  cmOK;
+  cmCancel;
+<<
+
+  Фильтр по: 
+  [.] подразделению` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] работникам   ` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+     <.Продолжить.>                           <.  Отмена  .>
+
+>>
+end;
+
+HandleEvent
+
+cmInit:
+{
+  InitUser(1);
+
+  _PodrMArkerPointer := CLSF.LoadFullCurrentDepartmentList;
+}
+
+
+cmCheckField:
+{
+  PodrPubCheck;
+  RedrawPanel(#Zar_User);
+}//cmCheckField
+
+cmPick:
+{
+  PodrPubPick;
+  RedrawPanel(#Zar_User);
+}
+
+cmOk:
+{
+  _PodrMArkerPointer := CLSF.LoadFullCurrentDepartmentList;
+
+  update current Zar_User;
+
+  if not FillMarks then
+  {
+    abort;
+    exit;
+  }
+
+  IncTMP;
+
+  CloseInterface(cmClose);
+
+}
+end;
+
+end;
+
+function ItogObsh(Nom:word): longint;
+{
+  ItogObsh := 0;
+
+  _loop Tmp_WinPlanOtpuskItog
+  {
+
+    if Tmp_WinPlanOtpuskItog.Prizn != 0
+      continue;
+
+    if GetMarkerCount(_PodrMArkerPointer) > 0 and Not Foundmarker(_PodrMArkerPointer, Tmp_WinPlanOtpuskItog.Cex)
+      continue;
+
+    Case Nom of
+    1: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[1];
+    2: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[2];
+    3: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[3];
+    4: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[4];
+    5: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[5];
+    6: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[6];
+    7: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[7];
+    8: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[8];
+    9: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[9];
+    10: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[10];
+    11: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[11];
+    12: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[12];
+    13: ItogObsh += Tmp_WinPlanOtpuskItog.wDay   ;
+    14: ItogObsh += Tmp_WinPlanOtpuskItog.wDayDop;
+    15: ItogObsh += Tmp_WinPlanOtpuskItog.Mon[1] +
+                    Tmp_WinPlanOtpuskItog.Mon[2] +
+                    Tmp_WinPlanOtpuskItog.Mon[3] +
+                    Tmp_WinPlanOtpuskItog.Mon[4] +
+                    Tmp_WinPlanOtpuskItog.Mon[5] +
+                    Tmp_WinPlanOtpuskItog.Mon[6] +
+                    Tmp_WinPlanOtpuskItog.Mon[7] +
+                    Tmp_WinPlanOtpuskItog.Mon[8] +
+                    Tmp_WinPlanOtpuskItog.Mon[9] +
+                    Tmp_WinPlanOtpuskItog.Mon[10] +
+                    Tmp_WinPlanOtpuskItog.Mon[11] +
+                    Tmp_WinPlanOtpuskItog.Mon[12];
+    end;
+  }
+
+}
+
+panel panWinPlanOtpusk
+  table Tmp_WinPlanOtpusk;
+
+screen scrPlanOtpusk;
+  show at (,,,1);
+  fields
+    dPlanOtOld  ('Установите год формирования отпуска',,sci1Esc): [10] NoProtect;
+<<
+  Учитывать плановые отпуска прошлых периодов начиная с :.@@@@@@@@@@
+>>
+
+end; // screen scrPlanOtpusk
+
+browse bWinPlanOtpusk 'Плановые отпуска' ('Плановые отпуска', hcAvtoWSelectKartZakNaVneshRab,sci1EscIns);
+  Show  at (,2,,18);
+//  table Tmp_WinPlanOtpusk;
+  Fields
+
+   {Font = {Color = if (Picked = 'V',ColorMark,0);backcolor = if (Tmp_WinPlanOtpusk.OtpUxod != '', ColorSysAqua, 0 )}};
+    picked        'V'  : [1], skip;
+//    {font = {backcolor = if (Tmp_WinPlanOtpusk.OtpUxod != '', ColorSysAqua, 0 )}};
+
+    Tmp_WinPlanOtpusk.FIO       'ФИО' ('Фамилия имя отчество')                  :[28], Protect,{Font = {color = if((Tmp_WinPlanOtpusk.Day14 or Tmp_WinPlanOtpusk.Day28 or Tmp_WinPlanOtpusk.Day28Plus) and Tmp_WinPlanOtpusk.Prizn!=3, ColorErrorRec, ColorSysBlack); bold = true}};
+    Tmp_WinPlanOtpusk.TabN      'Табельный №' ('Табельный номер')               :[12], Protect;
+    iCatFunc.GetCatalogsName(Tmp_WinPlanOtpusk.Post) 'Должность' ('Должность'):[12], Protect;
+    iCatFunc.GetCatalogsCode(Tmp_WinPlanOtpusk.Dep) 'Код'#13'подразделения' ('Код подразделения'):[12], Protect;
+    sPrizn                      'Вид'#13'назначения' ('Вид назначения')         :[7], Protect;
+    Utver                       'Состояние'#13'отпуска' ('Состояние отпуска')   :[5], Protect;
+    Tmp_WinPlanOtpusk.Prich     'Причина'#13'отказа' ('Причина отказа')         :[10], Protect;
+    Tmp_WinPlanOtpusk.DisD      'Дата'#13'увольнения' ('Дата увольнения')       :[10], Protect;
+    Tmp_WinPlanOtpusk.OtpUxod   'Отпуск'#13'по уходу' ('Отпуск по уходу')       :[7], Protect;
+    Tmp_WinPlanOtpusk.wDay      'Отпусков'#13'основных' ('Отпусков основных')   :[5], Protect,{Font = {backcolor = ColorSysLime}};
+    Tmp_WinPlanOtpusk.wDayDop   'Отпусков'#13'доп.' ('Отпусков дополнительных') :[5], Protect,{Font = {backcolor = ColorSysLime}};
+    Tmp_WinPlanOtpusk.Mon[1]    'Январь,'#13'дней' ('Дней, январь')             :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,1,wYearPlanVac)),1,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[1]!=0, if(Tmp_WinPlanOtpusk.MonFact[1],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                         
+    Tmp_WinPlanOtpusk.Mon[2]    'Февраль,'#13'дней' ('Дней, февраль')           :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,2,wYearPlanVac)),2,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[2]!=0, if(Tmp_WinPlanOtpusk.MonFact[2],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                       
+    Tmp_WinPlanOtpusk.Mon[3]    'Март,'#13'дней' ('Дней, март')                 :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,3,wYearPlanVac)),3,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[3]!=0, if(Tmp_WinPlanOtpusk.MonFact[3],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                             
+    Tmp_WinPlanOtpusk.Mon[4]    'Апрель,'#13'дней' ('Дней, апрель')             :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,4,wYearPlanVac)),4,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[4]!=0, if(Tmp_WinPlanOtpusk.MonFact[4],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                         
+    Tmp_WinPlanOtpusk.Mon[5]    'Май,'#13'дней' ('Дней, май')                   :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,5,wYearPlanVac)),5,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[5]!=0, if(Tmp_WinPlanOtpusk.MonFact[5],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                               
+    Tmp_WinPlanOtpusk.Mon[6]    'Июнь,'#13'дней' ('Дней, июнь')                 :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,6,wYearPlanVac)),6,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[6]!=0, if(Tmp_WinPlanOtpusk.MonFact[6],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                             
+    Tmp_WinPlanOtpusk.Mon[7]    'Июль,'#13'дней' ('Дней, июль')                 :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,7,wYearPlanVac)),7,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[7]!=0, if(Tmp_WinPlanOtpusk.MonFact[7],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                             
+    Tmp_WinPlanOtpusk.Mon[8]    'Август,'#13'дней' ('Дней, август')             :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,8,wYearPlanVac)),8,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[8]!=0, if(Tmp_WinPlanOtpusk.MonFact[8],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                         
+    Tmp_WinPlanOtpusk.Mon[9]    'Сентябрь,'#13'дней' ('Дней, сентябрь')         :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,9,wYearPlanVac)),9,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[9]!=0, if(Tmp_WinPlanOtpusk.MonFact[9],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                     
+    Tmp_WinPlanOtpusk.Mon[10]   'Октябрь,'#13'дней' ('Дней, октябрь')           :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,10,wYearPlanVac)),10,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[10]!=0, if(Tmp_WinPlanOtpusk.MonFact[10],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                       
+    Tmp_WinPlanOtpusk.Mon[11]   'Ноябрь,'#13'дней' ('Дней, ноябрь')             :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,11,wYearPlanVac)),11,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[11]!=0, if(Tmp_WinPlanOtpusk.MonFact[11],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                         
+    Tmp_WinPlanOtpusk.Mon[12]   'Декабрь,'#13'дней' ('Дней, декабрь')           :[5], Protect
+      ,{Font = {backcolor = if(Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,12,wYearPlanVac)),12,wYearPlanVac),ColorSysBlack,if(Tmp_WinPlanOtpusk.Mon[12]!=0, if(Tmp_WinPlanOtpusk.MonFact[12],ColorSysFuchsia,ColorSysYellow), 0)); bold = true}};                       
+
+    [Ostatok]
+    (Tmp_WinPlanOtpusk.wDay+   
+    Tmp_WinPlanOtpusk.wDayDop)
+    -(Tmp_WinPlanOtpusk.Mon[1] 
+    +Tmp_WinPlanOtpusk.Mon[2] 
+    +Tmp_WinPlanOtpusk.Mon[3] 
+    +Tmp_WinPlanOtpusk.Mon[4] 
+    +Tmp_WinPlanOtpusk.Mon[5] 
+    +Tmp_WinPlanOtpusk.Mon[6] 
+    +Tmp_WinPlanOtpusk.Mon[7] 
+    +Tmp_WinPlanOtpusk.Mon[8] 
+    +Tmp_WinPlanOtpusk.Mon[9] 
+    +Tmp_WinPlanOtpusk.Mon[10]
+    +Tmp_WinPlanOtpusk.Mon[11]
+    +Tmp_WinPlanOtpusk.Mon[12]) 'Остаток' ('Остаток') :[5], Protect,{Font = {backcolor = if(Ostatok<0, ColorSysRed, if(Ostatok>0, ColorSysGreen,0)); bold = true}};
+
+    Tmp_WinPlanOtpusk.wDayOld   'Остаток'#13'прошлого года' ('Остаток прошлого года') :[5], Protect,{Font = {backcolor = if(Ostatok<0, ColorSysRed, if(Ostatok>0, ColorSysGreen,0)); bold = true}};
+
+  end;// browse
+  
+browse bWinItog 'Итого дней' ('Итого дней', hcAvtoWSelectKartZakNaVneshRab,sci1Esc);
+  Show  at (,19,,20);
+  table Zar_User;
+  Fields
+
+    {Font = {bold = true}};
+
+    [Itogpicked]    ''                            :[1], skip;
+    [ItogFIO]       '' ('Фамилия имя отчество')   :[28], Protect;
+    [ItogTabN]      '' ('Табельный номер')        :[12], Protect;
+    [ItogPost]      '' ('Должность')              :[12], Protect;
+    [ItogDep]       '' ('Код подразделения')      :[12], Protect;
+    [ItogPrizn]     '' ('Вид назначения')         :[7], Protect;
+    [ItogUtver]     '' ('Состояние отпуска')      :[5], Protect;
+    [ItogPrich]     '' ('Причина отказа')         :[10], Protect;
+    [ItogDisD]      '' ('Дата увольнения')        :[10], Protect;
+    [ItogOtpUxod]   '' ('Отпуск по уходу')        :[7], Protect;
+    [ItogwDay]      '' ('Отпусков основных')      :[5], Protect;
+    [ItogwDayDop]   '' ('Отпусков дополнительных'):[5], Protect;
+    [M1]  ItogObsh(1) 'Дн.,'#13'январь'  ('Дней, январь')   :[5], Protect;
+    [M2]  ItogObsh(2) 'Дн.,'#13'февраль'  ('Дней, февраль')  :[5], Protect;
+    [M3]  ItogObsh(3) 'Дн.,'#13'март'  ('Дней, март')     :[5], Protect;
+    [M4]  ItogObsh(4) 'Дн.,'#13'апрель'  ('Дней, апрель')   :[5], Protect;
+    [M5]  ItogObsh(5) 'Дн.,'#13'май'  ('Дней, май')      :[5], Protect;
+    [M6]  ItogObsh(6) 'Дн.,'#13'июнь'  ('Дней, июнь')     :[5], Protect;
+    [M7]  ItogObsh(7) 'Дн.,'#13'июль'  ('Дней, июль')     :[5], Protect;
+    [M8]  ItogObsh(8) 'Дн.,'#13'август'  ('Дней, август')   :[5], Protect;
+    [M9]  ItogObsh(9)  'Дн.,'#13'сентябрь' ('Дней, сентябрь') :[5], Protect;
+    [M10] ItogObsh(10) 'Дн.,'#13'октябрь'  ('Дней, октябрь') :[5], Protect;
+    [M11] ItogObsh(11) 'Дн.,'#13'ноябрь'  ('Дней, ноябрь')  :[5], Protect;
+    [M12] ItogObsh(12) 'Дн.,'#13'декабрь'  ('Дней, декабрь') :[5], Protect;
+    [ItogOstatok]   '' ('Остаток')                 :[5], Protect;
+    [ItogOstatokOld]   '' ('Остаток прошлого года') :[5], Protect;
+  end;// browse
+
+browse bWinItog2 'Итого %' ('Итого %', hcAvtoWSelectKartZakNaVneshRab,sci1Esc);
+  Show  at (,21,,22);
+  table Zar_User;
+  Fields
+
+    {Font = {bold = true}};
+
+    [Itogpicked_2]    ''                            :[1], skip;
+    [ItogFIO_2]       '' ('Фамилия имя отчество')   :[28], Protect;
+    [ItogTabN_2]      '' ('Табельный номер')        :[12], Protect;
+    [ItogPost_2]      '' ('Должность')              :[12], Protect;
+    [ItogDep_2]       '' ('Код подразделения')      :[12], Protect;
+    [ItogPrizn_2]     '' ('Вид назначения')         :[7], Protect;
+    [ItogUtver_2]     '' ('Состояние отпуска')      :[5], Protect;
+    [ItogPrich_2]     '' ('Причина отказа')         :[10], Protect;
+    [ItogDisD_2]      '' ('Дата увольнения')        :[10], Protect;
+    [ItogOtpUxod_2]   '' ('Отпуск по уходу')        :[7], Protect;
+    [ItogwDay_2]      '' ('Отпусков основных')      :[5], Protect;
+    [ItogwDayDop_2]   '' ('Отпусков дополнительных'):[5], Protect;
+    [M1_2]  ItogObsh(1)/ItogObsh(15)*100 '%,'#13'январь'  ('Дней, январь')   :[5], Protect;
+    [M2_2]  ItogObsh(2)/ItogObsh(15)*100 '%,'#13'февраль'  ('Дней, февраль')  :[5], Protect;
+    [M3_2]  ItogObsh(3)/ItogObsh(15)*100 '%,'#13'март'  ('Дней, март')     :[5], Protect;
+    [M4_2]  ItogObsh(4)/ItogObsh(15)*100 '%,'#13'апрель'  ('Дней, апрель')   :[5], Protect;
+    [M5_2]  ItogObsh(5)/ItogObsh(15)*100 '%,'#13'май'  ('Дней, май')      :[5], Protect;
+    [M6_2]  ItogObsh(6)/ItogObsh(15)*100 '%,'#13'июнь'  ('Дней, июнь')     :[5], Protect;
+    [M7_2]  ItogObsh(7)/ItogObsh(15)*100 '%,'#13'июль'  ('Дней, июль')     :[5], Protect;
+    [M8_2]  ItogObsh(8)/ItogObsh(15)*100 '%,'#13'август'  ('Дней, август')   :[5], Protect;
+    [M9_2]  ItogObsh(9)/ItogObsh(15)*100  '%,'#13'сентябрь' ('Дней, сентябрь') :[5], Protect;
+    [M10_2] ItogObsh(10)/ItogObsh(15)*100 '%,'#13'октябрь'  ('Дней, октябрь') :[5], Protect;
+    [M11_2] ItogObsh(11)/ItogObsh(15)*100 '%,'#13'ноябрь'  ('Дней, ноябрь')  :[5], Protect;
+    [M12_2] ItogObsh(12)/ItogObsh(15)*100 '%,'#13'декабрь'  ('Дней, декабрь') :[5], Protect;
+    [ItogOstatok_2]   '' ('Остаток')                 :[5], Protect;
+    [ItogOstatokOld_2]   '' ('Остаток прошлого года') :[5], Protect;
+/*
+    [ItogwDay]      ItogObsh(13)/(ItogObsh(13)+ItogObsh(14))*100 '%' ('Отпусков основных')      :[5], Protect;
+    [ItogwDayDop]   ItogObsh(14)/(ItogObsh(13)+ItogObsh(14))*100 '%' ('Отпусков дополнительных'):[5], Protect;
+    [M1]  ItogObsh(1)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, январь')                   :[5], Protect;
+    [M2]  ItogObsh(2)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, февраль')                  :[5], Protect;
+    [M3]  ItogObsh(3)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, март')                     :[5], Protect;
+    [M4]  ItogObsh(4)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, апрель')                   :[5], Protect;
+    [M5]  ItogObsh(5)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, май')                      :[5], Protect;
+    [M6]  ItogObsh(6)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, июнь')                     :[5], Protect;
+    [M7]  ItogObsh(7)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, июль')                     :[5], Protect;
+    [M8]  ItogObsh(8)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, август')                   :[5], Protect;
+    [M9]  ItogObsh(9)/(ItogObsh(13)+ItogObsh(14))*100  '%' ('Дней, сентябрь')                 :[5], Protect;
+    [M10] ItogObsh(10)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, октябрь')                  :[5], Protect;
+    [M11] ItogObsh(11)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, ноябрь')                   :[5], Protect;
+    [M12] ItogObsh(12)/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Дней, декабрь')                  :[5], Protect;
+    [ItogOstatok] (ItogObsh(13)+ItogObsh(14)-ItogObsh(15))/(ItogObsh(13)+ItogObsh(14))*100 '%'  ('Остаток')                 :[5], Protect;
+*/    
+  end;// browse
+//------------------------------------------------------------------------------
+screen  scUserDeskRep (,hcOkHelp ,);
+  Show  at (,23,,);
+  Fields
+    [ItogLeto] (ItogObsh(5)+ItogObsh(6)+ItogObsh(7)+ItogObsh(8)+ItogObsh(9))/(ItogObsh(15))*100 ('Итого летние месяцы',,sci1Esc): Protect,{Font = {color = if(ItogLeto>=55, ColorErrorRec, 0);bold = true}};
+  
+buttons
+  cmValue1 , default,,, hcOkHelp     , scGalDial;
+  cmValue2 ,        ,,, hcOkHelp     , scGalDial;
+  cmValue9 ,        ,,, hcOkHelp     , scGalDial;
+  cmValue7 ,        ,,, hcOkHelp     , scGalDial;
+  cmValue10 ,       ,,, hcOkHelp     , scGalDial;
+  cmValue6 ,        ,,, hcOkHelp     , scGalDial;
+  cmCancel ,        ,,, hcCancelHelp , scGalDial;
+
+<<
+  <.Редактировать.>  <.Сохранить.>  <.На согласование.>  <.Согласование.>                                                                          Итого летние месяцы:.@@@@@ %
+
+  <.Отклонить.>      <.Утвердить.>             <.  Отмена  .>
+>>
+
+end;   //screen
+
+procedure MonField(i:integer);
+{
+//message(Tmp_WinPlanOtpusk.Mon[i]+'/'+Tmp_WinPlanOtpusk.WRESERVE[i]+'/'+Tmp_WinPlanOtpusk.MonFact[i]+'/'+(getfirst Tmp_PlanOtpuskTMP where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskTMP.cWinPlOtp
+//                                            and i  == Tmp_PlanOtpuskTMP.Mon[i])) = tsOk))
+
+//    if (getfirst Tmp_PlanOtpuskTMP where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskTMP.cWinPlOtp
+//                                            and i  == Tmp_PlanOtpuskTMP.Mon)) = tsOk)
+//message(Tmp_WinPlanOtpusk.Nrec)
+
+  if GetMarkerCount(_PodrMArkerPointer) > 0 and Not Foundmarker(_PodrMArkerPointer, Tmp_WinPlanOtpusk.Cex)
+  {
+    Message('Редактирование запрешено!' + chr(13)
+      + chr(3) + 'Сотрудник отображен в подразделении информационно.', Warning + OkButton);
+    set Tmp_WinPlanOtpusk.Mon[i] := 0;
+  }
+  else
+    if Tmp_WinPlanOtpusk.WRESERVE != -32000 and Tmp_WinPlanOtpusk.WRESERVE != -4000 and Tmp_WinPlanOtpusk.WRESERVE != -8000
+    {
+
+      set Tmp_WinPlanOtpusk.Mon[i] := 0;
+      Message('Редактирование запрешено! Неоходимо создавать приказ', Warning + OkButton);
+      PushPos(#Tmp_PlanOtpuskTMP);
+      _loop Tmp_PlanOtpuskTMP where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskTMP.cWinPlOtp
+                                            and i  == Tmp_PlanOtpuskTMP.Mon))
+        Tmp_WinPlanOtpusk.Mon[i] += Tmp_PlanOtpuskTMP.DURATION;
+      PopPos(#Tmp_PlanOtpuskTMP);
+    }
+    else
+      if Tmp_WinPlanOtpusk.AppD>date(Last_Day(Date(1,i,wYearPlanVac)),i,wYearPlanVac)
+      {
+        Message('Сотрудник еще не принят!', Warning + OkButton);
+        set Tmp_WinPlanOtpusk.Mon[i] := 0;
+      }
+      else
+        if Tmp_WinPlanOtpusk.Prizn=3
+        {
+          Message('Совмещение будет заполено из основного назначения!', Warning + OkButton);
+          set Tmp_WinPlanOtpusk.Mon[i] := 0;
+        }
+        else
+          if Tmp_WinPlanOtpusk.MonFact[i]
+          {
+            Message('Фактические отпуска привязанные к плану!', Warning + OkButton);
+            FlagField := false;
+          }
+//message(Tmp_WinPlanOtpusk.Nrec)
+}
+
+
+function SummTMPPlan(WinNrec:comp;iMon:Integer):double;
+{
+  SummTMPPlan := 0;
+  PushPos(#Tmp_PlanOtpusk);
+  _loop Tmp_PlanOtpusk where ((WinNrec  == Tmp_PlanOtpusk.cWinPlOtp
+                               and iMon == Tmp_PlanOtpusk.Mon))
+    SummTMPPlan += Tmp_PlanOtpusk.DURATION;
+  PopPos(#Tmp_PlanOtpusk);
+
+}
+
+procedure DelTMPPlan(WinNrec:comp;iMon:Integer);
+{
+  _loop Tmp_PlanOtpusk where ((WinNrec == Tmp_PlanOtpusk.cWinPlOtp
+                           and iMon    == Tmp_PlanOtpusk.Mon))
+    delete current Tmp_PlanOtpusk;
+}
+
+procedure SetWin;
+{
+  if UpDate current Tmp_WinPlanOtpusk=tsOk
+  {
+
+    for(j:= 1; j<= 12; j++)
+    {
+    
+      if Tmp_WinPlanOtpusk.Mon[j] = 0
+      {
+        DelTMPPlan(Tmp_WinPlanOtpusk.Nrec,j);
+      }
+      else
+      {
+
+        if Tmp_WinPlanOtpusk.Mon[j] != SummTMPPlan(Tmp_WinPlanOtpusk.Nrec,j)
+        {
+          DelTMPPlan(Tmp_WinPlanOtpusk.Nrec,j);
+        
+          ClearBuffer(#Tmp_PlanOtpusk);
+          Tmp_PlanOtpusk.Nrec      := GetNextnRec(#Tmp_PlanOtpusk,0);
+          Tmp_PlanOtpusk.cPlOtp    := 0;
+          Tmp_PlanOtpusk.cWinPlOtp := Tmp_WinPlanOtpusk.Nrec;
+          Tmp_PlanOtpusk.DURATION  := Tmp_WinPlanOtpusk.Mon[j];
+          Tmp_PlanOtpusk.Mon       := j;
+          Tmp_PlanOtpusk.DatBeg    := date(1,j,wYearPlanVac);
+          Tmp_PlanOtpusk.DatEnd    := GetLastDate(Tmp_PlanOtpusk.DatBeg,Tmp_PlanOtpusk.DURATION);
+          Tmp_PlanOtpusk.WRESERVE  := Tmp_WinPlanOtpusk.WRESERVE;
+          if (insert current Tmp_PlanOtpusk != tsOk) {}
+        }
+      }
+    }
+  }
+}
+
+
+HandleEvent  // for panel
+cmCheckField:
+{
+//message(Tmp_WinPlanOtpusk.Nrec)
+  FlagField := true;
+
+  case CurField of
+    #Tmp_WinPlanOtpusk.Prich:
+    {
+      if Tmp_WinPlanOtpusk.WorkP = 0
+        Message('Отсутствует период начинающийся в' + wYearPlanVac + ' году. Причина не сохранена.')
+      else
+        sSetAttr(coWorkPeriod, Tmp_WinPlanOtpusk.WorkP, 'Причина отказа', Tmp_WinPlanOtpusk.Prich)
+    }
+    #dPlanOtOld:
+    {
+      IncTMP;
+    }
+    #Tmp_WinPlanOtpusk.Mon[1]:  //
+    {
+      MonField(1);
+    }
+    #Tmp_WinPlanOtpusk.Mon[2]:  //
+    {
+      MonField(2);
+    }
+    #Tmp_WinPlanOtpusk.Mon[3]:  //
+    {
+      MonField(3);
+    }
+    #Tmp_WinPlanOtpusk.Mon[4]:  // Тема кандидатской диссертации
+    {
+      MonField(4);
+    }
+    #Tmp_WinPlanOtpusk.Mon[5]:  //
+    {
+      MonField(5);
+    }
+    #Tmp_WinPlanOtpusk.Mon[6]:  //
+    {
+      MonField(6);
+    }
+    #Tmp_WinPlanOtpusk.Mon[7]:  //
+    {
+      MonField(7);
+    }
+    #Tmp_WinPlanOtpusk.Mon[8]:  //
+    {
+      MonField(8);
+    }
+    #Tmp_WinPlanOtpusk.Mon[9]:  //
+    {
+      MonField(9);
+    }
+    #Tmp_WinPlanOtpusk.Mon[10]:  //
+    {
+      MonField(10);
+    }
+    #Tmp_WinPlanOtpusk.Mon[11]:  //
+    {
+      MonField(11);
+    }
+    #Tmp_WinPlanOtpusk.Mon[12]:  //
+    {
+      MonField(12);
+    }
+  end; // case
+
+  Day14_28;
+//message(Tmp_WinPlanOtpusk.Nrec)
+
+  if Tmp_WinPlanOtpusk.Prizn != 3 and FlagField
+  {
+    SetWin;
+  }
+
+//message(Tmp_WinPlanOtpusk.Nrec)
+
+  ReReadRecord;
+}
+End; // HandleEvent for panel
+end; // Panel
+
+Procedure PerenosPeriod(Tmp_PlanNrec:Comp);
+{
+
+  _loop Tmp_PlanOtpuskTMP where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskTMP.cWinPlOtp))
+  {
+    if Tmp_PlanOtpuskTMP.Nrec != Tmp_PlanNrec
+    if iStrFunc.isCrossPeriod(PlanOtpusk.PlanYearBeg,PlanOtpusk.PlanYearEnd, Tmp_PlanOtpuskTMP.DatBeg,Tmp_PlanOtpuskTMP.DatEnd)
+    {
+//message('Ko='+Tmp_PlanOtpusk.DatBeg+'='+Tmp_PlanOtpusk.DatEnd+'/'+Tmp_PlanOtpusk.Nrec)
+
+      PlanOtpusk.PlanYearBeg := Add_Day(Tmp_PlanOtpuskTMP.DatEnd,1);
+      PlanOtpusk.PlanYearEnd := GetLastDate(PlanOtpusk.PlanYearBeg, Tmp_WinPlanOtpusk.Mon[j]);
+      PerenosPeriod(Tmp_PlanNrec);
+    }
+  }
+/*
+  PushPos(#PlanOtpuskD);
+  _loop PlanOtpuskD where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskD.Person
+                         and wYearPlanVac == PlanOtpuskD.Year_Vac
+                         and wTuneVacType == PlanOtpuskD.VacType
+//                         and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                         and (PlanOtpuskD.WSTATUS = 0 and PlanOtpuskD.Nrec != 0
+                         )))
+  {
+
+    if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+      and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+      continue;
+
+    if iStrFunc.isCrossPeriod(PlanOtpusk.PlanYearBeg,PlanOtpusk.PlanYearEnd, PlanOtpuskD.PlanYearBeg,PlanOtpuskD.PlanYearEnd)
+    {
+      PlanOtpusk.PlanYearBeg := Add_Day(PlanOtpuskD.PlanYearEnd,1);
+      PlanOtpusk.PlanYearEnd := GetLastDate(PlanOtpusk.PlanYearBeg, Tmp_WinPlanOtpusk.Mon[j]);
+      PerenosPeriod(Tmp_PlanNrec);
+    }
+
+  }
+  PopPos(#PlanOtpuskD);
+*/
+}
+
+Procedure SaveUtv(RESERVE:Integer);
+{
+
+  if GetMarkerCount(Marker) > 0
+  {
+
+    StartNewVisual(vtIndicatorVisual, 0, 'Загрузка плановых отпусков...', RecordsInTable(#Tmp_WinPlanOtpusk));
+    
+    _loop Tmp_WinPlanOtpusk
+    {
+    
+      if not NextVisual
+        break;
+    
+      if (Tmp_WinPlanOtpusk.Prizn = 3)
+        continue;
+
+      if not Foundmarker(Marker, Tmp_WinPlanOtpusk.Nrec)
+        continue;
+    
+      wCalcMode := word(0);
+
+      RESERVE   := Tmp_WinPlanOtpusk.WRESERVE;
+    
+      for(j:= 1; j<= 12; j++)
+      {
+    
+        var bDURATION : boolean = false;
+        var dDURATION : double = 0;
+        var bPlan : boolean = true;
+
+        if Tmp_WinPlanOtpusk.Mon[j] = 0
+        {
+          _loop PlanOtpuskD where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskD.Person
+                                 and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                 and wTuneVacType == PlanOtpuskD.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                 and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                 )))
+          {
+    
+            if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+              and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+              continue;
+
+            _Loop WorkPCon where (( coPlanOtpusk          == WorkPCon.wTable      and
+                                  PlanOtpuskD.Nrec        == WorkPCon.cTable      and
+                                  Tmp_WinPlanOtpusk.WorkP == WorkPCon.cWorkPeriod ))
+              delete current WorkPCon;
+
+            _Loop Tmp_PlanOtpuskTMP where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskTMP.cWinPlOtp
+                                            and j  == Tmp_PlanOtpuskTMP.Mon))
+              delete current Tmp_PlanOtpuskTMP;
+
+            delete current PlanOtpuskD;
+    
+          }
+
+          if getfirst fastfirstrow Tmp_WinPlanOtpuskSovm where((Tmp_WinPlanOtpusk.cPerson == Tmp_WinPlanOtpuskSovm.cPerson
+                                                            and 3                      == Tmp_WinPlanOtpuskSovm.Prizn)) = tsOk
+          {
+
+            _loop PlanOtpuskD where((Tmp_WinPlanOtpuskSovm.cPerson == PlanOtpuskD.Person
+                                   and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                   and wTuneVacType == PlanOtpuskD.VacType
+//                                   and Tmp_WinPlanOtpuskSovm.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                   and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                   )))
+            {
+        
+              if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+                and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpuskSovm.Prizn
+                continue;
+
+              _Loop WorkPCon where (( coPlanOtpusk              == WorkPCon.wTable      and
+                                    PlanOtpuskD.Nrec            == WorkPCon.cTable      and
+                                    Tmp_WinPlanOtpuskSovm.WorkP == WorkPCon.cWorkPeriod ))
+                delete current WorkPCon;
+
+              _Loop Tmp_PlanOtpuskTMP where ((Tmp_WinPlanOtpuskSovm.Nrec == Tmp_PlanOtpuskTMP.cWinPlOtp
+                                            and j  == Tmp_PlanOtpuskTMP.Mon))
+                delete current Tmp_PlanOtpuskTMP;
+
+              delete current PlanOtpuskD;
+        
+            }
+
+            Tmp_WinPlanOtpuskSovm.Mon[j] := 0;
+            UpDate current Tmp_WinPlanOtpuskSovm;
+
+          }
+
+        }
+    
+        _loop PlanOtpuskD where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskD.Person
+                                 and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                 and wTuneVacType == PlanOtpuskD.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                 and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                 )))
+        {
+
+          if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+           and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+           continue;
+
+          bPlan := false;
+          dDURATION += PlanOtpuskD.DURATION
+    
+        }
+
+        _loop PlanOtpuskD where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskD.Person
+                                 and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                 and wTuneVacType == PlanOtpuskD.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                 and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                 )))
+        {
+    
+          if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+           and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+           continue;
+
+          if GetFirst FastFirstRow Tmp_PlanOtpusk where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpusk.cWinPlOtp
+                                                      and PlanOtpuskD.PlanYearBeg == Tmp_PlanOtpusk.DatBeg
+                                                      and PlanOtpuskD.PlanYearEnd == Tmp_PlanOtpusk.DatEnd
+                                                      )) <> tsok
+          {
+            bDURATION := true;
+            break;
+          }
+
+        }
+
+//message(j+'/'+SummTMPPlan(Tmp_WinPlanOtpusk.Nrec,j))
+
+        if (bPlan or bDURATION) and SummTMPPlan(Tmp_WinPlanOtpusk.Nrec,j) != 0
+        {
+    
+
+//message('k/'+j)
+
+          var FlagRESERV :boolean = true; 
+
+          _loop PlanOtpuskD where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskD.Person
+                                 and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                 and wTuneVacType == PlanOtpuskD.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                 and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                 )))
+          {
+    
+
+            if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+              and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+              continue;
+
+            _Loop WorkPCon where (( coPlanOtpusk          == WorkPCon.wTable      and
+                                  PlanOtpuskD.Nrec        == WorkPCon.cTable      and
+                                  Tmp_WinPlanOtpusk.WorkP == WorkPCon.cWorkPeriod ))
+              delete current WorkPCon;
+
+//message(PlanOtpuskD.wRESERVE);
+
+//            if PlanOtpuskD.wRESERVE = -32000 or PlanOtpuskD.wRESERVE = -8000  or PlanOtpuskD.wRESERVE = -4000 or PlanOtpuskD.wRESERVE = 0
+              FlagRESERV := true;
+//            else
+//              FlagRESERV := false;
+
+            delete current PlanOtpuskD;
+    
+          }
+    
+          if FlagRESERV
+          _Loop Tmp_PlanOtpusk where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpusk.cWinPlOtp
+                                         and j == Tmp_PlanOtpusk.Mon))
+          {
+
+            ClearBuffer(#PlanOtpusk);
+            PlanOtpusk.Person      := Tmp_WinPlanOtpusk.cPerson;
+            PlanOtpusk.Appoint     := Tmp_WinPlanOtpusk.Appoint;
+            PlanOtpusk.VacType     := wTuneVacType;
+            PlanOtpusk.Year_Vac    := wYearPlanVac;
+            PlanOtpusk.Year_Work   := wYearPlanVac;
+    
+            if GetFirst FastFirstRow WorkPeriodTMP where((Tmp_WinPlanOtpusk.WorkP == WorkPeriodTMP.Nrec)) = tsOk
+            {
+              PlanOtpusk.WORKYEARBEG := WorkPeriodTMP.DPERBEG;
+              PlanOtpusk.WORKYEAREND := WorkPeriodTMP.DPEREND;
+            }
+    
+            var cTmpWP:comp = 0;
+            cTmpWP := funGetFirstPeriodInTune;
+        
+////    if ( funCalcDateBeg(cTmpWP) = date(0, 0, 0) ) // если человек принят на работу позже даты, на которую формируем
+////      exit;
+      
+
+            PlanOtpusk.PlanYearBeg := Tmp_PlanOtpusk.DatBeg;
+            PlanOtpusk.PlanYearEnd := Tmp_PlanOtpusk.DatEnd;
+
+            PerenosPeriod(Tmp_PlanOtpusk.Nrec);
+
+//message(j+'/'+Tmp_PlanOtpusk.DURATION)
+            PlanOtpusk.DURATION    := Tmp_PlanOtpusk.DURATION;
+
+            PlanOtpusk.wRESERVE    := RESERVE;
+
+          if ( insert current PlanOtpusk = tsOk ) 
+          {
+
+            Tmp_PlanOtpusk.cPlOtp    := PlanOtpusk.Nrec;
+            if (Update current Tmp_PlanOtpusk != tsOk) {}
+
+            ClearBuffer(#WorkPCon);
+            WorkPCon.wTable      := coPlanOtpusk;
+            WorkPCon.cTable      := PlanOtpusk.Nrec;
+            WorkPCon.cWorkPeriod := Tmp_WinPlanOtpusk.WorkP;
+            if (insert current WorkPCon = tsOK) {}
+
+            var TMPPlanOtpusk : type$PlanOtpusk;
+            TMPPlanOtpusk := PlanOtpusk.Buffer;
+
+            if getfirst fastfirstrow Tmp_WinPlanOtpuskSovm where((Tmp_WinPlanOtpusk.cPerson == Tmp_WinPlanOtpuskSovm.cPerson
+                                                              and 3                      == Tmp_WinPlanOtpuskSovm.Prizn)) = tsOk
+            {
+
+              FlagRESERV := true;
+
+              _loop PlanOtpuskD where((Tmp_WinPlanOtpuskSovm.cPerson == PlanOtpuskD.Person
+                                     and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                     and wTuneVacType == PlanOtpuskD.VacType
+//                                     and Tmp_WinPlanOtpuskSovm.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                     and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                     )))
+              {
+        
+                if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+                  and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpuskSovm.Prizn
+                  continue;
+
+                _Loop WorkPCon where (( coPlanOtpusk              == WorkPCon.wTable      and
+                                      PlanOtpuskD.Nrec            == WorkPCon.cTable      and
+                                      Tmp_WinPlanOtpuskSovm.WorkP == WorkPCon.cWorkPeriod ))
+                  delete current WorkPCon;
+
+//                if PlanOtpuskD.wRESERVE = -32000  or PlanOtpuskD.wRESERVE = -8000  or PlanOtpuskD.wRESERVE = -4000 or PlanOtpuskD.wRESERVE = 0
+                  FlagRESERV := true;
+//                else
+//                  FlagRESERV := false;
+
+                delete current PlanOtpuskD;
+        
+              }
+
+              if FlagRESERV
+//              _Loop Tmp_PlanOtpuskSovm where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskSovm.cWinPlOtp
+//                                           and j == Tmp_PlanOtpuskSovm.Mon))
+              {
+
+              ClearBuffer(#PlanOtpusk);
+              PlanOtpusk.Buffer := TMPPlanOtpusk;
+              PlanOtpusk.Nrec   := 0;
+              PlanOtpusk.Appoint:= Tmp_WinPlanOtpuskSovm.Appoint;
+              if GetFirst FastFirstRow WorkPeriodTMP where((Tmp_WinPlanOtpuskSovm.WorkP == WorkPeriodTMP.Nrec)) = tsOk
+              {
+                PlanOtpusk.WORKYEARBEG := WorkPeriodTMP.DPERBEG;
+                PlanOtpusk.WORKYEAREND := WorkPeriodTMP.DPEREND;
+              }
+
+              PlanOtpusk.wRESERVE    := RESERVE;
+
+              if ( insert current PlanOtpusk = tsOk ) 
+              {
+
+                Tmp_PlanOtpuskSovm.cPlOtp    := PlanOtpusk.Nrec;
+                if (UpDate current Tmp_PlanOtpuskSovm != tsOk) {}
+
+                ClearBuffer(#WorkPCon);
+                WorkPCon.wTable      := coPlanOtpusk;
+                WorkPCon.cTable      := PlanOtpusk.Nrec;
+                WorkPCon.cWorkPeriod := Tmp_WinPlanOtpuskSovm.WorkP;
+                if (insert current WorkPCon = tsOK) {}
+
+                Tmp_WinPlanOtpuskSovm.Mon[j] := PlanOtpusk.DURATION;//SummTMPPlan(Tmp_WinPlanOtpuskSovm.Nrec,j)
+                Tmp_WinPlanOtpuskSovm.WRESERVE := RESERVE;
+
+                if UpDate current Tmp_WinPlanOtpuskSovm=tsOk
+                {
+                  for(k:= 1; k<= 12; k++)
+                  {
+                  
+                    if Tmp_WinPlanOtpuskSovm.Mon[k] = 0
+                    {
+                      DelTMPPlan(Tmp_WinPlanOtpuskSovm.Nrec,k);
+                    }
+                    else
+                    {
+                      if Tmp_WinPlanOtpuskSovm.Mon[k] != SummTMPPlan(Tmp_WinPlanOtpuskSovm.Nrec,k)
+                      {
+                        DelTMPPlan(Tmp_WinPlanOtpuskSovm.Nrec,k);
+                      
+                        ClearBuffer(#Tmp_PlanOtpusk);
+                        Tmp_PlanOtpusk.Nrec      := GetNextnRec(#Tmp_PlanOtpusk,0);
+                        Tmp_PlanOtpusk.cPlOtp    := 0;
+                        Tmp_PlanOtpusk.cWinPlOtp := Tmp_WinPlanOtpuskSovm.Nrec;
+                        Tmp_PlanOtpusk.DURATION  := Tmp_WinPlanOtpuskSovm.Mon[k];
+                        Tmp_PlanOtpusk.Mon       := k;
+                        Tmp_PlanOtpusk.DatBeg    := date(1,k,wYearPlanVac);
+                        Tmp_PlanOtpusk.DatEnd    := GetLastDate(Tmp_PlanOtpusk.DatBeg,Tmp_PlanOtpusk.DURATION);
+                        Tmp_PlanOtpusk.WRESERVE  := Tmp_WinPlanOtpuskSovm.WRESERVE;
+                        if (insert current Tmp_PlanOtpusk != tsOk) {}
+                      }
+                    }
+                  }
+                }
+              }//if ( insert current PlanOtpusk = tsOk ) 
+
+              }//_Loop Tmp_PlanOtpuskSovm where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskSovm.cWinPlOtp
+
+            }
+
+          }//if ( insert current PlanOtpusk = tsOk ) 
+
+          }//_Loop Tmp_PlanOtpusk where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpusk.cWinPlOtp
+
+        }
+      
+      }//for(j:= 1; j<= 12; j++)
+    
+    }
+    
+    SetFieldOption(#Tmp_WinPlanOtpusk.Prich , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[1] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[2] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[3] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[4] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[5] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[6] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[7] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[8] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[9] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[10], ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[11], ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[12], ofProtected);
+    SetInterfaceOptions(opEscClose or opCyanInterface);
+    FlagIntOpt:=True;
+
+    RescanPanel(#Tmp_WinPlanOtpusk);
+    RescanPanel(#Zar_User);
+    ReReadRecord;
+
+    StopVisual('', 0);
+    DisableCommand(cmCheckField);
+
+  }
+  else
+  {
+    Message('Нет выбранных сотрудников')
+  }
+
+}
+
+Procedure SaveUtv6(RESERVE:Integer);
+{
+
+  if GetMarkerCount(Marker) > 0
+  {
+
+  StartNewVisual(vtIndicatorVisual, 0, 'Проверка плановых отпусков...', RecordsInTable(#Tmp_WinPlanOtpusk));
+
+  intInit;
+  var Flag : boolean = false;
+
+//message('SaveUtv6/'+Tmp_WinPlanOtpusk.Nrec)
+
+  PushPos(#Tmp_WinPlanOtpusk);
+
+  _loop Tmp_WinPlanOtpusk
+  {
+
+    if not NextVisual
+      break;
+
+    if not Foundmarker(Marker, Tmp_WinPlanOtpusk.Nrec)
+      continue;
+
+    if (RESERVE = -16000 or RESERVE = -32000 or RESERVE = -8000) and Tmp_WinPlanOtpusk.wRESERVE = 0
+    {
+      displ('[-] запрет изменения статуса "Утв." по '+ Tmp_WinPlanOtpusk.FIO + ' ('+Tmp_WinPlanOtpusk.Tabn+')');
+      Flag := true;
+      continue;
+    }
+
+    if ((Tmp_WinPlanOtpusk.Day14) or (Tmp_WinPlanOtpusk.Day28) or (Tmp_WinPlanOtpusk.Day28Plus)) and Tmp_WinPlanOtpusk.OtpUxod = '' and Tmp_WinPlanOtpusk.Prizn!=3
+    {
+
+      displ('-->'+ Tmp_WinPlanOtpusk.FIO + ' ('+Tmp_WinPlanOtpusk.Tabn+')');
+
+      if Tmp_WinPlanOtpusk.Day28Plus
+        displ('[-] необходимо заполнить не менее 28 дней текущего года и ' + Tmp_WinPlanOtpusk.wDayOld + ' остаток прошлого года');
+
+      if Tmp_WinPlanOtpusk.Day28
+        displ('[-] необходимо заполнить не менее 28 дней в год');
+
+      if Tmp_WinPlanOtpusk.Day14
+        displ('[-] необходимо заполнить не менее 14 дней одним отрезком');
+
+      Flag := true;
+    }
+
+  }
+
+  PopPos(#Tmp_WinPlanOtpusk);
+
+//message('==============SaveUtv6/'+Tmp_WinPlanOtpusk.Nrec)
+
+  ExitProc;
+
+  StopVisual('', 0);
+
+  if Flag
+  {
+    Message('Необходимо поправить план отпусков(ФИО выделено красным) или выбраны "Утв."', Warning + OkButton);
+    abort;
+    exit;
+  }
+  else
+  {
+
+    StartNewVisual(vtIndicatorVisual, 0, 'Загрузка плановых отпусков...', RecordsInTable(#Tmp_WinPlanOtpusk));
+
+    PushPos(#Tmp_WinPlanOtpusk);
+    
+    _loop Tmp_WinPlanOtpusk
+    {
+    
+      if not NextVisual
+        break;
+    
+    if (Tmp_WinPlanOtpusk.Prizn = 3)
+        continue;
+    
+      if not Foundmarker(Marker, Tmp_WinPlanOtpusk.Nrec)
+        continue;
+
+      if RESERVE = -16000 and Tmp_WinPlanOtpusk.wRESERVE = 0
+        continue;
+
+      wCalcMode := word(0);
+    
+      for(j:= 1; j<= 12; j++)
+      {
+    
+        var bDURATION : boolean = false;
+        var dDURATION : double = 0;
+        var bPlan : boolean = true;
+
+        if Tmp_WinPlanOtpusk.Mon[j] = 0
+        {
+          _loop PlanOtpuskD where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskD.Person
+                                 and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                 and wTuneVacType == PlanOtpuskD.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                 and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                 )))
+          {
+    
+            if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+              and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+              continue;
+
+            _Loop WorkPCon where (( coPlanOtpusk          == WorkPCon.wTable      and
+                                  PlanOtpuskD.Nrec        == WorkPCon.cTable      and
+                                  Tmp_WinPlanOtpusk.WorkP == WorkPCon.cWorkPeriod ))
+              delete current WorkPCon;
+
+            _Loop Tmp_PlanOtpuskTMP where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskTMP.cWinPlOtp
+                                            and j  == Tmp_PlanOtpuskTMP.Mon))
+              delete current Tmp_PlanOtpuskTMP;
+
+            delete current PlanOtpuskD;
+    
+          }
+
+          if getfirst fastfirstrow Tmp_WinPlanOtpuskSovm where((Tmp_WinPlanOtpusk.cPerson == Tmp_WinPlanOtpuskSovm.cPerson
+                                                            and 3                      == Tmp_WinPlanOtpuskSovm.Prizn)) = tsOk
+          {
+
+            _loop PlanOtpuskD where((Tmp_WinPlanOtpuskSovm.cPerson == PlanOtpuskD.Person
+                                   and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                   and wTuneVacType == PlanOtpuskD.VacType
+//                                   and Tmp_WinPlanOtpuskSovm.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                   and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                   )))
+            {
+        
+              if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+                and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpuskSovm.Prizn
+                continue;
+
+              _Loop WorkPCon where (( coPlanOtpusk              == WorkPCon.wTable      and
+                                    PlanOtpuskD.Nrec            == WorkPCon.cTable      and
+                                    Tmp_WinPlanOtpuskSovm.WorkP == WorkPCon.cWorkPeriod ))
+                delete current WorkPCon;
+
+              _Loop Tmp_PlanOtpuskTMP where ((Tmp_WinPlanOtpuskSovm.Nrec == Tmp_PlanOtpuskTMP.cWinPlOtp
+                                              and j  == Tmp_PlanOtpuskTMP.Mon))
+                delete current Tmp_PlanOtpuskTMP;
+
+              delete current PlanOtpuskD;
+        
+            }
+
+            Tmp_WinPlanOtpuskSovm.Mon[j] := 0;
+            UpDate current Tmp_WinPlanOtpuskSovm;
+
+          }
+
+        }
+    
+        _loop PlanOtpuskD where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskD.Person
+                                 and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                 and wTuneVacType == PlanOtpuskD.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                 and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                 )))
+        {
+
+          if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+            and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+            continue;
+
+          bPlan := false;
+          dDURATION += PlanOtpuskD.DURATION
+    
+        }
+
+        _loop PlanOtpuskD where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskD.Person
+                                 and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                 and wTuneVacType == PlanOtpuskD.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                 and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                 )))
+        {
+    
+          if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+            and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+            continue;
+
+          if GetFirst FastFirstRow Tmp_PlanOtpusk where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpusk.cWinPlOtp
+                                                      and PlanOtpuskD.PlanYearBeg == Tmp_PlanOtpusk.DatBeg
+                                                      and PlanOtpuskD.PlanYearEnd == Tmp_PlanOtpusk.DatEnd
+                                                      )) <> tsok
+          {
+             bDURATION := true;
+             break;
+          }
+          else
+          {
+            PlanOtpuskD.wRESERVE := RESERVE;
+            update current PlanOtpuskD;
+            Tmp_PlanOtpusk.wRESERVE := RESERVE;
+            update current Tmp_PlanOtpusk;
+            Tmp_WinPlanOtpusk.wRESERVE    := RESERVE;
+            update current Tmp_WinPlanOtpusk;
+
+            if getfirst fastfirstrow Tmp_WinPlanOtpuskSovm where((Tmp_WinPlanOtpusk.cPerson == Tmp_WinPlanOtpuskSovm.cPerson
+                                                              and 3                      == Tmp_WinPlanOtpuskSovm.Prizn)) = tsOk
+            {
+
+              _loop PlanOtpuskSovm where((Tmp_WinPlanOtpuskSovm.cPerson == PlanOtpuskSovm.Person
+                                       and wYearPlanVac == PlanOtpuskSovm.Year_Vac
+                                       and wTuneVacType == PlanOtpuskSovm.VacType
+//                                       and Tmp_WinPlanOtpuskSovm.Appoint == PlanOtpuskSovm.Appoint(NoIndex)
+                                       and (j = Month(PlanOtpuskSovm.PlanYearBeg) and PlanOtpuskSovm.WSTATUS = 0
+                                       )))
+              {
+          
+                if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskSovm.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+                  and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpuskSovm.Prizn
+                  continue;
+
+                if GetFirst FastFirstRow Tmp_PlanOtpuskSovm where ((Tmp_WinPlanOtpuskSovm.Nrec == Tmp_PlanOtpuskSovm.cWinPlOtp
+                                                            and PlanOtpuskSovm.PlanYearBeg == Tmp_PlanOtpuskSovm.DatBeg
+                                                            and PlanOtpuskSovm.PlanYearEnd == Tmp_PlanOtpuskSovm.DatEnd
+                                                            )) = tsok
+                {
+                  PlanOtpuskSovm.wRESERVE := RESERVE;
+                  update current PlanOtpuskSovm;
+                  Tmp_PlanOtpuskSovm.wRESERVE := RESERVE;
+                  update current Tmp_PlanOtpuskSovm;
+                  Tmp_WinPlanOtpuskSovm.wRESERVE    := RESERVE;
+                  update current Tmp_WinPlanOtpuskSovm;
+                }
+
+              }
+
+            }
+
+          }
+
+        }
+
+        if (bPlan or bDURATION) and SummTMPPlan(Tmp_WinPlanOtpusk.Nrec,j) != 0
+        {
+    
+          _loop PlanOtpuskD where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskD.Person
+                                 and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                 and wTuneVacType == PlanOtpuskD.VacType
+//                                 and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                 and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                 )))
+          {
+    
+             if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+               and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+               continue;
+
+            _Loop WorkPCon where (( coPlanOtpusk          == WorkPCon.wTable      and
+                                  PlanOtpuskD.Nrec        == WorkPCon.cTable      and
+                                  Tmp_WinPlanOtpusk.WorkP == WorkPCon.cWorkPeriod ))
+              delete current WorkPCon;
+
+            delete current PlanOtpuskD;
+    
+          }
+    
+          _Loop Tmp_PlanOtpusk where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpusk.cWinPlOtp
+                                         and j == Tmp_PlanOtpusk.Mon))
+          {
+
+            ClearBuffer(#PlanOtpusk);
+            PlanOtpusk.Person      := Tmp_WinPlanOtpusk.cPerson;
+            PlanOtpusk.Appoint     := Tmp_WinPlanOtpusk.Appoint;
+            PlanOtpusk.VacType     := wTuneVacType;
+            PlanOtpusk.Year_Vac    := wYearPlanVac;
+            PlanOtpusk.Year_Work   := wYearPlanVac;
+    
+            if GetFirst FastFirstRow WorkPeriodTMP where((Tmp_WinPlanOtpusk.WorkP == WorkPeriodTMP.Nrec)) = tsOk
+            {
+              PlanOtpusk.WORKYEARBEG := WorkPeriodTMP.DPERBEG;
+              PlanOtpusk.WORKYEAREND := WorkPeriodTMP.DPEREND;
+            }
+    
+            var cTmpWP:comp = 0;
+            cTmpWP := funGetFirstPeriodInTune;
+        
+////    if ( funCalcDateBeg(cTmpWP) = date(0, 0, 0) ) // если человек принят на работу позже даты, на которую формируем
+////      exit;
+      
+
+            PlanOtpusk.PlanYearBeg := Tmp_PlanOtpusk.DatBeg;
+            PlanOtpusk.PlanYearEnd := Tmp_PlanOtpusk.DatEnd;
+
+            PerenosPeriod(Tmp_PlanOtpusk.Nrec);
+
+            PlanOtpusk.DURATION    := Tmp_PlanOtpusk.DURATION;
+
+            PlanOtpusk.wRESERVE    := RESERVE;
+
+          if ( insert current PlanOtpusk = tsOk ) 
+          {
+
+            Tmp_PlanOtpusk.cPlOtp    := PlanOtpusk.Nrec;
+            if (Update current Tmp_PlanOtpusk != tsOk) {}
+
+            ClearBuffer(#WorkPCon);
+            WorkPCon.wTable      := coPlanOtpusk;
+            WorkPCon.cTable      := PlanOtpusk.Nrec;
+            WorkPCon.cWorkPeriod := Tmp_WinPlanOtpusk.WorkP;
+            if (insert current WorkPCon = tsOK) {}
+
+            var TMPPlanOtpusk : type$PlanOtpusk;
+            TMPPlanOtpusk := PlanOtpusk.Buffer;
+
+            if getfirst fastfirstrow Tmp_WinPlanOtpuskSovm where((Tmp_WinPlanOtpusk.cPerson == Tmp_WinPlanOtpuskSovm.cPerson
+                                                              and 3                      == Tmp_WinPlanOtpuskSovm.Prizn)) = tsOk
+            {
+
+              _loop PlanOtpuskD where((Tmp_WinPlanOtpuskSovm.cPerson == PlanOtpuskD.Person
+                                     and wYearPlanVac == PlanOtpuskD.Year_Vac
+                                     and wTuneVacType == PlanOtpuskD.VacType
+//                                     and Tmp_WinPlanOtpuskSovm.Appoint == PlanOtpuskD.Appoint(NoIndex)
+                                     and (j = Month(PlanOtpuskD.PlanYearBeg) and PlanOtpuskD.WSTATUS = 0
+                                     )))
+              {
+        
+                if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskD.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+                  and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpuskSovm.Prizn
+                  continue;
+
+                _Loop WorkPCon where (( coPlanOtpusk              == WorkPCon.wTable      and
+                                      PlanOtpuskD.Nrec            == WorkPCon.cTable      and
+                                      Tmp_WinPlanOtpuskSovm.WorkP == WorkPCon.cWorkPeriod ))
+                  delete current WorkPCon;
+
+                delete current PlanOtpuskD;
+        
+              }
+
+              _Loop Tmp_PlanOtpuskSovm where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskSovm.cWinPlOtp
+                                           and j == Tmp_PlanOtpuskSovm.Mon))
+              {
+
+              ClearBuffer(#PlanOtpusk);
+              PlanOtpusk.Buffer := TMPPlanOtpusk;
+              PlanOtpusk.Nrec   := 0;
+              PlanOtpusk.Appoint:= Tmp_WinPlanOtpuskSovm.Appoint;
+              if GetFirst FastFirstRow WorkPeriodTMP where((Tmp_WinPlanOtpuskSovm.WorkP == WorkPeriodTMP.Nrec)) = tsOk
+              {
+                PlanOtpusk.WORKYEARBEG := WorkPeriodTMP.DPERBEG;
+                PlanOtpusk.WORKYEAREND := WorkPeriodTMP.DPEREND;
+              }
+
+              PlanOtpusk.wRESERVE    := RESERVE;
+
+              if ( insert current PlanOtpusk = tsOk ) 
+              {
+
+                Tmp_PlanOtpuskSovm.cPlOtp    := PlanOtpusk.Nrec;
+                if (UpDate current Tmp_PlanOtpuskSovm != tsOk) {}
+
+                ClearBuffer(#WorkPCon);
+                WorkPCon.wTable      := coPlanOtpusk;
+                WorkPCon.cTable      := PlanOtpusk.Nrec;
+                WorkPCon.cWorkPeriod := Tmp_WinPlanOtpuskSovm.WorkP;
+                if (insert current WorkPCon = tsOK) {}
+
+                Tmp_WinPlanOtpuskSovm.Mon[j] := PlanOtpusk.DURATION;
+                Tmp_WinPlanOtpuskSovm.WRESERVE := RESERVE;
+
+                if UpDate current Tmp_WinPlanOtpuskSovm=tsOk
+                {
+                  for(k:= 1; k<= 12; k++)
+                  {
+                  
+                    if Tmp_WinPlanOtpuskSovm.Mon[k] = 0
+                    {
+                      DelTMPPlan(Tmp_WinPlanOtpuskSovm.Nrec,k);
+                    }
+                    else
+                    {
+                      if Tmp_WinPlanOtpuskSovm.Mon[k] != SummTMPPlan(Tmp_WinPlanOtpuskSovm.Nrec,k)
+                      {
+                        DelTMPPlan(Tmp_WinPlanOtpuskSovm.Nrec,k);
+                      
+                        ClearBuffer(#Tmp_PlanOtpusk);
+                        Tmp_PlanOtpusk.Nrec      := GetNextnRec(#Tmp_PlanOtpusk,0);
+                        Tmp_PlanOtpusk.cPlOtp    := 0;
+                        Tmp_PlanOtpusk.cWinPlOtp := Tmp_WinPlanOtpuskSovm.Nrec;
+                        Tmp_PlanOtpusk.DURATION  := Tmp_WinPlanOtpuskSovm.Mon[k];
+                        Tmp_PlanOtpusk.Mon       := k;
+                        Tmp_PlanOtpusk.DatBeg    := date(1,j,wYearPlanVac);
+                        Tmp_PlanOtpusk.DatEnd    := GetLastDate(Tmp_PlanOtpusk.DatBeg,Tmp_PlanOtpusk.DURATION);
+                        Tmp_PlanOtpusk.WRESERVE  := Tmp_WinPlanOtpuskSovm.WRESERVE;
+                        if (insert current Tmp_PlanOtpusk != tsOk) {}
+                      }
+                    }
+                  }
+                }
+              }//if ( insert current PlanOtpusk = tsOk ) 
+
+              }//_Loop Tmp_PlanOtpuskSovm where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpuskSovm.cWinPlOtp
+
+            }
+
+          }//if ( insert current PlanOtpusk = tsOk ) 
+
+          }//_Loop Tmp_PlanOtpusk where ((Tmp_WinPlanOtpusk.Nrec == Tmp_PlanOtpusk.cWinPlOtp
+
+        }
+      
+      }//for(j:= 1; j<= 12; j++)
+    
+    }
+
+    PopPos(#Tmp_WinPlanOtpusk);
+    
+    SetFieldOption(#Tmp_WinPlanOtpusk.Prich , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[1] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[2] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[3] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[4] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[5] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[6] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[7] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[8] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[9] , ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[10], ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[11], ofProtected);
+    SetFieldOption(#Tmp_WinPlanOtpusk.Mon[12], ofProtected);
+    SetInterfaceOptions(opEscClose or opCyanInterface);
+    FlagIntOpt:=True;
+
+    RescanPanel(#Tmp_WinPlanOtpusk);
+    RescanPanel(#Zar_User);
+    ReReadRecord;
+
+    StopVisual('', 0);
+    DisableCommand(cmCheckField);
+
+  }
+
+  }
+  else
+  {
+    Message('Нет выбранных сотрудников')
+  }
+
+//  message('+++++++++SaveUtv6/'+Tmp_WinPlanOtpusk.Nrec)
+}
+
+Window wnMon (, hcNoContext, ) escclose, Blue;//Cyan;
+
+  browse bTmp_PlanOtpusk ('Период отпуска', ,sci1EscIns);//sci147EnEsc
+   table Tmp_PlanOtpuskM;
+  Fields
+    Tmp_WinPlanOtpuskM.FIO   'ФИО'     ('Фамилия имя отчество') :[28], Protect;
+    iCatFunc.GetCatalogsName(Tmp_WinPlanOtpuskM.Post) 'Должность' ('Должность'):[12], Protect;
+    iCatFunc.GetCatalogsCode(Tmp_WinPlanOtpuskM.Dep) 'Код'#13'подразделения' ('Код подразделения'):[12], Protect;
+    Tmp_PlanOtpuskM.DatBeg   'Дата c'  ('Дата c'):[10], NoProtect;
+    Tmp_PlanOtpuskM.DatEnd   'Дата по' ('Дата по'):[10], Skip;
+    Tmp_PlanOtpuskM.DURATION 'Дней'    ('Дней'):[5], NoProtect;
+  end; // browse
+/*
+HandleEvent
+cmInit:
+{
+  // Загружаем протектор
+  LoadVipRef(Protector, 'Protector');
+  Protector.LinkTo(cfsGetCurrentContainerSelf, 'MainWindow');
+  if FlagIntOpt
+  {
+  Protector.SetProtectedStatusCtx(sci1EscIns);
+  SetInterfaceOptions(opEscClose or opCyanInterface);
+  }
+  else
+  {
+  SetInterfaceOptions(opEscClose);
+  Protector.SetProtectedStatusCtx(sci18EscIns);
+  }
+}
+
+end;
+*/
+end; //Window wnMon ;
+
+function Peresechenie:boolean;
+{
+  Peresechenie := false;
+  _loop Tmp_PlanOtpuskPer where((Tmp_PlanOtpuskM.cWinPlOtp == Tmp_PlanOtpuskPer.cWinPlOtp))
+  {
+    if Tmp_PlanOtpuskM.Nrec != Tmp_PlanOtpuskPer.Nrec
+    if iStrFunc.isCrossPeriod(Tmp_PlanOtpuskM.DatBeg,Tmp_PlanOtpuskM.DatEnd, Tmp_PlanOtpuskPer.DatBeg,Tmp_PlanOtpuskPer.DatEnd)
+    {
+      Message('Ошибка пересечение дат '+Tmp_PlanOtpuskM.DatBeg+'-'+Tmp_PlanOtpuskM.DatEnd+' и '+Tmp_PlanOtpuskPer.DatBeg+'-'+Tmp_PlanOtpuskPer.DatEnd, Error);
+      Peresechenie := true;
+      break;
+    }
+  }
+}
+
+HandleEvent
+  cmCheckField:
+  {
+/*    if Tmp_PlanOtpuskM.WRESERVE != -32000  or PlanOtpuskD.wRESERVE != -8000  or PlanOtpuskD.wRESERVE != -4000
+    {
+      Message('Редактирование запрешено! Неоходимо создавать приказ', Warning + OkButton);
+    }
+    else
+*/
+    case CurField of
+    #Tmp_PlanOtpuskM.DURATION:
+    {
+      if Tmp_PlanOtpuskM.DURATION != 0
+      {
+        if Tmp_WinPlanOtpuskM.Mon[FieldMon] > Tmp_PlanOtpuskM.DURATION
+        {
+        
+          Tmp_PlanOtpuskM.DatEnd    := GetLastDate(Tmp_PlanOtpuskM.DatBeg,Tmp_PlanOtpuskM.DURATION);
+          if Not Peresechenie
+          {
+            update current Tmp_PlanOtpuskM;
+        
+          ClearBuffer(#Tmp_PlanOtpuskDbl);
+          Tmp_PlanOtpuskDbl.Buffer    := Tmp_PlanOtpuskM.Buffer;
+          Tmp_PlanOtpuskDbl.Nrec      := GetNextnRec(#Tmp_PlanOtpusk,0);
+          Tmp_PlanOtpuskDbl.DURATION  := Tmp_WinPlanOtpuskM.Mon[FieldMon] - SummTMPPlan(Tmp_WinPlanOtpuskM.Nrec,FieldMon);
+          Tmp_PlanOtpuskDbl.DatBeg    := Add_Day(Tmp_PlanOtpuskM.DatEnd,1);
+          Tmp_PlanOtpuskDbl.DatEnd    := GetLastDate(Tmp_PlanOtpuskDbl.DatBeg,Tmp_PlanOtpuskDbl.DURATION);
+          if (insert current Tmp_PlanOtpuskDbl != tsOk) {}
+          }
+        
+        }
+        if Tmp_WinPlanOtpuskM.Mon[FieldMon] < Tmp_PlanOtpuskM.DURATION
+        {
+          Message(chr(3)+'Превышено плановое количество дней', okButton);
+          Tmp_PlanOtpuskM.DURATION := Tmp_WinPlanOtpuskM.Mon[FieldMon];
+          Tmp_PlanOtpuskM.DatEnd   := GetLastDate(Tmp_PlanOtpuskM.DatBeg,Tmp_PlanOtpuskM.DURATION);
+          if Not Peresechenie
+            update current Tmp_PlanOtpuskM;
+        }
+      }
+      else
+        Message(chr(3)+'Количество дней не должно быть 0!', okButton);
+    }
+    #Tmp_PlanOtpuskM.DatBeg:
+    {
+
+      if year(Tmp_PlanOtpuskM.DatBeg) = WYEARPLANVAC
+      {
+
+        if Month(Tmp_PlanOtpuskM.DatBeg) != FieldMon
+        {
+          Tmp_PlanOtpuskM.DatBeg := date(Day(Tmp_PlanOtpuskM.DatBeg),FieldMon,Year(Tmp_PlanOtpuskM.DatBeg));
+          Tmp_PlanOtpuskM.DatEnd := GetLastDate(Tmp_PlanOtpuskM.DatBeg,Tmp_PlanOtpuskM.DURATION);
+        
+          if Not Peresechenie
+            update current Tmp_PlanOtpuskM;
+        }
+        else
+        {
+          Tmp_PlanOtpuskM.DatEnd    := GetLastDate(Tmp_PlanOtpuskM.DatBeg,Tmp_PlanOtpuskM.DURATION);
+          if Not Peresechenie
+            update current Tmp_PlanOtpuskM;
+        }
+      }
+      else
+        Message(chr(3)+'Дата должна попадать в диапазон '+WYEARPLANVAC+' года!', okButton);
+
+    }
+    #Tmp_PlanOtpuskM.DatEnd:
+    {
+
+//      if year(Tmp_PlanOtpuskM.DatEnd) = WYEARPLANVAC
+//      {
+
+        Tmp_PlanOtpuskM.DURATION := To_Days(Sub_Date(Tmp_PlanOtpuskM.DatEnd,Tmp_PlanOtpuskM.DatBeg));
+        if Not Peresechenie
+        {
+          update current Tmp_PlanOtpuskM;
+        
+        if Tmp_WinPlanOtpuskM.Mon[FieldMon] > Tmp_PlanOtpuskM.DURATION
+        {
+          ClearBuffer(#Tmp_PlanOtpuskDbl);
+          Tmp_PlanOtpuskDbl.Buffer    := Tmp_PlanOtpuskM.Buffer;
+          Tmp_PlanOtpuskDbl.Nrec      := GetNextnRec(#Tmp_PlanOtpusk,0);
+          Tmp_PlanOtpuskDbl.DURATION  := Tmp_WinPlanOtpuskM.Mon[FieldMon] - SummTMPPlan(Tmp_WinPlanOtpuskM.Nrec,FieldMon);
+          Tmp_PlanOtpuskDbl.DatBeg    := Add_Day(Tmp_PlanOtpuskM.DatEnd,1);
+          Tmp_PlanOtpuskDbl.DatEnd    := GetLastDate(Tmp_PlanOtpuskDbl.DatBeg,Tmp_PlanOtpuskDbl.DURATION);
+          if (insert current Tmp_PlanOtpuskDbl != tsOk) {}
+        }
+        if Tmp_WinPlanOtpuskM.Mon[FieldMon] < Tmp_PlanOtpuskM.DURATION
+        {
+          Message(chr(3)+'Превышено плановое количество дней', okButton);
+          Tmp_PlanOtpuskM.DURATION := Tmp_WinPlanOtpuskM.Mon[FieldMon];
+          Tmp_PlanOtpuskM.DatEnd   := GetLastDate(Tmp_PlanOtpuskM.DatBeg,Tmp_PlanOtpuskM.DURATION);
+          if Not Peresechenie
+            update current Tmp_PlanOtpuskM;
+        }
+
+        }
+        
+//      }
+//      else
+//        Message(chr(3)+'Дата должна попадать в диапазон '+WYEARPLANVAC+' года!', okButton);
+    }
+
+    end; //case
+
+    ReReadRecord(#Tmp_PlanOtpuskM);
+//    RescanPanel(#Tmp_PlanOtpuskM);
+    RescanPanel(#Zar_User);
+}
+
+cmInit:
+{
+  mtClear(#Tmp_WinPlanOtpusk, mfNormal);
+  mtClear(#Tmp_PlanOtpusk, mfNormal);
+
+  Marker := InitMarker('WinPlanOtpusk',8,100,10,FALSE) ;
+  ClearMarker(Marker);
+
+  if not ReadMyDsk(Filtrpodr,'k_Filtrpodr',false)
+    {}
+  mrkOuterClassfier:=InitMarker('Z_Statis_mrkOuterClassfier',8,20,10); //маркер с отмеченными классификаторами
+
+  if GetMarkerCount(mrkOuterClassfier) = 0
+    MarkerNotNull:= false;
+  else MarkerNotNull:=true;
+
+  _PodrMArkerPointer := CLSF.LoadFullCurrentDepartmentList;
+
+  FlagIntOpt := true;
+  dPlanOtOld := date(1,Month(Add_Months(Cur_Date,1)),Year(Cur_Date));
+
+  wTuneVacType := word(coGetTune('UP.ZAR.KlPlanOtp'));
+
+  if (not ReadMyDsk(wYearPlanVac, 'WinPlanOtpusk_wYearPlanVac', false))
+    wYearPlanVac := Year(Cur_Date);
+
+  if Year(Cur_Date) > wYearPlanVac
+    wYearPlanVac := Year(Cur_Date);
+
+  SetTitle('Плановые отпуска на ' + wYearPlanVac + ' год');
+
+  If getfirst PlanOtpuskSave where((wYearPlanVac == PlanOtpuskSave.Year_Vac
+                               and wTuneVacType == PlanOtpuskSave.VacType
+                               and (PlanOtpuskSave.WSTATUS = 65535))) = tsOk
+    DisableCommand(cmValue8);
+
+  if Not isValid(#Formarks)
+    PutCommand(cmValue3);
+  else
+    IncTMP;
+
+  SetEnableCommand(cmValue6, wGetTune('NPOEM_OWN.PLOTP.USERROLE') = 1);
+}             	
+cmPositionChanged:
+{
+  if Tmp_WinPlanOtpusk.WRESERVE = 0
+  {
+//    DisableCommand(cmValue1);
+//    DisableCommand(cmValue2);
+//    DisableCommand(cmValue9);
+//    DisableCommand(cmValue7);
+//    DisableCommand(cmValue10);
+
+  }
+  else
+  {
+//    EnableCommand(cmValue1);
+//    EnableCommand(cmValue2);
+//    EnableCommand(cmValue9);
+//    EnableCommand(cmValue7);
+//    EnableCommand(cmValue10);
+  }
+}
+cmMarkUnMark :
+{
+  if (SearchMarker(Marker,Tmp_WinPlanOtpusk.NRec,IndexMarker))
+  {
+     DeleteMarker(Marker,Tmp_WinPlanOtpusk.NRec);
+//     if (GetNext Tmp_WinPlanOtpusk = tsOk) /*CallToNeighBours(cmPosDown,#Tmp_WinPlanOtpusk);*/
+  }
+  else
+  {
+     InsertMarker(Marker,Tmp_WinPlanOtpusk.NRec);
+//    if (GetNext Tmp_WinPlanOtpusk = tsOk) CallToNeighBours(cmPosDown,#Tmp_WinPlanOtpusk);
+  }
+//  ReReadRecord;
+  RedrawCurrentAndGo (GetCurrentFormat, true);
+  RescanPanel(#Tmp_WinPlanOtpusk);
+  RescanPanel(#Zar_User);
+}
+cmSelectAll :
+{
+  PushPos(#Tmp_WinPlanOtpusk);
+  ClearMarker(Marker);
+  StartNewVisual(vtRotateVisual, vfTimer+vfBreak+vfConfirm,
+          ''#3'Помечаю ...'#13#3, 1);
+  if (GetFirst Tmp_WinPlanOtpusk = tsOK)
+  do
+  if (not NextVisual)
+     Break;
+  else
+  {
+    if (SearchMarker(Marker,Tmp_WinPlanOtpusk.NRec,IndexMarker))
+      InsertMarker(Marker,Tmp_WinPlanOtpusk.NRec);
+    else
+    {
+      InsertMarker(Marker,Tmp_WinPlanOtpusk.NRec);
+    }
+  }
+  while (GetNext Tmp_WinPlanOtpusk = tsOK);
+  PopPos(#Tmp_WinPlanOtpusk);
+  ReReadRecord;
+  RescanPanel(#Tmp_WinPlanOtpusk);
+  RescanPanel(#Zar_User);
+  StopVisual('',0);
+}
+cmUnSelectAll :
+{
+  ClearMarker(Marker);
+  ReReadRecord;
+  RescanPanel(#Tmp_WinPlanOtpusk);
+  RescanPanel(#Zar_User);
+}
+cmDone:
+{
+
+  if not FlagIntOpt
+  if Message(''#3'Сохранить изменения в отпусках?', YesNo) = cmYes
+  {
+
+    PushPos(#Tmp_WinPlanOtpusk);
+    ClearMarker(Marker);
+    StartNewVisual(vtRotateVisual, vfTimer+vfBreak+vfConfirm,
+            ''#3'Помечаю ...'#13#3, 1);
+    if (GetFirst Tmp_WinPlanOtpusk = tsOK)
+    do
+    if (not NextVisual)
+       Break;
+    else
+    {
+      if (SearchMarker(Marker,Tmp_WinPlanOtpusk.NRec,IndexMarker))
+        InsertMarker(Marker,Tmp_WinPlanOtpusk.NRec);
+      else
+      {
+        InsertMarker(Marker,Tmp_WinPlanOtpusk.NRec);
+      }
+    }
+    while (GetNext Tmp_WinPlanOtpusk = tsOK);
+    PopPos(#Tmp_WinPlanOtpusk);
+    ReReadRecord;
+    RescanPanel(#Tmp_WinPlanOtpusk);
+    RescanPanel(#Zar_User);
+    StopVisual('',0);
+
+    SaveUtv(word(-4000));
+
+    ClearMarker(Marker);
+  }
+
+  SaveMyDsk(wYearPlanVac, 'WinPlanOtpusk_wYearPlanVac');
+  SaveMyDsk(FiltrPodr, 'k_FiltrPodr');
+  DoneMarker(_PodrMArkerPointer,'');
+  DoneMarker(mrkOuterClassfier,'');
+  DoneMarker(Marker,'WinPlanOtpusk');
+}
+
+cmUpdateRecord :
+{
+
+  Day14_28;
+  SetWin;
+
+}
+
+cmDeleteRecord:
+{
+
+  if getfirst fastfirstrow Tmp_PlanOtpuskNO where((Tmp_WinPlanOtpuskM.Nrec == Tmp_PlanOtpuskNO.cWinPlOtp 
+                               and(Tmp_PlanOtpuskM.Nrec <> Tmp_PlanOtpuskNO.Nrec))) = tsOk
+  {
+    Tmp_PlanOtpuskNO.DURATION += Tmp_PlanOtpuskM.DURATION;
+    Tmp_PlanOtpuskNO.DatEnd   := GetLastDate(Tmp_PlanOtpuskNO.DatBeg,Tmp_PlanOtpuskNO.DURATION);
+    update current Tmp_PlanOtpuskNO;
+
+    delete current Tmp_PlanOtpuskM;
+  }
+  else
+    if Message('''Запись одиночная. Удалить?', YesNo) = cmYes
+    {
+
+      PushPos(#Tmp_WinPlanOtpusk);
+      if getfirst fastfirstrow Tmp_WinPlanOtpusk where((Tmp_PlanOtpuskM.cWinPlOtp == Tmp_WinPlanOtpusk.Nrec)) = tsOk
+      {
+        Tmp_WinPlanOtpusk.Mon[Tmp_PlanOtpuskM.Mon] := 0;
+        SetWin;
+      }
+      PopPos(#Tmp_WinPlanOtpusk);
+
+      delete current Tmp_PlanOtpuskM;
+    }
+
+}
+
+cmHotkeys:
+{
+
+  if (((CurField = #Tmp_WinPlanOtpusk.Mon[1]    and (1  >= Month(Cur_date) and wYearPlanVac = year(Cur_date)))
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[2]  and (2  >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[3]  and (3  >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[4]  and (4  >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[5]  and (5  >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[6]  and (6  >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[7]  and (7  >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[8]  and (8  >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[9]  and (9  >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[10] and (10 >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[11] and (11 >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     or (CurField = #Tmp_WinPlanOtpusk.Mon[12] and (12 >= Month(Cur_date) and wYearPlanVac = year(Cur_date))) 
+     ) or wYearPlanVac > year(Cur_date)) 
+     and (not FlagIntOpt)
+    EnableCommand(cmValue5);
+  else
+    DisableCommand(cmValue5);
+
+  PutHotCommand(RunMenu('hkWinPlanOtpusk'));
+}
+
+cmValue1:
+{
+    EnableCommand(cmCheckField);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Prich , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[1] , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[2] , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[3] , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[4] , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[5] , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[6] , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[7] , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[8] , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[9] , ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[10], ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[11], ofProtected);
+    ClearFieldOption(#Tmp_WinPlanOtpusk.Mon[12], ofProtected);
+    SetInterfaceOptions(opEscClose);
+
+    FlagIntOpt:=False;
+
+}
+
+cmValue2:
+{
+
+SaveUtv(word(-4000));
+
+}
+
+cmValue9:
+{
+
+SaveUtv6(word(-32000));
+
+}
+
+cmValue7:
+{
+
+SaveUtv6(word(-16000));
+
+}
+
+cmValue10:
+{
+
+SaveUtv6(word(-8000));
+
+}
+
+cmValue6:
+{
+
+SaveUtv6(word(0));
+
+}
+
+cmValue3:
+{
+  RunWindowModal(wnMess);
+  RescanPanel(#Tmp_WinPlanOtpusk);
+  RescanPanel(#Zar_User);
+}
+
+cmValue4:
+{
+  RunWindowModal(wnFormTune);
+  SetTitle('Плановые отпуска на ' + wYearPlanVac + ' год');
+  IncTMP;
+  If getfirst PlanOtpuskSave where((wYearPlanVac == PlanOtpuskSave.Year_Vac
+                               and wTuneVacType == PlanOtpuskSave.VacType
+                               and (PlanOtpuskSave.WSTATUS = 65535))) = tsOk
+    DisableCommand(cmValue8);
+  else
+    EnableCommand(cmValue8);
+
+  RescanPanel(#Tmp_WinPlanOtpusk);
+  RescanPanel(#Zar_User);
+}
+
+cmValue5:
+{
+  FieldMon := 1;
+
+  case CurField of
+    #Tmp_WinPlanOtpusk.Mon[1]: set FieldMon := 1;
+    #Tmp_WinPlanOtpusk.Mon[2]: set FieldMon := 2;
+    #Tmp_WinPlanOtpusk.Mon[3]: set FieldMon := 3;
+    #Tmp_WinPlanOtpusk.Mon[4]: set FieldMon := 4;
+    #Tmp_WinPlanOtpusk.Mon[5]: set FieldMon := 5;
+    #Tmp_WinPlanOtpusk.Mon[6]: set FieldMon := 6;
+    #Tmp_WinPlanOtpusk.Mon[7]: set FieldMon := 7;
+    #Tmp_WinPlanOtpusk.Mon[8]: set FieldMon := 8;
+    #Tmp_WinPlanOtpusk.Mon[9]: set FieldMon := 9;
+    #Tmp_WinPlanOtpusk.Mon[10]: set FieldMon := 10;
+    #Tmp_WinPlanOtpusk.Mon[11]: set FieldMon := 11;
+    #Tmp_WinPlanOtpusk.Mon[12]: set FieldMon := 12;
+  end; // case
+
+
+
+  RunWindowModal(wnMon);
+}
+cmValue8:
+{
+
+  If getfirst PlanOtpuskSave where((wYearPlanVac == PlanOtpuskSave.Year_Vac
+                               and wTuneVacType == PlanOtpuskSave.VacType
+                               and (PlanOtpuskSave.WSTATUS = 65535
+                               ))) = tsOk
+    Message('Первоначальный график уже сформирован. Операция невозможна.')
+  else
+  if GetMarkerCount(Marker) > 0
+  {
+
+    StartNewVisual(vtIndicatorVisual, 0, 'Загрузка плановых отпусков...', RecordsInTable(#Tmp_WinPlanOtpusk));
+    
+    _loop Tmp_WinPlanOtpusk
+    {
+    
+      if not NextVisual
+        break;
+    
+      if (Tmp_WinPlanOtpusk.Prizn = 3)
+        continue;
+
+      if not Foundmarker(Marker, Tmp_WinPlanOtpusk.Nrec)
+        continue;
+
+      _loop PlanOtpuskSave where((Tmp_WinPlanOtpusk.cPerson == PlanOtpuskSave.Person
+                               and wYearPlanVac == PlanOtpuskSave.Year_Vac
+                               and wTuneVacType == PlanOtpuskSave.VacType
+//                               and Tmp_WinPlanOtpusk.Appoint == PlanOtpuskSave.Appoint(NoIndex)
+                               and (PlanOtpuskSave.WSTATUS = 0
+                               )))
+      {
+
+              if (GetFirst FastFirstRow AppointmentsPlan where ((PlanOtpuskSave.Appoint == AppointmentsPlan.Nrec)) = tsOk)
+                and AppointmentsPlan.lPrizn != Tmp_WinPlanOtpusk.Prizn
+                continue;
+
+              ClearBuffer(#PlanOtpusk);
+              PlanOtpusk.Buffer  := PlanOtpuskSave.Buffer;
+              PlanOtpusk.Nrec    := 0;
+              PlanOtpusk.WSTATUS := 65535;
+              if ( insert current PlanOtpusk = tsOk ) 
+              {
+                ClearBuffer(#WorkPCon);
+                WorkPCon.wTable      := coPlanOtpusk;
+                WorkPCon.cTable      := PlanOtpusk.Nrec;
+                WorkPCon.cWorkPeriod := Tmp_WinPlanOtpusk.WorkP;
+                if (insert current WorkPCon = tsOK) {}
+              }
+      }
+
+    }
+
+    StopVisual('', 0);
+
+    DisableCommand(cmValue8);
+  }
+  else
+  {
+    Message('Нет выбранных сотрудников')
+  }
+}
+cmStaffDoWin1:
+{
+  RunInterface(Z_Staff::Recwin01, Tmp_WinPlanOtpusk.cPerson, word(0));
+}
+cmStaffDoWin2:
+{
+  RunInterface(Z_Staff::Recwin02, Tmp_WinPlanOtpusk.cPerson, word(0));
+}
+cmStaffDoWin3:
+{
+  RunInterface(Z_Staff::Recwin03, Tmp_WinPlanOtpusk.cPerson, word(0));
+}
+cmStaffDoWin4:
+{
+  RunInterface(Z_Staff::Recwin04, Tmp_WinPlanOtpusk.cPerson, word(0));
+}
+cmStaffDoWin5:
+{
+  RunInterface(Z_Staff::Recwin05, Tmp_WinPlanOtpusk.cPerson, word(0));
+}
+cmStaffDoWin6:
+{
+  RunInterface(Z_Staff::Recwin06, Tmp_WinPlanOtpusk.cPerson, word(0));
+}
+cmStaffDoWin7:
+{
+  RunInterface(Z_Staff::Recwin07, Tmp_WinPlanOtpusk.cPerson, word(0));
+  IncTMP;
+  If getfirst PlanOtpuskSave where((wYearPlanVac == PlanOtpuskSave.Year_Vac
+                               and wTuneVacType == PlanOtpuskSave.VacType
+                               and (PlanOtpuskSave.WSTATUS = 65535))) = tsOk
+    DisableCommand(cmValue8);
+  else
+    EnableCommand(cmValue8);
+
+  RescanPanel(#Tmp_WinPlanOtpusk);
+  RescanPanel(#Zar_User);
+}
+cmStaffDoWin8:
+{
+  RunInterface(Z_Staff::Recwin08, Tmp_WinPlanOtpusk.cPerson, word(0));
+}
+cmStaffDoWin9:
+{
+  var cLschet: comp;
+  cLschet := 0;
+  if MLFP.GetMainLschet(Tmp_WinPlanOtpusk.cPerson, cLschet)
+    if (GetFirst LSchetTabN where ((cLschet == LSchetTabN.nRec)) = tsOk)
+      RunInterface(Z_SREDN::ZBlisNet1, LSchetTabN.Nrec, LSchetTabN.Cex, p2, word(0), word(1), Tmp_WinPlanOtpusk.cPerson, comp(0));
+}
+cmStartDopTables:
+{
+  RunInterface(Z_STAFF::StaffViewDopTbls, Word(1), Tmp_WinPlanOtpusk.cPerson);
+}
+cmStaffPens:
+{
+  RunInterface(Z_Staff::Recwin11, Tmp_WinPlanOtpusk.cPerson, word(0), comp(0));
+}
+cmPrintDoc:
+{
+var CurRow:longint = 1;
+var NumCol:longint = 1;
+
+  StartNewVisual(vtIndicatorVisual, vfTimer, ''#3'Идет выгрузка данных в отчет', RecordsInTable(#Tmp_WinPlanOtpusk));
+
+  xlCreateExcel('Плановые отпуска',true);
+
+  xlSetCellStringValue('Плановые отпуска на '+wYearPlanVac+' год', 1, 1, 1, 1);
+  xlSetFontStyle(xlBold, 1, 1, 1, 1);
+  xlSetFontSize(18, 1, 1, 1, 1);
+
+  xlSetCellStringValue('Фамилия имя отчество',++CurRow , Numcol, CurRow, Numcol);
+  xlSetColumnWidth(40, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Табельный номер',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(12, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Должность',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(20, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Код подразделения',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(12, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Вид назначения',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(5, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Состояние отпуска',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(15, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Причина отказа',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Дата увольнения',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Отпуск по уходу',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Отпусков основных',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Отпусков дополнительных',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Дней, январь',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, февраль',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, март',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, апрель',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, май',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, июнь',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, июль',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, август',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, сентябрь',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, октябрь',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, ноябрь',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+  xlSetCellStringValue('Дней, декабрь',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetCellStringValue('Остаток',CurRow , ++Numcol, CurRow, Numcol);
+  xlSetColumnWidth(10, CurRow, Numcol, CurRow, Numcol); //ширина ячейки
+
+  xlSetFontStyle(xlBold, CurRow, 1, CurRow, NumCol);
+  xlAlignCellsEx(xlCenter,xlTop, CurRow, 1, CurRow, NumCol); //текст в ячейке по центру
+
+  _Loop Tmp_WinPlanOtpusk
+  {
+
+    nextvisual;
+
+    Numcol:=0;
+
+    xlSetCellStringValue(Tmp_WinPlanOtpusk.FIO                            , ++CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(Tmp_WinPlanOtpusk.TabN                           , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(iCatFunc.GetCatalogsName(Tmp_WinPlanOtpusk.Post) , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(iCatFunc.GetCatalogsCode(Tmp_WinPlanOtpusk.Dep)  , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(sPrizn                                           , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(Utver                                            , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(Tmp_WinPlanOtpusk.Prich                          , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(iStrFunc.UnVisibleDate(Tmp_WinPlanOtpusk.DisD, 'DD.MM.YYYY')                           , CurRow, ++NumCol, CurRow, NumCol);
+
+    xlSetCellStringValue(Tmp_WinPlanOtpusk.OtpUxod                                     , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.wDay   !=0,Tmp_WinPlanOtpusk.wDay   ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.wDayDop!=0,Tmp_WinPlanOtpusk.wDayDop,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[1] !=0,Tmp_WinPlanOtpusk.Mon[1] ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[2] !=0,Tmp_WinPlanOtpusk.Mon[2] ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[3] !=0,Tmp_WinPlanOtpusk.Mon[3] ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[4] !=0,Tmp_WinPlanOtpusk.Mon[4] ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[5] !=0,Tmp_WinPlanOtpusk.Mon[5] ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[6] !=0,Tmp_WinPlanOtpusk.Mon[6] ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[7] !=0,Tmp_WinPlanOtpusk.Mon[7] ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[8] !=0,Tmp_WinPlanOtpusk.Mon[8] ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[9] !=0,Tmp_WinPlanOtpusk.Mon[9] ,'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[10]!=0,Tmp_WinPlanOtpusk.Mon[10],'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[11]!=0,Tmp_WinPlanOtpusk.Mon[11],'') , CurRow, ++NumCol, CurRow, NumCol);
+    xlSetCellStringValue(if(Tmp_WinPlanOtpusk.Mon[12]!=0,Tmp_WinPlanOtpusk.Mon[12],'') , CurRow, ++NumCol, CurRow, NumCol);
+
+    xlSetCellStringValue(if((Tmp_WinPlanOtpusk.wDay+   
+    Tmp_WinPlanOtpusk.wDayDop)
+    -(Tmp_WinPlanOtpusk.Mon[1] 
+    +Tmp_WinPlanOtpusk.Mon[2] 
+    +Tmp_WinPlanOtpusk.Mon[3] 
+    +Tmp_WinPlanOtpusk.Mon[4] 
+    +Tmp_WinPlanOtpusk.Mon[5] 
+    +Tmp_WinPlanOtpusk.Mon[6] 
+    +Tmp_WinPlanOtpusk.Mon[7] 
+    +Tmp_WinPlanOtpusk.Mon[8] 
+    +Tmp_WinPlanOtpusk.Mon[9] 
+    +Tmp_WinPlanOtpusk.Mon[10]
+    +Tmp_WinPlanOtpusk.Mon[11]
+    +Tmp_WinPlanOtpusk.Mon[12])!=0,
+
+    (Tmp_WinPlanOtpusk.wDay+   
+    Tmp_WinPlanOtpusk.wDayDop)
+    -(Tmp_WinPlanOtpusk.Mon[1] 
+    +Tmp_WinPlanOtpusk.Mon[2] 
+    +Tmp_WinPlanOtpusk.Mon[3] 
+    +Tmp_WinPlanOtpusk.Mon[4] 
+    +Tmp_WinPlanOtpusk.Mon[5] 
+    +Tmp_WinPlanOtpusk.Mon[6] 
+    +Tmp_WinPlanOtpusk.Mon[7] 
+    +Tmp_WinPlanOtpusk.Mon[8] 
+    +Tmp_WinPlanOtpusk.Mon[9] 
+    +Tmp_WinPlanOtpusk.Mon[10]
+    +Tmp_WinPlanOtpusk.Mon[11]
+    +Tmp_WinPlanOtpusk.Mon[12]),'')                                           , CurRow, ++NumCol, CurRow, NumCol);
+
+  }
+
+  Numcol:=0;
+  xlSetCellStringValue('Итого дней'                            , ++CurRow, ++NumCol, CurRow, NumCol);
+  xlMergeCells(CurRow, NumCol, CurRow, 11); // об]единение ячеек
+  Numcol:=11;
+  xlSetCellStringValue(if(ItogObsh(1) !=0,ItogObsh(1) ,'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(2) !=0,ItogObsh(2) ,'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(3) !=0,ItogObsh(3) ,'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(4) !=0,ItogObsh(4) ,'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(5) !=0,ItogObsh(5) ,'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(6) !=0,ItogObsh(6) ,'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(7) !=0,ItogObsh(7) ,'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(8) !=0,ItogObsh(8) ,'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(9) !=0,ItogObsh(9) ,'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(10)!=0,ItogObsh(10),'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(11)!=0,ItogObsh(11),'')                          , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(12)!=0,ItogObsh(12),'')                          , CurRow, ++NumCol, CurRow, NumCol);
+
+  NumCol++;
+
+  xlSetFontStyle(xlBold, CurRow, 1, CurRow, NumCol);
+
+  Numcol:=0;
+  xlSetCellStringValue('Итого %'                            , ++CurRow, ++NumCol, CurRow, NumCol);
+  xlMergeCells(CurRow, NumCol, CurRow, 11); // об]единение ячеек
+  Numcol:=11;
+  xlSetCellStringValue(if(ItogObsh(1)/ItogObsh(15)*100 !=0,ItogObsh(1)/ItogObsh(15)*100 ,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(2)/ItogObsh(15)*100 !=0,ItogObsh(2)/ItogObsh(15)*100 ,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(3)/ItogObsh(15)*100 !=0,ItogObsh(3)/ItogObsh(15)*100 ,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(4)/ItogObsh(15)*100 !=0,ItogObsh(4)/ItogObsh(15)*100 ,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(5)/ItogObsh(15)*100 !=0,ItogObsh(5)/ItogObsh(15)*100 ,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(6)/ItogObsh(15)*100 !=0,ItogObsh(6)/ItogObsh(15)*100 ,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(7)/ItogObsh(15)*100 !=0,ItogObsh(7)/ItogObsh(15)*100 ,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(8)/ItogObsh(15)*100 !=0,ItogObsh(8)/ItogObsh(15)*100 ,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(9)/ItogObsh(15)*100 !=0,ItogObsh(9)/ItogObsh(15)*100 ,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(10)/ItogObsh(15)*100!=0,ItogObsh(10)/ItogObsh(15)*100,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(11)/ItogObsh(15)*100!=0,ItogObsh(11)/ItogObsh(15)*100,'') , CurRow, ++NumCol, CurRow, NumCol);
+  xlSetCellStringValue(if(ItogObsh(12)/ItogObsh(15)*100!=0,ItogObsh(12)/ItogObsh(15)*100,'') , CurRow, ++NumCol, CurRow, NumCol);
+
+  NumCol++;
+
+  xlSetFontStyle(xlBold, CurRow, 1, CurRow, NumCol);
+
+  xlWrapText(2, 1, CurRow, Numcol);//перенос по словам
+  xlFrameCells(xlBorderL + xlBorderR + xlBorderT + xlBorderB + xlInsideV + xlInsideH,
+                          xlThin, xlContinuous, 0, 2, 1, CurRow, Numcol);//рамка xlThick - жирная
+
+  xlKillExcel;
+
+  StopVisual('', 0);
+}
+cmPickClass:
+  if (Tmp_WinPlanOtpusk.WorkP <> 0)
+    {
+      //запретить редактирование вн.классификации при запрете редактирования каталога
+      RunInterface('c_extclass::ExClassifier', coWorkPeriod, Tmp_WinPlanOtpusk.WorkP);
+    }
+
+cmPickAttr:
+  if (Tmp_WinPlanOtpusk.WorkP <> 0)
+    {
+      //запретить редактирование вн.классификации при запрете редактирования каталога
+      RunInterface('c_extclass::Attribute', coWorkPeriod, Tmp_WinPlanOtpusk.WorkP);
+    }
+
+end;
+
+end.
+
+hkWinPlanOtpusk menu
+{
+  - 'Редактировать', cmValue1, 'Редактировать'    , hcNocontext, '', , sci1Esc;
+  - 'Сохранить',     cmValue2, 'Сохранить'    , hcNocontext, '', , sci1Esc;
+  - 'На согласование',  cmValue9, 'На согласование'    , hcNocontext, '', , sci1Esc;
+  - 'Согласование',  cmValue7, 'Согласование'    , hcNocontext, '', , sci1Esc;
+  - 'Отклонить',     cmValue10, 'Отклонить'    , hcNocontext, '', , sci1Esc;
+  - 'Утвердить',     cmValue6, 'Утвердить'    , hcNocontext, '', , sci1Esc;
+-----------------------;
+  - 'Выбор фильтра...', cmValue3, 'Выбор фильтра...'    , hcNocontext, '', , sci1Esc;
+  - 'Год формирования отпуска', cmValue4,    'Год формирования отпуска'    , hcNocontext, '', , sci1Esc;
+-----------------------;
+  - 'Планирование по датам месяца', cmValue5,    'Планирование по датам месяца'    , hcNocontext, '', , sci1Esc;
+-----------------------;
+  - 'Сохранить исходный график', cmValue8,    'Сохранить исходный график'    , hcNocontext, '', , sci1Esc;
+-----------------------;
+ -' ~1~. Общие сведения', cmStaffDoWin1, 'Общие сведения',
+          hcStaffReceptionMenu, '', kbAlt1;
+ -' ~2~. Сведения об образовании', cmStaffDoWin2, 'Сведения об образовании',
+          hcStaffReceptionMenu, '', kbAlt2;
+ -' ~3~. Анкетные данные, стаж', cmStaffDoWin3, 'Анкетные данные, стаж',
+          hcStaffReceptionMenu, '', kbAlt3;
+ -' ~4~. Родственники', cmStaffDoWin4, 'Родственники',
+          hcStaffReceptionMenu, '', kbAlt4;
+ -' ~5~. Сведения о воинском учете', cmStaffDoWin5, 'Сведения о воинском учете',
+          hcStaffReceptionMenu, '', kbAlt5;
+ -' ~6~. Сведения о работе на предприятии', cmStaffDoWin6, 'Назначения и перемещения',
+          hcStaffReceptionMenu, '', kbAlt6;
+ -' ~7~. Сведения об отпусках', cmStaffDoWin7, 'Сведения об отпусках',
+          hcStaffReceptionMenu, '', kbAlt7;
+ -' ~8~. Место предыдущей работы', cmStaffDoWin8,
+        'Выполняемая работа с начала трудовой деятельности',
+          hcStaffReceptionMenu, '', kbAlt8;
+ -' ~9~. Сведения о заболеваемости', cmStaffDoWin9, 'Сведения о заболеваемости',
+          hcStaffReceptionMenu, '', kbAlt9;
+ -'1~0~. Дополнительная информация', cmStartDopTables, 'Дополнительные таблицы',
+          hcStaffReceptionMenu, '', kbAltI;
+ -'11. Пенсионный ~с~таж', cmStaffPens, 'Пенсионный стаж',
+          hcStaffReceptionMenu, '', kbAltP;
+-----------;
+- 'Печать', cmPrintDoc, 'Печать документа/каталога', hcPrintKatalog, 'Ctrl+P', kbCtrlP, sci1Esc;
+-----------;
+- 'Внешняя классификация',cmPickClass,'Внешняя классификация',hcGkatalM1ExtClass,'Alt-C',kbAltC,sci1Esc;
+- 'Внешние атрибуты',cmPickAttr,'Заполнение внешних атрибутов по данной позиции',hcGkatalM1Attr,'Alt-A',kbAltA,sci1Esc;
+}
+/*  Письмо клиента от 8 ноября 2018 г. 13:23
+#include UserReport.vih
+
+vipinterface UserReport_WinPlanOtpusk implements IUserReport;
+
+interface UserReport_WinPlanOtpusk;
+
+create view
+  var
+    Dummy: Byte;
+;
+
+procedure Run;
+begin
+  RunInterfaceNoModal('Gp_WinPlanOtpusk');
+end;
+
+function GetReportName: String;
+begin
+  GetReportName := 'Плановые отпуска';
+end;
+
+function GetGroupName(Level: Word): String;
+begin
+  GetGroupName := '';
+  case Level of
+    1: GetGroupName := 'Отпуска';
+  end;
+end;
+
+function GetPriority: Integer;
+begin
+  GetPriority := 0;
+end;
+
+function VisibleInModule(Ind: Byte): String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1: VisibleInModule := 'StaffMainMenu';
+  end;
+end;
+
+end.
+*/

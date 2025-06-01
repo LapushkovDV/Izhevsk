@@ -1,0 +1,170 @@
+#component "GP_ZP"
+#include GP_ReesBVipExportObj.vih
+#include LoadReesByGroup.vih
+#include ReesByGroup.Tbl
+
+interface GP_ReesBVipExport_PSB;
+
+table struct SpPlBanTmp 
+(
+  FIO    : string
+, NomLsh : string
+, NomCard: string
+, sOrder : string
+, PasSer : string
+, PasNum : string
+, TabN   : string
+, SumUd  : double
+, SumOpl : double
+, Sbor   : double
+, SumAlim: double
+)
+(i1 = sOrder, i2 = NomLSh + FIO + NomCard);
+
+var oLoadGr: LoadReesByGroup;
+create view
+var cOrg: comp;
+as select * from
+  KatOrg
+, NPlat
+, Passports
+, Persons
+, SbBan
+, SpPlBanTmp
+, tp_Rees
+;
+
+property GP_ReesBVipExportObj.Caption: string read 'ПСБ';
+function ChooseReesToApply(mRee: TPtr): TPtr;
+var m: TPtr;
+    i: longint;
+    cRec: comp;
+{
+  m := InitMarker('', 8, 1, 1);
+  for (i := 0; i < GetMarkerCount(mRee); i++)
+  {
+    GetMarker(mRee, i, cRec);
+    if getfirst SbBan where ((cRec == SbBan.NRec)) = tsOk
+      if SbBan.cPol = cOrg
+        InsertMarker(m, cRec);
+  }
+  Result := m;
+}
+
+function GetData(cSbBan: comp): boolean;
+var boIns: boolean;
+{
+  Result := false;
+  oLoadGr.pLoadRees(cSbBan);
+  mtClear(tnSpPlBanTmp, mfNormal);
+  _loop tp_Rees
+  {
+    boIns := false;
+    var _NomLsh : tNomLSch = tp_Rees.NomLsh;
+    if ( SbBan.Prefix <> 'R$D' )
+      _NomLsh := LTrim(_NomLsh, '0');
+    if GetFirst SpplbanTmp where (( _NomLsh           == SpplbanTmp.NomLsh and
+                                    Trim(tp_Rees.FIO) == SpplbanTmp.FIO and
+                                    tp_Rees.NomCard   == SpplbanTmp.NomCard)) <> tsOk
+    {
+      boIns := true;
+      ClearBuffer( #SpplbanTmp );
+      SpplbanTmp.FIO     := trim(tp_Rees.FIO);
+      SpplbanTmp.TabN    := tp_Rees.StrTabn;
+      SpplbanTmp.NomLsh  := _NomLsh;
+      SpplbanTmp.NomCard := tp_Rees.NomCard;
+      SpplbanTmp.sOrder  := tp_Rees.FIO;
+      if getfirst Persons where ((tp_Rees.tPerson == Persons.NRec)) = tsOk
+      {
+        if getfirst Passports where ((Persons.PasspRus == Passports.nrec))= tsOk
+        {
+          SpplbanTmp.PasSer := Passports.Ser;
+          SpplbanTmp.PasNum := Passports.Nmb;
+        }
+      } //  if getfirst Persons = tsOk
+    } // if
+    SpplbanTmp.SumUd  += tp_Rees.SumUd;
+    SpplbanTmp.SumOpl += tp_Rees.SumOpl;
+    SpplbanTmp.Sbor   += tp_Rees.Sbor;
+    SpplbanTmp.SumAlim += tp_Rees.SumAlim;
+    if ( boIns )
+      insert current SpplbanTmp;
+    else
+      update current SpplbanTmp;
+  } //  _loop tp_Rees
+  Result := true;
+}
+
+function GetNumRee(sPath, mask: string): byte;
+var str: string;
+    i, p: byte;
+{
+  Result := 0;
+  timelog('GetNumRee: ' + mask);
+  str := GetFirstFile(sPath, mask);
+  while str <> strDataIsEmpty do
+  {
+    for (i := length(str); i > 0; i--)
+    {
+      if str[i] = '\'
+      {
+        str := substr(str, i + 1, 255);
+        break;
+      }
+    }
+    timelog('  ' + str);
+    p := byte(substr(str, 11, 2));
+    timelog('  ' + str + ' -> ' + substr(str, 11, 2) + ' -> ' + p);
+    if Result < p
+      Result := p;
+
+    str := GetNextFile;
+  }
+  Result++;
+}
+
+function Export(cRec: comp; sPath: string; var fileName: string): boolean;
+var s, kodPlat: string;
+{
+  Result := false;
+  if getfirst SbBan where ((cRec == SbBan.NRec)) <> tsOk
+    exit;
+  if GetFirst NPlat where ((SbBan.cPlat == NPlat.NRec)) = tsOk
+    kodPlat := NPlat.KodPlat;
+  GetData(cRec);
+
+  var gozAbbr: string = sGetAttr(covPlan, coGetAttr(coSbBan, cRec, 'Группа заказов'), 'Аббревиатура');
+  fileName := DateToStr(SbBan.DatOk, 'HK4912MMDD');
+  if sPath[length(sPath)] <> '\' sPath += '\';
+  var ii: byte = GetNumRee(sPath, fileName + '??*.txt');
+  fileName += LPadCh(ii, '0', 2) + gozAbbr + '.txt';
+
+  _loop SpplbanTmp ordered by SpplbanTmp.sOrder
+  {
+    s := '';
+    s += SpPlBanTmp.NomLsh + '^';
+    s += '810' + '^';
+    s += string(round(SpplbanTmp.SumOpl - SpplbanTmp.Sbor, 2), 0, 2) + '^';
+    s += ExtractWord(1, SpplbanTmp.FIO, ' ') + '^';
+    s += ExtractWord(2, SpplbanTmp.FIO, ' ') + '^';
+    s += ExtractWord(3, SpplbanTmp.FIO, ' ') + '^';
+    s += '21' + '^';
+    s += SpPlBanTmp.PasSer + ' ' + SpPlBanTmp.PasNum + '^';
+    s += SpPlBanTmp.TabN + '^';
+    s += string(round(SpplbanTmp.SumAlim, 2), 0, 2) + '^';
+    s += kodPlat + '^';
+
+    LogStrToFile(sPath + fileName, Oem2Ansi(s));
+  }
+  sSetAttr(coSbBan,cRec,'Имя файла',fileName);
+  Result := true;
+}
+
+handleEvent
+  cmOnVipLoad:
+  {
+    if getfirst KatOrg where (('ПАО "Промсвязьбанк"' == KatOrg.Name)) = tsOk
+      cOrg := KatOrg.NRec;
+  }
+end;
+end.

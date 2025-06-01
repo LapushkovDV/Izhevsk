@@ -1,0 +1,956 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                "Сводная ведомость компенсаций и льгот (ЭМ)"                                     *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+* Время формирования за 2018 год                                                                  *
+* дата 21/03/2019 тек.вр 15:52:15:13 - пред.этап =  00:05:03:83 GP_SVedKomL->Run:Report           *
+* дата 21/03/2019 тек.вр 16:05:17:51 - пред.этап =  00:13:02:38 GP_SVedKomL->Run:finish           *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#214          |01/11/17|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include UserReport.vih
+#include ComFiltr.vih
+#include CatFunc.vih
+#include AppFuncs.vih
+#include RunStaj.vih
+#include GP_XlOutExt.vih
+#include GP_3GD.vih
+#include GP_AppChange.vih
+
+#define GPInt GP_SVedKomL // #(GPInt)
+#define GPNam Сводная ведомость компенсаций и льгот // #(GPNam)
+
+Interface #(GPInt) '#(GPNam) (ЭМ)' EscClose, Gray;
+  show (,,86,13);
+
+const
+#include Excel.inc;
+end;
+
+table struct ttPerFlt // для фильтра по персоналу
+(
+  cRecPers : comp
+)
+with index
+(
+  ttPerFlt01  = cRecPers
+);
+
+table struct ttHeaD
+(
+  nRec  : comp
+, sCode : string
+, sName : string
+, dbItC : double  
+  
+)
+with index
+(
+  ttHeaD01 = nRec(Surrogate)
+, ttHeaD02 = sCode+sName
+);
+
+table struct ttTypOp
+(
+  wCodeOper : word
+, sNameOper : string
+)
+with index
+(
+  ttTypOp01 = wCodeOper
+);
+
+table struct ttResDyn
+(
+  cPers : comp
+, cHead : comp
+, dbSum : double
+)
+with index
+(
+  ttResDyn01 = cPers + cHead
+);
+
+table struct ttResStr // статический набор данных
+(
+  nRec      : comp
+, cRecPers  : comp
+, sTbNmb    : string
+, sFIO      : string
+, sDept     : string
+, sDepP     : string
+, sPost     : string
+, dBorn     : date
+, sStaj     : string
+, sINN      : string
+, sSNILS    : string
+, sIsCh     : string
+, dbItRow   : double
+)
+with index
+(
+  ttResStr00 = nRec(Surrogate)
+, ttResStr01 = cRecPers
+, ttResStr02 = sFIO
+);
+//======================================
+table struct ttZGD
+(
+  cRecDept : comp
+, sCodeZGD : string
+, sNameZGD : string
+)
+with index
+(
+  ttZGD01 = cRecDept
+);
+//======================================
+table struct ttVidopl
+(  cRaiseType:comp
+  ,Name:string[100]
+  ,Code:string[100]
+  ,Vidopl :word
+  ,VidoplP:word
+)
+with index
+( ttVidopl01=cRaiseType
+ ,ttVidopl02=Vidopl
+); //ttVidopl
+//======================================
+table struct ttSum
+(  cPersons:comp
+  ,Vidopl  :word
+  ,Summa   :tSumma
+)
+with index
+( ttSum=cPersons
+); //ttVidopl
+
+
+//======================================
+var
+  dBeg, dEnd    : date;
+  dOtchPer      : date; // dGetTune('Up.DatOtch')
+  VCommonFiltr  : CommonFiltr; // Для встраивания фильтра по подразделениям / сотрудникам
+  MadeReport    : boolean;
+  PersMarker    : TPtr;
+  iCatFunc      : CatalogsFunctions;
+  iAppFunc      : AppointmentsFunctions; // cAppOnDate iAppFunc
+  iRunStaj      : Runstaj;
+  iOut          : GP_XlOutExt;
+  i3GD          : GP_3GD;
+  iAppCh        : GP_AppChange;
+  sFullName     : string;
+  lRB, lRE,
+  lCB, lCE,
+  lSB, lSE,
+  lDB, lDE,
+  lRow          : longint;
+  wTypOper      : word;
+  Marker_Raise  : longint;
+  wTypeRep      : word;//0 - по РДП, 1 - по зарплате
+create view
+var
+  cMainLinkDept : comp;
+  cRecApp       : comp;
+as select persons.nrec
+from
+  persons
+, Appointments
+, passports PINN
+, passports PSNILS
+, raisehist
+, raise
+, TYPEPR
+, ttPerFlt
+, ttResStr
+, ttTypOp
+, ttHeaD
+, ttResDyn
+, contdoc
+, Catalogs ZGDDept
+, ttZGD
+, ttZGD ttZGDD
+, KlVidOpl
+, SumVidOp
+, Nachisl
+, ttVidopl
+, ttSum
+where
+((
+     ttPerFlt.cRecPers == persons.nrec
+and  ttPerFlt.cRecPers == Raise.Person
+and  Dend >>= Raise.FROMDATE
+and  DBeg <<= Raise.FROMDATE // иначе полис ДМС попадает дважды
+and  (  ( Raise.TODATE=ZeroDate
+    and   Raise.DRABORT=ZeroDate
+        )
+   or  ( dBeg<= Raise.TODATE)
+   or  ( dBeg<= Raise.DRABORT)
+    )
+//and  ttPerFlt.cRecPers == raisehist.CPSN
+and Raise.Nrec == raisehist.CRAISE
+/*
+and (
+//        raisehist.DOCDATE >= dBeg
+//    and raisehist.DOCDATE <= dEnd
+        RAISEHIST.DREC >= dBeg
+    and RAISEHIST.DREC <= dEnd
+    )
+ and   raisehist.cRaise == raise.nrec
+*/
+and raisehist.cContDoc == contdoc.nrec
+and   ContDoc.TypeOper == ttTypOp.wCodeOper
+
+and ttPerFlt.cRecPers == PINN.person
+and integer(505)      == PINN.syscode
+and ttPerFlt.cRecPers == PSNILS.person
+and integer(501)      == PSNILS.syscode
+
+and cRecApp                 == Appointments.nRec
+and appointments.DEPARTMENT == ttZGDD.cRecDept
+
+and integer(0)    == ZGDDept.LPr
+and cMainLinkDept == ZGDDept.MainLink
+and ZGDDept.nRec  == ttZGD.cRecDept
+
+and Persons.NRec  == LSchet.tPerson
+))
+;
+
+//=========================================
+Create view vCatalogs
+Var
+  pCatParent:comp;
+From
+  Catalogs
+ ,Catalogs CatMain
+where ((
+     -17        == CatMain.SysCode
+ and pCatParent == Catalogs.cParent
+));
+
+//=========================================
+function sFPF : string;
+{  sFPF := DateToStr(Cur_Date(),'_YYMMDD')+TimeToStr(Cur_Time(),'_HHMMSS');
+}
+
+
+//=========================================
+Procedure Fill_ttVidopl(_pParent:comp);
+var
+   vliErrorCode : longint;
+   ww_Str:string;
+{ if _pParent=0
+  { if vCatalogs.getfirst CatMain<>tsok exit;
+    _pParent:=vCatalogs.CatMain.Nrec;
+  }
+  var sCT, sNT : string;
+  var iVidOpl  : longint=0;
+  var _pNrec   : comp=0;
+  vCatalogs.pCatParent:=_pParent;
+  vCatalogs._Loop Catalogs
+  { if _pParent=vCatalogs.CatMain.Nrec
+    { if vCatalogs.Catalogs.Name<>'Компенсации и льготы' continue;
+    } //if _pParent:=vCatalogs.CatMain.Nrec
+    //-------------------------------
+    _pNrec:=vCatalogs.Catalogs.Nrec;
+    //-------------------------------
+    Fill_ttVidopl(_pNrec);
+    //-------------------------------
+    vCatalogs.pCatParent:=_pParent;
+    if vCatalogs.Getfirst Catalogs where (( _pNrec == Catalogs.Nrec )) =tsok {}
+    //-------------------------------
+    sCT := iCatFunc.GetCatalogsCatData(_pNrec);
+    if sCT='' then continue;
+    sNT := iCatFunc.GetCatalogsName(_pNrec);
+    iVidopl:= longint(Substr(sCT, 1, 5));
+    if iVidopl=0 then continue;
+    if getfirst ttVidopl where (( iVidopl == ttVidopl.Vidopl )) <>tsok
+    { if (GetFirst KlVidOpl where ((iVidOpl == KlVidOpl.VidOpl)) = tsOk)
+      { sCT:=string(KlVidOpl.VidoplP,3);
+        sNT:=KLVIDOPL.NVIDOPL;
+        Insert into ttVidopl set
+             ttVidopl.cRaiseType:=_pNrec
+            ,ttVidopl.Name      :=sNT
+            ,ttVidopl.Code      :=sCT
+            ,ttVidopl.Vidopl    :=iVidopl
+            ,ttVidopl.VidoplP   :=KlVidOpl.VidoplP
+            ;
+        timelog('#(GPInt)->Fill_ttVidopl:ttVidopl.Name='+ttVidopl.Name+', Vidopl='+string(ttVidopl.Vidopl)+',VidoplP='+string(ttVidopl.VidoplP));
+        ww_Str:='insert into TEMPVIB (WLIST,CREC,wVidopl) values ('+string(2)+', #comp(0),'+string(iVidopl)+')';
+        vliErrorCode:=sqlExecDirect(ww_str);
+
+      }
+    }//if getfirst ttVidopl (( iVidopl == ttVidopl.Vidopl )) <>tsok
+  } //vCatalogs._Loop Catalogs
+} //Procedure Fill_ttVidopl(_pParent:comp);
+
+//=========================================
+procedure FillZGD;
+{
+  set cMainLinkDept := iCatFunc.GetCatalogsNRec(-11);
+  RestartVisual('Заполняю описатель иерархии ЗГД',1);
+  i3GD.Init3GD;
+  if isvalid(#ZGDDept)
+  _loop ZGDDept
+  {
+    if (not NextVisual) break;
+    if not isvalid(#ttZGD)
+    {
+      ClearBuffer(#ttZGD);
+      ttZGD.cRecDept := ZGDDept.nRec;
+      ttZGD.sCodeZGD := i3GD.sCode3GD(ZGDDept.nRec);
+      insert current ttZGD;
+    }
+  }
+} //procedure FillZGD;
+
+// Рассчитывает сумму всех оплат с указанным пользовательским кодом в архиве оплат
+// и результатов расчёта модуля зарплата
+function GetSumOplFromZP(_VidOplS: longint): double;
+{
+  result := 0;
+  //if (getFirst KlVidOpl where((_VidOplS == KlVidOpl.VidOplS)) != tsOk)
+  //  exit;
+  var DtOpl: Date;
+  var _YearB:word=year(dBeg);
+  var _YearE:word=year(dEnd);
+  _loop LSchet
+  {
+    // Считаем сумму по всем записям по указанной оплате, попадающим в отчетный период, в архиве оплат
+    _loop SumVidOp where ((
+         LSchet.NRec == SumVidOp.cLSch
+     and _YearB <<= SumVidOp.YearN
+     and _YearE >>= SumVidOp.YearN
+     and _VidOplS == SumVidOp.VidOpl (noindex)
+    ))
+    {
+      DtOpl := To_Date(1, SumVidOp.MesN, SumVidOp.YearN);
+      if (DtOpl > dEnd or DtOpl < dBeg)
+        continue;
+      result += SumVidOp.Summa;
+    }
+    // Считаем сумму по всем записям по указанной оплате, попадающим в отчетный период, в результатах расчёта
+    if dEnd >=dOtchPer
+    _loop Nachisl where ((
+         LSchet.NRec == Nachisl.cLSch
+     and  _VidOplS    == Nachisl.VidOplS(noindex)
+    )) //and Nachisl.VidOplS = KlVidOpl.VidOpl
+    {
+      DtOpl := To_Date(1, Nachisl.MesN, Nachisl.YearN);
+      if (DtOpl > dEnd or DtOpl < dBeg)
+        continue;
+      result += Nachisl.Summa;
+    }
+  }
+} //function GetSumOplFromZP(_VidOplP: longint): double;
+
+//=============================================================================
+// Рассчитать кол во периодов
+function Calc_Period(_DTB,_DTE:date; _wType:word) :double;
+{
+  Result:=0;
+  if _DTE<_DTB then exit;
+  var _MonB : word = Month(_DTB);
+  var _MonE : word = Month(_DTE);
+  var _YearB: word = Year(_DTB);
+  var _YearE: word = Year(_DTE);
+  case _wType of
+  1: //101 сумму доплаты умножать на кол-ко месяцев действия доплаты
+  { Result:=(_YearE-_YearB)*12+(1+_MonE-_MonB);
+  }
+  2: //107 сумму доплаты рассчитать по алгоритму:
+     //сумма доплаты * кол-во полных месяцев действия доплаты
+     //+ сумма доплаты* кол-во календарных дней действия доплаты в неполных месяцах
+     //            /полное кол-во календарных дней в неполных месяцах действия доплаты
+  { var _wdtb:date=_DTB; // стартовая дата
+    var _dn1 :word=0; //кол-во календарных дней действия доплаты в неполных месяцах
+    var _dn2 :word=0; //полное кол-во календарных дней в неполных месяцах действия доплаты
+    var _Last:word=0;
+    var _wdte:date;
+    do
+    { _Last:=Last_Day(_wdtb);
+      _wdte:=Date(_Last,Month(_wdtb),Year(_wdtb));
+      if _wdte>_DTE _wdte:=_DTE;
+      if day(_wdtb)<>1 or Day(_wdte)<>_Last
+      { _dn1 += 1+Day(_wdte)-day(_wdtb);
+        _dn2 += _Last;
+      } //if day(_wdtb)<>1 or Day(_wdte)<>_Last
+      else
+      { Result+=1.00;
+      }
+      _wdtb:=add_months(_wdtb,1);
+      _wdtb:=Date(1,Month(_wdtb),Year(_wdtb));
+    } while _wdtb<=_DTE;
+    // есть неполные месяца
+    if _dn2>0
+       Result+= _dn1/_dn2;
+  } //2
+  end; //case _wType
+} //function Calc_Period(_DTB,_DTE:date; _wType:word) :double;
+
+//=============================================================================
+// Заберем из Run
+  var kol, i    : integer;
+  var cPersNRec : comp;
+  var cKomL     : comp;
+
+
+//=============================================================================
+// Заполнение данных по зарплате
+// очень медленно - но пока так
+Function FillZarpl :boolean;
+var
+  _RaiseSum:double;
+  sCT, sNT : string;
+  iVidOpl  :longint=0;
+  iVidOplP :longint=0;
+
+{ Result := False;
+  _Loop ttVidopl
+  { _RaiseSum:=GetSumOplFromZP(ttVidopl.VidOpl);
+    if (not NextVisual) exit;
+    if _RaiseSum=0 then continue;
+    //-----------------------------
+    sNT     := ttVidopl.Name;
+    sCT     := ttVidopl.Code;
+    iVidOpl := ttVidopl.Vidopl;
+    //-----------------------------
+    //clearbuffer(#ttResStr);
+    if getfirst ttResStr where((ttPerFlt.cRecPers == ttResStr.cRecPers)) <> tsOk
+    {
+      if isvalidAll(#persons)
+      {
+        ttResStr.cRecPers := persons.nrec;
+        ttResStr.sTbNmb   := if(persons.STRTABN='',persons.TABNMB,persons.STRTABN);
+        ttResStr.sFIO     := persons.FIO;
+        set cRecApp := iAppFunc.GetAppNrec_OnDate(persons.nrec, dEnd);
+        if isvalidAll(#Appointments)
+        {
+          ttResStr.sDept  := iCatFunc.GetCatalogsCode(appointments.DEPARTMENT);
+          if ( trim(ttResStr.sDept) = '' )
+            ttResStr.sDept:= iCatFunc.GetCatalogsName(appointments.DEPARTMENT);
+          ttResStr.sPost  := iCatFunc.GetCatalogsName(appointments.POST);
+          if isvalidall(#ttZGDD)
+            ttResStr.sDepP:= ttZGDD.sCodeZGD;
+        }
+        ttResStr.dBorn    := persons.BORNDATE;
+        ttResStr.sStaj    := iRunStaj.RunStrStaj(persons.nrec,89,dEnd);
+        if isvalid(#PINN)
+          ttResStr.sINN   := PINN.NMB;
+        if isvalid(#PSNILS)
+          ttResStr.sSNILS := PSNILS.NMB;
+        ttResStr.sIsCh   := iAppCh.State(persons.nrec,0,dEnd,12);
+        insert current ttResStr;
+      }
+    }
+    ttResStr.dbItRow += _RaiseSum; //RaiseHist.RHSUM;
+    update current ttResStr;
+
+    clearbuffer(#ttHeaD);
+    if getfirst ttHeaD where ((sCT == ttHeaD.sCode  and sNT == ttHeaD.sName)) <> tsOk
+    {
+      ttHeaD.sCode := sCT;
+      ttHeaD.sName := sNT;
+      ttHeaD.dbItC := _RaiseSum; //RaiseHist.RHSUM;
+      insert current ttHeaD;
+    }
+    else
+    {
+      ttHeaD.dbItC := ttHeaD.dbItC + _RaiseSum;//RaiseHist.RHSUM;
+      update current ttHeaD;
+    }
+    //-------------------------------
+    clearbuffer(#ttResDyn);
+    if getfirst ttResDyn where((ttResStr.nRec == ttResDyn.cPers and ttHeaD.nRec == ttResDyn.cHead)) <> tsOk
+    {
+      ttResDyn.cPers := ttResStr.nRec;
+      ttResDyn.cHead := ttHeaD.nRec;
+      ttResDyn.dbSum := _RaiseSum;
+      insert current ttResDyn;
+    }
+    else
+    {
+      ttResDyn.dbSum := ttResDyn.dbSum + _RaiseSum;
+      update current ttResDyn;
+    }
+
+  } //_Loop ttVidopl
+  Result := True;
+} //Function FiilZarpl :boolean;
+
+//=============================================================================
+Function FillOrder :boolean;
+{ Result:=False;
+    ClearMarker(Marker_Raise);
+    _Loop Raise
+    //_loop RaiseHist
+    if getfirst RaiseHist =tsok
+    {
+      if (not NextVisual) exit;
+      //if isvalid(#Raise)
+      if isvalid(#contdoc)
+      if isvalid(#ttTypOp)
+      if raise.OrderDate1 = RaiseHist.DOCDATE and raise.OrderDate2 = 0
+      {
+        // Для РПД 102 "Проезд к месту работы и обратно. Доп.соглашение" сумму берем из архива оплат
+        // и результатов расчёта модуля зарплата
+        // теперь и все остальное
+        var sCT, sNT : string;
+        var iVidOpl  :longint=0;
+        var iVidOplP :longint=0;
+        if getfirst ttVidopl where (( RaiseHist.cRaiseType ==   ttVidopl.cRaiseType )) <>tsok
+        { sCT := iCatFunc.GetCatalogsCatData(RaiseHist.cRaiseType);
+          sNT := iCatFunc.GetCatalogsName(RaiseHist.cRaiseType);
+          iVidopl:= longint(Substr(sCT, 1, 5));
+          if (GetFirst KlVidOpl where ((iVidOpl == KlVidOpl.VidOpl)) = tsOk)
+          { sCT:=string(KlVidOpl.VidoplP,3);
+            iVidOplP:=KlVidOpl.VidoplP;
+          }
+          else
+          { sCT := iCatFunc.GetCatalogsCode(RaiseHist.cRaiseType);
+
+          }
+          insert into ttVidopl set
+             ttVidopl.cRaiseType:=RaiseHist.cRaiseType
+            ,ttVidopl.Name      :=sNT
+            ,ttVidopl.Code      :=sCT
+            ,ttVidopl.Vidopl    :=iVidopl
+            ,ttVidopl.VidoplP   :=iVidoplP
+            ;
+
+        }
+        else
+        { sNT     := ttVidopl.Name;
+          sCT     := ttVidopl.Code;
+          iVidOpl := ttVidopl.Vidopl;
+        }
+        var _RaiseSum: double = 0;
+        case ContDoc.TypeOper of
+        102:
+        { if not FoundMarker(Marker_Raise, iVidOpl)//RaiseHist.cRaiseType)
+          {  _RaiseSum := GetSumOplFromZP(iVidOpl);
+              InsertMarker(Marker_Raise,iVidOpl ); //RaiseHist.cRaiseType
+          }
+          else
+          { _RaiseSum:=0;
+          }
+        } //if (ContDoc.TypeOper = 102)
+        101:// сумму доплаты умножать на кол-ко месяцев действия доплаты
+        { _RaiseSum := RaiseHist.RHSUM*Calc_Period(RAISEHIST.DREC,RAISEHIST.DDAT2,1);
+        }
+        107:// сумму доплаты рассчитать по алгоритму: сумма доплаты * кол-во полных месяцев действия доплаты + сумма доплаты/полное кол-во календарных дней в
+        { _RaiseSum := RaiseHist.RHSUM*Calc_Period(RAISEHIST.DREC,RAISEHIST.DDAT2,2);
+        }
+        else
+        { _RaiseSum := RaiseHist.RHSUM;
+        }
+        end;
+
+        //clearbuffer(#ttResStr);
+        if getfirst ttResStr where((ttPerFlt.cRecPers == ttResStr.cRecPers)) <> tsOk
+        {
+          if isvalid(#persons)
+          {
+            ttResStr.cRecPers := persons.nrec;
+            ttResStr.sTbNmb   := if(persons.STRTABN='',persons.TABNMB,persons.STRTABN);
+            ttResStr.sFIO     := persons.FIO;
+            set cRecApp := iAppFunc.GetAppNrec_OnDate(persons.nrec, dEnd);
+            if isvalid(#Appointments)
+            {
+              ttResStr.sDept  := iCatFunc.GetCatalogsCode(appointments.DEPARTMENT);
+              if ( trim(ttResStr.sDept) = '' )
+                ttResStr.sDept:= iCatFunc.GetCatalogsName(appointments.DEPARTMENT);
+              ttResStr.sPost  := iCatFunc.GetCatalogsName(appointments.POST);
+              if isvalid(#ttZGDD)
+                ttResStr.sDepP:= ttZGDD.sCodeZGD;
+            }
+            ttResStr.dBorn    := persons.BORNDATE;
+            ttResStr.sStaj    := iRunStaj.RunStrStaj(persons.nrec,89,dEnd);
+            if isvalid(#PINN)
+              ttResStr.sINN   := PINN.NMB;
+            if isvalid(#PSNILS)
+              ttResStr.sSNILS := PSNILS.NMB;
+            ttResStr.sIsCh   := iAppCh.State(persons.nrec,0,dEnd,12);
+            insert current ttResStr;
+          }
+        }
+        ttResStr.dbItRow += _RaiseSum; //RaiseHist.RHSUM;
+        update current ttResStr;
+
+        clearbuffer(#ttHeaD);
+        if RaiseHist.CRAISE <> 0
+        {
+          if getfirst ttHeaD where ((sCT == ttHeaD.sCode  and sNT == ttHeaD.sName)) <> tsOk
+          {
+            ttHeaD.sCode := sCT;
+            ttHeaD.sName := sNT;
+            ttHeaD.dbItC := _RaiseSum; //RaiseHist.RHSUM;
+            insert current ttHeaD;
+          }
+          else
+          {
+            ttHeaD.dbItC := ttHeaD.dbItC + _RaiseSum;//RaiseHist.RHSUM;
+            update current ttHeaD;
+          }
+        } //if RaiseHist.CRAISE <> 0
+        else
+        {
+          if getfirst ttHeaD where ((ttTypOp.wCodeOper == ttHeaD.sCode  and ttTypOp.sNameOper == ttHeaD.sName)) <> tsOk
+          {
+            ttHeaD.sCode := ttTypOp.wCodeOper;
+            ttHeaD.sName := ttTypOp.sNameOper;
+            ttHeaD.dbItC := _RaiseSum;//RaiseHist.RHSUM;
+            insert current ttHeaD;
+          }
+          else
+          {
+            ttHeaD.dbItC := ttHeaD.dbItC +_RaiseSum;// RaiseHist.RHSUM;
+            update current ttHeaD;
+          }
+        } // else if RaiseHist.CRAISE <> 0
+        //-------------------------------
+        clearbuffer(#ttResDyn);
+        if getfirst ttResDyn where((ttResStr.nRec == ttResDyn.cPers and ttHeaD.nRec == ttResDyn.cHead)) <> tsOk
+        {
+          ttResDyn.cPers := ttResStr.nRec;
+          ttResDyn.cHead := ttHeaD.nRec;
+          ttResDyn.dbSum := _RaiseSum;
+          insert current ttResDyn;
+        }
+        else
+        {
+          ttResDyn.dbSum := ttResDyn.dbSum + _RaiseSum;
+          update current ttResDyn;
+        }
+      } //if raise.OrderDate1 = RaiseHist.DOCDATE and raise.OrderDate2 = 0
+    } //if getfirst RaiseHist
+
+
+  Result:=true;
+} //Function FiilOrder :boolean;
+
+//=============================================================================
+// основной запуск
+procedure Run;
+var
+   vliErrorCode : longint;
+   ww_Str:string;
+{
+  timelog('#(GPInt)->Run:Start');
+  //------------------
+  MtClear(#ttVidopl,mfNormal );
+  MtClear(#ttSum   ,mfNormal );
+  //------------------
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+  //-----------------
+  if (VCommonFiltr.GetPsnCount = 0)
+    VCommonFiltr.SelectAllPsn;
+
+  if (getfirst TypePr where TypePr.NOPER = 'Компенсации и льготы') = tsOk
+  {
+    cKomL := TypePr.nRec;
+    _loop TypePr where TypePr.CTDOP = cKomL
+    {
+      clearbuffer(#ttTypOp);
+      ttTypOp.wCodeOper := TYPEPR.CODOPER;
+      ttTypOp.sNameOper := TYPEPR.NOPER;
+      insert current ttTypOp;
+    }
+  }
+
+//---------------
+  RestartVisual('Заполняю таблицу фильтров',1);
+  PersMarker := InitMarker('',8,200,100);
+  PersMarker := VCommonFiltr.GetPersonsMarker;
+  kol:=  GetMarkerCount(PersMarker);
+  i := 0;
+  //-----------------
+  if wTypeRep=1
+  { sqlDropTmpTable ( 'TEMPVIB' ); //На всякий случай дропнем
+    sqlCreateTmpTable ( 'Table TEMPVIB ( WLIST:word, CREC:comp,wVidopl:word) with index (a1 = wlist+crec);', ctmNormal );
+    Fill_ttVidopl(0);
+
+  } //if wTypeRep=1
+  while i < kol
+  {
+    GetMarker(PersMarker, i, cPersNRec);
+    insert ttPerFlt set ttPerFlt.cRecPers := cPersNRec;
+    i++;
+    if wTypeRep=1
+    { ww_Str:='insert into TEMPVIB (WLIST,CREC,wVidopl) values ('+string(1)+', #comp('+string(cPersNRec)+'),0 )';
+      vliErrorCode:=sqlExecDirect(ww_str);
+    }
+    if (not NextVisual) break;
+  }
+  
+  FillZGD;
+  
+  RestartVisual('Идет сбор данных',1);
+  if isvalid(#ttPerFlt)
+  _loop ttPerFlt
+  {
+    if wTypeRep=1 // Зарплата
+    { if not FillZarpl break;
+    }
+    else
+    { if not FillOrder break;
+    }
+  } //_loop ttPerFlt
+  timelog('#(GPInt)->Run:Report '+string(RecordsInTable(#ttResStr)));
+
+  //==============================
+  if isvalid(#ttResStr)
+  {
+    RestartVisual('Выгружаю данные',1);
+    sFullName := GetDefaultUserPath + '#(GPNam)'+sFPF+'.xls';
+
+    xlCreateExcel(sFullName, TRUE);
+    lRB  := 4;
+    lRow := 1;
+    lDB  := lDE := lRB + 3;
+    lCB  := 1;
+    lCE  := 1;
+
+    iOut.xlR1C1OnOff(true);
+    iOut.StringValL
+    (
+      '#(GPNam) за период с '+datetostr(dBeg,'DD.MM.YYYY')+' по '+datetostr(dEnd,'DD.MM.YYYY'),2,3,2,3
+    );
+    xlSetFontSize(14,2,3,2,3); xlSetFontStyle(xlBold,2,3,2,3);
+
+    #define FrmHdr lRB,lCE,lRB,lCE
+    iOut.Header3Row('№ п/п',                      #FrmHdr); lCE++;
+    iOut.Header3Row('Таб. Ном.',                  #FrmHdr); lCE++;
+    iOut.Header3Row('ФИО',                        #FrmHdr); lCE++;
+    iOut.Header3Row('Подраз-'+chr(10)+'деление (код)',  #FrmHdr); lCE++;
+    iOut.Header3Row('Код вышест.'+chr(10)+'подразд.',   #FrmHdr); lCE++;
+    iOut.Header3Row('Должность',                  #FrmHdr); lCE++;
+    iOut.Header3Row('Дата рождения',              #FrmHdr); lCE++;
+    iOut.Header3Row('Стаж работы на предприятии', #FrmHdr); lCE++;
+    iOut.Header3Row('СНИЛС',                      #FrmHdr); lCE++;
+    iOut.Header3Row('ИНН',                        #FrmHdr); lCE++;
+    iOut.Header3Row('Изменение'+chr(10)+'условий',#FrmHdr); lCE++;
+    iOut.Header3Row('Итого компенсаций и льгот',  #FrmHdr); lCE++;
+
+    if isvalid(#ttHeaD)
+    _loop ttHeaD ordered index ttHeaD02
+    {
+      iOut.Header1Row(ttHeaD.sName,        lRB+1,lCE,lRB+1,lCE);
+      iOut.Header1Row('В/о '+ttHeaD.sCode, lRB+2,lCE,lRB+2,lCE); lCE++;
+    }
+    iOut.HeaderIns('Суммы компенсаций и льгот по видам',lRB,13,lRB,13, lCE-13);
+
+    #define FrmCl lDE,lSE,lDE,lSE
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+
+      lSB := lSE := 1;
+      iOut.IntegerVal(lRow,            #FrmCl); lSE++;
+      iOut.CodeVal   (ttResStr.sTbNmb, #FrmCl); lSE++;
+      iOut.StringValL(ttResStr.sFio,   #FrmCl); lSE++;
+      iOut.CodeVal   (ttResStr.sDept,  #FrmCl); lSE++;
+      iOut.CodeVal   (ttResStr.sDepP,  #FrmCl); lSE++;
+      iOut.StringValL(ttResStr.sPost,  #FrmCl); lSE++;
+//       iOut.DateVal   (ttResStr.dBorn,  #FrmCl); lSE++;
+      xlSetCellDateValue(ttResStr.dBorn,  #FrmCl); lSE++;
+      iOut.StringValR(ttResStr.sStaj,  #FrmCl); lSE++;
+      iOut.StringValC(ttResStr.sSNILS, #FrmCl); lSE++;
+      iOut.CodeVal   (ttResStr.sINN,   #FrmCl); lSE++;
+      iOut.StringValC(ttResStr.sIsCh,  #FrmCl); lSE++;
+      iOut.FormulaDoubleVal('=СУММ(R'+lDE+'C'+13+':R'+lDE+'C'+(lCE-1)+')',#FrmCl); lSE++;
+      if isvalid(#ttHeaD)
+      _loop ttHeaD ordered index ttHeaD02
+      {
+        if getfirst ttResDyn where((ttResStr.nRec == ttResDyn.cPers and ttHeaD.nRec == ttResDyn.cHead)) = tsOk
+        {
+          iOut.DoubleVal(ttResDyn.dbSum,#FrmCl);
+        }
+        lSE++;
+      }
+      lDE++;
+      lRow++;
+    }
+
+    iOut.StringValR('Итого:',lDE,3,lDE,3);
+    lSE := 13;
+
+    var dbTotalIt : double;
+    dbTotalIt:=0;
+
+    if isvalid(#ttHeaD)
+    _loop ttHeaD ordered index ttHeaD02
+    {                            // FrmCl lDE,lSE,lDE,lSE
+      iOut.FormulaDoubleVal('=СУММ(R'+lDB+'C'+lSE+':R'+(lDE-1)+'C'+lSE+')',#FrmCl); lSE++;
+      dbTotalIt := dbTotalIt+ttHeaD.dbItC;
+    }
+    iOut.FormulaDoubleVal('=СУММ(R'+lDB+'C'+12+':R'+(lDE-1)+'C'+12+')',lDE,12,lDE,12);
+
+    lSE := 1;
+    #define FrmBl lDB,lSE,lDE,lSE
+    xlSetColumnWidth( 5,#FrmBl); lSE++;
+    xlSetColumnWidth( 8,#FrmBl); lSE++;
+    xlSetColumnWidth(30,#FrmBl); lSE++;
+    xlSetColumnWidth(10,#FrmBl); lSE++;
+    xlSetColumnWidth(10,#FrmBl); lSE++;
+    xlSetColumnWidth(30,#FrmBl); lSE++;
+    xlSetColumnWidth(10,#FrmBl); lSE++;
+    xlSetColumnWidth(24,#FrmBl); lSE++;
+    xlSetColumnWidth(14,#FrmBl); lSE++;
+    xlSetColumnWidth(14,#FrmBl); lSE++;
+    xlSetColumnWidth(14,#FrmBl); lSE++;
+    xlSetColumnWidth(14,#FrmBl); lSE++;
+    
+    xlSetColumnWidth(14,lRB,12,lDE,lCE);
+
+    xlSetFontSize(11,lRB,lCB,lDE,lCE); xlSetFontStyle(xlBold,lRB,lCB,lRB+2,lCE); xlSetFontStyle(xlBold,lDE,1,lDE,lCE);
+    xlWrapText(lRB,lCB,lRB+2,lCE);
+    xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0,lRB,lCB,lDE,lCE-1);
+    iOut.StringValL('Ответственный исполнитель: '+sGetTune('User.FIO'),lDE+2,3,lDE+2,3);
+    xlSetFontSize(11,lDE+2,3,lDE+2,3); xlSetFontStyle(xlBold,lDE+2,3,lDE+2,3);
+    iOut.xlR1C1OnOff(false);
+    iOut.TitleEachPage(lRB,lDB-1,'#(GPInt)');
+    xlFreeze(7,6);
+    xlKillExcel;
+  } //if isvalid(#ttResStr)
+  else
+  {
+    message('Нет данных для формирования отчета!');
+  }
+  StopVisual;
+  timelog('#(GPInt)->Run:finish');
+
+} //procedure Run;
+
+
+//**********************************************************
+Screen s1(,,sci1Esc);
+  show at (,,85,4);
+  fields
+    dBeg ('Начало периода',,):{Font = {BackColor = if(dBeg = 0, ColorNeed, 0)}}, noprotect;
+    dEnd ('конец периода',,): {Font = {BackColor = if(dEnd = 0, ColorNeed, 0)}}, noprotect;
+    wTypeRep   : NoProtect;
+  << 'Параметры отчета'
+   `Период отчета`    .@@@@@@@@@@ .@@@@@@@@@@@
+        (.)  По РПД`
+        (.)  По Зарплате`
+  >>
+end;  
+embedded ComFiltrEmbedded 'Фильтры' interface VCommonFiltr;
+  show (,5,85,10);
+end
+Screen s2(,,sci1Esc);
+  show (,11,85,12);
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+  <<
+     <. ~С~формировать .>                         <. ~З~акрыть .>
+  >>
+end;
+
+handleevent
+  cmInit:
+  { timelog_init;
+    if (not (ReadMyDsk(dBeg, '#(GPInt)_dBeg', false)))
+      dBeg := date(1,1,year(Cur_Date));
+    if (not (ReadMyDsk(dEnd, '#(GPInt)_dEnd', false)))
+      dEnd := date(31,12,year(Cur_Date));
+    wTypeRep:=0;
+    if (not (ReadMyDsk(wTypeRep, '#(GPInt)_wTypeRep', false)))
+      wTypeRep := 0;
+    dOtchPer      := dGetTune('Up.DatOtch');
+    MadeReport:= false;
+    Marker_Raise:=InitMarker('', 8, 50, 10, True);
+
+  }
+  cmDone:
+  { DoneMarker(Marker_Raise,'');
+
+
+  }
+  cmOk:
+  {
+    if (dBeg = 0) or (dEnd = 0) or (dBeg > dEnd)
+    {
+      message('Задан некорректный период!');
+    }
+    else
+    {
+      Run;
+      SaveMyDsk(dBeg    , '#(GPInt)_dBeg'    );
+      SaveMyDsk(dEnd    , '#(GPInt)_dEnd'    );
+      SaveMyDsk(wTypeRep, '#(GPInt)_wTypeRep');
+
+      MadeReport:= true;
+      VCommonFiltr.IntClose(MadeReport);
+      VCommonFiltr.StoreAllParams;
+      Notify(cmEvaluateAndModify, 0);
+    
+      closeinterface(cmDefault);
+    }
+  }
+  cmCancel:
+  {
+    VCommonFiltr.IntClose(MadeReport);
+  }
+end;
+end.
+
+
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+
+Procedure Run;
+Begin
+  runinterface(#(GPInt));
+End;
+!-------------------------------------------------------------------------------
+! Наименование отчета в списке
+!-------------------------------------------------------------------------------
+Function GetReportName: String;
+Begin
+  GetReportName := '#(GPNam) (ЭМ)';
+End;
+
+!-------------------------------------------------------------------------------
+! Наименования групп, в которые входит отчет
+!-------------------------------------------------------------------------------
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Компенсации и льготы';
+  End;
+End;
+
+!-------------------------------------------------------------------------------
+! Приоритет отчета - сортировка внутри группы выполняется сначала
+! по приоритету, а затем по наименованию
+!-------------------------------------------------------------------------------
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+!-------------------------------------------------------------------------------
+! ModuleID модулей, в которых будет виден отчет
+! '*' - отчет будет виден в любом модуле
+!-------------------------------------------------------------------------------
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+//    2 : VisibleInModule := 'STAFFMAINMENU2';
+  end;
+end;
+
+!-------------------------------------------------------------------------------
+End.

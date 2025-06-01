@@ -1,0 +1,923 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                лист 4-К "Сведения о молодых специалистах, поступивших на работу                 *
+*                после окончания учебных заведений, и о призыве работников в Вооруженные силы РФ" *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#364          |30/08/17|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_RKStat.vih
+#include CatFunc.vih
+#include RunStaj.vih
+#include TotalOrganizationAttributes.vih
+#include GP_ChRPD.vih
+#include APPFUNCS.VIH
+#include GP_UDR_RKStat.vih
+
+
+#define GPInt GP_RKStat_List4K // #(GPInt)
+#define GPNam 04-К "Сведения о молодых специалистах, поступивших на работу после окончания учебных заведений, и о призыве работников в Вооруженные силы РФ" // #(GPNam)
+
+VipInterface #(GPInt) Implements IGP_RKStat;
+Interface #(GPInt);
+
+const
+#include Excel.inc;
+//--------------
+wStajUpTo1 = 1;
+wStajUpTo2 = 2;
+wStajUpTo3 = 3;
+wStajUpTo4 = 5;
+sDisReasonArmy = 'п.1 ст.83 ТК';
+//--------------
+end;
+#include TotalOrganizationAttributes.var
+
+table struct ttStat4K
+(
+  lRow  : longint
+, iVal  : integer
+)
+with index
+(
+  ttStat4K01 = lRow
+);
+table struct ttPsn4K
+(
+  cPsn    : comp
+, sTbNmb  : string[20]
+, sPodr   : string[100]
+, dEndEdu : date
+, cEduLev : comp
+, isFirst : boolean
+, iStaj   : integer
+, dBegWrk : date
+, dOnArmy : date
+, dEndWrk : date
+, dEndWrk2: date
+, dRepWrk : date
+, sFIO    : string[60]
+, cRsnDis1: comp
+, cRsnDis2: comp
+, wAge    : word
+, wYear   : word
+, sRows   : string
+)
+with index
+(
+  ttPsn4K01 = cPsn
+, ttPsn4K02 = sFIO
+);
+
+table struct mtAppoint
+(
+  cPsn      : comp
+, sTbNmb  : string[20]
+, dBornDate : date
+, sFIO      : string[60]
+, dAppoint  : date
+, cDept     : comp
+, iTypeOper : integer
+, cContDoc  : comp
+, wDopAttr  : word
+)
+with index
+(
+  mtAppoint01 = cPsn + dAppoint
+);
+
+var
+  dRep          : date;
+  iCatFunc      : CatalogsFunctions;
+  iRunStaj      : Runstaj;
+  iChRPD        : GP_ChRPD;
+  iAppFuncs     : AppointmentsFunctions;
+  iUDR          : GP_UDR_RKStat;
+  sFullName     : string;
+  sPodr1        : string;
+  mPodr1        : TPtr;
+  sEdu1         : string;
+  mEdu1         : TPtr;
+  sEdu2         : string;
+  mEdu2         : TPtr;
+  wPrintRash    : word;
+  wToExistFile  : word;
+  sToExistFile  : string;
+/*
+  mHighEdu      : TPtr;
+  cHighEdu
+ ,cMidEdu       : comp;
+*/
+
+
+create view
+var
+  dBeg,
+  dEnd     : date;
+  __cAppoint: comp;
+from
+  ttStat4K
+, ttPsn4K
+, ttPsn4K ttPsn4KPost
+, mtAppoint
+//, StaffStruct  StaffStruct1
+, StaffStruct  StaffStruct8
+, Appointments Appointments1
+, Appointments Appointments8
+//, LSchet LSchet1    
+, LSchet LSchet8    
+//, Persons
+, Persons Persons8
+, Education
+//, ContDoc ContDoc1
+, ContDoc ContDoc8
+//, Catalogs
+, Experience
+, MOVELSC
+where
+((
+//---Приемы на работу + повторные 
+//---Уехало на DSQL
+/*
+                        dBeg<<= Appointments1.AppointDate and (dEnd >= Appointments1.AppointDate)
+and      Appointments1.nRec == ContDoc1.cStr and (ContDoc1.TypeOper = integer(1))
+and  Appointments1.StaffStr == StaffStruct1.nRec
+and Appointments1.cAddnRec2 == LSchet1.nRec
+and Appointments1.Person == persons.nrec
+*/
+    __cAppoint == Appointments1.nRec
+//---Образования
+and ttPsn4K.cPsn == Education.Person
+and      word(1) == Education.wType
+//---Увольнения----
+and            ttPsn4K.cPsn == Appointments8.Person
+and                    dBeg<<= Appointments8.DismissDate and (dEnd >= Appointments8.DismissDate)
+and      Appointments8.nrec == ContDoc8.cStr and (ContDoc8.TypeOper = integer(8))
+and  Appointments8.StaffStr == StaffStruct8.nRec
+and Appointments8.cAddnRec2 == LSchet8.nRec
+and            ttPsn4K.cPsn == Persons8.nRec
+and            ttPsn4K.cPsn == MOVELSC.TPerson and (dBeg <= MOVELSC.DATUV and dEnd >= MOVELSC.DATUV)
+//---Для апдейтa себя в проходе по ttPsn4K - иногда при апдейте таблицы сбивается _loop по ней
+and ttPsn4K.cPsn == ttPsn4KPost.cPsn
+//---Предыдущие места работы
+and ttPsn4K.cPsn == Experience.Person
+//debug
+//and ttPsn4K.cPsn == p2.nrec
+))
+;
+
+function sSetPodrName(mSetPdr: TPtr): string;
+{
+  if (getMarkerCount(mSetPdr) = 0)
+  {
+    result := 'Все подразделения';
+    exit;
+  }
+  else
+    if (getMarkerCount(mSetPdr) = 1)
+    {
+      var cTmp: comp;
+      GetMarker(mSetPdr, 0, cTmp);
+        result := iCatFunc.GetCatalogsName(cTmp);
+    }
+    else
+      result := 'Несколько подразделений (' + string(getMarkerCount(mSetPdr)) + ')';
+}
+
+function sSetEduName(_mSetEdu: TPtr): string;
+{
+  if (getMarkerCount(_mSetEdu) = 0)
+  {
+    result := 'Не выбрано';
+    exit;
+  }
+  else
+    if (getMarkerCount(_mSetEdu) = 1)
+    {
+      var cTmp: comp = 0;
+      GetMarker(_mSetEdu, 0, cTmp);
+        result := iCatFunc.GetCatalogsName(cTmp);
+    }
+    else
+      result := 'Несколько видов (' + string(getMarkerCount(_mSetEdu)) + ')';
+}
+
+function wWhatStajRow(cPsn : comp; dOnDate : date) : integer;
+{
+  var wYearStaj : word;
+
+  wYearStaj := iRunStaj.GetStajYears(cPsn, 89, dOnDate);
+  if wYearStaj < wStajUpTo1
+    result := 1
+  else
+  if wYearStaj < wStajUpTo2
+    result := 2
+  else
+  if wYearStaj < wStajUpTo3
+    result := 3
+  else
+  if wYearStaj < wStajUpTo4
+    result := 4
+  else
+    result := 0;
+}
+
+function wSQLMakeAppoint(_dBegSQL, _dEndSQL: date): word;
+{
+  result := 
+    sql
+      select
+        appointments.person
+      , Persons.STRTABN
+      , persons.borndate
+      , Persons.FIO
+      , appointments.appointdate
+      , appointments.department
+      , contdoc.typeoper
+      , contdoc.nrec
+      , ContDoc.wDopAttr
+      from
+        appointments
+      inner join apphist on appointments.nrec = apphist.cappoint
+      left join contdoc on apphist.cappoint = contdoc.cstr and contdoc.typeoper = 1
+      left join LSchet on appointments.cAddnRec2 = LSchet.nRec
+      left join persons on Appointments.Person = persons.nrec
+      where
+          appointments.appointdate >= :(_dBegSQL)
+      and appointments.appointdate <= :(_dEndSQL)
+      and (Appointments.lPrizn = 0 or Appointments.lPrizn = 100)
+//      and Appointments.Rate <> 0
+      and apphist.codoper = 1
+//      and LSchet.Sovm = 0
+    into mtAppoint;    
+}
+
+procedure Make4K;
+{
+  var isFilterPodr : boolean = false;
+  var wKatEmpl : word = 0;
+  var cAppDept : comp = comp(0);
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Формируются данные для Листа 4-к.', 0);
+  if (GetMarkerCount(mPodr1) > 0) isFilterPodr:=true;
+  set dBeg := date(1,1,Year(dRep)-4);
+  set dEnd := dRep;
+
+  if ( wSQLMakeAppoint(dBeg, dEnd) = 0 ) 
+    _loop mtAppoint
+    {
+      if (not NextVisual) break;
+      
+      if ( mtAppoint.iTypeOper > 1 ) 
+        continue;
+      
+      set __cAppoint := iAppFuncs.GetOldAppNrec_OnDate(mtAppoint.cPsn, dRep);
+      if ( not isvalid(#Appointments1) )
+        continue;
+      if isFilterPodr
+      {
+        if ( not FoundMarker(mPodr1, Appointments1.Department) )
+          continue;
+      }
+
+      if ( mtAppoint.cContDoc <> 0 )
+        if ( not iChRPD.isConfirmed(mtAppoint.cContDoc) )
+          continue;
+    
+      ClearBuffer(#ttPsn4K);
+      if getfirst ttPsn4K where ((mtAppoint.cPsn == ttPsn4K.cPsn)) <> tsOk
+      {
+        ttPsn4K.cPsn := mtAppoint.cPsn;
+        ttPsn4K.sFIO := mtAppoint.sFIO;
+        ttPsn4K.wAge := Year(Sub_Date(dRep, mtAppoint.dBornDate))-1;
+        ttPsn4K.sTbNmb := mtAppoint.sTbNmb;
+        ttPsn4K.sPodr  := iCatFunc.GetCatalogsCode(Appointments1.Department);
+        insert current ttPsn4K;
+      }
+      if ( mtAppoint.wDopAttr <> 3 and mtAppoint.wDopAttr <> 5 ) //Первое трудоустройство в периоде
+        if ( ttPsn4K.dBegWrk = 0 or ttPsn4K.dBegWrk > mtAppoint.dAppoint )
+          ttPsn4K.dBegWrk := mtAppoint.dAppoint;
+      if ( mtAppoint.wDopAttr = 3 or mtAppoint.wDopAttr = 5 ) //Повторное трудоустройство в периоде
+        ttPsn4K.dRepWrk := mtAppoint.dAppoint;
+      update current ttPsn4K;
+    }
+//    message('mtAppoint='+recordsintable(#mtAppoint));
+
+
+/*
+  if isvalid(#Appointments1)
+  _loop Appointments1
+  {
+    if not isvalid(#StaffStruct1) continue;
+    if isFilterPodr
+    if (not FoundMarker(mPodr1,StaffStruct1.Department)) continue;
+
+    if (not NextVisual) break;
+    if isvalid(#LSchet1)
+    if LSchet1.Sovm <> 1 and LSchet1.Sovm <> 2 and (Appointments1.lPrizn=0 or Appointments1.lPrizn=100) and Appointments1.Rate<>0
+    if isvalid(#ContDoc1)
+    _loop ContDoc1
+    {
+      if iChRPD.isConfirmed(ContDoc1.nRec)
+      {
+        ClearBuffer(#ttPsn4K);
+        if getfirst ttPsn4K where ((Appointments1.Person == ttPsn4K.cPsn)) <> tsOk
+        {
+          ttPsn4K.cPsn:=Appointments1.Person;
+          ttPsn4K.sFIO:=Persons.FIO;
+          ttPsn4K.wAge:=Year(Sub_Date(dRep,Persons.BornDate));
+          insert current ttPsn4K;
+        }
+        if (ContDoc1.wDopAttr<>3 and ContDoc1.wDopAttr<>5) //Первое трудоустройство в периоде
+          ttPsn4K.dBegWrk:=Appointments1.AppointDate;
+        if (ContDoc1.wDopAttr=3 or ContDoc1.wDopAttr=5) //Повторное трудоустройство в периоде
+          ttPsn4K.dRepWrk:=Appointments1.AppointDate;
+        update current ttPsn4K;
+      }
+    }
+  }
+*/
+//  if isvalid(#ttPsn4K) _loop ttPsn4K message(ttPsn4K.sFIO);
+
+  if isvalid(#ttPsn4K)
+  _loop ttPsn4K
+  {
+    if (not NextVisual) break;
+    if isvalid(#ttPsn4KPost)
+    {
+      //Заполняем данными по Образованию
+      if isvalid(#Education)
+        _loop Education
+          if ( Education.Todate <> 0 )
+            if ( Education.Todate <= ttPsn4K.dBegWrk and Add_Months(Education.Todate,3) >= ttPsn4K.dBegWrk )
+              if ( FoundMarker(mEdu1,Education.Level) or FoundMarker(mEdu2,Education.Level) )
+              {
+                ttPsn4KPost.dEndEdu := Education.Todate;
+                ttPsn4KPost.cEduLev := Education.Level;
+                update current ttPsn4KPost;
+              }
+      //Заполняем данными по Увольнениям
+      if isvalid(#Appointments8)
+      {
+        _loop backward Appointments8 
+        if isvalid(#ContDoc8) //Можно ограничиться причиной увольнения, но лучше проконтролировать наличие и состояние приказа
+        if iChRPD.isConfirmed(ContDoc8.nRec)
+        {
+          if trim(iCatFunc.GetCatalogsCode(Appointments8.cDisReason)) = sDisReasonArmy
+          {
+//            ttPsn4KPost.cRsnDis2:= Appointments8.cDisReason;
+            ttPsn4KPost.dOnArmy := Appointments8.DismissDate;
+            update current ttPsn4KPost;
+          }
+          if ttPsn4KPost.dEndWrk <= Appointments8.DismissDate
+          {
+            ttPsn4KPost.cRsnDis1:= Appointments8.cDisReason;
+            ttPsn4KPost.dEndWrk := Appointments8.DismissDate;
+            update current ttPsn4KPost;
+          }
+          if ttPsn4KPost.dEndWrk2<= Appointments8.DismissDate and ttPsn4KPost.dEndWrk > Appointments8.DismissDate
+          {
+            ttPsn4KPost.cRsnDis2:= Appointments8.cDisReason;
+            ttPsn4KPost.dEndWrk2:= Appointments8.DismissDate;
+            update current ttPsn4KPost;
+          }
+        }
+      }
+      if ( Persons8.DisDate <> 0 and ttPsn4KPost.dEndWrk = 0 )
+      {
+        ttPsn4KPost.cRsnDis1:= Persons8.DISMOTIVE;
+        ttPsn4KPost.dEndWrk := Persons8.DisDate;
+        update current ttPsn4KPost;
+      }
+      if ( ttPsn4KPost.dEndWrk = 0 )
+        if isvalid(#MOVELSC)
+          _loop MOVELSC
+            if ( ttPsn4KPost.dEndWrk = 0 or ttPsn4KPost.dEndWrk < MOVELSC.DATUV)
+              ttPsn4KPost.dEndWrk := MOVELSC.DATUV;
+            // Причину увольнения смысла искать тут нет
+            // здесь идет ссылка на приказ
+            // если есть приказ - он обработается выше и сюда даже не дойдет ход
+            // иначе тут будет просто запись об увольнении без приказа
+            // т.е. брать причину не от куда
+
+      var dEndWrkT : date;
+      dEndWrkT := 0;
+      if ttPsn4KPost.dEndWrk <> 0 and (ttPsn4K.dRepWrk = 0 or ttPsn4K.dRepWrk < ttPsn4KPost.dEndWrk)
+        dEndWrkT := ttPsn4KPost.dEndWrk;
+      if dEndWrkT <> 0
+        ttPsn4KPost.iStaj := wWhatStajRow(ttPsn4KPost.cPsn, dEndWrkT);
+      ttPsn4KPost.isFirst := true;
+      if isvalid(#Experience)
+      _loop Experience
+        if Experience.GroupCode=1
+          if Experience.EntranceDate >= ttPsn4KPost.dEndEdu and Experience.EntranceDate <= ttPsn4K.dBegWrk
+            ttPsn4KPost.isFirst := false;
+      ttPsn4KPost.wYear := Year(dRep);
+      update current ttPsn4KPost;
+    }
+  }
+  StopVisual;
+}
+
+procedure LocateSetRow(lRowT : longint; iValT : integer);
+{
+  ClearBuffer(#ttStat4K);
+  if getfirst ttStat4K where ((lRowT==ttStat4K.lRow))<>tsOk
+  {
+    ttStat4K.lRow := lRowT;
+    insert current ttStat4K;
+  }
+  ttStat4K.iVal += iValT;
+  update current ttStat4K;
+}
+function LocateReturnRow(lRowT : longint; var iValT : integer) : boolean;
+{
+
+  if getfirst ttStat4K where ((lRowT==ttStat4K.lRow))=tsOk
+  {result :=  true; iValT := ttStat4K.iVal;}
+  else
+  {result := false;}
+}
+
+
+procedure PostProcess4K;
+{
+  var iCurPos : integer;
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Обрабатываются данные для Листа 4-к.', 0);
+  if isvalid(#ttPsn4K)
+  _loop ttPsn4K
+  {
+    if (not NextVisual) break;
+    if ttPsn4K.isFirst and ttPsn4K.cEduLev <> 0
+    {
+      if FoundMarker(mEdu2, ttPsn4K.cEduLev)// ttPsn4K.cEduLev = cMidEdu
+        iCurPos := 18
+      else
+        iCurPos :=  3;
+      ttPsn4K.sRows += ' ' + iCurPos;
+      LocateSetRow(iCurPos,1);
+      if ttPsn4K.iStaj <> 0
+      {
+        LocateSetRow(iCurPos-1+ttPsn4K.iStaj*2,1);
+        ttPsn4K.sRows += ' ' + (iCurPos-1+ttPsn4K.iStaj*2);
+      }
+      if ttPsn4K.dOnArmy <> 0
+      {
+//        if ttPsn4K.dRepWrk = 0 //???????????????????????
+          LocateSetRow(iCurPos+11,1);
+        ttPsn4K.sRows += ' ' + (iCurPos+11);
+        if ttPsn4K.dRepWrk <> 0
+        {
+          LocateSetRow(iCurPos+13,1);
+          ttPsn4K.sRows += ' ' + (iCurPos+13);
+        }
+      }
+      update current ttPsn4K;
+    }
+  }
+  StopVisual;
+}
+
+function isData4K : boolean;
+{
+  if isvalid(#ttStat4K)
+    result := true
+  else
+    result := false;
+}
+
+
+procedure Print4K;
+{
+  var iCur : integer;
+  var i : integer;
+  
+  if isData4K
+  if xlSetActiveSheetByName('4-к')
+  {
+    StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Выгружаю данные для Листа 4-к в Excel.', 0);
+    TOA.Bind(0);
+    xlSetCellStringValue(Trim(TOA1.GetNaming.GetFullName()),5,4,5,4);
+    xlSetCellStringValue(DateToStr(dRep,'DD.MM.YYYY'),2,4,2,4);
+    for(i:=3;i<=31;i++)
+    {
+      if (not NextVisual) break;
+      if LocateReturnRow(i, iCur)
+        xlSetCellNumberValue(iCur,3+i,4,3+i,4);
+    }
+    StopVisual;
+  }
+}
+
+procedure Save4K;
+{
+  iUDR.SaveMarker('RKS4_mPodr1', mPodr1);
+  iUDR.SaveMarker('RKS4_mEdu1' , mEdu1 );
+  iUDR.SaveMarker('RKS4_mEdu2' , mEdu2 );
+  DoneMarker(mPodr1, '');
+  DoneMarker(mEdu1 , '');
+  DoneMarker(mEdu2 , '');
+//  DoneMarker(mHighEdu,'');
+  iUDR.SaveDate  ('RKS4_dRep'        , dRep        );
+  iUDR.SaveWord  ('RKS4_wToExistFile', wToExistFile);
+  iUDR.SaveString('RKS4_sToExistFile', sToExistFile);
+  iUDR.SaveWord  ('RKS4_wPrintRash'  , wPrintRash  );
+}
+procedure Clear4K;
+{
+  delete all from ttStat4K;
+}
+procedure init4K;
+{
+  set dRep := iUDR.ReadDate('RKS4_dRep');
+  if dRep = 0
+    set dRep := To_Date(31,12,Year(Cur_Date));
+  
+  set wPrintRash   := iUDR.ReadWord  ('RKS4_wPrintRash'  );
+  set sToExistFile := iUDR.ReadString('RKS4_sToExistFile');
+  set wToExistFile := iUDR.ReadWord  ('RKS4_wToExistFile');
+  if wToExistFile = 1 
+    ToggleFieldVisible(#sToExistFile,true )
+  else
+    ToggleFieldVisible(#sToExistFile,false);
+
+  mPodr1     := iUDR.ReadMarker('RKS4_mPodr1');
+  set sPodr1 := sSetPodrName(mPodr1);
+  mEdu1      := iUDR.ReadMarker('RKS4_mEdu1');
+  set sEdu1  := sSetEduName(mEdu1);
+  mEdu2      := iUDR.ReadMarker('RKS4_mEdu2');
+  set sEdu2  := sSetEduName(mEdu2);
+
+/*
+  cMidEdu  := iCatFunc.GetCatalogsNRec(-97);
+  cHighEdu := iCatFunc.GetCatalogsNRec(-98);
+  mHighEdu := initMarker(''  + UserName(), 8, 1000, 100);
+  InsertMarker(mHighEdu,cHighEdu);
+  InsertMarker(mHighEdu,cMidEdu);
+  _loop Catalogs where((cHighEdu == Catalogs.CPARENT))
+    InsertMarker(mHighEdu,Catalogs.nRec);
+*/
+}
+
+function isCheckRepParam(isStayAlone : boolean) : boolean;
+{
+  result := false;
+  if dRep = 0
+  {if isStayAlone message('Не задана дата!'); exit;}
+  if ( Day(dRep) = 31 and Month(dRep) = 12 ) {}
+  else
+  {
+    if isStayAlone 
+      if ( message(         'Дата формирования отчета отличается от регламентной!'#3
+                   +chr(13)+'Правильная дата формирования отчета - 31 декабря.'#3
+                   +chr(13)+'Формировать на '+dRep+'?'#3, Information+yesNo) <> cmYes )
+        exit;
+//    message('Некорректно задана дата!'+chr(13)+'Дата формирования отчета - 31 декабря.'); exit;
+  }
+  if wToExistFile = 1
+  if not ExistFile(sToExistFile)
+  {if isStayAlone message('Ошибка открытия файла!'); exit;}
+  if ( ( GetMarkerCount(mEdu1) = 0 )
+    or ( GetMarkerCount(mEdu2) = 0 ) )
+  {if isStayAlone message('Не задан один из обязательных параметров!', Error); exit;}
+  result := true;
+}
+//++++++++++++++++++++++++++++++++++++++++++++++++
+window Win4KParamEx 'Параметры формирования. Лист 4-К.' Gray;
+//  show at (,,95,32);
+  show at (,,95,13);
+Screen sEx(,,sci1Esc);
+  fields
+    dRep   ('Дата формирования'): {Font = {BackColor = if(dRep = 0, ColorNeed, 0)}}, noprotect;
+    sPodr1 ('Выбранные подразделения',hcStaffAppDepartment,sci13Esc): {Font = {BackColor = if(sPodr1 = 'Не выбраны подразделения', ColorNeed, 0)}},Protect, PickButton ;
+    sEdu1  ('Высшие образования' ,hcStaffAppDepartment,sci13Esc): {Font = {BackColor = if(sEdu1 = 'Не выбрано', ColorNeed, 0)}},Protect, PickButton ;
+    sEdu2  ('Среднее проф.образование',hcStaffAppDepartment,sci13Esc): {Font = {BackColor = if(sEdu2 = 'Не выбрано', ColorNeed, 0)}},Protect, PickButton ;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+<< 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Высшее образование      `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Среднее проф.образование`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   <. ~С~охранить .>                                                        <. ~З~акрыть .>
+>>
+end;
+HandleEvent
+  cmOK:
+  {
+    Save4K;
+    init4K;
+    if not isCheckRepParam(true)
+      exit;
+    CloseWindowEx(CurWindow,cmDefault);
+  }
+  cmCancel:
+  {
+    Save4K;
+    CloseWindowEx(CurWindow,cmCancel);
+  }
+end;
+end;//Win4KParamEx
+//++++++++++++++++++++++++++++++++++++++++++++++++
+//++++++++++++++++++++++++++++++++++++++++++++++++
+window Win4KParam 'Параметры формирования. Лист 4-К.' Gray;
+//  show at (,,95,34);
+  show at (,,95,13);
+Screen s1(,,sci1Esc);
+  fields
+    dRep   ('Дата формирования'): {Font = {BackColor = if(dRep = 0, ColorNeed, 0)}}, noprotect;
+    sPodr1 ('Выбранные подразделения',hcStaffAppDepartment,sci13Esc): {Font = {BackColor = if(sPodr1 = 'Не выбраны подразделения', ColorNeed, 0)}},Protect, PickButton ;
+    sEdu1  ('Высшие образования' ,hcStaffAppDepartment,sci13Esc): {Font = {BackColor = if(sEdu1 = 'Не выбрано', ColorNeed, 0)}},Protect, PickButton ;
+    sEdu2  ('Среднее проф.образование',hcStaffAppDepartment,sci13Esc): {Font = {BackColor = if(sEdu2 = 'Не выбрано', ColorNeed, 0)}},Protect, PickButton ;
+    wPrintRash  ('Печать расшифровки'), noprotect;
+    wToExistFile('Добавить в существующий файл'), noprotect;
+    sToExistFile('Добавить в существующий файл',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sToExistFile = '', ColorNeed, 0)}},protect;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+<< 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Высшее образование      `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Среднее проф.образование`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   [.] Печать расшифровки`
+
+   [.] Добавить в существующий файл          `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   <. ~С~формировать .>                                                     <. ~З~акрыть .>
+>>
+end;
+
+HandleEvent
+  cmOK:
+  {
+    if not isCheckRepParam(true)
+      exit;
+    CloseWindowEx(CurWindow,cmDefault);
+  }
+end;
+end;//Win1KParam
+//++++++++++++++++++++++++++++++++++++++++++++++++
+
+function OpenNewRKS : boolean;
+{
+  result := false;
+  sToExistFile := TranslatePath('%ClientStartPath%') +'XLS_ЭМ\Staff\RKStat.xltm';
+  if xlCreateExcelWithTemplate(sToExistFile, true)
+    result := true;
+}
+function OpenExistRKS : boolean;
+{
+  result := false;
+  xlOpenExcel(true);
+  if xlOpenWorkBook(sToExistFile)
+    result := true;
+}
+
+function SetParam4k : boolean;
+{
+  result := false;
+  if RunWindowModal(Win4KParam)=cmDefault
+    result := true;
+}
+procedure PrintRash;
+{
+  var lLine : longint;
+  var lRB, lRE, lCB, lCE : longint = 1;
+  var sAgeT: string;
+  var dAge : date;
+  var wDays, wMonths, wYears : word;
+
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Печать расшифровки.', 0);
+  lRB := lRE := 2;
+  lCB := 1;
+  lLine:=0;
+  xlMergeCells(1,1,1,4);
+  xlSetCellStringValue('Расшифровка листа 4. Данные на '+datetostr(dRep,'DD.MM.YYYY')+'.',1,1,1,1);
+  if isvalid(#ttPsn4K)
+  {
+    lCE := 0;
+    lCE++; xlSetCellStringValue('№пп',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Таб.№',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('ФИО',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Код подр.',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата приема на работу',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Вид образования',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата окончания образовательного учреждения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата увольнения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Причина увольнения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Причина предыдущего увольнения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Возраст',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Год',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Строки',lRE,lCE,lRE,lCE);
+    lRE++;
+    _loop ttPsn4K ordered index ttPsn4K02
+    {
+      if (not NextVisual) break;
+      if ttPsn4K.isFirst and ttPsn4K.cEduLev <> 0
+//      if 2=2
+      {//if(dDate<>0,datetostr(dDate,'DD.MM.YYYY'),'')
+        lCE := 0;
+        lCE++; xlSetCellStringValue(++lLine       ,lRE,lCE,lRE,lCE);
+        lCE++; xlSetNumberFormat('@',lRE,lCE,lRE,lCE); xlSetCellStringValue(ttPsn4K.sTbNmb,lRE,lCE,lRE,lCE);
+        lCE++; xlSetCellStringValue(ttPsn4K.sFIO,lRE,lCE,lRE,lCE);
+        lCE++; xlSetNumberFormat('@',lRE,lCE,lRE,lCE); xlSetCellStringValue(ttPsn4K.sPodr,lRE,lCE,lRE,lCE);
+        lCE++; if ( ttPsn4K.dBegWrk <> 0 ) xlSetCellDateValue(ttPsn4K.dBegWrk,lRE,lCE,lRE,lCE);
+        lCE++; xlSetCellStringValue(iCatFunc.GetCatalogsName(ttPsn4K.cEduLev),lRE,lCE,lRE,lCE);
+        lCE++; if ( ttPsn4K.dEndEdu <> 0 ) xlSetCellDateValue(ttPsn4K.dEndEdu,lRE,lCE,lRE,lCE);
+        lCE++; if ( ttPsn4K.dEndWrk <> 0 ) xlSetCellDateValue(ttPsn4K.dEndWrk,lRE,lCE,lRE,lCE);
+        lCE++; xlSetCellStringValue(iCatFunc.GetCatalogsName(ttPsn4K.cRsnDis1),lRE,lCE,lRE,lCE);
+        lCE++; xlSetCellStringValue(iCatFunc.GetCatalogsName(ttPsn4K.cRsnDis2),lRE,lCE,lRE,lCE);
+        lCE++; xlSetCellStringValue(ttPsn4K.wAge,lRE,lCE,lRE,lCE);
+        lCE++; xlSetCellStringValue(ttPsn4K.wYear,lRE,lCE,lRE,lCE);
+        lCE++; xlSetNumberFormat('@',lRE,lCE,lRE,lCE); xlSetCellStringValue(ttPsn4K.sRows,lRE,lCE,lRE,lCE);
+        lRE++;
+      }
+    }
+  }
+  lRE--;
+  xlWrapText(lRB,lCB,lRB,lCE);
+  xlAutoFit(lRB+1,lCB,lRE,lCE);
+  xlAlignCellsEx(xlCenter,xlCenter,lRB,lCB,lRB,lCE);
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0, lRB,lCB,lRE,lCE);
+  StopVisual;
+}
+
+procedure PrintRepPage(isStayAlone : boolean);
+{
+  var isOkFile : boolean = false;
+  var isDoRep  : boolean = false; 
+  
+  init4K;
+
+  if isStayAlone
+    if SetParam4k
+      isDoRep := true;
+  if not isStayAlone
+    isDoRep := isCheckRepParam(true);
+
+  if isDoRep
+  {
+    Make4K;
+    PostProcess4K;
+    if isData4K
+    {
+      if isStayAlone
+      {
+        if wToExistFile = 0 {isOkFile := OpenNewRKS  ;}
+        if wToExistFile = 1 {isOkFile := OpenExistRKS;}
+      }
+      else
+      {
+        isOkFile := true;
+      }
+      if isOkFile
+      {
+        Print4K;
+
+        if (wPrintRash = 1) and isStayAlone
+        {
+          var i, j : integer = 0;
+          var s    : string = '';
+          xlGetSheetsCount(j);
+          while i<=j
+          {
+            xlSetActiveSheet(++i);
+            xlGetSheetName(i,s);
+            if s='4-к' break;
+          }
+          xlSetActiveSheet(++i);
+          xlAddSheet;
+          xlSetSheetName(i,'Расшифровка 4-К'); 
+          xlSetActiveSheet(i);
+          PrintRash;
+        }
+
+        xlSetActiveSheetByName('4-к');
+        if wToExistFile = 0 {sToExistFile:='';}
+        if isStayAlone
+          xlKillExcel;
+      }
+      else if isStayAlone message('Проверте наличие файла шаблона по пути EXE\XLS_ЭМ\Staff');
+    }
+    else if isStayAlone message('Нет данных для отчета.');
+  }
+  Save4K;
+  Clear4K;
+  closeinterface(cmDefault);
+}
+//++++++++++++++++++++++++++++++++++++++++++++++++
+//--------------------------------------------------------
+function bSetRepParam : boolean;  
+{
+  result := false;
+  if RunWindowModal(Win4KParamEx)=cmDefault
+    result := true;
+}//function bSetRepParam
+Function GetReportName: String;
+{
+  GetReportName := '#(GPNam) (ЭМ)';
+}
+function GetPriority : Integer;
+{
+  GetPriority := 4;
+}
+procedure initRKStatRepParam;
+{
+  init4K;
+}
+function dRepOnDateParam : date;
+{
+  dRepOnDateParam := dRep;
+}
+//--------------------------------------------------------
+handleevent
+  cmInit:
+  {
+    PrintRepPage(true);
+  }
+  cmPick:
+  {
+    case CurField of
+      #sPodr1:
+        if (RunInterface('PICKCATALOGEX', -11, 0, Comp(100), mPodr1) = cmDefault)
+          set sPodr1 := sSetPodrName(mPodr1);
+      #sEdu1:
+        if (RunInterface('PICKCATALOGEX', -9, 0, Comp(100), mEdu1) = cmDefault)
+          set sEdu1 := sSetEduName(mEdu1);
+      #sEdu2:
+        if (RunInterface('PICKCATALOGEX', -9, 0, Comp(100), mEdu2) = cmDefault)
+          set sEdu2 := sSetEduName(mEdu2);
+      #sToExistFile:
+      {
+        set sToExistFile := GetFileName('*.xls;*.xlsx;*.xlsm','Выбор файла...');
+      }
+    end;
+  }
+  cmDelOnprotect:
+  {
+    case CurField of
+      #sPodr1:      {ClearMarker(mPodr1); set sPodr1 := sSetPodrName(mPodr1);}
+      #sEdu1:       {ClearMarker(mEdu1);  set sEdu1  := sSetEduName(mEdu1);}
+      #sEdu2:       {ClearMarker(mEdu2);  set sEdu2  := sSetEduName(mEdu2);}
+      #sToExistFile:{set sToExistFile:='';}
+    end;
+  }
+  cmCheckField:
+  {
+    case CurField of
+      #wToExistFile:
+      {
+        if wToExistFile = 1 
+          ToggleFieldVisible(#sToExistFile,true )
+        else
+          ToggleFieldVisible(#sToExistFile,false);
+      }
+    end;
+  }
+end;
+
+
+End.
+//---------------------------------------------------------------------------------
+#include UserReport.vih
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+Procedure Run;
+{
+  runinterface(#(GPInt));
+}
+Function GetReportName: String;
+{
+  GetReportName := '#(GPNam) (ЭМ)';
+}
+Function GetGroupName (Level : Word) : String;
+{
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Формы "Роскосмоса"';
+  End;
+}
+function GetPriority : Integer;
+{
+  GetPriority := 3;
+}
+function VisibleInModule(Ind : Byte) : String;
+{
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+}
+End.

@@ -1,0 +1,1389 @@
+//------------------------------------------------------------------------------
+//                                                      (c) корпорация Галактика
+// Галактика 9.1 - Заработная плата
+// Печать свода начислений "Вспомогательные ведомости"
+//------------------------------------------------------------------------------
+/*************************************************************************************************\
+* Наименование:  Печать свода начислений "Вспомогательные ведомости"                              *
+*                Дополнительные поля                                                              *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Отчеты - Сводные аналитические отчеты -                                          *
+*                Вспомогательные ведомости - Свод по видам начислений/удержаний                   *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#812          |22/04/18|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+// Перекрываем стандартный интерфейс т.к. корректно вклинится докомпиляцией или точкой расширения 
+// не представляется возможным из-за структуры интерфейса
+// Стандартный код не меняется
+// Все дополнения выделены комментарием // GP 812
+// При обновлении - просто перенести в обновленный исходник куски кода с // GP 812
+#include CLSFuncs.vih
+#include PAFILTER.vih                    // работа с фильтрами по сотрудникам и подразделениям
+#include TotalOrganizationAttributes.vih // работа с атрибутами организации
+#include OrganizationInfo.vih            // Объявления объектных интерфейсов для выборки информации об организации
+#include xlReport.vih
+#include AdrFunc.vih                     // Функции работы с адресами
+#include PsnFuncs.vih
+#include Contexts.vih
+#include CatFunc.vih                     // Функции работы с CATALOGS
+#include vedsvod.vih
+
+#component "Z_ZarRep"
+
+#doc
+Печать свода начислений "Вспомогательные ведомости"
+#end
+interface pechsvod 'Свод начислений' DoAccept, EscClose;
+
+table struct tmp_VedGroup
+(
+  CREC1     : tNrec,
+  CREC2     : tNrec,
+  CREC3     : tNrec,
+  CREC4     : tNrec,
+  CREC5     : tNrec,
+  CREC6     : tNrec,
+  PCOMP1    : tNrec,
+  PCOMP3    : tNrec,
+  PCOMP4    : tNrec,
+  PCOMP5    : tNrec,
+  PDOUBLE1  : Double,
+  PDOUBLE2  : Double,
+  PDOUBLE3  : Double,
+  PDOUBLE4  : Double,
+  PDOUBLE5  : Double,
+  PDOUBLE6  : Double,
+  PDOUBLE7  : Double,
+  PDOUBLE8  : Double,
+  PDOUBLE9  : Double,
+  wMesVip   : word,
+  wMesZ     : word,
+  wMesV     : word,
+  wYearV    : word,
+  wYearZ    : word,
+  PSTRING1  : s60,
+  PSTRING2  : s60,
+  PSTRING3  : s60        //табельный номер
+)
+with index
+(
+  tmp_VedGroup01  =  CREC1 + CREC6 + CREC2 + CREC3 + PSTRING3 + CREC4 + CREC5,
+  tmp_VedGroup02  =  CREC1 + CREC6 + CREC2 + PSTRING2(Length=30) + CREC3 + PSTRING3+
+                     CREC4 + CREC5,
+  tmp_VedGroup03  =  CREC4 + CREC5
+);
+
+  create view Lnachisl
+    var
+      oParamSvod  : oVedSvod;
+      pXL       : XLSRepBuilder;  // объект формирования Excel-отчетов
+      pxlrepsetup : xlrepsetup;
+      QVidOpl   : longint; // Код выплат
+      QVidOplMy : longint; // Код выплат
+      QcLsch    : comp;
+      TekCex    : comp;
+      TekCexRec : comp;
+      TekGrPodr : comp;
+      LastCex   : comp;
+      Tsflag    : word;
+
+      prNvidopl : STRING[60]; // length(Klvidopl.nvidopl) = 60
+      prName    : STRING[40];
+      nomp      : word;
+      prPodr    : comp;
+      cPCOMP4   : comp;
+      cPCOMP5   : comp;
+      i         : integer;
+      GroupByCategory:  boolean;
+      GroupByWorker  :  boolean;
+      GroupBySex     :  boolean;
+      prNameGrPodr   : string;
+      CurPost
+     ,CurrFio   : string;
+      wYear     : word;
+      Category  : word;
+      Sex       : word;
+      GroupFlag : word;
+      IsBreaked : boolean;
+      recpar    : comp;
+      CexozGlub, OrganizationRef: comp;
+      TaxationInfo: IOrganizationTaxationInfo;
+      iAdrFunc    : AddressFunc;    // Переменная типа интерфейс AddressFunc
+      cnRecPodrOz : comp;
+      CLSF    : CurLSFunctionsChild;
+      ind     : integer;
+      TSFlag1 : word;
+      con     : integer;
+      curcex1 : comp;
+      iCatFunc  : CatalogsFunctions;     // Переменная типа интерфейс CatalogsFunctions
+      My : TPtr;
+      sXLSFileName
+    , sXLTFileName
+    , ID          : string;
+  #include PAFILTER.VAR
+
+    as select
+      LSchet.nrec,
+      LSchet.TabN,
+      LSchet.StrTabn,
+      KatPodr.Nrec,
+      KatPodr.Name,
+      VedGroup.*,
+      tmp_VedGroup.*
+    from
+      VedGroup(build),
+      tmp_VedGroup(build),
+      ZKAUVED(build),
+      KlVidopl,
+      KlVidUd,
+      LSchet,
+      synonym lschet lschett,
+      KatPodr,
+      Formarks,
+      KatPodr  KatPodrC,
+      klvidopl klvidoplMy,
+      klvidopl klvidoplM,
+      KlVidUd  KlVidUdM,
+      KlKatego,
+      KATKOD,
+      synonym KatKod KatKodGNI,
+      GrPodr,
+      LSchet LSPodr, // GP 812
+      ExtCatLinks // GP 812
+    where
+    ((
+      recpar          == Zkauved.Crec1     and
+      Category        == KlKatego.Kod      and
+      _clschet        == Formarks.Choice   and
+      TekCexRec       == KatPodrC.Nrec     and
+      QVidOplMy       == klvidoplMy.vidopl and
+      oParamSvod.prprvidop  == klvidopl.vidopl
+      // GP 812
+      and tmp_VedGroup.PCOMP1 == LSPodr.nRec
+      and 11 == ExtCatLinks.ObjType
+      and 1 == ExtCatLinks.ModType
+      and LSPodr.Cex == ExtCatLinks.ExtCat
+      // GP 812
+    ));
+//------------------------------------------------------------------------------
+  parameters oParamSvod;
+//------------------------------------------------------------------------------
+  form OutA('vednu.OUT','vednu') with novisual;
+//------------------------------------------------------------------------------
+  #include TotalOrganizationAttributes.var // объявление и инициализация TOA
+//------------------------------------------------------------------------------
+  var
+    sumtek        : array [1..8]  of double;
+    sumlow        : array [1..8]  of double;
+    sumrec        : array [1..8]  of double;
+    sumtab        : array [1..8]  of double;
+    sumopl        : array [1..8]  of double;
+    res           : array [1..8]  of double;
+    QSummaGrPodr  : Array [1..8]  of double;
+    QSummaSex     : Array [1..8]  of double;
+    QSummaPodr    : Array [1..8]  of double;
+    QSummaAll     : Array [1..8]  of double;
+//------------------------------------------------------------------------------
+// #include DepartmentTreeSession.vpp
+// GP 812
+var DepartmentTreeSession: IContextSession;
+
+function CaptureDepartmentTreeContext: boolean;
+{
+  var CL: ContextList;
+  Result := CL.Add(DepartmentTreeSession, 'DepartmentTree');
+}
+
+// ----- Код Подразделения
+function sKodePodr: string;
+{
+  result:='';
+  if IsValid(#LSPodr)
+    if IsValid(#ExtCatLinks)
+      result:=''''+SubStr(iCatFunc.GetCatalogsCode(ExtCatLinks.StaffCat), 1, 3);
+}
+// GP 812
+// ----- Код ГНИ -------------------
+function GetCodeGNI(CexozGlub: comp): string;
+var    CodeGNI: string;
+ nRecKPP,c_Gni: comp;
+{
+  CodeGNI := '';
+  c_Gni   := comp(0);
+  nRecKPP := comp(0);
+
+  if (GetDepartmentKpp(CexozGlub, nRecKPP))
+    if ( GetFirst KATKOD where (( nRecKPP == KATKOD.NREC )) =  tsOk )
+      c_Gni    := KATKOD.CORG1;
+
+  if (GetFirst KatKodGNI  where (( c_Gni == KatKodGNI.NREC )) = tsOk )
+    CodeGNI := KatKodGNI.Kod;
+
+  GetCodeGNI := CodeGNI;
+}
+// ----- Код КПП -------------------
+function GetCodeKPP(CexozGlub: comp): string;
+var CodeKPP: string;
+    nRecKPP: comp;
+{
+  CodeKPP := '';
+  nRecKPP := comp(0);
+
+   if GetDepartmentKpp(CexozGlub, nRecKPP)
+   {
+     if GetFirst KATKOD where ((nRecKPP == KATKOD.NREC)) =  tsOk
+       CodeKPP := KATKOD.Kod;
+   }
+   // на случай, если для организации КПП введено вручную, а не выбрано из справочника КПП
+   // (для подразделения вручную КПП ввести нельзя)
+   if  Trim(CodeKPP) = ''
+   {
+     if IOrganizationInfoFinder(TaxationInfo).Seek(OrganizationRef)
+       CodeKPP := Trim(TaxationInfo.GetKppStr)   // КПП
+   }
+
+  GetCodeKPP := CodeKPP;
+}
+
+// ----- Код ОКАТО -----------------
+function GetCodeOKATO(CexozGlub: comp; nRecAnalitic: comp): string;
+{
+  var CodeOKATO: string = '';
+
+  nRecAnalitic:=nRecAnalitic;// Убираем предупреждения компилятора.
+  GetDepartmentOkato(CexozGlub, CodeOKATO);
+
+  result := CodeOKATO;
+}
+//-----------------------------------
+function sGetSex(_wSex, _wParam : word) : string;
+{
+  Result := 'пол не указан';
+
+  case _wSex of
+  1: Result := if( _wParam = 0, 'Женщины', 'женщинам' );
+  2: Result := if( _wParam = 0, 'Мужчины', 'мужчинам' );
+  end;
+} // sGetSex
+//-----------------------------------
+function getKateg : string;
+{
+  Result := 'без названия';
+
+  if ( getfirst KLKATEGO = tsOk )
+    Result := KLKATEGO.NAIKAT;
+} // getKateg
+//-----------------------------------
+function getPeriodVip : string;
+{
+  Result := '';
+
+  if ( oParamSvod.prLocFlag6 = 0 )
+  {
+    Result :=  LPadCh(string(tmp_VedGroup.wMesV), '0', 2) + '.' +
+               SubStr(string(tmp_VedGroup.wYearV), 3, 2);
+  }
+  else
+  {
+    Result :=  LPadCh(string(tmp_VedGroup.wMesZ), '0', 2) + '.' +
+               SubStr(string(tmp_VedGroup.wYearZ), 3, 2);
+  }
+} // getPeriodVip
+//------------------------------------
+HandleEvent
+cmInit:
+{
+  // GP 812
+  if not CaptureDepartmentTreeContext
+    abort;
+  // GP 812
+  GroupByCategory := ((oParamSvod.prGrouping and 1) > 0);
+  GroupByWorker := ((oParamSvod.prGrouping and 2) > 0);
+  GroupBySex := ((oParamSvod.prGrouping and 4) > 0);
+
+  IsBreaked := False;
+
+  OrganizationRef := coGetTune('MyOrg');
+  LoadVipRef(TaxationInfo, 'OrganizationTaxationInfo');
+  // GP 812
+  ID := 'GP_SvodVed';
+  // GP 812
+  sXLTFileName := oParamSvod.prSvodVedName;
+  // GP 812
+  if (trim(sXLTFileName) = '')
+    sXLTFileName := TranslatePath('%ClientStartPath%XLS_ЭМ\ZP\' + ID + '.xlt');
+  // GP 812
+  case oParamSvod.prVedSvod of
+  0:
+  {
+    if ( oParamSvod.prprvidop = -1 )
+      PRnvidopl := 'по нескольким видам оплат'
+    else
+    {
+      if ( GetFirst klvidopl = tsOk )
+        PRnvidopl := klvidopl.Nvidopl
+      else
+        PRnvidopl := 'по выбранным видам начислений';
+    }
+
+    if ( ( oParamSvod.prPoCexOZ and 1 ) > 0 )
+      tsFlag := RunInterface('Formnc1', oParamSvod, oParamSvod.prUderType, IsBreaked);
+    else
+      tsFlag := RunInterface('Formnc', oParamSvod, oParamSvod.prUderType, IsBreaked);
+
+    if IsBreaked {abort; exit;};
+
+    if ( oParamSvod.prFormType = 0 )
+    {
+      case oParamSvod.prUderType of
+       1:
+       {
+         case oParamSvod.prInOtch of
+          0: OutA.SetGroup('Svodnc');
+          1: OutA.SetGroup('Svodnc1');
+          3: OutA.SetGroup('Svod1proc');
+          2: OutA.SetGroup('Svodproc');
+         end;
+       }
+
+       3: OutA.SetGroup('13zp');
+       4: OutA.SetGroup('ProfVznos');
+       5: OutA.SetGroup('SvodGrPodr');
+       else
+       {
+         if ( (oParamSvod.prInOtch and 1) = 1 )
+           OutA.SetGroup('Svodnc1');
+         else
+           OutA.SetGroup('Svodnc');
+       }
+       end; //case
+     }
+  }
+
+  1:    // по удержаниям
+  {
+    if (oParamSvod.prprvidud = -1) then
+      PRnvidopl := 'по нескольким видам удержаний'
+    else
+    {
+      if GetFirst klvidud where (( oParamSvod.prprvidud == klvidud.vidud )) = 0
+        PRnvidopl := klvidud.NVidUd
+      else
+        PRnvidopl := 'по выбранным видам удержаний';
+    }
+
+    if ( oParamSvod.prPoCexOZ and 1 ) > 0
+      tsFlag := RunInterface('formudOZ', oParamSvod, oParamSvod.prUderType );
+    else
+      tsFlag := RunInterface('FormUd', oParamSvod, oParamSvod.prUderType);
+
+    if IsBreaked {abort; exit;};
+
+    if ( oParamSvod.prFormType = 0 )
+    {
+      case oParamSvod.prUderType of
+       5 : OutA.SetGroup('SvodGrPodrUd');
+       6 : OutA.SetGroup('SvodGrPodrUdR'); // с реквизитами
+      else
+        OutA.SetGroup('SvodUd');
+      end;
+    }
+  }
+
+  2:
+  {
+    wYear := if(oParamSvod.prVedYear3 = 0, YearRas, YearRas - 1);
+
+    if ( YearRas = wYear ) and ( MonthRas = oParamSvod.prVedMonth3 )
+      RunInterface('FormDolg', oParamSvod );
+    else
+      RunInterface('ArxDolg', oParamSvod );
+
+    GroupByWorker := False;
+
+    if ( oParamSvod.prFormType = 0 )
+      OutA.SetGroup('SvodDolg');
+  }
+  end; //case
+
+  if ( getfirst VedGroup <> tsOK )
+  {
+    if getfirst formarks <> tsok
+      message(chr(3)+'В выбранных подразделениях нет лицевых счетов на '+datetostr(date(1,oParamSvod.prVedMonth1,oParamSvod.prVedYear1),'month')+' '+string(oParamSvod.prVedYear1)+'г.',CancelButton);
+    else
+      message(chr(3)+'Не найдена информация для формирования ведомости ',CancelButton);
+    abort; exit;
+  }
+
+  rereadrecord;
+
+  if ( oParamSvod.prFormType = 0 )
+    if (OutA.error) and ( oParamSvod.prFormType = 0 ) { abort; exit; }
+
+  StartNewVisual( vtIndicatorVisual, vfTimer, ''#3'Формирование временной таблицы', RecordsInTable(#VedGroup));
+
+  _loop VedGroup novisual
+  {
+    ClearBuffer(#tmp_VedGroup);
+    tmp_VedGroup.CREC1    := VedGroup.CREC1;     // группировка
+    tmp_VedGroup.CREC2    := VedGroup.CREC2;     // глубина иерархии
+    tmp_VedGroup.CREC3    := VedGroup.CREC3;     // Tabn
+    tmp_VedGroup.CREC4    := VedGroup.CREC4;  
+    tmp_VedGroup.CREC5    := VedGroup.CREC5;
+    tmp_VedGroup.PCOMP1   := VedGroup.PCOMP1;    // cLsch
+    tmp_VedGroup.PCOMP3   := VedGroup.PCOMP3;    // cAppoint
+    tmp_VedGroup.PCOMP4   := VedGroup.PCOMP4;    // _VidOplP
+    tmp_VedGroup.PCOMP5   := VedGroup.PCOMP5;    // _VidOplS
+    tmp_VedGroup.PDOUBLE1 := VedGroup.PDOUBLE1;  // Koldn
+    tmp_VedGroup.PDOUBLE2 := VedGroup.PDOUBLE2;  // Chasf
+    tmp_VedGroup.PDOUBLE3 := VedGroup.PDOUBLE3;  // summa
+    tmp_VedGroup.PDOUBLE4 := VedGroup.PDOUBLE4;  // summa
+    tmp_VedGroup.PDOUBLE5 := VedGroup.PDOUBLE5;  // summa
+    tmp_VedGroup.PDOUBLE6 := VedGroup.PDOUBLE6;
+    tmp_VedGroup.PDOUBLE7 := VedGroup.PDOUBLE7;
+    tmp_VedGroup.PDOUBLE8 := VedGroup.PDOUBLE8;
+    tmp_VedGroup.PDOUBLE9 := VedGroup.PDOUBLE9;
+    tmp_VedGroup.wMesVip  := VedGroup.pWord3;    // MesV
+    tmp_VedGroup.wMesZ    := VedGroup.pWord4;    // Mes
+    tmp_VedGroup.wMesV    := VedGroup.pWord5;    // MesN
+    tmp_VedGroup.wYearV   := VedGroup.pWord6;
+    tmp_VedGroup.wYearZ   := VedGroup.pWord7;
+
+    if ( oParamSvod.prUderType > 4 )
+    {
+      if GetFirst KatPodr Where (( VedGroup.CREC2  ==  KatPodr.NRec)) = tsoK
+      {
+        tmp_VedGroup.CREC6 := KatPodr.cGrPodr;
+
+        if GetFirst GrPodr Where (( KatPodr.cGrPodr  ==  GrPodr.NRec)) =tsoK
+          tmp_VedGroup.PSTRING1 := GrPodr.Name;
+        else
+          tmp_VedGroup.PSTRING1 := 'без группы';
+      }
+      else
+        tmp_VedGroup.PSTRING1 := 'без группы';
+    }
+
+    tmp_VedGroup.PSTRING2 := VedGroup.PSTRING2;
+    //заполняем поле с табельным номером
+    if ( getfirst lschett where ((VedGroup.pComp1 == Lschett.Nrec))= tsOk )
+      tmp_VedGroup.PSTRING3 := GetStrTabn(LSCHETT.TABN, LSCHETT.StrTABN);
+
+    insert current tmp_VedGroup;
+    nextvisual;
+  } // _loop
+
+  StopVisual('',0);
+
+  StartNewVisual( vtIndicatorVisual, vfTimer, ''#3'Печать вспомогательной ведомости', RecordsInTable(#tmp_VedGroup));
+
+  TOA.Bind(0); // связываем TOA с собственной организацией
+
+  if ( oParamSvod.prFormType = 1 )
+  {
+    Set sXLSFileName := pXL.CreateReport(sXLTFileName, true);
+    pXL.CreateVar(sXLSFileName);
+    pXL.SetNumberVar('Заголовок', oParamSvod.prVedSvod);
+    pXL.SetNumberVar('Дата_Форм', oParamSvod.prUderType);
+    pXL.SetNumberVar('Признак', oParamSvod.prInOtch);
+    pXL.SetStringVar('CommonFormHeader', CommonFormHeader);
+    pXL.SetStringVar('Организация', 'ОРГАНИЗАЦИЯ: ' + Trim(TOA1.GetNaming.GetFullName));
+    pXL.SetStringVar('ВидОплаты', LoCase(prnvidopl));
+    pXL.SetStringVar('Год_Расч', String(oParamSvod.prVedYear1));
+    // GP 812
+    pXL.SetStringVar('Отв_Исп', 'Дата составления: '+DateToStr(Cur_Date, 'DD.MM.YYYY')+' Исполнитель: '+sGetTune('User.FIO'));
+    // GP 812
+
+    if ( oParamSvod.prVedSvod = 2 )
+    {
+      pXL.SetStringVar('Дата_Расч', 'за ' + datetostr(to_date(1,oParamSvod.prVedMonth3,YearRas),'month') + ' ' + String(wYear) + 'г.');
+      pXL.SetStringVar('Период_Расч', 'за период с '+ datetostr(to_date(1,oParamSvod.prVedMonth1,YearRas),'mon') +  ' ' +
+                                      String(oParamSvod.prVedYear1) + ' по ' + datetostr(to_date(1,oParamSvod.prVedMonth3,YearRas),'month') +  ' ' +
+                                      String(wYear));
+    }
+    else
+    {
+      pXL.SetStringVar('Дата_Расч', 'за ' + datetostr(to_date(1,oParamSvod.prVedMonth2,YearRas),'month') + ' ' + String(oParamSvod.prVedYear2) + 'г.');
+      pXL.SetStringVar('Период_Расч', 'за период с '+ datetostr(to_date(1,oParamSvod.prVedMonth1,YearRas),'mon') + ' ' +
+                                      String(oParamSvod.prVedYear1) + ' по ' + datetostr(to_date(1,oParamSvod.prVedMonth2,YearRas),'month') + ' ' +
+                                      String(oParamSvod.prVedYear2));
+    }
+  }
+  else
+  {
+    OutA.write( Trim(TOA1.GetNaming.GetFullName) );
+    OutA.write( LoCase(prnvidopl) );
+    OutA.Write( datetostr(to_date(1,oParamSvod.prVedMonth1,YearRas), 'mon') );
+    OutA.Write( oParamSvod.prVedYear1 );
+    OutA.Write( oParamSvod.prLocFlag6 );
+
+    if ( oParamSvod.prVedSvod = 2 )
+    {
+      OutA.Write( datetostr(to_date(1,oParamSvod.prVedMonth3,YearRas),'month') );
+      OutA.Write( wYear );
+    }
+    else
+    {
+      OutA.Write( datetostr(to_date(1,oParamSvod.prVedMonth2,YearRas),'month') );
+      OutA.Write( oParamSvod.prVedYear2 );
+    }
+  }
+
+  TekCex := oParamSvod.proCex;
+  prName := PAF.GetDepartmentFilterStr;
+
+  if ( oParamSvod.prFormType = 1 )
+  {
+    pXL.SetStringVar('Пр_подр', prname);
+    pXL.PublishVar;
+    pXL.CreateTbls(sXLSFileName);
+    pXL.CreateTbl('VedSvod');
+    pXL.CreateTblFld('Удерж');
+    pXL.CreateTblFld('Код_польз');
+    pXL.CreateTblFld('Код_сист');
+    pXL.CreateTblFld('Наим_удерж');
+  }
+  else
+    OutA.write(prname);
+
+  GroupFlag := getfirst tmp_VedGroup;
+
+  while ( GroupFlag = tsOK )  do
+  {
+    QVidOpl   := tmp_VedGroup.cRec4;
+    QVidOplMy := tmp_VedGroup.cRec5;
+
+      case oParamSvod.prVedSvod of
+        0:
+        {
+          if (GetFirst fastfirstrow klvidoplM where ((tmp_VedGroup.cRec5 == klvidoplM.vidopl)) = tsOk )
+          {
+            if ( oParamSvod.prFormType = 0 )
+            {
+              OutA.Write(klvidoplM.vidoplp);
+              OutA.Write(klvidoplM.vidopl);
+              OutA.Write(klvidoplM.Nvidopl);
+            }
+            else
+            {
+              if ( oParamSvod.prUderType < 5 )
+              {
+                pXL.ClearTblBuffer;
+                pXL.SetTblStringFldValue('Код_польз', String(klvidoplM.vidoplp));
+                pXL.SetTblStringFldValue('Код_сист', String(klvidoplM.vidopl));
+                pXL.SetTblStringFldValue('Наим_удерж', String(klvidoplM.Nvidopl));
+                pXL.InsTblRow;
+              }
+            }
+          }
+          else
+          {
+            if ( oParamSvod.prFormType = 0 )
+              OutA.SkipFormat(3);
+          }
+        }
+        1:
+        {
+          if (GetFirst fastfirstrow klvidudM
+            where ((tmp_VedGroup.cRec5 == klvidudM.vidud)) = tsOk )
+          {
+            if (oParamSvod.prFormType = 1)
+            {
+              if ( oParamSvod.prUderType < 5 )
+              {
+                pXL.ClearTblBuffer;
+                pXL.SetTblStringFldValue('Код_польз', String(klvidudM.vidudp));
+                pXL.SetTblStringFldValue('Код_сист', String(klvidudM.vidud));
+                pXL.SetTblStringFldValue('Наим_удерж', String(klvidudM.Nvidud));
+                pXL.InsTblRow;
+              }
+            }
+            else
+            {
+              OutA.Write(klvidudM.vidudp);
+              OutA.Write(klvidudM.vidud);
+              OutA.Write(klvidudM.Nvidud);
+            }
+          }
+
+        }
+        else
+        {
+          if ( oParamSvod.prFormType = 0 )
+            OutA.skipformat(3);
+        }
+      end; //case
+
+     while ( GroupFlag = tsOK ) and ( QVidOpl = tmp_VedGroup.cRec4 ) and
+           ( QVidOplMy = tmp_VedGroup.cRec5 )
+     do
+     {
+       GroupFlag := getnext tmp_VedGroup;
+     }
+  }
+
+  if ( oParamSvod.prFormType = 1 )
+  {
+    pXL.PublishTbl('VedSvod');
+    pXL.CreateTbl('VedSvod1');
+    pXL.CreateTblFld('Уровень');
+    pXL.CreateTblFld('Ном_пп');
+    // GP 812
+    pXL.CreateTblFld('Код_подр');
+    // GP 812
+    pXL.CreateTblFld('Таб_номер');
+    pXL.CreateTblFld('ФИО1');
+    pXL.CreateTblFld('Кат_наим');
+    pXL.CreateTblFld('Код_удерж1');
+    pXL.CreateTblFld('Сумма_удерж1');
+    pXL.CreateTblFld('Сумма_удерж2');
+    pXL.CreateTblFld('Сумма_удерж3');
+    pXL.CreateTblFld('Процент');
+    pXL.CreateTblFld('Сумма_удерж4');
+    pXL.CreateTblFld('Сумма_удерж5');
+    pXL.CreateTblFld('Сумма_удерж6');
+    pXL.CreateTblFld('Сумма_удерж7');
+    pXL.CreateTblFld('Сумма_удерж8');
+    pXL.CreateTblFld('Код_ГНИ');
+    pXL.CreateTblFld('Код_КПП');
+    pXL.CreateTblFld('Код_ОКАТО');
+    pXL.CreateTblFld('Должность');
+    pXL.CreateTblFld('Период');
+    pXL.ClearTblBuffer;
+  }
+  else
+    OutA.PutEventById(feBreak, fcVEDNU_VidOpl);
+
+  Category := 0;
+  Sex := 0;
+
+  for (i := 1; i <= 8; i++)
+    QSummaAll[i] := 0;
+
+  if oParamSvod.prSort = 0
+    GroupFlag := getfirst tmp_VedGroup ordered  by tmp_VedGroup.cRec1, tmp_VedGroup.CREC6, tmp_VedGroup.CREC2,
+         tmp_VedGroup.CREC3, tmp_VedGroup.PSTRING3, tmp_VedGroup.CREC4, tmp_VedGroup.CREC5;
+  else
+    GroupFlag := getfirst tmp_VedGroup ordered  by tmp_VedGroup.cRec1, tmp_VedGroup.CREC6, tmp_VedGroup.CREC2,
+         tmp_VedGroup.PSTRING2(length=30), tmp_VedGroup.CREC3,tmp_VedGroup.PSTRING3, tmp_VedGroup.CREC4, tmp_VedGroup.CREC5;
+
+  while (GroupFlag = tsOK)  do
+  {
+    Category := GetTbl(tmp_VedGroup.cRec1,4);
+
+    if (GroupByCategory)
+    {
+      if ( oParamSvod.prFormType = 0 )
+      {
+        OutA.PutEventByID(feTrue, fcVEDNU_CATEGORYNAME);
+        OutA.Write( getKateg );
+      }
+      else
+      {
+        pXL.ClearTblBuffer;
+        pXL.SetTblStringFldValue('Ном_пп', 'Категория: ' + getKateg );
+        pXL.InsTblRow;
+      }
+    }
+
+    for (i := 1; i <= 8; i++)
+      QSummaPodr[i] := 0;
+
+    while (GroupFlag = tsOK) and (Category = GetTbl(tmp_VedGroup.cRec1,4)) do
+    {
+      Sex := GetTbl(tmp_VedGroup.cRec1,3);
+
+      if (GroupBySex)
+      {
+        if ( oParamSvod.prFormType = 0 )
+        {
+          OutA.PutEventByID(feTrue, fcVEDNU_SexNAME);
+          OutA.Write( sGetSex(Sex, 0) );
+        }
+        else
+        {
+          pXL.ClearTblBuffer;
+          pXL.SetTblStringFldValue('Ном_пп', sGetSex(Sex, 0));
+          pXL.SetTblStringFldValue('Уровень', 'Пол');
+          pXL.InsTblRow;
+        }
+      }
+
+      for (i:= 1; i <= 8; i++)
+        QSummaSex[i] := 0;
+
+      while ( GroupFlag = tsOK ) and ( Category = GetTbl(tmp_VedGroup.cRec1,4) )
+          and (Sex = GetTbl(tmp_VedGroup.cRec1,3)) do
+      {
+        TekGrPodr := tmp_VedGroup.cRec6;
+
+        if ( oParamSvod.prUderType > 4 )
+        {
+          if ( oParamSvod.prFormType = 0 )
+          {
+            OutA.PutEventById(feTrue,fcSchapkaGrPodr);
+            OutA.Write(tmp_VedGroup.PSTRING1)
+          }
+          else
+          {
+            pXL.ClearTblBuffer;
+            pXL.SetTblStringFldValue('Ном_пп', tmp_VedGroup.PSTRING1);
+            pXL.SetTblStringFldValue('Уровень', '3');
+            pXL.InsTblRow;
+          }
+
+          prNameGrPodr := tmp_VedGroup.PSTRING1;
+        }
+
+        for (i := 1; i <= 8; i++)
+          QSummaGrPodr[i] := 0;
+
+        while (GroupFlag = tsOK) and (Category = GetTbl(tmp_VedGroup.cRec1,4))
+              and (Sex = GetTbl(tmp_VedGroup.cRec1,3)) and (TekGrPodr = tmp_VedGroup.cRec6) do
+        {
+          TekCexRec := tmp_VedGroup.cRec2;
+
+          while (GroupFlag = tsOK) and (Category = GetTbl(tmp_VedGroup.cRec1,4))
+                and (Sex = GetTbl(tmp_VedGroup.cRec1,3))and (TekGrPodr = tmp_VedGroup.cRec6)and (TekCexRec = tmp_VedGroup.cRec2) do
+          {
+            if ( ( TekCexRec = 0 ) ) or ( TekCexRec <> 0 )
+            {
+              for(i := 1; i <= 8; i++)
+              {
+                sumtab[i] := 0; sumopl[i] := 0;
+                sumtek[i] := 0; res[i]    := 0;
+                sumlow[i] := 0; sumrec[i] := 0;
+              }
+
+              if ( TekCexRec = 0 ) then
+                KatPodrC.Name := ''
+              else
+                TSFlag1 := getfirst KatPodrC;
+
+              if ( TekCexRec = 0 ) then
+                TSFlag1 := tsOk;
+
+              if ( TSFlag1 = tsok )
+              {
+                Nomp := 1;
+
+                if (GroupFlag = tsOK) and (Category = GetTbl(tmp_VedGroup.cRec1,4))
+                   and (Sex = GetTbl(tmp_VedGroup.cRec1,3))and (TekGrPodr = tmp_VedGroup.cRec6)and (TekCexRec = tmp_VedGroup.cRec2)
+                {
+                  if ( oParamSvod.prFormType = 0 )
+                  {
+                    OutA.PutEventById(feTrue,fcTekVednu);
+                    OutA.Write(KatPodrC.Name)
+                  }
+                  else
+                  {
+                    pXL.ClearTblBuffer;
+
+                    if ( oParamSvod.prUderType < 5 )
+                    {
+                      pXL.SetTblStringFldValue('Уровень', 'Подр');
+                      pXL.SetTblStringFldValue('Ном_пп', KatPodrC.Name);
+                      pXL.InsTblRow;
+                    }
+                  }
+
+                  while (GroupFlag = tsOK) and (Category = GetTbl(tmp_VedGroup.cRec1,4))
+                        and (Sex = GetTbl(tmp_VedGroup.cRec1,3))and (TekGrPodr = tmp_VedGroup.cRec6)and (TekCexRec = tmp_VedGroup.cRec2) do
+                  {
+                    QcLsch  := tmp_VedGroup.pComp1;
+                    cpComp4 := tmp_VedGroup.pComp4;
+                    cpComp5 := tmp_VedGroup.pComp5;
+
+                    var iPF: PersonsFunctions;
+
+                    CurrFio := if(tmp_VedGroup.PSTRING2='','<отсутствует>', iPF.GetStrFIO_ZAR(tmp_VedGroup.PSTRING2));
+                    CurPost := iCatFunc.GetCatalogsName(tmp_VedGroup.pComp3);
+
+                    for (i := 1; i <= 8; i++)
+                      sumtab[i] := 0;
+
+                    if ( oParamSvod.prUderType = 3 ) or ( oParamSvod.prUderType = 4 ) then
+                    {
+                      if (oParamSvod.prFormType = 0)
+                        OutA.write(Nomp);
+                      else
+                      {
+                        pXL.SetTblStringFldValue('Уровень', '5');
+                        pXL.SetTblStringFldValue('Ном_пп', String(Nomp));
+                      }
+
+                      if (oParamSvod.prFormType = 0)
+                      {
+                        OutA.write(tmp_VedGroup.pString3);
+                        OutA.write(CurrFio);
+                        OutA.write(tmp_VedGroup.wMesVip);
+                        OutA.write(tmp_VedGroup.wMesV);
+                        OutA.write(tmp_VedGroup.wMesZ);
+                        OutA.write(tmp_VedGroup.wYearV);
+                        OutA.write(tmp_VedGroup.wYearZ);
+                      }
+                      else
+                      {
+                        pXL.SetTblStringFldValue('Код_подр', sKodePodr); // GP 812
+                        pXL.SetTblStringFldValue('Таб_номер', ''''+tmp_VedGroup.pString3);
+                        pXL.SetTblStringFldValue('ФИО1', CurrFio);
+                        pXL.SetTblStringFldValue('Должность', CurPost );
+                        pXL.SetTblStringFldValue('Период', getPeriodVip );
+                      }
+
+                      if ( (oParamSvod.prInOtch and 1) = 1 )
+                      {
+                        if (trim(CurPost) <> '' )
+                        {
+                          if (oParamSvod.prFormType = 0)
+                          {
+                            if ( oParamSvod.prVedSvod = 0 ) and ( ( oParamSvod.prUderType<>3 ) or ( oParamSvod.prUderType<>4 ) or ( oParamSvod.prUderType<5 ) )
+                              OutA.write(CurPost);
+                            else
+                              OutA.write('('+CurPost+')');
+                          }
+                        }
+                        else
+                          if ( oParamSvod.prFormType = 0 )
+                            OutA.SkipFormat(1);
+                      }
+                      else
+                        if ( oParamSvod.prFormType = 0 )
+                          OutA.SkipFormat(1);
+
+                      if ( oParamSvod.prFormType = 0 )
+                        OutA.SkipFormat(1);
+                    }
+
+                    while (GroupFlag = tsOK) and (Category = GetTbl(tmp_VedGroup.cRec1,4))
+                           and (Sex = GetTbl(tmp_VedGroup.cRec1,3))and (TekGrPodr = tmp_VedGroup.cRec6)and (TekCexRec = tmp_VedGroup.cRec2)
+                           and (QcLsch = tmp_VedGroup.pComp1) do
+                    {
+                      QVidOpl   := tmp_VedGroup.cRec4;
+                      QVidOplMy := tmp_VedGroup.cRec5;
+
+                      for (i:= 1; i <= 8; i++)
+                        sumopl[i] := 0;
+
+                      if ( oParamSvod.prUderType = 0 ) or ( oParamSvod.prUderType = 2 )
+                      {
+                        if ( oParamSvod.prFormType = 0 )
+                          OutA.write(Nomp);
+                        else
+                        {
+                          pXL.SetTblStringFldValue('Уровень', '5');
+                          pXL.SetTblStringFldValue('Ном_пп', String(Nomp));
+                        }
+
+                        if ( oParamSvod.prFormType = 0 )
+                        {
+                          OutA.write(tmp_VedGroup.pString3);
+                          OutA.write(CurrFio);
+                          OutA.write(tmp_VedGroup.wMesVip);
+                          OutA.write(tmp_VedGroup.wMesV);
+                          OutA.write(tmp_VedGroup.wMesZ);
+                          OutA.write(tmp_VedGroup.wYearV);
+                          OutA.write(tmp_VedGroup.wYearZ);
+                        }
+                        else
+                        {
+                          pXL.SetTblStringFldValue('Код_подр', sKodePodr); // GP 812
+                          pXL.SetTblStringFldValue('Таб_номер', ''''+tmp_VedGroup.pString3);
+                          pXL.SetTblStringFldValue('ФИО1', CurrFio);
+                          pXL.SetTblStringFldValue('Должность', CurPost );
+                          pXL.SetTblStringFldValue('Период', getPeriodVip );
+                        }
+
+                        if ((oParamSvod.prInOtch and 1) = 1)
+                        {
+                          if (trim(CurPost) <> '' )
+                          {
+                            if ( oParamSvod.prFormType = 0 )
+                            {
+                              if ( oParamSvod.prVedSvod = 0)and((oParamSvod.prUderType<>3)or(oParamSvod.prUderType<>4)or(oParamSvod.prUderType<5))
+                                OutA.write(CurPost);
+                              else
+                                OutA.write('('+CurPost+')');
+                            }
+                          }
+                          else if (oParamSvod.prFormType = 0) OutA.SkipFormat(1);
+                        }
+                        else
+                          if ( oParamSvod.prFormType = 0 )
+                            OutA.SkipFormat(1);
+
+                          if ( oParamSvod.prFormType = 0 )
+                            OutA.write(QVidOpl);
+                          else
+                            pXL.SetTblStringFldValue('Код_удерж1', QVidOpl);
+                      }
+
+                      while ( GroupFlag = tsOK ) and ( Category = GetTbl(tmp_VedGroup.cRec1,4) )
+                            and ( Sex = GetTbl(tmp_VedGroup.cRec1,3) ) and ( TekGrPodr = tmp_VedGroup.cRec6 ) and ( TekCexRec = tmp_VedGroup.cRec2 )
+                            and ( QcLsch = tmp_VedGroup.pComp1 ) and ( QVidOpl = tmp_VedGroup.cRec4 )and
+                                ( QVidOplMy = tmp_VedGroup.cRec5 ) do
+                      {
+                        if ( oParamSvod.prUderType = 1 ) or ( oParamSvod.prUderType > 4 ) then
+                        {
+                          if (oParamSvod.prFormType = 0)
+                            OutA.write(Nomp);
+                          else
+                          {
+                            pXL.SetTblStringFldValue('Уровень', '5');
+                            pXL.SetTblStringFldValue('Ном_пп', String(Nomp));
+                          }
+
+                          if ( oParamSvod.prFormType = 0 )
+                          {
+                            OutA.write(tmp_VedGroup.pString3);
+                            OutA.write(CurrFio);
+                            OutA.write(tmp_VedGroup.wMesVip);
+                            OutA.write(tmp_VedGroup.wMesV);
+                            OutA.write(tmp_VedGroup.wMesZ);
+                            OutA.write(tmp_VedGroup.wYearV);
+                            OutA.write(tmp_VedGroup.wYearZ);
+                          }
+                          else
+                          {
+                            pXL.SetTblStringFldValue('Код_подр', sKodePodr); // GP 812
+                            pXL.SetTblStringFldValue('Таб_номер', ''''+tmp_VedGroup.pString3);
+                            pXL.SetTblStringFldValue('ФИО1', CurrFio);
+                            pXL.SetTblStringFldValue('Должность', CurPost );
+                            pXL.SetTblStringFldValue('Период', getPeriodVip );
+                          }
+
+                          if ( (oParamSvod.prInOtch and 1) = 1 )
+                          {
+                            if (trim(CurPost) <> '' )
+                            {
+                              if ( oParamSvod.prFormType = 0 )
+                              {
+                                if ( oParamSvod.prVedSvod = 0 ) and ( ( oParamSvod.prUderType<>3 ) or ( oParamSvod.prUderType<>4 ) or ( oParamSvod.prUderType<5 ) )
+                                  OutA.write(CurPost);
+                                else
+                                  OutA.write('('+CurPost+')');
+                              }
+                            }
+                            else
+                              if ( oParamSvod.prFormType = 0 )
+                                OutA.SkipFormat(1);
+                          }
+                          else
+                            if ( oParamSvod.prFormType = 0 )
+                              OutA.SkipFormat(1);
+
+                          if ( oParamSvod.prFormType = 0 )
+                          {
+                            OutA.write(QVidOpl);
+                            OutA.write(tmp_VedGroup.pDouble1, 2);
+                            OutA.write(tmp_VedGroup.pDouble2, 2);
+                            OutA.write(tmp_VedGroup.pDouble3, 2);
+                            OutA.write(tmp_VedGroup.pDouble9, 2);
+                            OutA.write(tmp_VedGroup.pDouble4, 2);
+                            OutA.write(tmp_VedGroup.pDouble5, 2);
+                          }
+                          else
+                          {
+                            if ( oParamSvod.prUderType < 5 )
+                            {
+                              pXL.SetTblStringFldValue('Код_удерж1',QVidOpl);
+                              pXL.SetTblNumberFldValue('Сумма_удерж1', tmp_VedGroup.pDouble1);
+                              pXL.SetTblNumberFldValue('Сумма_удерж2', tmp_VedGroup.pDouble2);
+                              pXL.SetTblNumberFldValue('Сумма_удерж3', tmp_VedGroup.pDouble3);
+                              pXL.SetTblNumberFldValue('Процент', tmp_VedGroup.pDouble9);
+                              pXL.SetTblNumberFldValue('Сумма_удерж4', tmp_VedGroup.pDouble4);
+                              pXL.SetTblNumberFldValue('Сумма_удерж5', tmp_VedGroup.pDouble5);
+                              pXL.SetTblNumberFldValue('Сумма_удерж6', tmp_VedGroup.pDouble6);
+                              pXL.SetTblNumberFldValue('Сумма_удерж7', tmp_VedGroup.pDouble7);
+                              pXL.SetTblNumberFldValue('Сумма_удерж8', tmp_VedGroup.pDouble8);
+
+                              pXL.InsTblRow;
+                            }
+                          }
+
+                          Nomp := Nomp + 1;
+                      }
+
+                      sumopl[1] += round(tmp_VedGroup.pDouble1, 2);
+                      sumopl[2] += round(tmp_VedGroup.pDouble2, 2);
+                      sumopl[3] += round(tmp_VedGroup.pDouble3, 2);
+                      sumopl[4] += round(tmp_VedGroup.pDouble4, 2);
+                      sumopl[5] += round(tmp_VedGroup.pDouble5, 2);
+                      sumopl[6] += round(tmp_VedGroup.pDouble6, 2);
+                      sumopl[7] += round(tmp_VedGroup.pDouble7, 2);
+                      sumopl[8] += round(tmp_VedGroup.pDouble8, 2);
+                      nextvisual;
+
+                      if  oParamSvod.prSort = 0
+                        GroupFlag := getnext tmp_VedGroup ordered  by tmp_VedGroup.cRec1, tmp_VedGroup.CREC6, tmp_VedGroup.CREC2, tmp_VedGroup.CREC3, tmp_VedGroup.PSTRING3, tmp_VedGroup.CREC4, tmp_VedGroup.CREC5;
+                      else
+                        GroupFlag := getnext tmp_VedGroup ordered  by tmp_VedGroup.cRec1, tmp_VedGroup.CREC6,
+                                     tmp_VedGroup.CREC2, tmp_VedGroup.PSTRING2(length=30), tmp_VedGroup.CREC3, tmp_VedGroup.PSTRING3, tmp_VedGroup.CREC4, tmp_VedGroup.CREC5;
+                    }
+
+                    if ( ( oParamSvod.prUderType <> 3 ) and ( oParamSvod.prUderType <> 4 ) ) and ( ( oParamSvod.prUderType <> 1 ) and ( oParamSvod.prUderType < 5 ) )
+                    {
+                      if (oParamSvod.prFormType = 0)
+                      {
+                        for (i:= 1; i <= 5; i++)
+                        {
+                          if i = 4
+                            OutA.SkipFormat(1);
+
+                          OutA.write(sumopl[i], 2);
+                        }
+                      }
+                      else
+                      {
+                        for (i:= 1; i <= 8; i++)
+                          pXL.SetTblNumberFldValue('Сумма_удерж'+ i, sumopl[i]);
+
+                        pXL.InsTblRow;
+                      }
+
+                        if ( oParamSvod.prUderType <> 1 ) and ( oParamSvod.prUderType < 5 ) then
+                          Nomp := Nomp + 1;
+                    }
+
+                    for (i := 1; i <= 8; i++)
+                      sumtab[i] += sumopl[i];
+                  }
+
+                  if ( oParamSvod.prUderType = 3 ) or ( oParamSvod.prUderType = 4 ) then
+                  {
+                    if (oParamSvod.prFormType = 0)
+                    {
+                      for (i:= 1; i <= 5; i++)
+                      {
+                        if i=4
+                          OutA.SkipFormat(1);
+
+                        OutA.write(sumtab[i], 2);
+                      }
+                    }
+                    else
+                    {
+                      for (i:= 1; i <= 8; i++)
+                        pXL.SetTblNumberFldValue('Сумма_удерж' + i, sumtab[i]);
+
+                      pXL.InsTblRow;
+                    }
+
+                    Nomp := Nomp + 1;
+                  }
+
+                  if GroupByWorker
+                  {
+                    if ( oParamSvod.prFormType = 0 )
+                    {
+                      OutA.PutEventById(feTrue,fcItogRab);
+                      OutA.Write(CurrFio);
+
+                      for (i:= 1; i <= 5; i++)
+                        OutA.write(sumtab[i], 2);  // {сумма по работнику}
+                    }
+                    else
+                    {
+                      pXL.ClearTblBuffer;
+                      pXL.SetTblStringFldValue('Уровень', '6');
+                      pXL.SetTblStringFldValue('Ном_пп', 'Итого:');
+                      pXL.SetTblStringFldValue('ФИО1', CurrFio);
+                      pXL.SetTblStringFldValue('Должность', CurPost);
+
+                      for (i:= 1; i <= 8; i++)
+                        pXL.SetTblNumberFldValue('Сумма_удерж'+ i, sumtab[i]);
+
+                      pXL.InsTblRow;
+                    }
+
+                    if (GroupFlag = tsOK) and (Category = GetTbl(tmp_VedGroup.cRec1,1))
+                       and (TekCexRec = tmp_VedGroup.cRec2) then
+                      if (oParamSvod.prFormType = 0)
+                        OutA.PutEventById(feTrue,fcNotLast);
+                  }
+
+                  for (i:= 1; i <= 8; i++)
+                    sumtek[i] += sumtab[i];
+
+                }// while
+
+                if  ( oParamSvod.prUderType = 6) // с реквизитами
+                {
+                  CexozGlub := 0;
+                  cnRecPodrOz := if(cpComp4 = comp(0), cpComp5, cpComp4);
+
+                  if GetBoundOrganization(GetDepartmentReduction(cnRecPodrOz, oParamSvod.prVedGlub), OrganizationRef)
+                    CexozGlub := GetDepartmentReduction(cnRecPodrOz,  oParamSvod.prVedGlub);
+                }
+
+                if ( oParamSvod.prFormType = 0 )
+                {
+                  OutA.PutEventById(feBreak,fcvedteknu);
+                  OutA.Write(KatPodrC.Name);
+
+                  if ( oParamSvod.prUderType = 6) // с реквизитами
+                  {
+                    OutA.Write(GetCodeGNI(CexozGlub));
+                    OutA.Write(GetCodeKPP(CexozGlub));
+                    OutA.Write(GetCodeOKATO(CexozGlub,tmp_VedGroup.pComp4));
+                  }
+                  else
+                    OutA.SkipFormat(3);
+
+                  for (i:= 1; i <= 5; i++)
+                    OutA.write(sumtek[i], 2);  // {сумма по цеху}
+                }
+                else
+                {
+                  pXL.ClearTblBuffer;
+                  pXL.SetTblStringFldValue('Уровень', '7');
+
+                  if ( oParamSvod.prUderType > 4 )
+                  {
+                    pXL.SetTblStringFldValue('Ном_пп', KatPodrC.Name);
+
+                    if ( oParamSvod.prUderType = 6) // с реквизитами
+                    {
+                      pXL.SetTblStringFldValue('Код_ГНИ', GetCodeGNI(CexozGlub));
+                      pXL.SetTblStringFldValue('Код_КПП', GetCodeKPP(CexozGlub));
+                      pXL.SetTblStringFldValue('Код_ОКАТО', GetCodeOKATO(CexozGlub,tmp_VedGroup.pComp4));
+                    }
+                  }
+                  else
+                  {
+                    pXL.SetTblStringFldValue('Ном_пп', 'Итого:');
+                    pXL.SetTblStringFldValue('ФИО1', KatPodrC.Name);
+                  }
+
+                  for (i := 1; i <= 8; i++)
+                    pXL.SetTblNumberFldValue('Сумма_удерж'+ i, sumtek[i]);  // {сумма по цеху}
+
+                  pXL.InsTblRow;
+                }
+
+                LastCex := KatPodrC.Nrec;
+              } // if
+
+              if (TekCexRec = 0) then
+                KatPodrC.Name := ''
+              else
+                TSFlag1 := getfirst KatPodrC;
+
+              if ( sumtek[1] + sumlow[1] <> 0 ) and ( LastCex <> TekCexRec ) and ( TekCexRec <> 0 )
+              {
+                if ( oParamSvod.prFormType = 0 )
+                {
+                  OutA.PutEventById(feTrue,fcItogVednu);
+                  OutA.Write(KatPodrC.Name);
+
+                  for (i := 1; i <= 5; i++)
+                    OutA.Write(sumtek[i] + sumlow[i], 2);   // {сумма по цеху}
+                }
+                else
+                {
+                  pXL.ClearTblBuffer;
+                  pXL.SetTblStringFldValue('Уровень', '8');
+                  pXL.SetTblStringFldValue('Ном_пп', 'Итого:');
+                  pXL.SetTblStringFldValue('ФИО1', KatPodrC.Name);
+
+                  for (i:= 1; i <= 8; i++)
+                    pXL.SetTblNumberFldValue('Сумма_удерж'+ i, sumtek[i] + sumlow[i]);   // {сумма по цеху}
+
+                  pXL.InsTblRow;
+                }
+              }
+            }
+
+            for (i := 1; i <= 8; i++)
+              res[i] := sumtek[i] + sumlow[i];
+
+            var flagvalid: boolean;
+
+            recpar := TekCexRec;
+            flagvalid := (getfirst Zkauved = tsOk);
+
+            if not flagvalid then
+            {
+              ClearBuffer(#Zkauved);
+              Zkauved.cRec1 := TekCexRec;
+            }
+
+            Zkauved.pDouble1 += res[1];
+            Zkauved.pDouble2 += res[2];
+            Zkauved.pDouble3 += res[3];
+            Zkauved.pDouble4 += res[4];
+            Zkauved.pDouble5 += res[5];
+            Zkauved.pDouble6 += res[6];
+            Zkauved.pDouble7 += res[7];
+            Zkauved.pDouble8 += res[8];
+
+            if flagvalid
+              update current Zkauved
+            else
+              insert current Zkauved;
+
+            if getfirst Zkauved = tsOk then
+            {
+              QSummaPodr[1]   += Zkauved.pDouble1;
+              QSummaPodr[2]   += Zkauved.pDouble2;
+              QSummaPodr[3]   += Zkauved.pDouble3;
+              QSummaPodr[4]   += Zkauved.pDouble4;
+              QSummaPodr[5]   += Zkauved.pDouble5;
+              QSummaPodr[6]   += Zkauved.pDouble6;
+              QSummaPodr[7]   += Zkauved.pDouble7;
+              QSummaPodr[8]   += Zkauved.pDouble8;
+
+              QSummaSex[1]    += Zkauved.pDouble1;
+              QSummaSex[2]    += Zkauved.pDouble2;
+              QSummaSex[3]    += Zkauved.pDouble3;
+              QSummaSex[4]    += Zkauved.pDouble4;
+              QSummaSex[5]    += Zkauved.pDouble5;
+              QSummaSex[6]    += Zkauved.pDouble6;
+              QSummaSex[7]    += Zkauved.pDouble7;
+              QSummaSex[8]    += Zkauved.pDouble8;
+
+              QSummaGrPodr[1] +=  Zkauved.pDouble1;
+              QSummaGrPodr[2] +=  Zkauved.pDouble2;
+              QSummaGrPodr[3] +=  Zkauved.pDouble3;
+              QSummaGrPodr[4] +=  Zkauved.pDouble4;
+              QSummaGrPodr[5] +=  Zkauved.pDouble5;
+              QSummaGrPodr[6] +=  Zkauved.pDouble6;
+              QSummaGrPodr[7] +=  Zkauved.pDouble7;
+              QSummaGrPodr[8] +=  Zkauved.pDouble8;
+            }
+          }
+
+          if (oParamSvod.prFormType = 0)
+            OutA.PutEventById(feBreak,fcvedmainnu);
+
+          TekCex :=  oParamSvod.proCex;
+
+          delete all Zkauved;
+        }
+      }
+
+      if ( oParamSvod.prUderType > 4 )
+      {
+        if ( oParamSvod.prFormType = 0 )
+        {
+          OutA.PutEventByID(feTrue, fcVEDNU_GrPodrITOG);
+          OutA.Write(prNameGrPodr);
+
+          for (i:= 1; i <= 5; i++)
+            OutA.write(QSummaGrPodr[i], 2);
+        }
+        else
+        {
+          pXL.ClearTblBuffer;
+          pXL.SetTblStringFldValue('Уровень', '9');
+          pXL.SetTblStringFldValue('Ном_пп', 'Итого:');
+          pXL.SetTblStringFldValue('ФИО1', prNameGrPodr);
+
+          for (i:= 1; i <= 8; i++)
+            pXL.SetTblNumberFldValue('Сумма_удерж'+ i, QSummaGrPodr[i]);
+
+          pXL.InsTblRow;
+        }
+      }
+    }
+
+    if (oParamSvod.prFormType = 0)
+      OutA.PutEventById(feBreak,fcVedNuGrPodr);
+
+    if (GroupBySex)
+    {
+      if (oParamSvod.prFormType = 0)
+      {
+        OutA.PutEventByID(feTrue, fcVEDNU_SexITOG);
+        OutA.Write( sGetSex(Sex, 1) );
+
+        for (i := 1; i <= 5; i++)
+          OutA.write(QSummaSex[i], 2);
+      }
+      else
+      {
+        pXL.ClearTblBuffer;
+        pXL.SetTblStringFldValue('Уровень', '10');
+        pXL.SetTblStringFldValue('Ном_пп', 'Итого по:');
+        pXL.SetTblStringFldValue('ФИО1', sGetSex(Sex, 1) );
+
+        for (i:= 1; i <= 8; i++)
+          pXL.SetTblNumberFldValue('Сумма_удерж'+ i, QSummaSex[i]);
+
+        pXL.InsTblRow;
+
+      }
+    }
+  }
+
+  if ( oParamSvod.prFormType = 0 )
+    OutA.PutEventById(feBreak, fcVEDNU_Sex);
+
+  for (i:= 1; i <= 8; i++)
+    QSummaAll[i] += QSummaPodr[i];
+
+  if ( GroupByCategory )
+  {
+    if ( oParamSvod.prFormType = 0 )
+    {
+      OutA.PutEventByID(feTrue, fcVEDNU_CATEGITOG);
+      OutA.Write('категории "' + getKateg + '"');
+
+        for (i:= 1; i <= 5; i++)
+          OutA.write(QSummaPodr[i], 2);
+      }
+      else
+      {
+        pXL.ClearTblBuffer;
+        pXL.SetTblStringFldValue('Уровень', '11');
+        pXL.SetTblStringFldValue('Ном_пп', 'Итого по:');
+        pXL.SetTblStringFldValue('ФИО1', 'категории "' + getKateg +'"');
+
+        for (i:= 1; i <= 8; i++)
+          pXL.SetTblNumberFldValue('Сумма_удерж'+ i, QSummaPodr[i]);
+
+        pXL.InsTblRow;
+      }
+    }
+  }
+
+  if ( oParamSvod.prFormType = 0 )
+  {
+    OutA.PutEventById(feBreak, fcVEDNU_CATEGORY);
+
+    prName := CLSF.GetDepartmentFilterStr;
+    OutA.write(prname);
+
+    for (i:= 1; i <= 5; i++)
+      OutA.write(QSummaAll[i], 2);
+
+    StopVisual('',0);
+
+    if ( not OutA.error )
+      OutA.showFile('')
+    else
+      OutA.abortForm;
+  }
+  else
+  {
+    pXL.ClearTblBuffer;
+    pXL.SetTblStringFldValue('Уровень', '12');
+    pXL.SetTblStringFldValue('Ном_пп', 'Итого по:');
+    pXL.SetTblStringFldValue('ФИО1', CLSF.GetDepartmentFilterStr);
+
+    for (i := 1; i <= 8; i++)
+      pXL.SetTblNumberFldValue('Сумма_удерж'+ i, QSummaAll[i]);
+
+    pXL.InsTblRow;
+
+    StopVisual('',0);
+
+    pXL.PublishTbl('VedSvod1'); // 'VedSvod1'
+    pXL.LoadReport(sXLSFileName);
+    pXL.DisConnectExcel;
+  }
+  Abort;
+}  // cmInit
+end; //HandleEvent
+end.   //interface

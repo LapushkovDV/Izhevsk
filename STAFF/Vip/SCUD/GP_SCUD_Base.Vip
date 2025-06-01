@@ -1,0 +1,491 @@
+/*************************************************************************************************\
+* Наименование: СКУД Базовый интерфейс                                                            *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#175          |20/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include Query.vih
+#include GetKau.Vih
+#include CatFunc.Vih
+#include ChoiseYourPersons.vih
+#include FRRecordDefinition.vih
+//---------------------------------
+#include CLSFUNCS.VIH // ф-ии пересканирования текущих л/с
+//---------------------------------
+#include GP_PickTypeDocs.Vih
+#include GP_Status.vih
+#include GP_StatusChange.vih
+#include GP_StatusAccessEdit.vih
+#include GP_VisibleHidden.vih //KBU
+#include GP_Protector.Vih
+#include GP_UserAccessService.vih
+
+#include GP_KPI_AlG.Vih
+#include GP_KPI_RaiseEdit.Vih
+//--------------------------
+#include GP_SCUD_Base.Vih
+//--------------------------
+#doc
+СКУД Базовый интерфейс
+#end
+
+//-------------------------------------
+Interface GP_SCUD_Base 'Базовый для Скуда';
+//-------------------------------------
+Var
+//----------------------------------------
+// объекты
+//----------------------------------------
+  iGP_VisibleHidden   : GP_VisibleHidden;     // скрыть/показать поля
+  DataProtector       : IGP_Protector2;//защита полей от модификации
+  UserAccessService   : GP_UserAccessService NoAuto;//cgiSingleEdit
+  StatusChange        : GP_StatusChange NoAuto;
+  Status              : GP_Status NoAuto;
+  //-- пометка подразделения
+  //CLSF: CurLSFunctions;
+  DA: IDepartmentAvailability(CurLSFunctions);
+  _PodrMArkerPointer        : Longint; // сам маркер по подразделениям
+  isPodrShare: boolean;// есть ограничение по подразделениям в зарплате
+  boPositionChange_Lock: boolean;
+  boDataProtector:boolean; // признак загрузки DataProtector
+  sTitle_Filter    :string;
+  wCount_Filter    :word;
+  sTitle_Interface:string;
+//----------------------------------------
+  wTypeDoc:word; // тип документа - установить в каждом объекте
+  wIntMode:word; // Режим работы
+  pDoc :comp; // Для установки статусов
+  pTmp :comp; // временная для выбора
+  pStatus_GetDefault  : comp; // статус по умолчанию
+  wTable_Stat:word;// для отбора статусов
+  isOpenSearch:boolean; //признак запуска быстрого выбора
+  isProtect,isProtect2 :boolean; //защищенный выбор
+  isProtect_Set :boolean=false;// признак первой установки
+  RoleGroupName    :string;
+  boWinEdit        :boolean;//признак открытия окна редактирования
+  isFilterRun:boolean;//признак работы фильтра
+  boVisibleRun:boolean; //тип запуска - false как объект
+  sUserName:string; // логин пользователя
+  fCurMainFormat    :longint; // список документов   - определить в CmInit
+  fCurMainFormatEdit:longint; // окно редактирования - определить в CmInit
+  pUserID :comp;// ID текущего пользователя
+  boStatus_Init:boolean; // результат Status_Init
+  Marker_New :longint;//На новые отключаем фильтр, пока не применят снова.
+//----------------------------------------
+Create view
+as select Gp_TypeDocs_Find.nrec
+From
+  Gp_TypeDocs Gp_TypeDocs_Find
+, GP_StatusChangeLog(STATUSCHANGELOG02)
+where ((
+   wTypeDoc == Gp_TypeDocs_Find.wType(noindex)
+//---------------
+and wTable_Stat    == GP_StatusChangeLog.wTbl
+and pDoc           == GP_StatusChangeLog.cDoc
+));
+
+//**************************************
+create view vSpr_base
+var sUserName_base:string;
+from Zar_User
+where ((
+ sUserName_base ==  Zar_User.OwnName
+));
+
+
+//------------------------------------
+// Наименование интерфейса
+//------------------------------------
+Function GetInterfaceName:string;
+{ Result:=#(__InterfaceName__);
+}
+
+//------------------------------------
+// Запретить/разрешить вставку
+//------------------------------------
+Procedure EnableDisableInsert(_Enable:boolean);
+{ if _Enable
+  { EnableCommand(cmInsert);
+    EnableCommand(cmEdit);
+    EnableCommand(cmAddNewRec);
+    EnableCommand(cmInsertRecord);
+    EnableCommand(cmSetDefault);
+
+
+  }
+  else
+  { DisableCommand(cmInsert);
+    DisableCommand(cmEdit);
+    DisableCommand(cmAddNewRec);
+    DisableCommand(cmInsertRecord);
+    DisableCommand(cmSetDefault);
+  }
+
+}//Function EnableDisableInsert(_Enable:boolean);
+
+//------------------------------------
+// Запретить/разрешить удаление
+//------------------------------------
+Procedure EnableDisableDelete(_Enable:boolean);
+{ if _Enable
+  { EnableCommand(cmDelete);
+    EnableCommand(cmDeleteRecord);
+  }
+  else
+  { DisableCommand(cmDelete);
+    DisableCommand(cmDeleteRecord);
+  }
+} //Function EnableDisableDelete(_Enable:boolean);
+
+//-----------------------------------
+// Установить стартовое состояние
+//-----------------------------------
+Procedure SetDocStateStart;
+{ EnableDisableInsert(UserAccessService.CanIns(wTypeDoc));
+}
+
+//-----------------------------------
+// Установить состояние полей
+//-----------------------------------
+Function SetDocFieldsState: boolean;
+{ Result:=true;
+  var _StatusDoc:comp=GetStatusDoc();
+  if  _StatusDoc=0 then exit;
+  var _FieldStatus:longint=GetFieldStatus();
+  if  _FieldStatus=0 then Exit;
+  var _CanDel   :boolean=true;
+  var _CanChange:boolean=true;
+
+
+  _CanDel:=False;
+  if wTypeDoc<>GP_iSC_Events_From_Scud
+  { _CanDel:=UserAccessService.CanDel(_StatusDoc);
+  }
+  EnableDisableDelete(_CanDel);
+  _CanChange:=StatusChange.CanChangeStatus(_StatusDoc);
+  //if timelog_status>2 timelog('GP_SCUD_BASE->SetDocFieldsState:_CanChange='+string(_CanChange)+', CanDel='+string(_CanDel) );
+  if _CanChange
+  { if _CanDel
+      SetHelpAndStatusContext(fCurMainFormatEdit, _FieldStatus, sci13478Esc, hcKeepCurrent);
+    else
+       SetHelpAndStatusContext(fCurMainFormatEdit, _FieldStatus, sci1478EscIns, hcKeepCurrent);
+    SetInputLineFlags(fCurMainFormatEdit, _FieldStatus, inPickButton);
+  }
+  else
+  { if _CanDel
+      SetHelpAndStatusContext(fCurMainFormatEdit, _FieldStatus, sci178Esc, hcKeepCurrent);
+    else
+      SetHelpAndStatusContext(fCurMainFormatEdit, _FieldStatus, sci1Esc, hcKeepCurrent);
+    SetInputLineFlags(fCurMainFormatEdit, _FieldStatus, 0);
+  }
+} //Function SetDocFieldsState: boolean;
+
+
+//---------------------------------------
+// Разрешение на редактирование
+//---------------------------------------
+Function CanEditTbl:boolean;
+var _pStatus:comp;
+{ Result:=((wIntMode and cgiNotEdit)=0) and (wIntMode<>cgiPick) and (wIntMode<>cgiPickMult);
+  if not Result Exit;
+  _pStatus:=GetStatusDoc();
+  result:=UserAccessService.CanEdit(_pStatus);
+  //if timelog_status>0    timelog(GetInterfaceName+'CanEditTbl->pStatus='+string(_pStatus,0,0)+', Result='+string(Result));
+  if not Result exit;
+} //Function CanEditTbl:boolean;
+
+Procedure LoadProtector;
+{  if boDataProtector then exit;
+   boDataProtector:=true;
+   LoadVipRef(DataProtector, 'GP_Protector');
+   DataProtector.LinkToExt(cfsGetCurrentContainerSelf, '', true);
+
+   DataProtector.ProtectedStatusCtx := sci1EscIns;
+   DataProtector.AutoPalette := true;
+   if (UserAccessService.CanIns(wTypeDoc))
+   { DataProtector.ProtectedStatusCtx := sci17EnIns;
+   }
+}
+
+procedure SetEditMode(Value: boolean);
+{
+  //timelog(GetInterfaceName+'->SetEditMode:Value='+string(Value));
+  if (isProtect=(not Value)) and isProtect_Set
+  {
+    SetDocFieldsState;
+//    exit; // не будем повторно ставить
+  }
+  else
+  {
+    if boVisibleRun
+    { LoadProtector;
+      DataProtector.SetProtected(not Value);
+    }
+    else
+    { ProtectRecord(CurTable,Not Value);
+    }
+    if Value
+      cfsSetProp(cfsGetCurrentContainerSelf, cfpPalette, wpBlueWindow);
+    else
+      cfsSetProp(cfsGetCurrentContainerSelf, cfpPalette, wpCyanWindow);
+    isProtect:=not Value;
+    isProtect_Set:=true;
+    SetDocFieldsState;
+  }
+  //timelog(GetInterfaceName+'->SetEditMode finish=');
+} //Procedure SetEditMode(_isEdit:boolean);
+
+
+
+Function Status_Init(_wType:word):boolean;
+{ Result:=False;
+  if _wType=0 then exit;
+  if wTypeDoc<>_wType
+  or (Status=NullRef)
+  { wTypeDoc:=_wType;
+    if getfirst GP_TypeDocs_Find<>tsok then
+    { Message('Не нашли запись в справочнике документов для типа '+string(_wType)
+       +chr(13)+'Зайдите в  Управление персоналом - СКУД - Настройки - Настройки доступа к документам' );
+      exit;
+    }
+    //if (Status=NullRef)
+    Status:=New(GP_Status,InitForTypeDoc(GP_TypeDocs_Find.Name));
+  }
+  else Result:=True;
+} //Function Status_Init(_wType:word):boolean;
+
+//--------- выполнить проверку перед изменением статуса
+Function Check_Status_Change_Before(_pStatus:comp):boolean;
+{ Result:=true;
+  Timelog(GeTInterFaceName+'->Check_Status_Change_Before,_pStatus= '+string(_pStatus,0,0) );
+  _pStatus:=_pStatus;
+} //Function Check_Status_Change_Before:boolean;
+
+//--------- выполнить проверку после изменения статуса
+Function Check_Status_Change_After(_pStatus:comp;_pStatusTo:comp):boolean;
+{ #__UNUSED__(_pStatus,_pStatusTo)
+  Result:=True;
+} //Function Check_Status_Change_After:boolean;
+
+//-------------------------------------
+// Установить статус
+// возвращает Nrec для установки статуса
+//-------------------------------------
+function ChangeStatus(pDoc:comp;StatusChangeLog:type$GP_StatusChangeLog):comp;
+var Rez:integer;
+{
+  result:=0;
+  Timelog(GeTInterFaceName+'->ChangeStatus:StatusChangeLog.cStatusFrom='+String(StatusChangeLog.cStatusFrom,0,0));
+  if not Check_Status_Change_Before(StatusChangeLog.cStatusFrom)
+  { Timelog(GeTInterFaceName+'->ChangeStatus:Result='+String(Result));
+    exit;
+  }
+  Timelog(GeTInterFaceName+'->ChangeStatus 001');
+  Status_Init(wTypeDoc);
+  //Начало транзакции
+  Rez:=BeginConcurrentTransaction(trNoLock);
+  if (Rez<>tsok)
+    message('Ошибка открытия транзакции - '+string(Rez),error);
+  else {
+    GP_StatusChangeLog.buffer:=StatusChangeLog;
+    GP_StatusChangeLog.NRec:=0;
+    GP_StatusChangeLog.wTbl:=coGP_Scud_Doc;
+    GP_StatusChangeLog.cDoc:=pDoc;
+    GP_StatusChangeLog.DateOper:=_CurDateTime;
+    GP_StatusChangeLog.cUser:=UserId;
+    Rez:=insert current GP_StatusChangeLog;
+    if (Rez<>tsok)
+      message('Ошибка вставки записи в таблицу GP_StatusChangeLog - '+string(Rez),error);
+
+    if (Rez=tsok) {
+      Result:=StatusChangeLog.cStatusTo;
+      if (Rez<>tsok)
+        message('Ошибка модификации записи в таблице GP_KPI_Statements - '+string(Rez),error);
+    }
+
+    if (Rez=tsok) {//Запись в БД
+      Rez:=EndTransaction;
+      if (Rez<>tsOK)
+      {  message('Ошибка завершения транзакции - '+string(Rez),error);
+         result:=0;
+      }
+    } else {//Откат
+      Rez:=AbortTransaction;
+      if (Rez<>tsOK)
+      { message('Ошибка отката транзакции - '+string(Rez),error);
+        Result:=0
+      }
+    }
+  }
+  Timelog(GeTInterFaceName+'->ChangeStatus Final ='+String(Result,0,0));
+  if Result<>0
+  { //Check_Status_Change_After(Result); - будем проверять только если переведен с дефалта
+    Check_Status_Change_After(StatusChangeLog.cStatusFrom,Result);
+
+  }
+} //function ChangeStatus(pDoc:comp;StatusChangeLog:type$GP_StatusChangeLog):comp;
+
+Function GetPodrShare :boolean;
+{ Result:= vSpr_base.ZAR_USER.PODRSHARE = '+'
+}//Function PodrShare :boolean;
+
+//------------------------------------
+// Доступность подразделения по зарплатным правам.
+//------------------------------------
+Function EnablePodr(_cPodr:comp) :boolean; cacheable;
+{
+  Result:=if(isPodrShare,DA.IsAvailable(_cPodr),true);
+} //Function AVaiblePodr(_cPodr:comp) :comp; cacheable;
+
+Procedure MySetTitle(_sTitle_Dop:string='');
+var ww_str:string;
+{ if sTitle_InterFace='' exit;
+  ww_str:=sTitle_InterFace+if(sTitle_Filter<>'',', фильтр: '+sTitle_Filter,'')+if(_sTitle_Dop<>'',' '+_sTitle_Dop,'');
+  SetTitle(ww_str);
+}
+//-----------------------------------------
+// инициализация интерфейса
+//-----------------------------------------
+Procedure LoadInterface(_boVisibleRun:boolean);
+{ isFilterRun:=True;
+  timelog_init;
+  timelog(GetInterfaceName+'->LoadInterface:Start');
+  boVisibleRun:=_boVisibleRun;
+  sUserName :=UserName();
+  vSpr_Base.sUserName_base:=sUserName;
+  if vSpr_Base.getfirst Zar_user=tsok {}
+
+  //------------------------------
+  isPodrShare:=GetPodrShare;
+  //------------------------------
+  Timelog_init;
+  //------------------------------
+  pUserID:=UserId();
+  //-----------------------------
+  Marker_New:=InitMarker('' , 8, 50, 10, True);
+  //-----------------------------
+
+  RoleGroupName:='СКУД';
+  UserAccessService:=New(GP_UserAccessService,InitForRoleGroup(RoleGroupName));
+  //timelog(GetInterfaceName+'->LoadInterface:003 ');
+  if (UserAccessService=NullRef) {
+        abort;
+        exit;
+  }
+  //------------------------------
+  boDataProtector:=false;
+  if boVisibleRun
+  { LoadProtector;
+  }
+  //timelog(GetInterfaceName+'->LoadInterface:002');
+  wTypeDoc:=GetTypeDoc;
+  //timelog(GetInterfaceName+'->LoadInterface:004');
+  Status_Init(wTypeDoc);
+  if not NullVipRef(Status)
+    pStatus_GetDefault:=Status.GetDefault();
+  timelog(GetInterfaceName+'->LoadInterface:005 pStatus_GetDefault='+string(pStatus_GetDefault,0,0));
+  //------------------
+  //timelog(GetInterfaceName+'->LoadInterface:006');
+  //-----------------------------
+  StatusChange:=New(GP_StatusChange,InitForRoleGroup(UserAccessService.RoleGroup));
+  //-----------------------------
+  fCurMainFormatEdit:=GetCurrentFormat;
+  //-------------------------
+  SetDocStateStart;
+  //-------------------------
+  sTitle_InterFace:='';
+  if boVisibleRun
+  { if(cfsSetCurrentContainer(cfsGetCurrentContainerSelf) <> cfOk)
+    {
+    }
+    cfsGetProp('GP_STAFF::'+GetInterfaceName,cfpTitle,sTitle_InterFace);
+  }
+  if timelog_status>0 timelog(GetInterfaceName+'->LoadInterface:Final');
+} //Procedure LoadInterface(_wVisibleRun:boolean);
+
+//---------------------------------------------
+// Выгрузчик интерфейса
+//---------------------------------------------
+Procedure UnLoadInterface(_boVisibleRun:boolean);
+{ _boVisibleRun:=_boVisibleRun;
+  if DataProtector<>NullRef
+  { FreeVipInterface(DataProtector);
+  }
+  //-----------------------------
+  DoneMarker(Marker_New,'');
+  //-----------------------------
+
+  //чтобы не ругался компилятор
+  if False
+  { CanEditTbl;
+    EnablePodr(0);
+  }
+} //Procedure UnLoadInterface(_wRunType:word);
+
+
+#doc
+ Получить поле со статусом
+#end
+Function GetFieldStatus:longint;
+{ Result:=0;//#GP_Status.Name
+
+}
+
+#doc
+ Установить позицию
+#end
+Function GetStatusDoc:comp;
+{ Result:=Status.GetDefault;
+}
+
+
+#doc
+ Получить статус
+#end
+Function SetDocPosition(_wTypeDoc:word;_cDoc:comp;_cDocSp:comp):boolean;//Abstract;
+{ Result:=True;
+  _wTypeDoc:=_wTypeDoc;_cDoc:=_cDoc;_cDocSp:=_cDocSp;
+}
+
+//----------------------------------------
+// переопределить в наследника
+//----------------------------------------
+Function GetTypeDoc:word;
+{ Result:=1001; //
+
+}
+
+
+//******************************************************************************
+// HandleEvent таблиц
+//******************************************************************************
+
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+HandleEvent
+cmInit:
+{ LoadInterFace(true)
+}
+cmOnVipLoad:
+{ LoadInterFace(False)
+}
+cmDone:
+{ UnLoadInterFace(true)
+}
+cmOnVipUnLoad:
+{ UnLoadInterFace(False)
+}
+cmOpenSearch :
+{ isOpenSearch:= true;
+  if boWinEdit
+  { ProcessCommand(cmPick);
+  }
+  isOpenSearch:= false;
+}
+end;
+end.

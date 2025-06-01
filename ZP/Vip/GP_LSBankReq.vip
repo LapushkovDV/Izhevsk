@@ -1,0 +1,200 @@
+/*************************************************************************************************\
+* Наименование: Библиотека для работы с банковскими реквизитами лицевого счета                    *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи |Дата    |Исполнитель             |Проект                             *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1668         |17/01/18|Тищенко Р.Н.             |НПО Энергомаш                    *
+* Разработка  |#2356_EM-73   |30/11/19|Торохов А.П.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include ZBankCard_Func.vih
+#include GP_LSBankReq.vih
+
+interface GP_LSBankReq;
+
+  const
+    // Диапазон для перечисления з/п 206...210, 220...230, для перечисления аванса 141...145, 199
+    // На Энергомаше для этих целей используются следующие удержания - копируем только их:
+    VID_UD_Z = 220; // Системный код постоянного удержания по перечислению з/п (польз.код 999)
+    VID_UD_A = 141; // Системный код постоянного удержания по перечислению аванса (польз.код 226)
+  end;
+#IfDef _2019_02_13_
+#include PometkaRP.inc
+#EndIf
+
+  var iZBankCard_Func: ZBankCard_Func new;
+
+  create view
+    from
+      LSchet,
+      Shtraf,
+      synonym LSchet LSchetD,
+      synonym Shtraf ShtrafD,
+      ZBankCard      
+    where ((
+      Shtraf.VidUd == KlVidUd.VidUd
+    ))
+  ;
+
+  // Выводит сообщение об ошибке
+  procedure ErrorMessage(S: String);
+  begin
+    Message(S);
+  end;
+
+  // Копирует данные с закладки "Банк" лицевого счета
+  function CopyLSBank: boolean;
+  begin
+    LSchetD.Summa27 := LSchet.Summa27;
+    LSchetD.cPodr := LSchet.cPodr;
+    LSchetD.cLSchDop := LSchet.cLSchDop;
+    LSchetD.Pasport := LSchet.Pasport;
+    LSchetD.NomCard := LSchet.NomCard;
+    //#2356_EM-73 - копирование банковских реквизитов
+    LSchetD.cBankCard := LSchet.cBankCard; 
+    if update current LSchetD != tsOk then
+    begin
+      result := false;
+      Message(''#3'Не удалось скопировать данные из смежного лицевого счета', Error);
+    end else
+    begin
+      result := true;
+      //#2356_EM-73 - создание банковских реквизитов      
+      If(GetFirst FastFirstRow ZBankCard where((LSchetD.cBankCard == ZBankCard.nrec))<>TsOk)
+      {        
+        iZBankCard_Func.fboCreateBankCardLS(LSchetD.nrec);
+      }
+    end  
+  end;
+
+  // Обновление полей, которые копируются и при создании нового пост.удержания,
+  // и при обновлении существующего
+  procedure CopyShtrafFields;
+  begin
+    ShtrafD.cPol := Shtraf.cPol;
+    ShtrafD.cBankPol := Shtraf.cBankPol;
+    ShtrafD.NomLSh := Shtraf.NomLSh;
+    ShtrafD.NomCard := Shtraf.NomCard;
+    ShtrafD.LastUser := Shtraf.LastUser;
+    ShtrafD.PayNum := Shtraf.PayNum;
+    ShtrafD.NamePl1 := Shtraf.NamePl1;
+    ShtrafD.NamePl2 := Shtraf.NamePl2;
+    //#2356_EM-73 - копирование банковских реквизитов
+    ShtrafD.cBankCard := Shtraf.cBankCard;
+    If(GetFirst FastFirstRow ZBankCard where((ShtrafD.cBankCard == ZBankCard.nrec))<>TsOk)
+    {        
+      ShtrafD.cBankCard := LSchetD.cBankCard;
+    }    
+  end;
+
+  // Копирует одно постоянное удержание
+  function CopyShtraf(_StartPerDt: Date): boolean;
+  begin
+    result := true;
+    // Если в лицевом счете, в который выполняется копирование постоянное удержание с указанным кодом уже есть
+    if getFirst ShtrafD where ((
+          LSchetD.NRec == ShtrafD.cLSch
+      and Shtraf.Vidud == ShtrafD.VidUd
+!      and (ShtrafD.Pometka != coInactiveRP and ShtrafD.Pometka != coArchivedRP)
+    )) = tsOk then
+    begin
+      // обновляем данные в этой постоянном удержании
+      CopyShtrafFields;
+      if update current ShtrafD != tsOk then
+      begin
+        result := false;
+        Message(''#3'Не удалось обновить постоянное'#13#3'удержание с сист.кодом ' + To_Char(Shtraf.Vidud), Error);
+      end;
+    end else
+    begin
+      // добавляем новое постоянном удержании
+      clearBuffer(#ShtrafD);
+      ShtrafD.TabN := LSchetD.TabN;
+      ShtrafD.StrTabN := LSchetD.StrTabN;
+      ShtrafD.cLSch := LSchetD.NRec;
+      ShtrafD.tPerson := LSchetD.tPerson;
+      ShtrafD.Cex := LSchetD.Cex;
+      ShtrafD.Pometka := Shtraf.Pometka;
+      ShtrafD.VidUd := Shtraf.Vidud;
+      ShtrafD.PrPer := Shtraf.PrPer;
+      ShtrafD.FIO := Shtraf.FIO;
+      ShtrafD.Flag3 := Shtraf.Flag3;
+      ShtrafD.DataN := _StartPerDt;
+      CopyShtrafFields;
+      if insert current ShtrafD != tsOk then
+      begin
+        result := false;
+        Message(''#3'Не удалось добавить постоянное'#13#3'удержание с сист.кодом ' + To_Char(Shtraf.Vidud), Error);
+      end;
+    end;    
+  end;
+
+  // Копирует постоянное удержание с указанным системным кодом или заменяет в нем реквизиты
+  // по перечислению, если такое удержание уже есть
+  function CopyShtrafs(_StartPerDt: Date): Boolean;
+  begin
+    result := true;
+    // Обрабатываем все активные постоянные удержания
+    _loop Shtraf where ((
+          LSchet.NRec == Shtraf.cLSch
+      and (Shtraf.Pometka != coInactiveRP and Shtraf.Pometka != coArchivedRP)
+    ))
+    begin
+      // Если у вида удержания в поле "Учитывать как" выбрано "перечисление"
+      if KlVidUd.VHVO3 = '0' then 
+        // Копируем постоянное удержание
+        if not CopyShtraf(_StartPerDt) then
+          // Если при копировании была ошибка
+          if result then
+            // Функция CopyShtrafs вернет false
+            result := false;
+    end;
+  end;
+
+  // Копирует банковские реквизиты
+  // _cLSchetSrc - ссылка на лицевой счет, из которого копируются банковские реквизиты
+  // _cLSchetDst - ссылка на лицевой счет, в который копируются банковские реквизиты
+  // _SilentMode - если true, сообщения об ошибках при копировании не выводятся
+  // _StartPerDt - значение поля "Начало пересчета" для создаваемых удержаний
+  function CopyBankReq(_cLSchetSrc: tNRec; _cLSchetDst: tNRec; _SilentMode: Boolean = false; _StartPerDt: Date = ZeroDate): Boolean;
+  begin    
+    result := true;
+    if getFirst LSchet where ((_cLSchetSrc == LSchet.NRec)) != tsOk then
+    begin
+      result := false;
+      if not _SilentMode then
+        ErrorMessage('Не найден лицевой счет с NRec ' + To_Char(_cLSchetSrc, 0, 0));
+      exit;
+    end;
+    if getFirst LSchetD where ((_cLSchetDst == LSchetD.NRec)) != tsOk then
+    begin
+      result := false;
+      if not _SilentMode then
+        ErrorMessage('Не найден лицевой счет с NRec ' + To_Char(_cLSchetDst, 0, 0));
+      exit;
+    end;
+    if result then
+      result := CopyLSBank;
+    if result then
+      result := CopyShtrafs(_StartPerDt); // Копируем все постоянные удержания по перечислению з/п и аванса
+    if result then
+      if not _SilentMode then
+        Message('Банковские реквизиты скопированы'#13 + 
+         'из таб.№: ' + GetStrTabN(LSchet.TabN, LSchet.StrTabN) + 
+         ' в таб.№: ' + GetStrTabN(LSchetD.TabN, LSchetD.StrTabN)
+        );
+  end;
+
+  // Ищет лицевой счет с указанным табельным номером
+  // _TabN - числовое представление табельного номера
+  // _StrTabn - строковое представление табельного номера
+  function FindLSchet(_TabN: tTabN; _StrTabN: TabNStr): tNRec;
+  begin
+    if getFirst LSchet where ((_TabN == LSchet.TabN and _StrTabN == LSchet.StrTabN and 0 == lschet.datuv(noindex))) = tsOk then
+      result := LSchet.NRec
+    else
+      result := 0;
+  end;
+
+end.

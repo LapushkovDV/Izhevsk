@@ -1,0 +1,957 @@
+/*************************************************************************************************\
+* Наименование: Импорт Каталога Матценностей из Excel в Галактику                                 *
+* Контур/Модуль: Обмен бизнес-документами                                                         *
+* Примечание:                                                                                     *
+*          Запустить импорт можно из каталока МЦ последняя кнопка под заголовком окна             *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата      |Исполнитель              |Проект                         *
+* ---------------------------------------------------------------------------------------------   *
+* Разработка  |#2515         |05/04/2018|Шунин А.Г.               |НПО Энергомаш                  *
+\*************************************************************************************************/
+#include oEdIzm.vih
+// #2515 Импорт Каталога Матценностей из Excel в Галактику
+#doc
+<p>Импорт Каталога Матценностей из Excel в Галактику
+<p>Добавлены новый поля для импорта KATMC:
+KATMC.GOST
+KATMC.PRMAT - Признак 0-Материал/1-ДСЕ/2-Инструмент, оснастка
+KATMC.CTYPE - Тип матценности. Поиск по коду или по наименованию
+KATMC.isarch - признак архивности,
+<p>Добавлен импорт внешнего атрибута - строка
+<p>Добавлен импорт внешнего атрибута - число
+<p>Добавлен импорт внешнего атрибута - Ссылка
+<p> Добавлены типы ссылок:
+<p> Ссылка на Подразделение. Поиск по наименованиию подразделения. Влияет в дальнейшем для поиска МОЛ
+<p> Ссылка на МОЛ. Поиск по наименованию МОЛ (обычно это ФИО сотрудника). Если ранее был поиск подразделения, то nRec этого подразделения будет ограничивать список МОЛ
+<p> Ссылка на Сотрудника. Поиск по табельному номеру
+
+<p>Добавлен импорт внешнего атрибута числа <- Номер записи источника (N строки Excel)
+
+<p>Добавлено обновление существующей записи KatMC данными из импорта поиск по БарКОДУ
+
+<p>ПЛАН: Добавлен импорт внешнего атрибута отложенной ссылки на запись KATMC, которая будет импортирована
+   Алгоритм:
+   необходимо импортировать 2 поля:
+   ID записи и Ссылка на ID на запись по ID из "ID записи"
+   1) При импорте из источника в память пишем ID в Атрибут-"Ссылку" в AttrVal.VLONGINT
+   2) После вставки всех записей в базу, обновляем Атрибут-"Ссылку":
+      ищщем ID=AttrVal.VLONGINT в атрибуте "Значение ID", и
+#end
+
+
+#component "C_ExpImp"
+ieOtherKatalog DIALOG
+  HelpLine 'Такой документ уже есть в базе.'
+  HelpCtx   hcAllAFilterData
+  StatusCtx scGalDial;
+  fields
+    sDocumentSignature1 ('') : string[255], protect;
+    sDocumentSignature2 ('') : string[255], protect;
+    sDocumentSignature3 ('') : string[255], protect;
+  buttons
+    cmOk      , default, closeowner , 'Заменить'     , hcAllBOk    , scGalDial;
+    cmOkAll   ,        , closeowner , 'Заменить все' , hcAllBOk    , scGalDial;
+    cmSkipThis,        , closeowner , 'Пропустить'        , hcAllBOk    , scGalDial;
+    cmSkipAll ,        , closeowner , 'Пропустить все'    , hcAllBOk    , scGalDial;
+    cmCancel  ,        , closeowner , 'Выход'             , hcAllBCancel, scGalDial;
+<<'Предупреждение'
+
+.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+      <. Заменить новым .>   <. Заменить новым для всех документов .>
+
+ <.Оставить без изменения.> <.Оставить без изменения для всех документов.> <.Прервать импорт.>
+
+>>
+
+#include ieCommonImp.vih
+
+Alter InterFace ieTempMC;
+overload
+Function DefineField( sFieldValue : String; HeadOrSpec : Byte; sCode : String ) : Boolean;
+Function ImportExcelField( sFieldName : string; iRow : longInt; Var sFieldValue : String ) : Boolean;
+Function ImportField( IsHeader : Boolean; wNumber : Word; Var sFieldValue : String ) : Boolean;
+procedure ClearHeaderLinksVar;
+Procedure AddDocument( IsHeader  : Boolean );
+function ImportDocument( cTempDoc : Comp ) : comp;
+end;
+#include oEdIzm.var
+var 
+  sLastFieldValue : string;  // значение последнего прочитанного поля из Excel. Для получения "всех" 255 символов строки.
+  cLastPodr: comp;
+  cLastPodrUp: comp;
+  sLastPodrKOD: string;
+  lCurColumn: longint;
+  boDoChangeDB: boolean;
+Create View
+As Select KlSkidka.nRec, SPSETAN.cKAU
+From
+KatOrg, KlSkidka, TypeMC,KATPODR, AttrNam, KatMol, Persons, BuhSchet, Dover, KatPayment
+, MaskMC // ,AttrVal tmpAttrVal
+, HashAn HashAnFind
+, HashAn
+, SPSLOJ
+, SPSETAN
+where
+((
+        HashAn.CSLOJ == SpSloj.cMain
+  and
+   000B000000000001h == MaskMC.nRec
+))
+;
+Function GetIEHFldsCODE: word;
+{
+  var bPos: byte;
+  var sTemp: string = '';
+    sTemp := IEHFlds.Value;
+    bPos  := Pos('"', sTemp );
+    GetIEHFldsCODE := word( If ( bPos <> 0, SubStr( sTemp, 1, bPos - 1 ), sTemp ));
+}
+/*******************************************************************************
+  AddDocument - добавить во временную таблицу импортированный документ
+********************************************************************************/
+Procedure AddDocument( IsHeader  : Boolean );
+{
+  If ( IsHeader )
+  {
+    //Обновляем все ссылки
+    UpdateHeaderLinks; //  Перенесено перед LogDocument, чтоб номер документа lImportDocCounter в ieFun был единым.
+
+    fun.LogDocument(tHeader.NRec, ieImportedInTemp, 'Обозн.:'+tHeader.Obozn+' '+tHeader.Name, IEHead.nRec);
+    lDocumentsImported++;
+    Insert Current tHeader;
+
+    if EXIMLOGT.RSTR = ''  Update current EXIMLOGT Set EXIMLOGT.rStr := 'lCurRow';
+    Update current ExImLogR Set ExImLogR.rStr := string(lCurRow);
+
+    // Update ExImLogE.rStr здесь вспомогательно.
+    // Раз уж приходится делать update из-за cLogR=0, пишем в rStr номер записи источника.
+    Update ExImLogE Where((0 == ExImLogE.cLogR)) Set  ExImLogE.SVALUES[1] := string(lCurRow)
+                                                     ,ExImLogE.SVALUES[2] := ExImLogE.NOREFFLD
+                                                     ,ExImLogE.SVALUES[3] := ExImLogE.VALUE
+                                                     ,ExImLogE.SVALUES[4] := ExImLogE.RSTR
+                                                     ,ExImLogE.cLogR := ExImLogR.nRec
+                                                     ,ExImLogE.rStr := string(lCurRow)
+                                                     ;
+
+  }
+  Else
+  {
+    UpdateSpecLinks;
+    tSpec.cMCUsl := cCurrentHeader;
+    If GetFirst tOtpEdDupl Where((cCurrentHeader  == tOtpEdDupl.cMCUsl And
+                                  0               == tOtpEdDupl.PrMC   And //! просто это поле не заполняется
+                                  tSpec.Name      == tOtpEdDupl.Name)) <> tsOk
+    {
+      Insert Current tSpec;
+      Update ExImLogE Where((0 == ExImLogE.cLogR)) Set ExImLogE.cLogR := ExImLogR.nRec;
+    }
+  }
+  if (not bValidSpec) and (tHeader.cEd <> comp(0))
+    CreateKatOtped;
+} // Procedure AddDocument
+
+function GetSrcAddres:string;
+{
+  result := 'R' +string(lCurRow)+'C'+ string(lCurColumn);
+}
+
+Create View vwKauGen
+as select * from SpKau;
+// Получть nrec пользовательского КАУ по его наименованию или коду
+function GetUserKauId (wKau: word; var sKau: string) : comp;
+{
+  result := 0;
+  if (sKau = '')    exit;
+
+   // Если значение найдено среди спецификаций данной пользовательской аналитики
+    if (vwKauGen.GetFirst SpKau where ((wKau == SpKau.KodGrKau
+                                    and sKau == SpKau.Code)) = tsOk)
+    {
+      sKau := vwKauGen.SpKau.Code + ' ' + vwKauGen.SpKau.NAME;
+      Result := vwKauGen.SpKau.Nrec
+
+    }
+    else
+    if (vwKauGen.GetFirst SpKau where ((wKau == SpKau.KodGrKau
+                                         and sKau == SpKau.Name)) = tsOk)
+    {
+      sKau := vwKauGen.SpKau.Code + ' ' + vwKauGen.SpKau.NAME;
+      Result := vwKauGen.SpKau.Nrec
+    }
+}
+
+Function DefineField( sFieldValue : String; HeadOrSpec : Byte; sCode : String ) : Boolean;
+{
+  sFieldValue := Trim(sFieldValue);             // Избавляемся от пробелов по бокам
+  sFieldValue := Replace(sFieldValue,''#13,''); //
+  sFieldValue := Replace(sFieldValue,''#10,'');
+  sFieldValue := Replace(sFieldValue,'■', ' '); // Избавляемся от юникод символов, которые появляются вместо пробелов
+
+
+// Имя текущего поля для протокола ошибок
+  if HeadOrSpec = ieHeader
+  {
+     // ПредОбработка. Мапинг даннах для привязке к данным в Базе ERP
+     Case ( Word(sCode) ) Of
+      iehMC + 12 :  { sFieldValue := trim(sFieldValue) ;  // идентификационная классификация tHeader.BARKOD
+                      if sFieldValue <> '' sFieldValue :=  LPadCh(sFieldValue,'0',10);
+                    }
+      iehMC + 18 :  { sFieldValue := trim(sFieldValue) ;
+                      if sFieldValue <> '' sFieldValue := LPadCh(sFieldValue,'0',3);
+                    }
+/*     iehMC + 46 : { //  tHeader.CGRNAL
+                     if Instr('18',sFieldValue) > 0 sFieldValue := 'НДС 20%(18% до 2019)' // 'НДС 18%'
+                     else
+                     if Instr('10',sFieldValue) > 0 sFieldValue := 'НДС 10%'
+                     else
+                     if Instr('БЕЗ',UpCASE(sFieldValue)) > 0 sFieldValue := 'БЕЗ НДС'
+                     else
+                     if sFieldValue = '0%'  sFieldValue := 'НДС 0%'
+                     else
+                     if sFieldValue = '0'  sFieldValue := 'НДС 0%'
+                     ;
+
+                   }  */
+     End; // Case
+
+
+     // Сообщение об ошибке Пред обработкой поля
+     Case ( Word(sCode) ) Of
+      iehMC + 18 : fun.Set_sCurFieldName('Код учетной единицы измерения ' +GetSrcAddres);        //  tHeader.CED
+      iehMC + 19 : fun.Set_sCurFieldName('Название ед.веса ' +GetSrcAddres);                     //  tHeader.CMASED
+      iehMC + 26 : fun.Set_sCurFieldName('Код рес.хранения ' +GetSrcAddres);                     //  tHeader.CRESHR
+      iehMC + 33 : fun.Set_sCurFieldName('Номер основного техпроцесса ' +GetSrcAddres);          //  tHeader.CTECH
+      iehMC + 39 : fun.Set_sCurFieldName('Код основного материала ' +GetSrcAddres);              //  tHeader.CMCMAT
+      iehMC + 40 : fun.Set_sCurFieldName('Код материала отхода используемого ' +GetSrcAddres);   //  tHeader.RET1
+      iehMC + 41 : fun.Set_sCurFieldName('Код материала отхода НЕиспользуемого ' +GetSrcAddres); //  tHeader.RET2
+      iehMC + 46 : fun.Set_sCurFieldName('Группа налогов ' +GetSrcAddres);                       //  tHeader.CGRNAL
+     End; // Case
+  }
+
+
+  DefineField := inherited::DefineField( sFieldValue, HeadOrSpec, sCode);
+
+
+
+// Дополнительные поля для импорта
+  Case ( HeadOrSpec ) Of
+    ieHeader :
+    {
+
+       Case ( Word(sCode) ) Of
+         iehMC + 68 : if (sFieldValue != '')  // Внешний атрибут строка
+                      {
+                        Var bPos : word;
+                        var AttrValue, AttrNAME : string;
+                        bPos := Pos('"', SFieldValue);
+                        if bPos > 0
+                        {
+                          AttrValue := trim(replace(SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos), '■', ' '));
+                          AttrNAME := SubStr(SFieldValue,1,bpos-1);
+
+                         // begin ПредОбработка для ЭНЕРГОМАШ
+                                        // тут 1С на кирилице
+                            if AttrValue <> ''
+                            if ( Instr('1С',AttrNAME) > 0 ) AttrValue := LPadCh(trim(AttrValue),'0',11)
+                            else          // тут 1С на латинице
+                            if ( Instr('1C',AttrNAME) > 0 ) AttrValue := LPadCh(trim(AttrValue),'0',11);
+                         //   end ПредОбработка для ЭНЕРГОМАШ
+
+                          if AttrValue <> ''
+                          iexAttr.sSetAttr(coIEHFlds,tHeader.Nrec, AttrNAME ,AttrValue);
+                        }
+                      }
+         iehMC + 59 : if (sFieldValue != '') //Внешний атрибут строка 255 символов
+                      if (sLastFieldValue != '')
+                      {
+                        Var bPos : word;
+                        var AttrNAME: string;
+                        bPos := Pos('"', IEHFlds.Value);
+                        if bPos > 0
+                        {
+                            AttrNAME := SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1);
+                            iexAttr.sSetAttr(coIEHFlds,tHeader.Nrec, AttrNAME, sLastFieldValue);
+                        }
+                      }
+         iehMC + 60 :   // Внешний атрибут число
+          if (sFieldValue != '')
+          {
+            Var bPos : word;
+            var AttrValue: string;
+            bPos := Pos('"', SFieldValue);
+            AttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+            AttrValue := Replace(AttrValue,',','.');
+            if AttrValue <> ''
+            iexAttr.doSetAttr(coIEHFlds,tHeader.Nrec, SubStr(SFieldValue,1,bpos-1), double(AttrValue));
+          }
+
+         iehMC + 61: // Внешний атрибут ссылка
+          if (sFieldValue != '')
+          {
+            Var bPos : word;
+            var sAttrValue, sAttrName: string = '';
+            var cAttrValue: comp;
+            var sErrorStr : string = '';
+
+            bPos := Pos('"', SFieldValue);   //    sFieldValue = '[sAttrName]"[sAttrValue]'
+            sAttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+            if trim(sAttrValue) = '' exit; // пустое значение из источника
+
+            cAttrValue := comp(trim(sAttrValue));
+            sAttrName := SubStr(SFieldValue,1,bpos-1);
+
+  LogStrToFile('#MC_imp_buh.txt', GetSrcAddres + 'sAttrName=' + sAttrName + ' cAttrValue=' + cAttrValue + ' sAttrValue=' + sAttrValue);
+
+            if (GetFirst AttrNam where (( sAttrName == AttrNam.Name and
+                                          word(5)   == AttrNam.AttrType and
+                                          coKatmc   == AttrNam.wTable)) = tsOk)
+            {
+  LogStrToFile('#MC_imp_buh.txt', GetSrcAddres + 'AttrNam.rObject =' + AttrNam.rObject);
+              case AttrNam.rObject of
+              2: {// подразделение / склад. влияет в дальнейшем для поиска МОЛ
+
+                  // begin ПредОбработка для ЭНЕРГОМАШ
+                   var iKey: word = 0;
+                    cLastPodrUp := cLastPodr := cAttrValue := comp(0);
+
+                    if IEHFlds.DbfName = 'Склад оприходования'
+                    {
+                       var bPos: word = InStr('_',sAttrValue); // Нужен только код подразделения
+                       if bPos = 0
+                       {
+                         sLastPodrKOD := sAttrValue;
+                       }
+                       else
+                       {
+                          sAttrValue := SubStr(sAttrValue,1,bPos-1);
+                          sLastPodrKOD := sAttrValue;
+                       }
+                       iKey++;
+LogStrToFile('#SKL_MOL.log' , 'sLastPodrKOD = ' + sLastPodrKOD);
+                    }
+                    //   end ПредОбработка для ЭНЕРГОМАШ
+                   cAttrValue := comp(0);
+                   if (getFirst KATPODR where ((sAttrValue == KATPODR.KOD)) ) = tsOk
+                   {
+                     cLastPodrUp := cLastPodr := KATPODR.nRec;
+                     cAttrValue := KATPODR.nRec;
+                   }
+                   else
+                   if (getFirst KATPODR where ((sAttrValue == KATPODR.NAME)) ) = tsOk
+                   {
+                     cLastPodrUp := cLastPodr := KATPODR.nRec;
+                     cAttrValue := KATPODR.nRec;
+                   }
+LogStrToFile('#SKL_MOL.log' , 'cLastPodr = ' + cLastPodr);
+
+                  // begin ПредОбработка для ЭНЕРГОМАШ
+                  // Выбор нижестоящего склада для указанного подразделения по наличию: 1<основной>, 2<МАСК>, 3 прочие склады, 4 не менять.
+                   if iKey > 0
+                   if cLastPodr <> comp(0)
+                   {
+                      Var _cUpNrec: comp = cLastPodr;
+LogStrToFile('#SKL_MOL.log' , 'cLastPodr = ' + cLastPodr);
+
+                      cAttrValue := KATPODR.nREC ;sAttrValue := KATPODR.KOD + ' ' + KATPODR.NAME;
+
+                      if ( Getfirst Fastfirstrow KatPodr WHERE (( _cUpNrec == KatPodr.cpodr AND 1==KatPodr.sklad)) and Instr('осн', KatPodr.kod ) > 1) =tsOK
+                      { cAttrValue := KATPODR.nREC ;sAttrValue := KATPODR.KOD + ' ' + KATPODR.NAME;}
+                      else
+                      if ( Getfirst Fastfirstrow KatPodr WHERE (( _cUpNrec == KatPodr.cpodr AND 1==KatPodr.sklad)) and Instr('МАСК)', KatPodr.kod ) > 1) =tsOK
+                      { cAttrValue := KATPODR.nREC ;sAttrValue := KATPODR.KOD + ' ' + KATPODR.NAME;}
+                      else
+                      if ( Getfirst Fastfirstrow KatPodr WHERE (( _cUpNrec == KatPodr.cpodr AND 1==KatPodr.sklad)) and Instr('МАСК', KatPodr.kod ) > 1) =tsOK
+                      { cAttrValue := KATPODR.nREC ;sAttrValue := KATPODR.KOD + ' ' + KATPODR.NAME;}
+                      else
+                      if ( Getfirst Fastfirstrow KatPodr WHERE (( _cUpNrec == KatPodr.cpodr AND 1==KatPodr.sklad)) ) =tsOK
+                      { cAttrValue := KATPODR.nREC ;sAttrValue := KATPODR.KOD + ' ' + KATPODR.NAME;}
+
+                      cLastPodr := cAttrValue;
+LogStrToFile('#SKL_MOL.log' , 'sAttrValue = ' + sAttrValue);
+/*
+                      sql
+                      select nRec, KOD + NAME from
+                          ( select top 1 nRec, KOD, NAME, N
+                            from
+                              ( SELECT kp2.nRec, kp2.KOD, kp2.NAME,
+                                        CASE
+                                         WHEN kp2.kod LIKE '%осн%' THEN 0
+                                         WHEN kp2.kod LIKE '%МАСК%' THEN 1
+                                         ELSE 2
+                                        END N
+                                  FROM KATPODR kp2
+                                  WHERE ( :(cLastPodr) = kp2.cpodr AND kp2.sklad = 1)
+                                Union
+                                SELECT nRec, KOD, NAME, 3 N
+                                  from KatPodr kp3
+                                  where :(cLastPodr) = kp3.nRec
+                              ) SkladOK
+                            ORDER BY SkladOK.N
+                          ) Sklad1
+                       into (cAttrValue, sAttrValue)
+                      ;*/
+                   }
+                  //   end ПредОбработка для ЭНЕРГОМАШ
+
+                   sErrorStr := 'Подразделение / склад.';
+                 }
+             60:{ // МОЛ
+
+                    // begin ПредОбработка для ЭНЕРГОМАШ
+                    if false // код склада из Наименавания МОЛ убдали
+                    if IEHFlds.DbfName = 'МОЛ (Кладовщик)'
+                    if sLastPodrKOD <> ''
+                    {
+                      sAttrValue := sLastPodrKOD + '_' + sAttrValue;     // Добавить код склада к ФИО МОЛ
+                      cLastPodr := comp(0);
+                    }
+                    // end   ПредОбработка для ЭНЕРГОМАШ
+
+                  if cLastPodr <> Comp(0) // если ранее был поиск подразделения
+                  {
+                     if (getfirst KATMOL where ((cLastPodr == KATMOL.CSKL and sAttrValue == KATMOL.NAME)) = tsOk)
+                       cAttrValue := KATMOL.nRec
+                     else
+                     if (getfirst KATMOL where ((cLastPodr == KATMOL.CSKL and sAttrValue == KATMOL.KOD)) = tsOk)
+                       cAttrValue := KATMOL.nRec
+                     else
+                     if cLastPodrUp <> Comp(0) // если Есть код вышестоящего подразделения
+                     if (getfirst KATMOL where ((cLastPodrUp == KATMOL.CSKL and sAttrValue == KATMOL.NAME)) = tsOk)
+                       cAttrValue := KATMOL.nRec
+
+                  }
+                  else
+                  {
+                     if (getfirst KATMOL where ((sAttrValue == KATMOL.NAME)) = tsOk)
+                       cAttrValue := KATMOL.nRec
+                     else
+                     if (getfirst KATMOL where ((sAttrValue == KATMOL.KOD)) = tsOk)
+                       cAttrValue := KATMOL.nRec;
+                  }
+                  sErrorStr := 'МОЛ';
+                }
+           3,25001:{
+                       if (getFirst Persons where (('С' == Persons.IsEmployee and sAttrValue == Persons.STRTABN (noindex) )) ) = tsOk
+                       {
+                         cAttrValue := Persons.nRec;
+                         sAttrValue := Persons.FIO;
+                       }
+                       else
+                       if (getFirst Persons where (('С' == Persons.IsEmployee and sAttrValue == Persons.FIO (noindex) )) ) = tsOk
+                       {
+                         cAttrValue := Persons.nRec;
+                         sAttrValue := Persons.FIO;
+                       }
+                      sErrorStr := 'Сотрудник';
+                   }
+         1502,5063:{
+  LogStrToFile('#MC_imp_buh.txt', GetSrcAddres + ' = ' + sAttrValue);
+
+                      var Str6: string;
+                      Str6 := substr(sAttrValue, 1, 6);
+                      Str6 := RePlace(Str6, '/', '.');
+
+                      if Str6 = '10.151' sAttrValue := '10.01' else
+                      if Str6 = '10.200' sAttrValue := '10.02' else
+                      if Str6 = '10.156' sAttrValue := '10.13' else
+                      if Str6 = '10.450' sAttrValue := '10.04' else
+                      if Str6 = '10.956' sAttrValue := '10.09' else
+                      if Str6 = '08.451' sAttrValue := '10.12' else
+                      if Str6 = '10.300' sAttrValue := '10.03' else
+                      if Str6 = '10.900' sAttrValue := '10.09' else
+                      if Str6 = '10.952' sAttrValue := '10.10' else
+                      if Str6 = '10.152' sAttrValue := '10.13' else
+                      if Str6 = '10.965' sAttrValue := '10.13' else
+                      if Str6 = '10.902' sAttrValue := '10.13' else
+                      if Str6 = '10.101' sAttrValue := '10.06' else
+                      if Str6 = '10.900' sAttrValue := '10.09' else
+                      if Str6 = '10.652' sAttrValue := '10.13' else
+                      if Str6 = '10.550' sAttrValue := '10.05' else
+                      if Str6 = 'Готовая продукция' sAttrValue := '43' ;
+
+  LogStrToFile('#MC_imp_buh.txt', GetSrcAddres + ' > ' + Str6  + ' > ' +  sAttrValue);
+
+                   if (getfirst SPSETAN where (( 10142 == SPSETAN.KODGRKAU  and  (InStr(sAttrValue,trim(SPSETAN.Name) ) =1 ) )) = tsOk)
+                   {
+                     sAttrValue := SPSETAN.Name;
+                     cAttrValue := SPSETAN.cKAU;
+                   }
+                   else
+                   if (getfirst BuhSchet where ((coGetTune('FIN.USER.CPLANSSCH') == Buhschet.CPLANSSCH and sAttrValue == Buhschet.CODE)) = tsOk)
+                   {
+                     sAttrValue := BuhSchet.Name;
+                     cAttrValue := Buhschet.Nrec;
+                   }
+                   else
+                   if (getfirst BuhSchet where ((cAttrValue == Buhschet.Nrec)) = tsOk)
+                     sAttrValue := BuhSchet.Name;
+              }
+              1412:
+                  if (getfirst KatEd where ((cAttrValue == KatEd.Nrec)) = tsOk)
+                     sAttrValue := KatEd.Name;
+              1138:
+                  if (getfirst Dover where ((cAttrValue == Dover.Nrec)) = tsOk)
+                     sAttrValue := string(Dover.NoDoc);
+              1485:
+                  if (getfirst KatPayment where ((cAttrValue == KatPayment.Nrec)) = tsOk)
+                     sAttrValue := KatPayment.Name;
+              1418:
+                  if (getfirst KatOrg where ((cAttrValue == KatOrg.Nrec)) = tsOk)
+                     sAttrValue := KatOrg.Name;
+              1115:
+                  if (getfirst KlSkidka where ((cAttrValue == KlSkidka.Nrec)) = tsOk)
+                     sAttrValue := KlSkidka.Name;
+      10000..19999:
+                  cAttrValue := GetUserKauId(AttrNam.rObject,sAttrValue);
+              else
+                  {}
+              end; // case
+            }
+
+            if cAttrValue = comp(0)
+            {
+              if sErrorStr ='' sErrorStr := 'не определено';
+              else
+              if sAttrName <> '' sErrorStr := sErrorStr + '. Атрибут: ' + sAttrName;
+
+              fun.Set_sCurFieldName(sErrorStr + ' ' + +GetSrcAddres);
+              fun.LogError(0, constDocErrorCode, sAttrValue);
+            }
+            else
+            {
+
+              iexAttr.coSetAttr(coIEHFlds,tHeader.Nrec, sAttrName,cAttrValue,sAttrValue);
+
+              if (GetFirst AttrNam where ((sAttrName  == AttrNam.Name and
+                                            word(5)   == AttrNam.AttrType and
+                                            coIEHFlds == AttrNam.wTable)) = tsOk)
+              {
+                AttrNam.rType := word(100);
+                update current AttrNam;
+              }
+            }
+
+
+           } // Внешний атрибут ссылка
+        iehMC + 62 : tHeader.GOST := sFieldValue; // ГОСТ
+        iehMC + 63 : tHeader.PRMAT:= word(sFieldValue); // 'Признак 0-Материал/1-ДСЕ/2-Инструмент, оснастка'
+        iehMC + 64 : { // 'Тип матценности (KATMC.CTYPE -> KIND, PRMAT) ', 'TYPEMC.NAME
+                       if (getfirst TYPEMC where ((sFieldValue == TYPEMC.NAME)) = tsOk)
+                       {
+                          tHeader.KIND  := TYPEMC.KIND;  // 0-Покупная, 1-Собственного производства,2=нету!!!, 3-Фантомная, 4-Субподрядная
+                          tHeader.PRMAT := TYPEMC.PRMAT; // 0-Материал, 1-ДСЕ, 2-Инструмент, оснастка
+                          tHeader.CTYPE := TYPEMC.nRec;
+                       }else
+                       {
+                         fun.Set_sCurFieldName('Тип матценности по наименованию ' +GetSrcAddres);
+                         fun.LogError(0, constDocErrorCode, sFieldValue);
+                       }
+
+                     }
+        iehMC + 65 : { // 'Тип матценности (KATMC.CTYPE -> KIND, PRMAT) ', 'TYPEMC.KOD
+                       if (getfirst TYPEMC where ((sFieldValue == TYPEMC.KOD)) = tsOk)
+                       {
+                          tHeader.KIND  := TYPEMC.KIND;  // 0-Покупная, 1-Собственного производства,2=нету!!!, 3-Фантомная, 4-Субподрядная
+                          tHeader.PRMAT := TYPEMC.PRMAT; // 0-Материал, 1-ДСЕ, 2-Инструмент, оснастка
+                          tHeader.CTYPE := TYPEMC.nRec;
+                       }
+                       else
+                       {
+                         fun.Set_sCurFieldName('Тип матценности по коду ' +GetSrcAddres);
+                         fun.LogError(0, constDocErrorCode, sFieldValue);
+                       }
+
+                     }
+
+        iehMC + 66 : tHeader.isarch := if(Trim(sFieldValue) = '0' , 0, if( length(Trim(sFieldValue))>0, 1, 0) );
+
+        iehMC + 67 :   // Внешний атрибут число <- Номер записи источника' , 'N строки Excel
+          if (sFieldValue != '')
+          {
+            Var bPos : word;
+            var AttrValue: string;
+            bPos := Pos('"', SFieldValue);
+            AttrValue := SubStr(SFieldValue, bPos+1, length(SFieldValue)-bPos);
+            if AttrValue <> ''
+            iexAttr.doSetAttr(coIEHFlds,tHeader.Nrec, SubStr(SFieldValue,1,bpos-1), double(AttrValue));
+          }
+
+       End; // Case
+
+   }
+   End; // Case
+
+}
+
+/*******************************************************************************
+  GetNextBARKOD2 - генерация следующего по порядку BARKOD2 по правилу GGGGNNNNNN
+********************************************************************************/
+var wWarningResult2  : Word;
+function GetNextBARKOD2: string;
+{
+   GetNextBARKOD2 := '';
+   if Katmc.CGROUPMC <> comp(0)
+   if getfirst GROUPMC where (( Katmc.CGROUPMC == GROUPMC.nRec)) = tsOK
+   {
+      Var wWhatKey: word=0; // 0-пусто, 1-как есть, 2-новый
+      var Prefix4: string;
+
+      Prefix4 := SubStr(GROUPMC.KOD,1,4);
+      Prefix4 := PadCh(Prefix4, '0', 4);
+
+    if not ( length(KATMC.Barkod2) = 10 )  wWhatKey := 2
+    else
+    {
+      if ( SubStr(KATMC.Barkod2,1,4) = Prefix4 ) wWhatKey := 1
+      else
+      {
+          if (wWarningResult2 = 0) or  (cmOk = wWarningResult2) or  (cmSkipThis = wWarningResult2)
+          {
+              Var sTemp, sTemp2, sTemp3 : String[255];
+              sTemp := 'Документ с номером ' + KATMC.BARKOD ;
+              sTemp2:= 'Есть в Базе данных с BARKOD2=' + KATMC.BARKOD2 ;
+              sTemp3:= 'Но импортируется с группой ' + GROUPMC.KOD + ' Заменить BARKOD2 с учетом новой группы?';
+
+              wWarningResult2 := RunDialog('ieOtherKatalog', sTemp, sTemp2, sTemp3);
+          }// if (wWarningResult2...
+
+          Case ( wWarningResult2 ) Of
+            cmSkipThis, cmSkipAll :  wWhatKey := 1;
+
+            cmOk, cmOkAll :          wWhatKey := 2;
+
+            cmCancel :
+            {
+              _raise exUserBreak;
+            }
+          End; // Case
+      }
+   } // if length(KATMC.Barkod2) < 10
+
+   Case ( wWhatKey) Of
+     1: GetNextBARKOD2 := KATMC.Barkod2;
+     2: {
+          var Counter : longint=0;
+          SQL select MAX(cast(SubString(K1.Barkod2,5,6) as longint))
+              from katmc k1
+              where SubString(K1.Barkod2,1,4) = :( Prefix4 ) and LENGTH(k1.Barkod2) = 10
+              into (Counter);
+
+              Counter++;
+
+              GetNextBARKOD2 := Prefix4 + LPadCh(StrinG(Counter), '0', 6);
+        }
+   End; // Case
+
+  }
+} //function GetNextBARKOD2: string;
+
+
+function GetHashAn: comp;
+{
+   Result := comp(0);
+   if Katmc.cHashan > comp(0)
+   if getfirst Hashan where (( Katmc.cHashan == Hashan.nRec)) = tsOK
+   {
+     Result := Hashan.nRec;
+   }
+
+   if Result = comp(0)
+   {
+     ClearBuffer(tnHashan);
+     Hashan.npp   := 4;
+     Hashan.CSLOJ := KatMC.cSloj; // 000B000000000001h;
+   }
+
+   Hashan.CANALIT[2] := coGetAttr(coKatmc,Katmc.nRec,'.Виды взаиморасчетов по договору');
+   Hashan.CANALIT[3] := coGetAttr(coKatmc,Katmc.nRec,'.Аналитика БухСчета');
+   Hashan.CANALIT[4] := coGetAttr(coKatmc,Katmc.nRec,'.Аналитика Группы драгметаллов');
+
+    if (GetFirst HashAnFind where ((HashAn.CSLOJ == HashAnFind.CSLOJ and HashAn.CBLOCK == HashAnFind.CBLOCK and HashAn.CANALIT[1] == HashAnFind.CANALIT[1] and
+                                    HashAn.CANALIT[2] == HashAnFind.CANALIT[2] and HashAn.CANALIT[3] == HashAnFind.CANALIT[3] and HashAn.CANALIT[4] == HashAnFind.CANALIT[4] and
+                                    HashAn.CANALIT[5] == HashAnFind.CANALIT[5] and HashAn.CANALIT[6] == HashAnFind.CANALIT[6] and HashAn.CANALIT[7] == HashAnFind.CANALIT[7] and
+                                    HashAn.CANALIT[8] == HashAnFind.CANALIT[8] and HashAn.CANALIT[9] == HashAnFind.CANALIT[9] and HashAn.CANALIT[10] == HashAnFind.CANALIT[10] )) = tsOk)
+    {
+        Result := HashAnFind.nRec
+    }
+    else
+    {
+      HashAn.nRec := comp(0);
+      if (insert current HashAn = tsOk) Result := HashAn.nRec
+    }
+}
+/*******************************************************************************
+  ImportDocument - переносим запись из временной таблицы в постоянную
+********************************************************************************/
+function ImportDocument( cTempDoc : Comp ) : comp;
+{
+  result := 0;
+  If ( cTempDoc <> 0 )
+  {
+    If ( GetFirst tHeader Where (( cTempDoc == tHeader.nRec )) <> tsOk ) Exit;
+  }
+
+  If(((IEHead.Reestr And mskVerifyDoc) Shr 05h) = 0)
+  If((tHeader.Name = ''))
+  {
+    fun.UpdateImportLog(tHeader.NRec, 0, ieAbsentFields, ExImLogT.nRec);
+    Case(wAbsWarningResult) Of
+      cmSkipAll : Exit;
+    Else
+    {
+      Var sTemp : String[70];
+      Var sTemp2 : String[70];
+      Var sTemp3 : String[70];
+      Var sTmp1 : String;
+      Var sTmp2 : String;
+      Var cTmp  : Comp;
+
+      sTemp  := 'Отсутствуют обязательные поля для импорта МЦ';
+      sTemp2 :=  '';
+      If tHeader.Name = ''
+      {
+        sTemp2 := 'Не задано наименование МЦ ';
+      }
+      sTemp3 := 'Такой документ не может быть добавлен';
+      wAbsWarningResult := RunDialog('ieAbsentFieldsError', sTemp, sTemp2, sTemp3);
+      Case(wAbsWarningResult) Of
+        cmSkipThis :
+        {
+          wAbsWarningResult := 0;
+        }
+        cmSkipAll :
+        {
+        }
+        cmCancel :
+        {
+          _raise exUserBreak;
+        }
+      End; // Case
+    }
+    End;
+    Exit;
+  }
+
+  Var boNeedUpdate: boolean = false;
+
+  if Getfirst KatMC where (( tHeader.BARKOD == KatMC.BARKOD)) = tsOK
+  {
+      boNeedUpdate := true;
+
+      if KatMc.BARKOD2 = '' KatMc.BARKOD2 := GetNextBARKOD2() ;
+
+      // LogStrToFile('#MC_imp_cmp.txt', ' не изменилось KATMC с nrec= '  + string(KATMC.nRec,0,0) );
+      // Меняем только те поля, который есть в настройке и в файле импорта
+      var bPos: byte;
+      Var AttrNAME: string;
+      if boDoChangeDB
+      _LOOP IEHFlds Where((IEHead.nRec == IEHFlds.cHead  And true == IEHFlds.isLeaf )) Ordered By Number
+      if iFileStruct.GetIndexFieldByName(IEHFlds.DbfName) > 0 // Это поле есть в файле импорта
+      Case GetIEHFldsCODE of 
+        iehMC + 10 : KATMC.NAME     := tHeader.NAME     ; // tHeader.NAME       :=  sFieldValue; // наименование товара
+        iehMC + 11 : KATMC.OBOZN    := tHeader.OBOZN    ; // tHeader.OBOZN      :=  sFieldValue; // Конструкторское обозначение
+        iehMC + 12 : KATMC.BARKOD   := tHeader.BARKOD   ; // tHeader.BARKOD     :=  sFieldValue; // идентификационная классификация
+        iehMC + 13 : KATMC.BARKOD2  := tHeader.BARKOD2  ; // tHeader.BARKOD2    :=  sFieldValue; // дополнительный бар-код
+        iehMC + 14 : KATMC.REMMC    := tHeader.REMMC    ; // tHeader.REMMC      :=  sFieldValue; // примечание
+        iehMC + 15 , 
+        iehMC + 16 :{KATMC.KGROUPMC := tHeader.KGROUPMC ;   //         KGROUPMC    strGroupMCKod      :=  sFieldValue; // код группы матценностей
+                     KATMC.CGROUPMC := tHeader.CGROUPMC ; } //         CGROUPMC    strGroupMCName     :=  sFieldValue; // ссылка на группу матценностей
+
+        iehMC + 17 : KATMC.TNVED    := tHeader.TNVED    ; // tHeader.TNVED      :=  sFieldValue; // код внешнеэкономической деятельности
+        iehMC + 18 : KATMC.CED      := tHeader.CED      ; // tHeader.CED        :=  refImpDef.SetToKatEd(sFieldValue); // код учетной единицы измерения
+        iehMC + 19 : KATMC.CMASED   := tHeader.CMASED   ; // tHeader.CMASED     :=  refImpDef.SetToKatEd(sFieldValue); // название ед.веса
+        iehMC + 20 : KATMC.MASSA    := tHeader.MASSA    ; // tHeader.MASSA      :=  Double(sFieldValue); // масса нетто
+        iehMC + 21 : KATMC.MTARA    := tHeader.MTARA    ; // tHeader.MTARA      :=  Double(sFieldValue); // масса брутто
+        iehMC + 22 : KATMC.SIZEX    := tHeader.SIZEX    ; // tHeader.SIZEX      :=  Double(sFieldValue); // линейные координаты (в метрах)
+        iehMC + 23 : KATMC.SIZEY    := tHeader.SIZEY    ; // tHeader.SIZEY      :=  Double(sFieldValue); // линейные координаты (в метрах)
+        iehMC + 24 : KATMC.SIZEZ    := tHeader.SIZEZ    ; // tHeader.SIZEZ      :=  Double(sFieldValue); // линейные координаты (в метрах)
+        iehMC + 25 : KATMC.VOLUME   := tHeader.VOLUME   ; // tHeader.VOLUME     :=  Double(sFieldValue); // объем (в м3)
+        iehMC + 26 : KATMC.CRESHR   := tHeader.CRESHR   ; // tHeader.CRESHR     :=  refImpDef.SetToKlResHr(sFieldValue); // код рес.хранения
+        iehMC + 27 : KATMC.CLASSGR  := tHeader.CLASSGR  ; // tHeader.CLASSGR    :=  Double(sFieldValue); // класс груза (коэффициент)
+        iehMC + 28 : KATMC.ZAPASMIN := tHeader.ZAPASMIN ; // tHeader.ZAPASMIN   :=  Double(sFieldValue); // нормативный запас минимальный
+        iehMC + 29 : KATMC.ZAPASMAX := tHeader.ZAPASMAX ; // tHeader.ZAPASMAX   :=  Double(sFieldValue); // нормативный запас максимальный
+        iehMC + 30 : KATMC.NORMUB   := tHeader.NORMUB   ; // tHeader.NORMUB     :=  Double(sFieldValue); // нормативный процент естественной убыли
+        iehMC + 31 : KATMC.PERCENTN := tHeader.PERCENTN ; // tHeader.PERCENTN   :=  Double(sFieldValue); // % наценки по умолчанию при закупке
+        iehMC + 33 : KATMC.CTECH    := tHeader.CTECH    ; // tHeader.CTECH      :=  refImpDef.SetToKaTech(sFieldValue); // Номер основного техпроцесса
+        iehMC + 38 : KATMC.PRICEPU  := tHeader.PRICEPU  ; // tHeader.PRICEPU    :=  Double(sFieldValue); // Текущая планово-учетная цена
+        iehMC + 39 : KATMC.CMCMAT   := tHeader.CMCMAT   ; // tHeader.CMCMAT     :=  refImpDef.SetToMC(sFieldValue); // Код основного материала
+        iehMC + 40 : KATMC.RET1     := tHeader.RET1     ; // tHeader.RET1       :=  refImpDef.SetToMC(sFieldValue); // Код материала отхода используемого
+        iehMC + 41 : KATMC.RET2     := tHeader.RET2     ; // tHeader.RET2       :=  refImpDef.SetToMC(sFieldValue); // Код материала отхода НЕиспользуемого
+        iehMC + 42 : KATMC.PRIOR    := tHeader.PRIOR    ; // tHeader.PRIOR      :=  byte(sFieldValue);   // Приоритет производства
+        iehMC + 43 : KATMC.SALE     := tHeader.SALE     ; // tHeader.SALE       :=  byte(sFieldValue);   // Признак продается-1 / не продается-0
+        iehMC + 44 : KATMC.CENAMC   := tHeader.CENAMC   ; // tHeader.CENAMC     :=  Double(sFieldValue); // Заводская цена в НДЕ
+        iehMC + 45 : KATMC.MAXPROCN := tHeader.MAXPROCN ; // tHeader.MAXPROCN   :=  Double(sFieldValue); // предельный процент наценки
+        iehMC + 46 : KATMC.CGRNAL   := tHeader.CGRNAL   ; // tHeader.CGRNAL     :=  refImpDef.SetToGrNal(sFieldValue, 1); // ссылка на группу налогов
+        iehMC + 47 : KATMC.OKDP     := tHeader.OKDP     ; // tHeader.OKDP       :=  sFieldValue; // код ОКДП
+        iehMC + 48 : KATMC.KOMPLEKT := tHeader.KOMPLEKT ; // tHeader.KOMPLEKT   :=  word(sFieldValue);   // Комплект-1 / просто МЦ-0
+        iehMC + 49 : KATMC.NALPROD  := tHeader.NALPROD  ; // tHeader.NALPROD    :=  Double(sFieldValue); // Ставка налога на продажу
+        iehMC + 50 : KATMC.MAXON    := tHeader.MAXON    ; // tHeader.MAXON      :=  Double(sFieldValue); // Мах оптовая наценка
+        iehMC + 51 : KATMC.MAXRN    := tHeader.MAXRN    ; // tHeader.MAXRN      :=  Double(sFieldValue); // Мах розничная наценка
+        iehMC + 52 : KATMC.MAXORN   := tHeader.MAXORN   ; // tHeader.MAXORN     :=  Double(sFieldValue); // Мах сумма оптовой и розничной наценки
+        iehMC + 54 : KATMC.KOLDEF   := tHeader.KOLDEF   ; // tHeader.KOLDEF     :=  Double(sFieldValue); // Количество по умолчанию
+        iehMC + 55 : KATMC.kind     := tHeader.kind     ; // tHeader.kind       :=  word(sFieldValue);   //категория
+        iehMC + 62 : KATMC.GOST     := tHeader.GOST     ; // tHeader.GOST       := sFieldValue; // ГОСТ
+        iehMC + 63 : KATMC.PRMAT    := tHeader.PRMAT    ; // tHeader.PRMAT      := word(sFieldValue); // 'Признак 0-Материал/1-ДСЕ/2-Инструмент, оснастка'
+        iehMC + 64 , // 'Тип матценности (KATMC.CTYPE -> KIND, PRMAT) ', 'TYPEMC.NAME
+        iehMC + 65 : { // 'Тип матценности (KATMC.CTYPE -> KIND, PRMAT) ', 'TYPEMC.KOD
+                          KATMC.KIND     := tHeader.KIND;
+                          KATMC.PRMAT    := tHeader.PRMAT;
+                          KATMC.CTYPE    := tHeader.CTYPE;
+                     }
+        iehMC + 66 : KATMC.isarch   := tHeader.isarch   ; // tHeader.isarch     := if(Trim(sFieldValue) = '0' , 0, if( length(Trim(sFieldValue))>0, 1, 0) );
+
+                    // Удаляем значения атрибутов, которые есть в настройке импорта
+        iehMC + 59, //'Внешний атрибут строка 255 символов'  ))'Имя атрибут
+        iehMC + 60, //'Внешний атрибут число'   ))'Введите имя атрибута'
+        iehMC + 61, //'Внешний атрибут ссылка'  ))'Введите имя атрибута'
+        iehMC + 67, //'Внешний атрибут число <- Номер записи источника' ))'
+        iehMC + 68: //'Внешний атрибут строка'               ))'Введите имя
+        {
+            bPos := Pos('"', IEHFlds.Value);
+            if bPos > 0
+            AttrNAME := SubStr(IEHFlds.Value, bPos+1, length(IEHFlds.Value)-bPos-1);
+            if AttrNAME<>''
+            {
+                if iexAttr.DeleteValue (coKatMc, KatMc.nRec, AttrNAME) > 0 {}
+            }
+        }
+      End; // Case
+
+
+  }
+  else
+  {
+      ClearBuffer(#KatMC);
+      KATMC.Buffer    := type$KATMC(tHeader.Buffer);
+      KATMC.NRec      := 0;
+      if (KATMC.CGRNAL = 0)
+        KatMC.cGrNal  := cGrNalDef;
+      if (KATMC.cEd = 0)
+        KatMC.cEd     := cEdDef;
+
+      if KatMc.BARKOD2 = '' KatMc.BARKOD2 := GetNextBARKOD2() ;
+
+      if boDoChangeDB
+      {
+        if (bValidBarKod)
+          Insert Current KatMC;
+        else
+          oFuncMC.KatMC_Insert(KATMC.bufferp, true, true);
+      }
+  }
+
+  result := KatMc.nRec;
+
+  if boDoChangeDB
+  if getfirst AllMemo where (( coIEHFlds == AllMemo.WTABLE and tHeader.Nrec == AllMemo.cRec)) = tsok
+  {
+    set AllMemo.cRec := KatMc.nRec; AllMemo.WTABLE := coKatMc;
+    update current AllMemo;
+  }
+
+  // КОПИРОВАНИЕ ВНЕШНИХ АТРИБУТОВ ДЛЯ ЗАГОЛОВКА
+  if boDoChangeDB
+  iExAttr.CopyAllAttrEx1(coIEHFlds, tHeader.nRec, coKatMc, KatMC.nRec, false);
+
+//  Делаем из 2х атрибутов HashAN, меняем 3 и 4 аналитику
+// .Аналитика Группы драгметаллов
+// .Аналитика БухСчета
+
+// Шаблон KATMC
+   if boDoChangeDB
+    if (GetFirst MaskMC = tsOk)
+    {
+      KatMC.cMaskMC := MaskMC.nRec ;
+      KatMC.cSloj   := MaskMC.cSloj;
+      KatMC.cHashAn := GetHashAn; // в 3 и 4 Аналитику из Атрибутов  .Аналитика БухСчета + .Аналитика Группы драгметаллов
+      boNeedUpdate := true;
+    }
+// Шаблон KATMC
+
+
+
+  ////////////////////////////////
+  if boDoChangeDB
+  oExtClass.CopyAllClassValEx(coIEHFlds, tHeader.nRec, coKatMc, KatMC.nRec);
+
+  fun.UpdateImportLog(cTempDoc, KatMC.nRec, ieImported, ExImLogT.nRec);
+  var bValidProizv : boolean = false;
+  _LOOP tSpec
+  {
+    If GetFirst OtpEdDupl <> tsOk //если такой отпускной единицы еще нет
+    {
+      ClearBuffer(#KatOtpED);
+      if (bValidProizv)
+        tSpec.Pr := 0;
+      else
+        bValidProizv := (tSpec.Pr = 1);
+      KatOtpED.Buffer := type$KatOtpED(tSpec.Buffer);
+      KatOtpED.NRec   := 0;
+      KatOtpED.cMCUsl := KatMC.NRec;
+      KatOtpED.PrMC   := 1;
+      fEdIzm.InsertKatOtpED(tBufOtpEd(KatOtpEd.buffer), FALSE);
+
+      // КОПИРОВАНИЕ ВНЕШНИХ АТРИБУТОВ ДЛЯ СПЕЦИФИКАЦИИ
+      iExAttr.CopyAllAttrEx1(coIESFlds, tSpec.nRec, coKatOtpEd, KatOtpEd.nRec, false);
+      ////////////////////////////////
+      oExtClass.CopyAllClassValEx(coIESFlds, tSpec.nRec, coKatOtpEd, KatOtpEd.nRec);
+    }
+  }
+
+  if boDoChangeDB
+  if boNeedUpdate 
+  {
+    UpDate Current KatMC;
+    LogStrToFile('#MC_imp_cmp.txt', ' !! изменилось KATMC с nrec= '  + string(KATMC.nRec,0,0) );
+  }
+
+  Delete all tSpec;
+  Delete Current tHeader;
+} // Procedure ImportDocument
+
+Function ImportField( IsHeader : Boolean; wNumber : Word; Var sFieldValue : String ) : Boolean;
+{
+  if IsHeader
+  if IEHFlds.CODE = String(iehMC + 67)
+  {
+    result := true;
+    sFieldValue := string(lCurRow);
+    exit;
+  }
+
+  var sFieldName : string = if (IsHeader, IEHFlds.DbfName, IESFlds.DbfName);
+  if substr(sFieldName,1,1) = '=' // Значение указано в настройках импорта
+  {
+    sFieldValue := substr(sFieldName,2,255);
+    result := true;
+    exit;
+  }
+
+  result := inherited::ImportField(IsHeader, wNumber,sFieldValue);
+}
+
+Function ImportExcelField( sFieldName : string; iRow : longInt; Var sFieldValue : String ) : Boolean;
+{
+  lCurColumn := iFileStruct.GetIndexFieldByName(sFieldName);
+  result := xlGetCellValue(iRow, lCurColumn, sFieldValue);
+  sLastFieldValue := sFieldValue ;
+}
+
+procedure ClearHeaderLinksVar;
+{
+  inherited::ClearHeaderLinksVar;
+  cLastPodr := comp(0); // Очистка для импорта новой записи KATMC
+  sLastPodrKOD := '';
+}
+handleevent
+cmINIT:
+{
+  wWarningResult2 := 0;
+  boDoChangeDB := TRUE;
+  inherited::HandleEvent(cmInit);
+}
+end;
+end.

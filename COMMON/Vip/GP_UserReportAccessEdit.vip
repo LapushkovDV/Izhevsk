@@ -1,0 +1,392 @@
+/*************************************************************************************************\
+* Наименование: Редактирование прав доступа к отчетам пользователя                                *
+* Контур/Модуль: *                                                                                *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#820          |13/12/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include Marker.vih
+#include UserReport.vih
+
+function GetResourceName(IfcName : string) : string; external 'G_COMMON.DLL';
+
+#include GP_UserReportAccessService.vih
+
+interface GP_UserReportAccessEdit 'Редактирование прав доступа к отчетам пользователя' Cyan;
+show(10,5,160,30);
+
+var pRepMarker,pAccessMarker:IMarker(Marker) new;
+    UserReport:IUserReport;
+    CurRepVipName,CopySrcRepVipName:string;
+    oAccessService:GP_UserReportAccessService;
+
+table struct ReportsTree(
+  NRec:comp,cNode:comp,IsLeaf:word,
+  RepName:string,RepVipName:string,
+  ResName:string,MenuID:string,
+  Priority:integer
+)
+with index (
+  i1=NRec(Unique, Surrogate, Journal),
+  i2=cNode + Priority + RepName,
+  i3=cNode + RepName + RepVipName,
+  i4=IsLeaf + RepVipName
+);
+
+create view
+var cTreeNode:comp;
+as select
+  if(GP_UserReportAccess.cUser=0 and GP_UserReportAccess.cGroup=0,'BMCOMMON',
+    if(GP_UserReportAccess.cUser=0,'IMGARMGROUP',
+      if(X$USERS.XU$TYPE=1,'IMGATLADMIN','IMGARMUSER'))) (fieldname = GroupOrUserIcon),
+  if(GP_UserReportAccess.cUser=0 and GP_UserReportAccess.cGroup=0,'Общий',
+    if(GP_UserReportAccess.cUser=0,Groups.Name,
+      X$USERS.XU$LOGINNAME+if(X$USERS.XU$FULLNAME<>'','('+X$USERS.XU$FULLNAME+')',''))) (fieldname = GroupOrUserName)
+from
+  ReportsTree(i2),
+  ReportsTree ReportsTree2,
+  GP_UserReportAccess,
+  GP_UserReportAccess GP_UserReportAccess2,
+  X$USERS,Groups,ContourComponents
+where((
+  cTreeNode==ReportsTree.cNode and
+  ReportsTree.RepVipName==GP_UserReportAccess.RepVipName and
+  GP_UserReportAccess.cUser==X$USERS.Atl_NRec and
+  GP_UserReportAccess.cGroup==Groups.Atl_NRec
+));
+
+parameters CurRepVipName;
+
+tree trReports (,,sci1EscTreeInsL);
+show(,,80,22);
+table ReportsTree;
+recMarker=pRepMarker;
+fields
+  ReportsTree.RepName 'Наименование':[60],Protect;
+end;
+
+screen scReports (,,sci1Esc);
+show(,23,80,) Fixed_Y;
+table ReportsTree;
+fields
+  ReportsTree.RepVipName ('Имя программы',,):Protect;
+  ReportsTree.ResName ('Ресурс',,):Protect;
+<<
+ `Имя программы`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Ресурс`       .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end;
+
+browse brReportAccess(,,sci178Esc);
+show(81,,,);
+table GP_UserReportAccess;
+recMarker=pAccessMarker;
+fields
+  GroupOrUserIcon '':NoAutoSize,Image;
+  GroupOrUserName 'Пользователи и группы' ('Пользователи и группы',, ): [40], Protect;
+  if(GP_UserReportAccess.IsAllow,'Разрешен','Запрещен') 'Доступ' (,,sci1378Esc):[10], Protect, PickButton;
+end;
+
+function GetModuleIcon(ModuleID:string):string;
+{
+  if (ModuleID='*')
+    result:='BMCOMMON'
+  else
+    result:='C_USERMANUAL::bmp'+UpCase(ModuleID);
+}
+
+TableEvent table ReportsTree;
+cmTreeNodeType:{
+  if (ReportsTree.cNode=0)
+    TreeSetNodeType(trReports,
+                    if(TreeIsTerminal(trReports),ntfText,if(TreeNodeIsOpen(trReports),ntfOpen,ntfClose)),
+                    GetModuleIcon(ReportsTree.MenuID))
+  else if (ReportsTree.IsLeaf=1)
+    TreeSetNodeType(trReports, ntfText);
+}
+cmTreeTop:{
+  cTreeNode:=0;
+}
+cmTreeUp:{
+  cTreeNode:=ReportsTree.cNode;
+}
+cmTreeDown:{
+  cTreeNode:=ReportsTree.NRec;
+}
+cmTreeNeedOwner:{
+  TreeJumpToRecord(trReports,ReportsTree.cNode);
+}
+end;
+
+TableEvent table GP_UserReportAccess;
+cmSetDefault:{
+  if (ReportsTree.IsLeaf<>1) {
+    message('Нельзя задать права доступа на группу.');
+    abort;
+  } else {
+    GP_UserReportAccess.RepVipName:=ReportsTree.RepVipName;
+    GP_UserReportAccess.IsAllow:=true;
+  }
+}
+cmInsertRecord:{
+  insert current GP_UserReportAccess;
+}
+cmUpdateRecord:{
+  update current GP_UserReportAccess;
+}
+cmDeleteRecord:{
+  delete current GP_UserReportAccess;
+}
+cmPick:{
+  set GP_UserReportAccess.IsAllow:=not GP_UserReportAccess.IsAllow;
+  stop;
+}
+end;
+
+function AddReportsTree(buf:type$ReportsTree):comp;
+{
+  result:=0;
+
+  if (getfirst fastfirstrow ReportsTree2
+      where((
+        buf.cNode==ReportsTree2.cNode and
+        buf.RepName==ReportsTree2.RepName and
+        buf.RepVipName==ReportsTree2.RepVipName
+      ))<>tsok) {
+    ReportsTree2.buffer:=buf;
+    insert current ReportsTree2;
+  }
+
+  result:=ReportsTree2.NRec;
+}
+
+function InsRepGroups(cCurNode:comp):comp;
+var j:integer;
+    GroupName,PrevGroupName:string;
+    buf:type$ReportsTree;
+{
+  result:=cCurNode;
+
+  PrevGroupName := '';
+  for (j := 1; j < 100; j++) {
+    GroupName := UserReport.GetGroupName(j);
+
+    if (GroupName = '' or GroupName = PrevGroupName)
+      break
+    else {
+      ClearAdvRecord(buf);
+      buf.cNode:=result;
+      buf.RepName:=GroupName;
+      buf.Priority:=-1000;
+      result:=AddReportsTree(buf);
+      PrevGroupName := GroupName;
+    }
+  }
+}
+
+procedure LoadReports;
+var ImpCount,i,j:integer;
+    ModuleID:string;
+    buf:type$ReportsTree;
+    cCurNode:comp;
+{
+  delete ReportsTree where((0<<=ReportsTree.NRec));
+
+  if (not LoadImplementationList('F_UserReport::IUserReport', 'UserReport_')) {
+    Message('Не удалось загрузить список отчетов', Error + OkButton);
+    Exit;
+  }
+
+  ImpCount := GetImplementationCount;
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Загрузка списка отчетов', ImpCount);
+
+  _try {
+    for (i := 0; i < ImpCount; i++) {
+      NextVisual;
+      if (not GetVipRef(UserReport, GetImplementationName(i))) continue;
+
+      for (j := 1; j < 100; j++) {
+        ModuleID:=UserReport.VisibleInModule(j);
+
+        if (ModuleID<>'') {
+          if (ModuleID[Length(ModuleID)]='2')
+            ModuleID:=SubStr(ModuleID,1,Length(ModuleID)-1);
+
+          ClearAdvRecord(buf);
+          buf.MenuID:=ModuleID;
+          if (ModuleID='*') {
+            buf.RepName:='Общие для всех модулей';
+            buf.Priority:=-1;
+          }
+          else if (getfirst fastfirstrow ContourComponents where((ModuleID==ContourComponents.Name))=tsok)
+            buf.RepName:=ContourComponents.Title
+          else if (getfirst fastfirstrow ContourComponents where((ModuleID+'2'==ContourComponents.Name))=tsok)
+            buf.RepName:=ContourComponents.Title
+          else {
+            buf.RepName:='Неизвестное имя модуля (' + ModuleID + ')';
+            buf.Priority:=-2;
+          }
+          cCurNode:=AddReportsTree(buf);
+
+          cCurNode:=InsRepGroups(cCurNode);
+
+          ClearAdvRecord(buf);
+          buf.cNode:=cCurNode;
+          buf.IsLeaf:=1;
+          buf.RepName:=UserReport.GetReportName;
+          buf.Priority:=UserReport.GetPriority;
+          buf.RepVipName:=VipFullName(UserReport);
+          buf.ResName:=GetResourceName(buf.RepVipName);
+          AddReportsTree(buf);
+        }
+
+        if (ModuleID='' or ModuleID='*') break;
+      }
+
+      UserReport:=NullRef;;
+    }
+  }
+  _except on ExUserBreak : {}
+  _finally {
+    UserReport:=NullRef;
+    StopVisual;
+  }
+
+  UnloadImplementationList;
+}
+
+HandleEvent
+cmInit:{
+  if (not pr_CurUserAdmin) {
+    message('Программа доступна только пользователям с правами администратора.',error);
+    abort;
+    exit;
+  }
+
+  LoadReports;
+
+  if (CurRepVipName<>'')
+    if (getfirst fastfirstrow ReportsTree2 where((1==ReportsTree2.IsLeaf and CurRepVipName==ReportsTree2.RepVipName))=tsok)
+      TreeJumpToRecord(trReports,ReportsTree2.NRec);
+
+  DisableCommand(cmRestoreDoc);
+}
+cmHotKeys:{
+  if (CurTable=tnGP_UserReportAccess)
+    PutHotCommand(RunMenu('GP_UserReportAccessEdit_Access_HotKeys'))
+  else
+    PutHotCommand(RunMenu('GP_UserReportAccessEdit_Reports_HotKeys'));
+}
+cmInsert:{
+  PutHotCommand(RunMenu('GP_UserReportAccessEdit_Access_HotKeys'));
+  stop;
+}
+cmValue1:{//Добавить пользователя
+  var cUser:comp=0;
+  var mUsers:Tptr=InitMarker('',8,0,1);
+
+  _loop GP_UserReportAccess2 where((ReportsTree.RepVipName==GP_UserReportAccess2.RepVipName)) {
+    if (GP_UserReportAccess2.cUser<>0) {
+      cUser:=GP_UserReportAccess2.cUser;
+      InsertMarker(mUsers,cUser);
+    }
+  }
+
+  if (RunInterface(GP_PickUsers,cgiPickMult,cUser,mUsers)=cmDefault) {
+    var i:longint;
+    for(i:=0;i<GetMarkerCount(mUsers);i++)
+      if (GetMarker(mUsers,i,cUser))
+        if (not oAccessService.AddRepAccess(ReportsTree.RepVipName,cUser,0)) break;
+
+    ReReadRecord(tnGP_UserReportAccess);
+  }
+
+  DoneMarker(mUsers,0);
+}
+cmValue2:{//Добавить группу пользователей
+  var cGroup:comp=0;
+  var mGroups:Tptr=InitMarker('',8,0,1);
+
+  _loop GP_UserReportAccess2 where((ReportsTree.RepVipName==GP_UserReportAccess2.RepVipName)) {
+    if (GP_UserReportAccess2.cGroup<>0) {
+      cGroup:=GP_UserReportAccess2.cGroup;
+      InsertMarker(mGroups,cGroup);
+    }
+  }
+
+  if (RunInterface(GP_PickGroups,cgiPickMult,cGroup,mGroups)=cmDefault) {
+    var i:longint;
+    for(i:=0;i<GetMarkerCount(mGroups);i++)
+      if (GetMarker(mGroups,i,cGroup))
+        if (not oAccessService.AddRepAccess(ReportsTree.RepVipName,0,cGroup)) break;
+
+    ReReadRecord(tnGP_UserReportAccess);
+  }
+
+  DoneMarker(mGroups,0);
+}
+cmValue3:{//Сделать общим
+  oAccessService.AddRepAccess(ReportsTree.RepVipName,0,0);
+  ReReadRecord(tnGP_UserReportAccess);
+}
+cmSaveDoc:{
+  if (ReportsTree.IsLeaf<>1) exit;
+
+  CopySrcRepVipName:=ReportsTree.RepVipName;
+  EnableCommand(cmRestoreDoc);
+  message('Скопированы права доступа отчета "'+ReportsTree.RepName+'".');
+}
+cmRestoreDoc:{
+  if (CopySrcRepVipName='') exit;
+  if (pRepMarker.Count=0 and (ReportsTree.IsLeaf<>1 or CopySrcRepVipName=ReportsTree.RepVipName)) exit;
+
+  if (message('Установить скопированные права доступа для '+
+              if(pRepMarker.Count=0,'текущего отчета','всех помеченных отчетов')+'?'#13+
+              chr(255)+chr(129)+'Текущие настройки будут удалены!'+chr(255)+chr(129),YesNo+Confirmation)<>cmYes) exit;
+
+  if (pRepMarker.Count=0)
+    oAccessService.CopyRepAccess(CopySrcRepVipName,ReportsTree.RepVipName)
+  else {
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Копирование прав доступа...', pRepMarker.Count);
+
+    SubBounds(tbRMReportsTree1);
+    _loop pRepMarker
+     _Loop ReportsTree2 where(( pRepMarker.pNRec==ReportsTree2.NRec)) {
+      if (not NextVisual) break;
+      if (ReportsTree2.IsLeaf<>1 or CopySrcRepVipName=ReportsTree2.RepVipName) continue;
+
+      if (not oAccessService.CopyRepAccess(CopySrcRepVipName,ReportsTree2.RepVipName))
+        break;
+    }//_loop pMarker
+    AddBounds(tbRMReportsTree1);
+
+    ReReadRecord(tnReportsTree);
+    pRepMarker.UnselectAll;
+
+    StopVisual;
+  }
+
+  ReReadRecord(tnGP_UserReportAccess);
+}
+cmDelete:{
+  if (IsValidAll(tnGP_UserReportAccess))
+    if (message('Удалить запись?',yesno+Warning+mfSwapButtons)<>cmYes) stop;
+}
+end;
+end.
+
+GP_UserReportAccessEdit_Access_HotKeys Menu
+{
+  - 'Добавить пользователя', cmValue1, 'Добавить пользователя',hcNoContext,,,sci1Esc,,,, IMGARMUSER;
+  - 'Добавить группу пользователей', cmValue2, 'Добавить группу пользователей',hcNoContext,,,sci1Esc,,,, IMGARMGROUP;
+  - 'Сделать общим', cmValue3, 'Сделать общим',hcNoContext,,,sci1Esc,,,, BMCOMMON;
+}
+
+GP_UserReportAccessEdit_Reports_HotKeys Menu
+{
+  - 'Копировать права доступа',cmSaveDoc, 'Копировать права доступа',hcNoContext,'Ctrl+F2',kbCtrlF2,sci1Esc,,,, bmpCopyDoc;
+  - 'Вставить права доступа', cmRestoreDoc,'Вставить права доступа',hcNoContext,'Ctrl+F3',kbCtrlF3,sci1Esc,,,, bmpPasteDoc;
+}

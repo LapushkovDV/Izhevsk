@@ -1,0 +1,401 @@
+/*************************************************************************************************\
+* Наименование: Хэлпер для РПД 90                                                                 *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи |Дата    |Исполнитель             |Проект                             *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2656        |08/06/18|Евдокимов М.А.          |НПО Энергомаш                      *
+\*************************************************************************************************/
+
+#include AtlProtocol.vih
+#include UniqueNumberOfOrders.vih
+#include ExtAttr.vih
+#include Query.vih
+
+#component "GP_Staff"
+
+#include GP_RPD_90_Helper.vih
+interface GP_RPD_90_Helper
+
+const
+  //Наименование внешнего атрибута к ContDoc для хранения ссылки на связанный c ним contdoc
+  //Используется для связывания contdoc'ов заявок на работу в вых.дни (РПД190) c contdoc'ами
+  //сформированных по ним приказов на работу в выходные дни (РПД90)
+  ATTRNAM_NAME_LINKED_SALSCALE_NREC = 'LinkedSalScaleNrec';
+end;
+
+var
+  _uniqueNumberOfOrders: UniqueNumberOfOrders;  // объект для работы с нумерацией приказов
+  _extAttr: IExtAttr; //объект для работы с внешними атрибутами
+  _qLinkedRPD90: IQuery; //запрос для определения привязанных к заявке приказов с рпд 90
+
+create view
+var
+  _titleDoc190Marker: TPtr;    //Маркер с нреками TitleDoc заявок на работу в вых.дни
+  _linkedSalScaleNrec: comp;    //нрек ContDoc'а связанного с ContDoc190
+as select TitleDoc.Nrec
+from TitleDoc TitleDoc190,
+     PartDoc  PartDoc190,
+     ContDoc  ContDoc190,
+     SalScale SalScale190,
+     TitleDoc,
+     PartDoc,
+     ContDoc,
+     SalScale,
+     SalScale LinkedSalScale,
+     ContDoc LinkedContDoc
+where ((
+  Root              /== TitleDoc190.Nrec       and (FoundMarker(_titleDoc190Marker, TitleDoc190.Nrec)) and
+
+  190               /== PartDoc190.TypeOper    and
+  TitleDoc190.Nrec  /== PartDoc190.cDoc        and
+
+  PartDoc190.Nrec   /== ContDoc190.cPart       and
+
+  0                 /== SalScale190.wTblCode   and
+  ContDoc190.Nrec   /== SalScale190.cUnit      and
+
+  ContDoc190.Person  == ContDoc.Person         and
+  PartDoc.Nrec       == ContDoc.cPart          and
+
+  _linkedSalScaleNrec  == LinkedSalScale.Nrec   and
+  LinkedSalScale.cUnit == LinkedContDoc.Nrec
+));
+
+function MyLogLine(aProtocol: IAtlProtocol; aType: byte; aStr: string): longint;
+{
+  if aProtocol != nullref
+    result := aProtocol.LogLine(aType, aStr);
+  else
+    result := 0;
+}
+
+function MyLogMessage(aProtocol: IAtlProtocol; aType: byte; aStr: string): longint;
+{
+  if aProtocol != nullref
+    result := aProtocol.LogLine(aType, aStr);
+  else
+    result := 0;
+}
+
+function MyLogCommit(aProtocol: IAtlProtocol): byte;
+{
+  if aProtocol != nullref
+    result := aProtocol.LogCommit;
+  else
+    result := 0;
+}
+
+
+//Формирует приказ по персоналу с РПД90 "Работа в выходные и праздничные"
+//по заявкам на работу в выходные и праздничные (приказы с РПД190).
+//Возвращает нрек созданного приказа. Если приказ не создан - возвращает 0.
+//Параметры:
+//  aTitleDocMarker - маркер с нреками приказов - заявок.
+//  aProtocol - протокол для вывода информации.
+function CreateStaffOrderByClaims(aTitleDocMarker: TPtr; dstTitleDocNrec: comp = 0; aProtocol: IAtlProtocol = nullref): comp;
+{
+  result := 0;
+
+  _titleDoc190Marker := aTitleDocMarker;
+
+  var isTitleDocCreated: boolean = false;
+  var isPartDocCreated: boolean = false;
+
+  if getfirst TitleDoc where ((dstTitleDocNrec == TitleDoc.Nrec)) = tsOk
+  {
+    MyLogLine(aProtocol, APE_MESSAGE, 'Заполнение приказа №' + TitleDoc.DocNmb + ' от ' + TitleDoc.DocDate);
+    isTitleDocCreated := true;
+    result := TitleDoc.Nrec;
+    if getfirst PartDoc where ((90 == PartDoc.TypeOper and dstTitleDocNrec == PartDoc.cDoc)) = tsOk
+      isPartDocCreated := true;
+  }
+
+  var contDocWRec: word = 0;        //счетчик создаваемых в приказе contdoc'ов
+
+  //Цикл по заголовкам приказов из маркера aTitleDocMarker
+  _loop TitleDoc190
+  {
+    //Пропускаем оформляемые приказы
+    if TitleDoc190.wStatus = 0
+    {
+      MyLogLine(aProtocol, APE_WARNING, 'Заявка №' + TitleDoc190.DocNmb + ' от ' + TitleDoc190.DocDate +
+          ' в статусе "Оформляемый". Пропущена.');
+      continue;
+    }
+
+    //Если ранее не создали приказ - создаем
+    if not isTitleDocCreated
+    {
+      ClearBuffer(#TitleDoc);
+      TitleDoc.DocDate  := Cur_Date;
+      TitleDoc.DocYear  := Year(TitleDoc.DocDate);
+      TitleDoc.DocNmb   := _uniqueNumberOfOrders.GetNmbPrWithYear(0, TitleDoc.DocYear);
+      TitleDoc.DocText  := 'Работа в выходные и праздничные';
+      isTitleDocCreated := insert current TitleDoc = tsOk;
+      if isTitleDocCreated
+      {
+        MyLogLine(aProtocol, APE_MESSAGE, 'Создан приказ №' + TitleDoc.DocNmb + ' от ' + TitleDoc.DocDate);
+        result := TitleDoc.Nrec;
+      }
+      else
+      {
+        MyLogLine(aProtocol, APE_ERROR, 'Ошибка формирования приказа');
+        continue;
+      }
+    }
+
+    //Если ранее не создали РПД приказа - создаем
+    if not isPartDocCreated
+    {
+      ClearBuffer(#PartDoc);
+      PartDoc.cDoc     := TitleDoc.Nrec;
+      PartDoc.TypeOper := 90;
+      PartDoc.NRazd    := 1;
+      PartDoc.cRef2    := UserId;
+      isPartDocCreated := insert current PartDoc = tsOk;
+      if not isPartDocCreated
+      {
+        MyLogLine(aProtocol, APE_ERROR, 'Ошибка формирования распорядительного действия в приказе');
+        continue;
+      }
+    }
+
+    //Цикл по РПД приказа из маркера
+    _loop PartDoc190
+    {
+
+      //Цикл по содержаниям РПД приказа из маркера
+      _loop ContDoc190
+      {
+
+        _loop SalScale190
+        {
+          //Если текущий ContDoc190 уже привязан к другому приказу - пропускаем
+          //если привязан к текущему приказу - обновляем
+          _linkedSalScaleNrec := comp(_extAttr.sGetAttr(coSalScale, SalScale190.Nrec, ATTRNAM_NAME_LINKED_SALSCALE_NREC));
+          if getfirst LinkedSalScale = tsOk
+            if GetFirst LinkedContDoc = tsOk
+            {
+              if LinkedContDoc.cPart != PartDoc.Nrec
+              {
+                MyLogLine(aProtocol, APE_WARNING, 'Заявка №' + TitleDoc190.DocNmb + ' от ' + TitleDoc190.DocDate +
+                          ', сотрудник ' + ShowKau(cgKau_Persons, ContDoc190.Person) + ': ' +
+                          'запись на дату ' + SalScale190.LastDate + 'включена в другой приказ. Пропущена');
+              }
+              else
+              {
+                 LinkedSalScale.LastDate := SalScale190.LastDate;
+                 LinkedSalScale.LastUser := SalScale190.LastUser;
+                 LinkedSalScale.FilialNo := SalScale190.FilialNo;
+                 LinkedSalScale.fMin     := SalScale190.fMin;
+                 LinkedSalScale.fMax     := SalScale190.fMax;
+                 LinkedSalScale.fSum0    := SalScale190.fSum0;
+                 update current LinkedSalScale
+              }
+              continue;
+            }
+
+          //Если в новом приказе нет ContDoc'а с сотрудником из ContDoc190 - создаем
+          if getfirst ContDoc != tsOk
+          {
+            contDocWRec++;
+            ContDoc.Buffer   := ContDoc190.Buffer;
+            ContDoc.Nrec     := 0;
+            ContDoc.wYearPr  := 0;
+            ContDoc.wRec     := contDocWRec;
+            ContDoc.cPart    := PartDoc.Nrec;
+            ContDoc.TypeOper := PartDoc.TypeOper;
+            ContDoc.NumPart  := PartDoc.NRazd;
+            ContDoc.cNew6    := UserId;
+            if insert current ContDoc != tsOk
+            {
+              MyLogLine(aProtocol, APE_ERROR, 'Заявка №' + TitleDoc190.DocNmb + ' от ' + TitleDoc190.DocDate +
+                        ': ошибка добавления сотрудника ' + ShowKau(cgKau_Persons, ContDoc190.Person));
+              continue;
+            }
+          }
+
+          SalScale.Buffer := SalScale190.buffer;
+          SalScale.Nrec   := 0;
+          SalScale.cUnit  := ContDoc.Nrec;
+          if insert current SalScale != tsOk
+          {
+            MyLogLine(aProtocol, APE_ERROR, 'Заявка №' + TitleDoc190.DocNmb + ' от ' + TitleDoc190.DocDate +
+                      ', сотрудник ' + ShowKau(cgKau_Persons, ContDoc190.Person) + ': ' +
+                      'ошибка добавления записи на дату ' + SalScale190.LastDate);
+            continue;
+          }
+
+          //Привязываем ContDoc190 к созданному/найденному ContDoc'у
+          _extAttr.sSetAttr(coSalScale, SalScale190.Nrec, ATTRNAM_NAME_LINKED_SALSCALE_NREC, SalScale.Nrec);
+
+        }//_loop SalScale190
+
+      } //_loop ContDoc190
+
+    } //_loop PartDoc190
+
+    //Обновляем текст заявки
+    update current TitleDoc190
+      set TitleDoc190.DocText := CalcClaimDocText(TitleDoc190.Nrec);
+
+  } //_loop TitleDoc190
+
+  if result = 0
+    MyLogLine(aProtocol, APE_ERROR, 'Отсутствуют данные для формирования приказа. Приказ не сформирован');
+}
+
+//возвращает номера и даты приказов, присоединенных к заявке
+sql query qLinkedRPD90 =
+select distinct
+      TitleDoc90.DocNmb, TitleDoc90.DocDate
+    from TitleDoc
+    join PartDoc
+      on PartDoc.TypeOper = 190 and PartDoc.cDoc = TitleDoc.Nrec
+    join ContDoc
+      on ContDoc.cPart = PartDoc.Nrec
+    join SalScale
+      on SalScale.wTblCode = 0 and SalScale.cUnit = ContDoc.Nrec
+    join AttrNam
+      on AttrNam.wTable = :wTable and AttrNam.Name = :AttrNamName
+    join AttrVal
+      on AttrVal.wTable = :wTable and AttrVal.cRec = SalScale.Nrec and AttrVal.cAttrNam = AttrNam.Nrec
+    join SalScale SalScale90
+      on SalScale90.Nrec = comp(AttrVal.vString)
+    join ContDoc ContDoc90
+      on ContDoc90.Nrec = SalScale90.cUnit
+    join PartDoc PartDoc90
+      on PartDoc90.Nrec = ContDoc90.cPart
+    join TitleDoc TitleDoc90
+      on TitleDoc90.Nrec = PartDoc90.cDoc
+    where TitleDoc.Nrec = :TitleDoc190Nrec and AttrVal.vString not like '';
+
+function CalcClaimDocText(aTitleDoc190Nrec: comp): string;
+{
+  var sDepCode, sDepCodes: string = '';
+  var dMinDate, dMaxDate: date = date(0,0,0);
+  sql_loop
+    select distinct
+      SubString(CatDep.Code, 1, 3),
+      Min(SalScale.LastDate) Over (),
+      Max(SalScale.LastDate) Over ()
+    from TitleDoc
+    join PartDoc
+      on PartDoc.TypeOper = 190 and PartDoc.cDoc = TitleDoc.Nrec
+    join ContDoc
+      on ContDoc.cPart = PartDoc.Nrec
+    join Catalogs CatDep
+      on ContDoc.cDopRef = CatDep.Nrec
+    left join SalScale
+      on SalScale.wTblCode = 0 and SalScale.cUnit = ContDoc.Nrec
+    where TitleDoc.Nrec = :(aTitleDoc190Nrec)
+    into (sDepCode, dMinDate, dMaxDate)
+    {
+      sDepCodes += if(sDepCodes != '', ', ', '') + sDepCode;
+    }
+
+  var sDocNmbs: string = '';
+  if _qLinkedRPD90 = nullref
+    _qLinkedRPD90 := queryManager.createQuery(qLinkedRPD90)
+                                 .setParam('wTable', coSalScale)
+                                 .setParam('AttrNamName', ATTRNAM_NAME_LINKED_SALSCALE_NREC);
+  _qLinkedRPD90.setParam('TitleDoc190Nrec', aTitleDoc190Nrec)
+               .execute;
+
+  if _qLinkedRPD90.errorCode = tsOk
+    while _qLinkedRPD90.fetch.errorCode = tsOk
+    {
+      sDocNmbs += if(sDocNmbs != '', ', ', '') + '№' + _qLinkedRPD90.row.ValAt(1) + ' от ' +
+                  DateToStr(_qLinkedRPD90.row.ValAt(2), 'DD.MM.YY');
+    }
+
+  result  := 'Заявка' +
+             if(sDepCodes = '', '', ' отдел ') + sDepCodes +
+             if(dMinDate <> date(0,0,0), ' ' + DateToStr(dMinDate, 'DD.MM.YY'), '') +
+             if(dMaxDate > dMinDate, ' - ' + DateToStr(dMaxDate, 'DD.MM.YY'), '') +
+             if(sDocNmbs = '', '', ' (в прик. ' + sDocNmbs + ')');
+}
+
+create view vTabel
+var
+  _cPersons: comp;
+  _wMonth  : word;
+  _wYear   : word;
+  _wRejim  : word;
+  _dDate   : date;
+as select
+  LSchet.Nrec
+from
+  LSchet
+ ,LSTab
+ ,Perexod
+ ,Klndr
+where ((
+      vTabel._cPersons == Lschet.tPerson
+  and (
+         Lschet.Sovm <> 3 and
+         (
+           Lschet.DatUv = 0 or
+           Lschet.DatUv >= Date(1, vTabel._wMonth, vTabel._wYear)
+         )
+      )
+
+  and LSchet.Nrec      == LsTab.cLschet
+  and vTabel._wYear    == LsTab.YearN
+  and vTabel._wMonth   == LsTab.MesN
+
+  and vTabel._wRejim   == Klndr.Rejim
+  and vTabel._wYear    == Klndr.YearK
+  and vTabel._wMonth   == Klndr.MonthK
+
+  and LSchet.Nrec      == Perexod.cLSch
+  and vTabel._dDate   >>= Perexod.DatIzm
+  and (
+        (Perexod.Flags2 and 16) = 16 and
+        (Perexod.DatOk = 0 or Perexod.DatOk >= vTabel._dDate) and
+        (
+          (Month(Perexod.DatIzm) = vTabel._wMonth and Year(Perexod.DatIzm)  = vTabel._wYear) or
+          (Month(Perexod.DatOk)  = vTabel._wMonth and Year(Perexod.DatOk)   = vTabel._wYear)
+        )
+      )
+));
+
+
+//Возвращает режим работы сотрудника aPersonsNrec на дату aDate с учетом переходов
+function GetPersonsRejimOnDate(aPersonsNrec: comp; aDate: date): word;
+{
+  result := 0;
+
+  vTabel._cPersons := aPersonsNrec;
+  vTabel._dDate    := aDate;
+  vTabel._wMonth   := Month(aDate);
+  vTabel._wYear    := Year(aDate);
+
+  if vTabel.getfirst LSchet != tsOk exit;
+  result := vTabel.LSchet.Rejim;
+
+  if vTabel.getfirst LsTab = tsOk
+    result := vTabel.LSTab.Rejim;
+
+  if vTabel.getlast Perexod = tsOk
+    result := vTabel.Perexod.Rejim;
+}
+
+
+//Возвращает количество рабочих минут по графику работы сотрудника aPersonsNrec на дату aDate
+function GetPersonsWorkMinOnDate(aPersonsNrec: comp; aDate: date): word;
+{
+  result := 0;
+  var d: byte = Day(aDate);
+  if d = 0 exit;
+  vTabel._wRejim   := GetPersonsRejimOnDate(aPersonsNrec, aDate);
+  vTabel._wMonth   := Month(aDate);
+  vTabel._wYear    := Year(aDate);
+  if vTabel.getFirst Klndr = tsOk
+    result := vTabel.Klndr.DayChas[d] * 60 + vTabel.Klndr.DayMin[d];
+}
+
+
+end.

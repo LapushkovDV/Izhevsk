@@ -1,0 +1,214 @@
+/*************************************************************************************************\
+* Наименование: Реализация класса с функциями для проверки доступа к PartDoc с учетом дескриптора *
+*               и группы дескрипторов пользователя                                                *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#000          |07/11/17|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include Query.vih
+
+#component "GP_Staff"
+
+#include GP_PartDocAccessController.vih
+interface GP_PartDocAccessController;
+
+
+//#region Query queryDisabledPartDocList - список partdoc, для которых запрещен доступ по дескриптору/группе дескрипторов
+sql query queryDisabledPartDocList =
+select partdoc.nrec
+from partdoc
+join TuneDef TuneDefDescr on TuneDefDescr.Code = 'USER.DESCR'
+join TuneDef TuneDefDesgr on TuneDefDesgr.Code = 'USER.DESGR'
+left join x$users usr on usr.atl_nrec = partdoc.cref2
+left join TuneVal TuneValDescr on TuneValDescr.Obj   = usr.xu$useroffice and
+                                  TuneValDescr.cUser = usr.atl_nrec and
+                                  TuneValDescr.cTune = TuneDefDescr.Nrec
+left join TuneVal TuneValDesgr on TuneValDesgr.Obj   = usr.xu$useroffice and
+                                  TuneValDesgr.cUser = usr.atl_nrec and
+                                  TuneValDesgr.cTune = TuneDefDesgr.Nrec
+left join AttrVal avHidden on avHidden.wTable = :coPartDoc and avHidden.cRec = partdoc.nrec and avHidden.cAttrNam = :AttrNamNrecPartDocHidden
+join servstav on servstav.wtblcode = partdoc.typeoper and servstav.cunit = :cUser and servstav.filialno = 1
+where
+  (
+    partdoc.typeOper < 30000
+  )
+  and
+  (
+    (
+      BITAND(cast(servstav.cserv as longint), :bitEnabled ) = :bitEnabled
+    )
+    and
+    (
+      (
+        BITAND(cast(servstav.cserv as longint), :bitOnlyDescr ) = 0 and
+        BITAND(cast(servstav.cserv as longint), :bitOnlyDesgr ) = :bitOnlyDesgr and
+        TuneValDesgr.StrVal <> :Desgr
+      )
+      or
+      (
+        BITAND(cast(servstav.cserv as longint), :bitOnlyDescr ) = :bitOnlyDescr and
+        TuneValDescr.StrVal <> :Descr
+      )
+      or
+      (
+        BITAND(cast(servstav.cserv as longint), :bitEnabledHidden ) = 0 and
+        Trim(avHidden.vString) = :AttrValValuePartDocHidden
+      )
+    )
+  )
+order by partdoc.nrec
+;
+//#endregion  Query queryDisabledPartDocList
+
+var
+  _lastUser: comp = 0;
+  _disabledPartDocMarker: TPtr;
+  _attrNamNrecPartDocHidden: comp;
+
+create view
+var
+  _cUser: comp;
+  _typeOper: word;
+from servstav
+where ((
+  _typeOper == servstav.wtblcode and
+  _cUser    == servstav.cunit and
+  (servstav.filialno = 1)
+));
+
+create view vUserHasAccess
+var
+  _partdocNrec: comp;
+(HiddenFld)
+as select if(isValidAll(tnAvHidden), trim(avHidden.vString), '')
+from partdoc, attrval avHidden
+where ((
+  _partdocNrec              == partdoc.nrec and
+  coPartDoc                 == avHidden.wTable and
+  _partdocNrec              == avHidden.cRec and
+  _attrNamNrecPartDocHidden == avHidden.cAttrNam
+));
+
+//*****************************************************************************
+//#region Вспомогательные функции
+
+function BitIsSet(cFlag: comp; cBit: comp): boolean;
+{
+  result := (cFlag and cBit) = cBit;
+}
+
+function GetUserDescr(cUser: comp): string; cacheable;
+{
+  result := sGetTuneEx('USER.DESCR', UserOfficeFilial(cUser), cUser);
+}
+
+function GetUserDesgr(cUser: comp): string; cacheable;
+{
+  result := sGetTuneEx('USER.DESGR', UserOfficeFilial(cUser), cUser);
+}
+
+procedure FillDisabledPartDocMarker(cUser: comp);
+{
+  var userDescr, userDesgr: string;
+  userDescr := GetUserDescr(cUser);
+  userDesgr := GetUserDesgr(cUser);
+
+  var q: IQuery;
+  q := queryManager.createQuery(queryDisabledPartDocList)
+                   .SetParam('cUser',            cUser)
+                   .SetParam('bitEnabled',       GP_BIT_RPD_ENABLED)
+                   .SetParam('bitOnlyDescr',     GP_BIT_RPD_ENABLED_ONLY_DESCR)
+                   .SetParam('bitOnlyDesgr',     GP_BIT_RPD_ENABLED_ONLY_DESGR)
+                   .SetParam('bitEnabledHidden', GP_BIT_RPD_ENABLED_HIDDEN)
+                   .SetParam('Desgr',            userDesgr)
+                   .SetParam('Descr',            userDescr)
+                   .SetParam('coPartDoc',        coPartDoc)
+                   .SetParam('AttrNamNrecPartDocHidden',  _attrNamNrecPartDocHidden)
+                   .SetParam('AttrValValuePartDocHidden', GP_ATTRVAL_VALUE_PARTDOC_HIDDEN)
+                   .Execute;
+
+  if q.errorCode = tsOk
+    while (q.fetch.errorCode = tsOk)
+      InsertMarker(_disabledPartDocMarker, comp(q.row.ValAt(1)));
+}
+
+//#endregion Вспомогательные функции
+//*****************************************************************************
+
+//*****************************************************************************
+//#region GP_IPartDocAccessController implementation
+
+function GP_IPartDocAccessController.GetUsersAccessFlag(cUser: comp; typeOper: word): comp; cacheable;
+{
+  _cUser := cUser;
+  _typeOper := typeOper;
+  if getfirst servstav = tsOk
+    result := servstav.cserv
+  else
+    result := comp(0);
+}
+
+function GP_IPartDocAccessController.UserHasAccess(cUser: comp; partdocNrec: comp): boolean; cacheable;
+{
+  result := false;
+
+  vUserHasAccess._partdocNrec := partdocNrec;
+  if vUserHasAccess.getFirst partdoc = tsOk
+  {
+    var flag: comp;
+    flag := GetUsersAccessFlag(cUser, vUserHasAccess.PartDoc.typeOper);
+
+    if BitIsSet(flag, GP_BIT_RPD_ENABLED)
+    {
+      if vUserHasAccess.partdoc.cRef2 = comp(0)
+        result := true;
+      else if BitIsSet(flag, GP_BIT_RPD_ENABLED_ONLY_DESCR)
+      {
+        result := (GetUserDesgr(cUser) = GetUserDesgr(vUserHasAccess.partdoc.cRef2));
+      }
+      else if BitIsSet(flag, GP_BIT_RPD_ENABLED_ONLY_DESGR)
+      {
+        result := (GetUserDescr(cUser) = GetUserDescr(vUserHasAccess.partdoc.cRef2));
+      }
+      else if not BitIsSet(flag, GP_BIT_RPD_ENABLED_HIDDEN)
+      {
+        result := vUserHasAccess.HiddenFld = '';
+      }
+      else
+        result := true;
+    }
+  }
+}
+
+function GetDisabledPartDocMarker(cUser: comp = 0): TPtr;
+{
+  if cUser = 0 cUser := UserId;
+  if _lastUser != cUser
+  {
+    ClearMarker(_disabledPartDocMarker);
+    FillDisabledPartDocMarker(cUser);
+    _lastUser := cUser;
+  }
+  result := _disabledPartDocMarker;
+}
+
+//#endregion GP_IPartDocAccessController implementation
+//*****************************************************************************
+
+handleevent
+  cmOnVipLoad:
+  {
+    _disabledPartDocMarker := InitMarker('', 8, 10000, 1000, true);
+
+    _attrNamNrecPartDocHidden := ExtAttr_Id(coPartDoc, GP_ATTRNAM_NAME_PARTDOC_HIDDEN);
+    if _attrNamNrecPartDocHidden = 0
+      _attrNamNrecPartDocHidden := ExtAttr_Create(coPartDoc, GP_ATTRNAM_NAME_PARTDOC_HIDDEN, cgAttrType_Str);
+  }
+  cmOnVipUnload: DoneMarker(_disabledPartDocMarker, '');
+end;
+
+end.

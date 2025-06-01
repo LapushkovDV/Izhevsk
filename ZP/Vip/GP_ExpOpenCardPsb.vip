@@ -1,0 +1,516 @@
+/*************************************************************************************************\
+* Наименование:  Разработка функционала выгрузки данных для открытия карт-счетов                  *
+*                "Выгрузка данных для Промсвязьбанка (ЭМ)"                                          *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |-             |23/10/20|Брюнин В.П.              |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include UserReport.vih
+#include ComFiltr.vih
+#include CatFunc.vih
+#include AdrFunc.vih
+#include StrFunc.vih
+#include GP_XlOutExt.vih
+
+
+#define GPInt GP_ExpOpenCardPsb // #(GPInt)
+#define GPNam Выгрузка данных для Промсвязьбанка // #(GPNam)
+
+Interface #(GPInt) '#(GPNam) (ЭМ)' EscClose, Gray;
+  show (,,86,9);
+
+const
+#include Excel.inc;
+end;
+
+table struct ttPerFlt // для фильтра по персоналу
+(
+  cRecPers : comp
+)
+with index
+(
+  ttPerFlt01  = cRecPers
+);
+
+table struct ttResStr // статический набор данных
+(
+  nRec       : comp
+, cRecPers   : comp
+, sTabNmb    : string
+, sFIO       : string
+, sF         : string
+, sI         : string
+, sO         : string
+, sPol       : string
+, sAdr       : string
+, sTypPass   : string
+, sSerPass   : string
+, sNomPass   : string
+, sPodrPass  : string
+, sKtoPass   : string
+, dKtoPass   : string
+, dBorn      : string
+, sBorn      : string
+, sGrazhd    : string
+, sTelDom    : string
+, sTelMob    : string
+, sTelRab    : string
+, sILat      : string
+, sFLat      : string
+, sEMail     : string
+, sAppoint   : string
+, sAppDate   : string
+, sAppTaxRate: string
+)
+with index
+(
+  ttResStr00 = nRec(Surrogate)
+, ttResStr01 = cRecPers
+, ttResStr02 = sFIO
+);
+
+var
+  VCommonFiltr  : CommonFiltr; // Для встраивания фильтра по подразделениям / сотрудникам
+  MadeReport    : boolean;
+  mPsn          : TPtr;
+  iCatFunc      : CatalogsFunctions;
+  iAdrFunc      : AddressFunc;
+  iStrFunc      : StringFunctions;
+  iOut          : GP_XlOutExt;
+  sFullName,
+  sFileName,
+  sDefaultPhone : string;
+  lRB, lRE,
+  lCB, lCE,
+  lDB, lDE,
+  iNPP          : integer = 0;
+  sR, sL        : array[1..33] of string[4];
+  sShKl         : array [1..67] of string;
+  sShKlGPB      : array [1..67] of string;
+
+create view
+from
+  Persons
+, Passports
+, Passports PassINN
+, Passports PassSNILS
+, Communications
+, ttPerFlt
+, ttResStr
+//, STerr
+, appointments
+, catalogs app
+, catalogs Gr
+where
+((
+    ttPerFlt.cRecPers == Persons.nRec
+and Persons.Gr   == Gr.nrec
+and Persons.PasspRus  == Passports.nRec
+and Persons.nRec      == Communications.Person
+and Persons.nrec == PassINN.person 
+and 505          == PassINN.syscode
+and Persons.nrec == PassSNILS.person 
+and 501          == PassSNILS.syscode
+and persons.appointcur == appointments.nrec
+and appointments.post == app.nrec
+))
+;
+
+function sFPF : string; {sFPF := DateToStr(Cur_Date(),'_YYMMDD')+TimeToStr(Cur_Time(),'_HHMMSS');}
+
+function formatPhone(sAny : string) : string;
+{
+  result := sAny;
+  result := Replace(result, '+', '');
+  result := Replace(result, '-', '');
+  result := Replace(result, '(', ' (');
+  result := Replace(result, ')', ') ');
+}
+
+function sRepPhoneList(sAny : string) : string;
+{
+  result:='';
+  if isvalid(#Communications)
+  _loop Communications
+    if Pos(sAny,LoCase(iCatFunc.GetCatalogsName(Communications.ComType)))<>0
+      result+=if((Trim(result)<>''),'; ','')+formatPhone(Communications.Addr);
+
+  if(Trim(result) = '')
+    result:= sDefaultPhone;
+}
+
+
+function sRetEMailList(sAny : string) : string;
+{
+  result:='';
+  if isvalid(#Communications)
+  _loop Communications
+    if ( Pos(sAny, LoCase(iCatFunc.GetCatalogsName(Communications.ComType))) <> 0 )
+      result += if(Trim(result) <> '', '; ', '') + Communications.EMail;
+}
+
+procedure InitRus2Lat;
+{
+  sR[ 1] := 'А';  sL[ 1] :=  'A';
+  sR[ 2] := 'Б';  sL[ 2] :=  'B';
+  sR[ 3] := 'В';  sL[ 3] :=  'V';
+  sR[ 4] := 'Г';  sL[ 4] :=  'G';
+  sR[ 5] := 'Д';  sL[ 5] :=  'D';
+  sR[ 6] := 'Е';  sL[ 6] :=  'E';
+  sR[ 7] := 'Ё';  sL[ 7] :=  'E';
+  sR[ 8] := 'Ж';  sL[ 8] :=  'ZH';
+  sR[ 9] := 'З';  sL[ 9] :=  'Z';
+  sR[10] := 'И';  sL[10] :=  'I';
+  sR[11] := 'Й';  sL[11] :=  'I';
+  sR[12] := 'К';  sL[12] :=  'K';
+  sR[13] := 'Л';  sL[13] :=  'L';
+  sR[14] := 'М';  sL[14] :=  'M';
+  sR[15] := 'Н';  sL[15] :=  'N';
+  sR[16] := 'О';  sL[16] :=  'O';
+  sR[17] := 'П';  sL[17] :=  'P';
+  sR[18] := 'Р';  sL[18] :=  'R';
+  sR[19] := 'С';  sL[19] :=  'S';
+  sR[20] := 'Т';  sL[20] :=  'T';
+  sR[21] := 'У';  sL[21] :=  'U';
+  sR[22] := 'Ф';  sL[22] :=  'F';
+  sR[23] := 'Х';  sL[23] :=  'KH';
+  sR[24] := 'Ц';  sL[24] :=  'TS';
+  sR[25] := 'Ч';  sL[25] :=  'CH';
+  sR[26] := 'Ш';  sL[26] :=  'SH';
+  sR[27] := 'Щ';  sL[27] :=  'SCSH';
+  sR[28] := 'Ы';  sL[28] :=  'Y';
+  sR[29] := 'Ъ';  sL[29] :=  'IE';
+  sR[30] := 'Ь';  sL[30] :=  '';
+  sR[31] := 'Э';  sL[31] :=  'E';
+  sR[32] := 'Ю';  sL[32] :=  'IU';
+  sR[33] := 'Я';  sL[33] :=  'IA';
+}
+
+function sRus2Lat(sAny : string) : string;
+Var
+  wI: word;
+{
+  if sAny <> ''
+    sAny := UpCase(sAny);
+    for(wI:=1; wI<=33; wI++) sAny:=Replace(sAny,sR[wI],sL[wI]);
+  result:=sAny;
+}
+procedure InitShortKLAdr;
+{
+  // сокращения из КЛАДР    // Сокращения как надо для газпромбанка
+  sShKl[1] :='аал';         sShKlGPB[1] := '';
+  sShKl[2] :='автодорога';  sShKlGPB[2] := '';
+  sShKl[3] :='Аобл';        sShKlGPB[3] := '';
+  sShKl[4] :='АО';          sShKlGPB[4] := '';
+  sShKl[5] :='арбан';       sShKlGPB[5] := '';
+  sShKl[6] :='аул';         sShKlGPB[6] := '';
+  sShKl[7] :='волость';     sShKlGPB[7] := '';
+  sShKl[8] :='высел';       sShKlGPB[8] := '';
+  sShKl[9] :='г.о.';        sShKlGPB[9] := '';
+  sShKl[10]:='гп';          sShKlGPB[10]:= '';
+  sShKl[11]:='городок';     sShKlGPB[11]:= '';
+  sShKl[12]:='г';           sShKlGPB[12]:= 'гор';
+  sShKl[13]:='дп';          sShKlGPB[13]:= '';
+  sShKl[14]:='д';           sShKlGPB[14]:= '';
+  sShKl[15]:='ж/д_будка';   sShKlGPB[15]:= '';
+  sShKl[16]:='ж/д_казарм';  sShKlGPB[16]:= '';
+  sShKl[17]:='ж/д_оп';      sShKlGPB[17]:= '';
+  sShKl[18]:='ж/д_платф';   sShKlGPB[18]:= '';
+  sShKl[19]:='ж/д_пост';    sShKlGPB[19]:= '';
+  sShKl[20]:='ж/д_рзд';     sShKlGPB[20]:= '';
+  sShKl[21]:='ж/д_ст';      sShKlGPB[21]:= '';
+  sShKl[22]:='жилзона';     sShKlGPB[22]:= '';
+  sShKl[23]:='жилрайон';    sShKlGPB[23]:= '';
+  sShKl[24]:='заимка';      sShKlGPB[24]:= '';
+  sShKl[25]:='казарма';     sShKlGPB[25]:= '';
+  sShKl[26]:='кв-л';        sShKlGPB[26]:= '';
+  sShKl[27]:='км';          sShKlGPB[27]:= '';
+  sShKl[28]:='кордон';      sShKlGPB[28]:= '';
+  sShKl[29]:='кп';          sShKlGPB[29]:= '';
+  sShKl[30]:='край';        sShKlGPB[30]:= '';
+  sShKl[31]:='лпх';         sShKlGPB[31]:= '';
+  sShKl[32]:='мкр';         sShKlGPB[32]:= '';
+  sShKl[33]:='массив';      sShKlGPB[33]:= '';
+  sShKl[34]:='м';           sShKlGPB[34]:= '';
+  sShKl[35]:='нп';          sShKlGPB[35]:= '';
+  sShKl[36]:='обл';         sShKlGPB[36]:= '';
+  sShKl[37]:='округ';       sShKlGPB[37]:= '';
+  sShKl[38]:='остров';      sShKlGPB[38]:= '';
+  sShKl[39]:='промзона';    sShKlGPB[39]:= '';
+  sShKl[40]:='п/о';         sShKlGPB[40]:= '';
+  sShKl[41]:='п/р';         sShKlGPB[41]:= '';
+  sShKl[42]:='п/ст';        sShKlGPB[42]:= '';
+  sShKl[43]:='пгт';         sShKlGPB[43]:= '';
+  sShKl[44]:='погост';      sShKlGPB[44]:= '';
+  sShKl[45]:='починок';     sShKlGPB[45]:= '';
+  sShKl[46]:='п';           sShKlGPB[46]:= '';
+  sShKl[47]:='Респ';        sShKlGPB[47]:= '';
+  sShKl[48]:='Респ';        sShKlGPB[48]:= '';
+  sShKl[49]:='рзд';         sShKlGPB[49]:= '';
+  sShKl[50]:='р-н';         sShKlGPB[50]:= '';
+  sShKl[51]:='рп';          sShKlGPB[51]:= '';
+  sShKl[52]:='ст-ца';       sShKlGPB[52]:= '';
+  sShKl[53]:='с/а';         sShKlGPB[53]:= '';
+  sShKl[54]:='с/мо';        sShKlGPB[54]:= '';
+  sShKl[55]:='с/о';         sShKlGPB[55]:= '';
+  sShKl[56]:='с/п';         sShKlGPB[56]:= '';
+  sShKl[57]:='с/с';         sShKlGPB[57]:= '';
+  sShKl[58]:='сл';          sShKlGPB[58]:= '';
+  sShKl[59]:='снт';         sShKlGPB[59]:= '';
+  sShKl[60]:='ст';          sShKlGPB[60]:= '';
+  sShKl[61]:='с';           sShKlGPB[61]:= '';
+  sShKl[62]:='тер';         sShKlGPB[62]:= '';
+  sShKl[63]:='ул';          sShKlGPB[63]:= '';
+  sShKl[64]:='у';           sShKlGPB[64]:= '';
+  sShKl[65]:='х';           sShKlGPB[65]:= '';
+  sShKl[66]:='Чувашия';     sShKlGPB[66]:= '';
+  sShKl[67]:='ш';           sShKlGPB[67]:= '';
+}
+
+
+procedure Run;
+var kol, i    : integer = 0;
+    cPersNRec : comp;
+    cAddrNeed : comp;
+{
+  sDefaultPhone := '7 (000) 0000000';
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+  InitRus2Lat;
+  InitShortKLAdr;
+  if (VCommonFiltr.GetPsnCount = 0)
+    VCommonFiltr.SelectAllPsn;
+
+  mPsn := InitMarker('#(GPInt)_PSN_'+UserName(),8,200,100);
+  mPsn := VCommonFiltr.GetPersonsMarker;
+  kol  := GetMarkerCount(mPsn);
+  RestartVisual('Формирование таблицы фильтров.',1);
+  while i < kol
+  {
+    GetMarker(mPsn, i++, cPersNRec);
+    insert ttPerFlt set ttPerFlt.cRecPers := cPersNRec;
+    If (not NextVisual) break;
+  }
+  
+  RestartVisual('Формирование данных для выгрузки.',1);
+  if IsValid(#ttPerFlt)
+  _loop ttPerFlt
+  {
+    if (not NextVisual) break;  
+    if IsValid(#Persons)
+    {
+      ClearBuffer(#ttResStr);
+      cAddrNeed         := Persons.PasspAddr;
+
+      ttResStr.cRecPers := Persons.nRec;
+      ttResStr.sTabNmb  := Persons.strtabn;
+
+      ttResStr.sFIO     := Persons.FIO ;
+      ttResStr.sPol     := if(Persons.Sex = 'М', 1, 2);
+      ttResStr.sF       := iStrFunc.Get_LastName (Persons.FIO);
+      ttResStr.sI       := iStrFunc.Get_FirstName(Persons.FIO);
+      ttResStr.sO       := iStrFunc.GetPatronymic(Persons.FIO);
+      ttResStr.sAdr     := iAdrFunc.GetFullAddressInd(Persons.PasspAddr);
+      ttResStr.dBorn    := DateToStr(Persons.BornDate, 'DD.MM.YYYY');
+      ttResStr.sBorn    := iAdrFunc.GetFullAddressInd(Persons.BornAddr);
+      ttResStr.sTelMob  := sRepPhoneList('моб');
+      ttResStr.sTelDom  := sRepPhoneList('дом');
+      ttResStr.sTelRab  := sRepPhoneList('раб');
+      ttResStr.sILat    := sRus2Lat(ttResStr.sI);
+      ttResStr.sFLat    := sRus2Lat(ttResStr.sF);
+      if IsValid(#Passports)
+      {
+        ttResStr.sSerPass := Passports.Ser;
+        ttResStr.sNomPass := Passports.Nmb;
+        ttResStr.sTypPass := '21';
+        ttResStr.sPodrPass:= Passports.GivenPodr;
+        ttResStr.sKtoPass := Passports.GivenBy;
+        ttResStr.dKtoPass := DateToStr(Passports.GivenDate, 'DD.MM.YYYY');
+      }
+      if IsValid(#appointments)
+      {
+        ttResStr.sAppTaxRate := Appointments.TaxRate;
+        if IsValid(#app)
+        {
+           ttResStr.sAppoint := app.Name;
+        }
+      }
+      if IsValid(#Gr)
+      {
+        ttResStr.sGrazhd  := Gr.CATDATA;
+      }
+      ttResStr.sEMail   := sRetEMailList('электронная почта');
+      ttResStr.sAppDate := DateToStr(Persons.AppDate, 'DD.MM.YYYY');;
+      insert current ttResStr;
+    }
+  }
+  if isvalid(#ttResStr)
+      {
+    //    00523 - код, присвоенный организации,
+    //2 - признак операции (файл на зачисление),
+    //MMDDYYYY
+    sFileName := '005232'+DateToStr(Cur_Date, 'MMDD')+'01';
+    sFullName := GetDefaultUserPath + '\'+sFileName+'.xlsx';
+    xlCreateExcel(sFullName, TRUE);
+    lRB  := 1;
+    lDB  := lRB + 1;
+    lCB  := 1;
+    lCE  := 1;
+    iNPP := 1;
+    RestartVisual('Выгрузка данных.',1);
+    
+    #define FrmHd  lRB,  lCE,  lRB,  lCE
+    iOut.Header1Row('№ строки',#FrmHd); lCE++;
+    iOut.Header1Row('Тип карты',#FrmHd); lCE++;
+    iOut.Header1Row('Табельный номер',#FrmHd); lCE++;
+    iOut.Header1Row('Фамилия',#FrmHd); lCE++;
+    iOut.Header1Row('Имя',#FrmHd); lCE++;
+    iOut.Header1Row('Отчество',#FrmHd); lCE++;
+    iOut.Header1Row('Пол держателя карты(муж- 1, жен -2)',#FrmHd); lCE++;
+    iOut.Header1Row('Эмбоссируемые данные, имя',#FrmHd); lCE++;
+    iOut.Header1Row('Эмбоссируемые данные, фамилия',#FrmHd); lCE++;
+    iOut.Header1Row('Кодовое слово',#FrmHd); lCE++;
+    iOut.Header1Row('Дата рождения',#FrmHd); lCE++;
+    iOut.Header1Row('Место рождения',#FrmHd); lCE++;
+    iOut.Header1Row('Гражданство',#FrmHd); lCE++;
+    iOut.Header1Row('Документ, удостоверяющий личность, Код',#FrmHd); lCE++;
+    iOut.Header1Row('Документ, удостоверяющий личность, Серия, номер)',#FrmHd); lCE++;
+    iOut.Header1Row('Документ, удостоверяющий личность, Когда выдан',#FrmHd); lCE++;
+    iOut.Header1Row('Документ, удостоверяющий личность, Кем выдан',#FrmHd); lCE++;
+    iOut.Header1Row('Документ, удостоверяющий личность, Код подразделения',#FrmHd); lCE++;
+    iOut.Header1Row('Миграционная карта, Серия номер',#FrmHd); lCE++;
+    iOut.Header1Row('Миграционная карта, Дата выдачи',#FrmHd); lCE++;
+    iOut.Header1Row('Миграционная карта, Дата окончания',#FrmHd); lCE++;
+    iOut.Header1Row('Документ на право пребывания на территории РФ, Серия Номер',#FrmHd); lCE++;
+    iOut.Header1Row('Документ на право пребывания на территории РФ, Дата выдачи',#FrmHd); lCE++;
+    iOut.Header1Row('Документ на право пребывания на территории РФ, Дата окончания',#FrmHd); lCE++;
+    iOut.Header1Row('Адрес регистрации в РФ (в соответствии с форматом КЛАДР)',#FrmHd); lCE++;
+    iOut.Header1Row('Адрес электронной почты',#FrmHd); lCE++;
+    iOut.Header1Row('Рабочий телефон',#FrmHd); lCE++;
+    iOut.Header1Row('Домашний телефон',#FrmHd); lCE++;
+    iOut.Header1Row('Мобильный телефон',#FrmHd); lCE++;
+    iOut.Header1Row('Должность',#FrmHd); lCE++;
+    iOut.Header1Row('Место доставки карт для сетевых и федеральных проектов',#FrmHd); lCE++;
+    iOut.Header1Row('Дата принятия на работу',#FrmHd); lCE++;
+    iOut.Header1Row('Должностной оклад',#FrmHd);  lCE++;
+
+    _loop ttResStr iNPP++; 
+    if (not xlCreateMatrix(iNPP+1,lCE))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    xlSetNumberFormat('@',lRB, 1,iNPP+1, lCE);
+
+    iNPP:=1;
+    lDE :=1;
+
+    #define FrmCl lDE,lCE++
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+      lCE := 1;
+      xlStWriteToMatrix(#FrmCl,iNPP++              );//  iOut.Header1Row('Номер',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,'2.0'               );//  iOut.Header1Row('Тип карты',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sTabNmb    );//  iOut.Header1Row('Табельный номер',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sF         );//  iOut.Header1Row('Фамилия',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sI         );//  iOut.Header1Row('Имя',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sO         );//  iOut.Header1Row('Отчество',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sPol       );//  iOut.Header1Row('Пол держателя карты(муж- 1, жен -2)',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sILat      );//  iOut.Header1Row('Эмбоссируемые данные, имя',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sFLat      );//  iOut.Header1Row('Эмбоссируемые данные, фамилия',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,''                  );//  iOut.Header1Row('Кодовое слово',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.dBorn      );//  iOut.Header1Row('Дата рождения',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sBorn      );//  iOut.Header1Row('Место рождения',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,'643'               );//  iOut.Header1Row('Гражданство',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,'21'                );//  iOut.Header1Row('Документ, удостоверяющий личность, Код',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sSerPass + ' ' + ttResStr.sNomPass);//  iOut.Header1Row('Документ, удостоверяющий личность, Серия, номер)',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.dKtoPass   );//  iOut.Header1Row('Документ, удостоверяющий личность, Когда выдан',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sKtoPass   );//  iOut.Header1Row('Документ, удостоверяющий личность, Кем выдан',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sPodrPass  );//  iOut.Header1Row('Документ, удостоверяющий личность, Код подразделения',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,''                  );//  iOut.Header1Row('Миграционная карта, Серия номер',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,''                  );//  iOut.Header1Row('Миграционная карта, Дата выдачи',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,''                  );//  iOut.Header1Row('Миграционная карта, Дата окончания',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,''                  );//  iOut.Header1Row('Документ на право пребывания на территории РФ, Серия Номер',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,''                  );//  iOut.Header1Row('Документ на право пребывания на территории РФ, Дата выдачи',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,''                  );//  iOut.Header1Row('Документ на право пребывания на территории РФ, Дата окончания',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sAdr       );//  iOut.Header1Row('Адрес регистрации в РФ (в соответствии с форматом КЛАДР)',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sEMail     );//  iOut.Header1Row('Адрес электронной почты',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,'7 (495) 2869206'   );//  iOut.Header1Row('Рабочий телефон',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sTelDom    );//  iOut.Header1Row('Домашний телефон',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sTelMob    );//  iOut.Header1Row('Мобильный телефон',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sAppoint   );//  iOut.Header1Row('Должность',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,''                  );//  iOut.Header1Row('Место доставки карт для сетевых и федеральных проектов',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sAppDate   );//  iOut.Header1Row('Дата принятия на работу',#FrmHd); lCE++;
+      xlStWriteToMatrix(#FrmCl,ttResStr.sAppTaxRate);//  iOut.Header1Row('Дата принятия на работу',#FrmHd); lCE++;
+      lDE++;
+    }
+    RestartVisual('Вставка данных в Excel.',1);
+    if (not xlWriteMatrixToExcel(2,1))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+    xlFreeMatrix;
+    xlAutoFit(lRB,lCB,lDE,lCE);
+    xlSetSheetName(1, 'РЕЕСТР');
+
+    xlKillExcel;
+  }
+  else
+  {
+    message('Нет данных для формирования отчета!');
+  }
+  StopVisual;
+}
+
+embedded ComFiltrEmbedded 'Фильтры' interface VCommonFiltr;
+  show (,,85,6);
+end
+Screen s2(,,sci1Esc);
+  show (,7,85,8);
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+  <<
+     <. ~С~формировать .>                         <. ~З~акрыть .>
+  >>
+end;
+
+handleevent
+  cmInit:
+  {
+    delete all from ttPerFlt;
+    delete all from ttResStr;
+    MadeReport:= false;
+  }
+  cmOk:
+  {
+    Run;
+    MadeReport:= true;
+    VCommonFiltr.IntClose(MadeReport);
+    VCommonFiltr.StoreAllParams;
+    Notify(cmEvaluateAndModify, 0);
+    DoneMarker(mPsn, '#(GPInt)_PSN_' + UserName());
+    closeinterface(cmDefault);
+  }
+  cmCancel:
+  {
+    VCommonFiltr.IntClose(MadeReport);
+    DoneMarker(mPsn, '#(GPInt)_PSN_' + UserName());
+  }
+end;
+end.
+
+
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+Procedure Run;                                  {runinterface(#(GPInt));}
+Function  GetReportName               : String; {GetReportName := '#(GPNam) (ЭМ)';}
+Function  GetGroupName (Level : Word) : String; {Level:=Level;GetGroupName := '';}
+function  GetPriority                 : Integer;{GetPriority := 3;}
+function  VisibleInModule(Ind : Byte) : String; {Ind:=Ind; VisibleInModule := 'STAFFMAINMENU';} // для Пушковой Перенесено из MENUZARP';}
+End.

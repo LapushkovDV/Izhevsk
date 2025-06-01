@@ -1,0 +1,662 @@
+//------------------------------------------------------------------------------
+//                                                      (c) корпорация Галактика
+// Галактика 9.1 - Заработная плата
+// Импорт листка нетрудоспособности из xml-файла
+//------------------------------------------------------------------------------
+
+#include ImportBlisnetadvXML.vih
+#include ImportBlisnetXML.vih
+#include XMLConverter.vih
+#include TXmlTables.tbl
+#include PerAcces.vih        // разграничение доступа к картотеке
+#include Marker.vih
+#include StrFunc.vih          // Функции работы со строками
+#include BlisNet.tbl
+#include MainLschetForPersons.vih // поиск основного лицевого счета
+
+#doc
+Пакетный импорт листков нетрудоспособности из xml-файлов
+#end
+
+interface ImportBlisnetadvXML 'Пакетный импорт листков нетрудоспособности из XML-файлов';
+  show at (,,100,20);
+
+Table Struct mt_List
+(
+  Nrec           : comp
+ ,NameFile       : string
+ ,SURNAME_       : string
+ ,NAME_          : string
+ ,PATRONIMIC_    : string
+ ,BornDate       : date
+ ,Snils_         : string[14]
+ ,DatBeg         : date
+ ,DatEnd         : date
+ ,VidPos         : word
+ ,Snils2         : string[14]
+ ,cLshet         : comp
+ ,tPerson        : comp
+)
+With Index
+(
+  mt_List01 = NRec (Unique, Surrogate)
+, mt_List02 = SURNAME_  + NAME_ + PATRONIMIC_
+, mt_List03 = Snils2
+);
+
+var oXMLConverter: XMLConverter;
+var VPerAccess   : SetPersonsAccess;
+
+
+create view
+var
+  LschetID
+ ,prLschet         : comp;
+
+  slTypeChoice
+ ,wUsPersAccess_9
+ ,typeRun
+ ,slType           : word;
+
+  cRecXml          : comp;
+
+  bUsePersAccess   : boolean;
+
+  sNameDir
+ ,UserNameMain     : string;
+
+  dtTune           : date;
+
+  ImportBl         : ImportBlisnetXML;
+  pMarker          : iMarker(marker) new;     // для пометки
+  iStrFuncs        : StringFunctions;
+  MLFP             : MainLschetForPersons;
+
+as select mt_List.*,
+  'bmBlisnet'            (FieldName = fSReportFR),
+  'Z_PayFSS::bmPrintXml' (FieldName = fSReportXML),
+  'Дата формирования ЛН будущего периода: '+
+  if ( day(dtTune) > 0, DateToStr(dtTune, 'DD.MM.YYYY'), '' )
+                         (FieldName = fdtTune)
+
+from
+  KlVidPos
+ ,Lschet
+ ,Persons
+ ,Passports
+ ,mt_List (mt_List02)
+ ,mt_List mt_ListImp
+ ,mt_List mt_ListWork
+ ,TXMLNODE
+ ,TXMLNODE TXMLNODE_TREAT_FULL_PERIOD
+ ,tp_BlisNet
+
+where
+((
+     cRecXml          == mt_ListImp.nRec
+
+   and mt_List.VidPos == KlVidPos.VidPos
+
+   and LschetID       == Lschet.NRec
+
+   and Lschet.tPerson == Persons.NRec
+
+   and Persons.NRec   == Passports.Person
+   and 501            == Passports.SysCode // Страховой номер
+
+))
+
+bounds bnBornDate = 'С'              == Persons.IsEmployee and
+                    mt_List.BornDate == Persons.BornDate // дата рождения
+
+;
+
+parameters prLschet, typeRun, slType;
+
+function CheckFIO(AFIO, ASurname, AName, APatronimic: string; ABornDate: date; ASnils: s20): boolean;
+{
+  result := False;
+
+  if (UpCase(iStrFuncs.Get_LastName(AFIO)) = UpCase(ASurname)) and (ASurname <> '')
+    if (UpCase(iStrFuncs.GetPatronymic(AFIO)) = UpCase(APatronimic))
+      if (UpCase(iStrFuncs.Get_FirstName(AFIO)) = UpCase(AName))
+        result := True;
+
+  if result
+    if ( not ( (Persons.BornDate = ABornDate) and (ABornDate <> ZeroDate) ) )
+      result := False;
+
+  if result
+  {
+    if (getFirst Passports = tsOk) // проверка страхового номера (задается в виде XXX-XXX-XXX XX, но может быть и без разделителей)
+    {
+      if (Passports.Nmb <> '')
+      {
+        var tmpStr: string;
+        tmpStr := Replace(UpCase(Passports.Nmb), '-', '');
+        tmpStr := Replace(tmpStr,' ','');
+
+        ASnils := Replace(UpCase(ASnils), '-', '');
+        ASnils := Replace(ASnils,' ','');
+
+        if (tmpStr <> ASnils)
+          result := False
+      }
+    }
+  }
+}
+
+function fsGetFIO: string;
+{
+  Result := '';
+  if (isValid(#mt_List) )
+    Result := mt_List.SURNAME_ + ' ' + mt_List.NAME_ + ' ' +  mt_List.PATRONIMIC_;
+}
+
+function fsGetPos: string;
+{
+  Result := '';
+  if (isValid(#mt_List) )
+    Result := UPCASE(KlVidPos.NPos)+ if ( day(mt_List.DatBeg) = 0, '',
+  ' c '+DateToStr(mt_List.DatBeg,   'DD.MM.YYYY') +
+                        ' по '+DateToStr(mt_List.DatEnd, 'DD.MM.YYYY'));
+}
+
+screen scImportParams(, hcNoContext, sci1Esc);
+show at (,,,3);
+table mt_List;
+  fields
+  sNameDir ('Укажите папку, содержащую XML-файлы для импорта ЭЛН',, sci13Esc): NoProtect, NoStatic,
+    {font = {backcolor = if(Trim(sNameDir) = '', ColorNeed, 0)}};
+  slTypeChoice ('Период, в который будет импортироваться ЭЛН'):
+           [List 0          '...'], Protect;
+  fdtTune   ('Дата начала формирования листков нетрудоспособности будущего периода'): Skip;
+<<
+
+ `Папка с XML-файлами:` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Устанавливать период:`.@@@@@@@@@@@@@@@@@ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+>>
+end;
+
+browse brCorDocum (,, sci1InsPM);
+show at (,4,,16);
+table mt_List;
+recMarker = pMarker { mt_List.nRec };
+fields
+  fsGetFIO()     'ФИО'('ФИО',,)                       : [30], protect;
+  mt_List.Snils_ 'СНИЛС'('СНИЛС',,)                   : [12], protect;
+  fsGetPos()     'Пособие'('Пособие',,)               : [50], protect;
+  fSReportFR     ''('Показать больничный лист (FR)',,): [2], image;
+  fSReportXML    ''('Открыть xml-файл',,)             : [2], {hint = if ( not IsValid(#mt_List), '', 'Открыть xml-файл: '+ mt_List.NameFile)}, image;
+end;
+Screen scButton ('',, sci1Esc);
+show at (,17,,);
+buttons
+  cmValue1,,, 'Импорт ЭЛН',, ;
+  cmCancel,,, 'Отмена    ',, ;
+
+<<
+
+                            <.   ~И~мпорт   .>             <.   ~О~тмена   .>
+>>
+end;
+
+function fsGetSNILS(AName: s14): s14;
+{
+  AName  := trim(AName);
+  Result := trim(AName);
+  mt_List.Snils2  := Result;
+
+  if ( Pos('-', AName) <> 0 or Pos(' ', AName) <> 0 )
+    exit;
+
+  Result := substr(AName, 1, 3)+'-'+substr(AName, 4, 3)+'-'+substr(AName, 7, 3)+' '+substr(AName, 10, 2);
+}
+
+procedure pLoadXML(sNameDir_: string);
+var
+  sWorkFile: string;
+{
+  if ( trim(sNameDir_) = '' )
+    exit;
+
+  delete all mt_List;
+  pMarker.UnSelectAll;
+
+  ImportBl.prboPacket := true;
+  ImportBl.pmtClear;
+
+  // пытаемся найти первый файл по маске в указанной директории
+  sWorkFile := GetFirstFile(sNameDir_, '*.xml');
+
+  if ( sWorkFile = strDataIsEmpty )
+    message('В указанной директории не найдено файлов XML.', OkButton)
+  else
+  {
+    StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Чтение XML-файлов...', 1);
+    ImportBl.LoadExteranalKod;
+    // обходим и обрабатываем все файлы
+    while sWorkFile <> strDataIsEmpty do
+    {
+      NextVisual;
+      oXMLConverter.Init;
+      oXMLConverter.SortAttrByName := false;
+      if oXMLConverter.LoadTxmlTables(sWorkFile)
+      {
+        ImportBl.CheckNodeName;
+        ClearBuffer(#mt_List);
+        mt_List.NameFile := sWorkFile;
+        _loop TXMLNODE where (( 'ROW' == TXMLNODE.NAME ))
+        {
+          mt_List.Snils_      := fsGetSNILS(ImportBl.GetNodeValue(TXMLNODE.nRec, 'SNILS', false));
+          if (trim(mt_List.Snils_) = '')
+            continue;
+
+          if ( GetFirst mt_ListWork where (( mt_List.Snils2 == mt_ListWork.Snils2 )) = tsOK )
+            continue;
+
+          mt_List.SURNAME_    := ImportBl.GetNodeValue(TXMLNODE.nRec, 'SURNAME',    false);
+          mt_List.NAME_       := ImportBl.GetNodeValue(TXMLNODE.nRec, 'NAME',       false);
+          mt_List.PATRONIMIC_ := ImportBl.GetNodeValue(TXMLNODE.nRec, 'PATRONIMIC', false);
+          mt_List.BornDate    := ImportBl.TrunslateDate(ImportBl.GetNodeValue(TXMLNODE.nRec, 'BIRTHDAY', false));
+          if ( LschetID <> comp(0) )
+          {
+            if ( GetFirst Persons <> tsOk )
+              continue;
+
+            if ( not CheckFIO(Persons.FIO, mt_List.SURNAME_, mt_List.NAME_, mt_List.PATRONIMIC_, mt_List.BornDate, mt_List.Snils2) )// совпадение фио
+              continue;
+          }
+
+          var dtHOSPITAL_DT1: date;
+          dtHOSPITAL_DT1 := ImportBl.TrunslateDate(ImportBl.GetNodeValue(TXMLNODE.nRec, 'HOSPITAL_DT1', false));                                    // вкладка 2 - Находился в стационаре
+          var tmpS2: s2;
+          tmpS2 := ImportBl.GetNodeValue(TXMLNODE.nRec, 'REASON1', false);
+          var tmpAgeFirst, tmpAgeSecond: byte;
+          tmpAgeFirst := byte(ImportBl.GetNodeValue(TXMLNODE.nRec, 'SERV1_AGE', false));   // возраст (лет) первого родственника, за которым осуществляется уход
+          tmpAgeSecond := byte(ImportBl.GetNodeValue(TXMLNODE.nRec, 'SERV2_AGE', false));  // возраст (лет) второго родственника, за которым осуществляется уход
+          mt_List.VidPos := ImportBl.fwGetVidPos(tmpAgeFirst, tmpAgeSecond, dtHOSPITAL_DT1,tmpS2);
+          var tmpID, tmpID2: comp;
+          tmpID := ImportBl.GetNodeID(TXMLNODE.nRec, 'TREAT_PERIODS'); // Находим идентификатор тега TREAT_PERIODS, принадлежавшего тегу ROW
+          if (tmpID <> 0) // нашли узел
+          {
+            // Периоды болезни (нужно для правильной сортировки периодов)
+            _loop TXMLNODE_TREAT_FULL_PERIOD where ((tmpID == TXMLNODE_TREAT_FULL_PERIOD.CNODE)) // тегу TREAT_PERIODS может принадлежать множество тегов TREAT_FULL_PERIOD
+            {
+              tmpID2           := ImportBl.GetNodeID(TXMLNODE_TREAT_FULL_PERIOD.nRec, 'TREAT_PERIOD'); // Находим идентификатор тега TREAT_PERIOD, принадлежавшего тегу TREAT_FULL_PERIOD
+              if ( mt_List.DatBeg = ZeroDate )
+                mt_List.DatBeg   := ImportBl.TrunslateDate(ImportBl.GetNodeValue(tmpID2, 'TREAT_DT1', false));
+              if (mt_List.DatBeg <> ZeroDate) // если нет даты начала заболевания, то такое данные не нужно дальше обрабатывать
+                mt_List.DatEnd := ImportBl.TrunslateDate(ImportBl.GetNodeValue(tmpID2, 'TREAT_DT2', false));
+            }
+          }
+          insert current mt_List;
+        }//_loop TXMLNODE where (( 'ROW' == TXMLNODE.NAME ))
+      }
+      // ищем следующий
+      sWorkFile := GetNextFile;
+    }
+    StopVisual;
+    if ( GetLast mt_List <> tsOk )
+    {
+      message('В указанной папке'+ if ( LschetID = comp(0), '', (' по сотруднику: '+Persons.FIO)) +
+      ' не найдено XML-файлов для импорта ЭЛН.');
+    }
+    else
+    {
+      set sNameDir := sNameDir_;
+
+      if ( typeRun = 0 and LschetID <> comp(0) )
+      {
+        if ( day(mt_List.DatBeg) > 0 and ( day(dtTune) > 0 ) )
+          if ( mt_List.DatBeg >= dtTune )
+            slTypeChoice := sltFuturePeriod;
+      }
+    }
+  }
+  RereadRecord(#mt_List);
+  pMarker.SelectAll;
+  if ( GetFirst mt_List = tsOk ) {}
+}
+
+procedure pSetVisiebledtPer;
+{
+  if ( typeRun = 0 )
+  {
+    if ( slTypeChoice = sltTunePeriod )
+    //период - по настройке
+      SetFieldState(#fdtTune, sfVisible);
+    else
+      ClearFieldState(#fdtTune, sfVisible);
+  }
+}
+
+tableevent table mt_List;
+cmCheckField:
+{
+  case CurField of
+  #sNameDir:
+  {
+    if ( trim(sNameDir) <> '' )
+      pLoadXML(sNameDir);
+  }
+
+  #slTypeChoice:
+  {
+    pSetVisiebledtPer;
+  }
+  end;
+}
+end;
+
+procedure pSetTuneMarker;
+{
+  // настройка маркера
+  pMarker.AutoSave  := False;
+  pMarker.IsCaption := False;
+}
+
+procedure pHandlePeriodDefList;
+var
+  ArrStr : array [1..1] of string;
+  ArrInt : array [1..1] of integer;
+
+{
+  if ( typeRun = 1 )
+  //запуск из модуля "Управление персоналом"
+  {
+    HideLabel4Field(#slTypeChoice);
+    ClearFieldState(#slTypeChoice, sfVisible);
+
+    ClearFieldState(#fdtTune, sfVisible);
+
+    //групповой импорт
+    if ( prLschet = 0 )
+      SetHelpAndStatusContext(brCorDocum, -1, sci14InsPM, hcNoContext);
+
+  }
+  else
+  {
+  //запуск из модуля "Заработная плата"
+    SetFieldState(#slTypeChoice, sfVisible);
+    ShowLabel4Field(#slTypeChoice);
+
+    if ( prLschet = 0 )
+    //групповой импорт
+    {
+      SetLimit(ArrStr, 4);
+      SetLimit(ArrInt, 4);
+
+      ArrStr[1] := 'по настройке';
+      ArrStr[2] := 'текущий';
+      ArrStr[3] := 'архивный';
+      ArrStr[4] := 'будущий';
+
+      ArrInt[1] := sltTunePeriod;
+      ArrInt[2] := sltCurrentPeriod;
+      ArrInt[3] := sltPastPeriod;
+      ArrInt[4] := sltFuturePeriod;
+
+      slTypeChoice := sltTunePeriod;
+    }
+    else
+    //одиночный импорт импорт
+    {
+      SetLimit(ArrStr, 3);
+      SetLimit(ArrInt, 3);
+
+      ArrStr[1] := 'текущий';
+      ArrStr[2] := 'архивный';
+      ArrStr[3] := 'будущий';
+
+      ArrInt[1] := sltCurrentPeriod;
+      ArrInt[2] := sltPastPeriod;
+      ArrInt[3] := sltFuturePeriod;
+
+      slTypeChoice := slType;
+    }
+    pSetVisiebledtPer;
+  }
+  SetEnumList(scImportParams, #slTypeChoice, ArrStr, ArrInt);
+}
+
+function fwGetPeriod: word;
+{
+  Result := if ( typeRun = 1, sltCurrentPeriod, slTypeChoice);
+  //запустили из зарплаты
+  if ( typeRun = 0 and slTypeChoice = sltTunePeriod )
+  {
+    if ( day(mt_List.DatBeg) > 0 and ( day(dtTune) > 0 ) )
+    {
+      if ( mt_List.DatBeg >= dtTune )
+        Result := sltFuturePeriod
+      else
+        Result := sltCurrentPeriod;
+    }
+  }
+}
+
+HandleEvent
+cmInit:
+{
+  bUsePersAccess  := boGetTune('UP.STAFF.RECEPTION.Access'); //Взять значение из настройки
+  wUsPersAccess_9 := VPerAccess.GetAccessMask(9);
+  UserNameMain    := UserName();
+
+  if bUsePersAccess
+  {
+    if ((wUsPersAccess_9 and 2) = 0)
+      {
+        Message('Внимание! У пользователя ' + UserNameMain
+                + ' нет прав на импорт ЭЛН', Warning + OkButton);
+        abort;
+        exit;
+      }
+  }
+
+  if ( prLschet <> comp(0) )
+  {
+    LschetID := prLschet;
+    if ( GetFirst Lschet <> tsOk )
+    {
+      Message('Не обнаружен лицевой счет сотрудника.', Warning + OkButton);
+      abort;
+      exit;
+    }
+  }
+
+  pSetTuneMarker;
+  slTypeChoice := sltCurrentPeriod; // установка типа больничного, так как нужно будет знать изначально переданное значение
+  delete all mt_List;
+
+  if ( LschetID <> comp(0) )
+    SetTitle('Импорт листков нетрудоспособности из XML-файлов');
+
+  dtTune := dGetTune('UP.ZAR.FUTUREPERIODSICKLISTSBEGINNING');
+
+  pHandlePeriodDefList;
+}
+
+cmFilterSave:
+{
+  PutCommand(cmValue1);
+}
+
+cmPick:
+{
+  case CurField of
+  #sNameDir:
+  {
+!    sNameDir := GetDirName('Путь к XML-файлам...');
+   set sNameDir := FileNetConnect_FolderDialog(sNameDir, 'Папка c XML-файлами');
+
+
+    if ( trim(sNameDir) <> '' )
+      pLoadXML(sNameDir);
+  }
+  end;
+}
+
+cmValue1:
+{
+  ResetBounds(#mt_ListImp);
+  if ( GetFirst mt_ListImp <> tsOk )
+  {
+    message('Выберите папку с XML-файлами.', CancelButton);
+    SelectFormat(scImportParams);
+    SelectField(#sNameDir);
+
+    exit;
+  }
+  SetBounds(#mt_ListImp);
+
+  var Mark_      : TPtr;
+  var lnCountM, i: longint;
+
+  ImportBl.pClear_Log;
+
+  if ( pMarker.Count = 0 )
+     pMarker.Mark;
+  Mark_ := InitMarker('Imp_Xml', 8, 100, 10, false);
+
+  pMarker.ExportTo(Mark_);
+  lnCountM  := GetMarkerCount(Mark_);
+  StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Чтение XML-файлов...', 1);
+  for ( i := 0; i < lnCountM; inc(i) )
+  {
+    NextVisual;
+    if ( GetMarker(Mark_, i, cRecXml) )
+    {
+      if ( GetFirst mt_ListImp = tsOk )
+      {
+        if ( trim(mt_ListImp.NameFile) <> '' )
+        {
+          ImportBl.prboPacket       := true;
+          ImportBl.prboFillMt_table := false;
+          ImportBl.prSNILS_         := mt_ListImp.Snils2;
+          ImportBl.prFIO_           := mt_ListImp.SURNAME_ + ' ' + mt_ListImp.NAME_ + ' ' +  mt_ListImp.PATRONIMIC_;
+          ImportBl.prLschet         := comp(0);
+          ImportBl.primportFileName := mt_ListImp.NameFile;
+          ImportBl.prtypeRun        := typeRun;
+          //тип больничного: больничные текущего периода sltCurrentPeriod = 0; больничные прошлых периодов (архивные) sltPastPeriod = 3;  больничные будущего периода (не участвующие в расчетах) sltFuturePeriod = 5;
+          ImportBl.prslTypeChoice   := fwGetPeriod;
+          ImportBl.ImportData;
+        }
+      }
+    }
+  }
+  StopVisual;
+  ImportBl.pView_Log;
+  DoneMarker(Mark_, '');
+  CloseInterface(cmDefault);
+}
+
+cmImgClick:
+{
+  case CurImgField of
+  #fSReportFR:
+  {
+    if ( not IsValid(#mt_List) )
+      exit;
+    delete all tp_BlisNet;
+    ImportBl.prboPacket       := true;
+    ImportBl.prboFillMt_table := true;
+    ImportBl.primportFileName := mt_List.NameFile;
+    ImportBl.prtypeRun        := 1;
+    ImportBl.prslTypeChoice   := fwGetPeriod;
+    ImportBl.ImportData;
+    if ( GetFirst tp_BlisNet = tsOk )
+      RunInterface('PrintBlankOfSick');
+  }
+  #fSReportXML:
+  {
+    if ( not IsValid(#mt_List) )
+      exit;
+
+    if ( trim(mt_List.NameFile) <> '' )
+    {
+      if ExistFile(mt_List.NameFile)
+      {
+        var RetCode, aExitCode : integer;
+        RetCode := ExecProgram('start', mt_List.NameFile, 'ЭЛН', pfFullScreen or pfDontWait, aExitCode);
+
+        if ( RetCode <> 0 )
+        {
+          Message('Ошибка запуска программы. Код ошибки: ' + string(RetCode), Error);
+        }
+      }
+      else
+        message('Не найден файл "'+mt_List.NameFile+'"', OkButton);
+    }
+  }
+  end;
+}
+
+cmEdit:
+{
+  //запуск из кадров
+  if ( typeRun = 1 and prLschet = 0 )
+  {
+    if ( not IsValid(#mt_List) )
+      exit;
+
+    if ( mt_List.cLshet = 0 or mt_List.tPerson = 0 )
+    {
+      ResetBounds(#Persons);
+      PushBounds(tbbnBornDate);
+      _loop Persons
+      {
+        if ( not CheckFIO(Persons.FIO, mt_List.SURNAME_, mt_List.NAME_, mt_List.PATRONIMIC_, mt_List.BornDate, mt_List.Snils2) )// совпадение фио
+          continue;
+
+        if ( MLFP.GetMainLschetWorkIndep(Persons.NRec, LschetID) )
+          if ( getFirst Lschet = tsOk )
+          {
+            mt_List.cLshet  := LschetID;
+            mt_List.tPerson := Persons.NRec;
+            update current mt_List;
+
+            break;
+          }
+      }
+      PopBounds(tbbnBornDate);
+      SetBounds(#Persons);
+    }
+
+    if ( mt_List.cLshet <> 0 and mt_List.tPerson <> 0 )
+    {
+      LschetID := mt_List.cLshet;
+      if ( GetFirst LSchet = tsOk )
+      {
+        var p2: double = 0;
+        RunInterface('ZBlisNet1', LSchet.nRec, LSchet.Cex, p2, word(0), word(1), mt_List.tPerson, comp(0));
+      }
+    }
+    LschetID := 0;
+  }
+}
+
+cmAlt9:
+{
+  PutCommand(cmEdit);
+}
+
+cmDelOnProtect:
+{
+  case CurField of
+  #sNameDir:
+  {
+    set sNameDir := '';
+    delete all mt_List;
+    RereadRecord;
+    pMarker.UnSelectAll;
+  }
+  end;
+}
+
+cmDone:
+{
+}
+
+end;
+end.

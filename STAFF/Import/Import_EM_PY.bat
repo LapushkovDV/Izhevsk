@@ -1,0 +1,12 @@
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_tabel.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_sumopl.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_ndfl.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_shtraf.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_bank.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_doplata.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_invalid.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_debts.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_isplist.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_klndr_1.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_klndr_2.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log
+start /w \\dep968-galsrv3\GalSrv\exe\asql.exe import_em_kps.lot /c:asql.cfg /L+ /NUSK- /j+ /jr+ /jf:journal.log

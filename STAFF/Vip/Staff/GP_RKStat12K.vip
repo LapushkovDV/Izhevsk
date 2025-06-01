@@ -1,0 +1,1653 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                лист 12-к Сведения об образовании в разрезе категорий персонала                  *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#375          |13/10/17|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_RKStat.vih
+#include CatFunc.vih
+#include GP_ChRPD.vih
+#include TotalOrganizationAttributes.vih
+#include APPFUNCS.VIH
+#include GP_UDR_RKStat.vih
+
+#define GPInt GP_RKStat_List12K // #(GPInt)
+#define GPNam 12-К "Сведения об образовании в разрезе категорий персонала" // #(GPNam)
+
+VipInterface #(GPInt) Implements IGP_RKStat;
+Interface #(GPInt);
+
+const
+#include Excel.inc;
+end;
+#include TotalOrganizationAttributes.var
+
+table struct ttStatRK
+(
+  wAgeBl   : word
+, wEduRw   : word
+, wCol     : word
+, lVal     : array [0..1] of longint
+)
+with index
+(
+  ttStatRK01 = wAgeBl + wEduRw + wCol
+);
+table struct ttSpecRK
+(
+  cPsn      : comp
+, isInRep   : boolean
+, sFIO      : string
+, dAppoint  : date
+, dDismiss  : date
+, cLevel    : array [0..1] of comp
+, dEduc     : array [0..1] of date
+, dBorn     : date
+, wAge      : array [0..1] of word
+, dPens     : date
+, cKat      : array [0..1] of comp
+, cAdChar   : array [0..1] of comp
+, cDegree   : array [0..1] of comp
+, dDegree   : array [0..1] of date
+, sPlWrk    : array [0..1] of string[5]
+, isError   : boolean
+, sWhatError: string
+)
+with index
+(
+  ttSpecRK00 = cPsn
+, ttSpecRK01 = sFIO
+);
+
+table struct mtForError
+(
+  lRowError: longint
+);
+
+#ifdef RKSTATDEBUG
+  File LogFile;
+#endif
+
+
+
+var
+  dRep          : date;
+  iCatFunc      : CatalogsFunctions;
+  iAppFuncs     : AppointmentsFunctions;
+  iChRPD        : GP_ChRPD;
+  iUDR          : GP_UDR_RKStat;
+  sFullName     : string;
+  sPodr1        : string;
+  mPodr1        : TPtr;
+  __cRecAppoint : comp;
+  sKatWorker1
+ ,sKatWorker2
+ ,sKatWorker3
+ ,sKatWorker4
+ ,sKatType1
+ ,sKatType2
+ ,sKatType3
+ ,sKatType4
+ ,sKatType5
+ ,sKatType6
+ ,sKatEdu1
+ ,sKatEdu2
+ ,sKatEdu3      : string;
+  mKatWorker1
+ ,mKatWorker2
+ ,mKatWorker3
+ ,mKatWorker4 
+ ,mKatType1
+ ,mKatType2
+ ,mKatType3
+ ,mKatType4
+ ,mKatType5
+ ,mKatType6
+ ,mKatEdu1
+ ,mKatEdu2
+ ,mKatEdu3      : TPtr;
+  isFilterPodr  : boolean;
+  wPrintRash    : word;
+  wToExistFile  : word;
+  sToExistFile  : string;
+  wFromExistFile  : word;
+  sFromExistFile  : string;
+  wPensM
+ ,wPensF        : word;
+  isStayAloneAll: boolean = false;
+
+create view
+var
+  dRepP         : date;
+  dRepV         : date;
+  //dRepV1        : date;
+  wBl
+ ,wEdu
+ ,wCol : word;
+as select Persons.nRec
+from
+  ttStatRK
+, ttSpecRK
+, mtForError
+, Persons
+, Education
+, Catalogs CatEdu
+, KlKatego
+, Badge  NameK
+, OldOrg DateK
+, Badge  NameD
+, OldOrg DateD
+//--------------------
+//, Appointments AppNext // Для поиска принятых в следующем году
+
+// для фильтра по подразделениям
+, Appointments AppStaff
+, StaffStruct  StaffApp
+, LSchet       AppLS
+, contdoc DisDocCheck
+where
+((   'С' <<= Persons.ISEMPLOYEE
+and  'У' >>= Persons.ISEMPLOYEE
+and Persons.nRec       == Education.Person
+and Education.Level    == CatEdu.nRec
+//and Persons.nRec       == AppStaff.Person
+and __cRecAppoint      == AppStaff.nRec
+/*
+and Persons.nRec       == AppNext.Person
+and 0                  == AppNext.lPrizn
+and dRepV             <<=  AppNext.AppointDate
+and dRepV1            >>=  AppNext.AppointDate
+*/
+//and integer(0)         == AppStaff.lPrizn
+//and dRepV             >>= AppStaff.AppointDate
+and AppStaff.StaffStr  == StaffApp.nRec
+and AppStaff.cAddnRec2 == AppLS.nRec
+and AppStaff.nrec == DisDocCheck.cStr and (DisDocCheck.TypeOper = integer(8))
+//--------- Кандидат
+and Persons.nRec == NameK.Person
+and integer(2)   == NameK.BadgeMonth
+and word(3)      == DateK.wObj
+and Persons.nRec == DateK.cParent
+//--------- Доктор
+and Persons.nRec == NameD.Person
+and integer(10)  == NameD.BadgeMonth
+and word(4)      == DateD.wObj
+and Persons.nRec == DateD.cParent
+))
+;
+
+function OpenFromRKS : boolean;
+{
+  result := false;
+  xlOpenExcel(true);
+  xlDisplayAlerts(false);
+  if xlOpenWorkBook(sFromExistFile)
+    result := true;
+}
+function CloseFromRKS : boolean;
+{
+  result := false;
+  if xlCloseWorkBookByName(sFromExistFile)
+//  if xlKillExcel
+    result := true;
+    // только ради того, чтобы прибить Книгу1, которая непонятно чем открывается и висит 2 файла
+    if xlGetActiveWorkBookName('Книга1')
+      xlCloseWorkBookByName('Книга1');
+  xlDisplayAlerts(true);
+  if isStayAloneAll
+    xlKillExcel;
+}
+
+function sSetPodrName(mSetPdr: TPtr): string;
+{
+  if (getMarkerCount(mSetPdr) = 0)
+  {
+    result := 'Все подразделения';
+    exit;
+  }
+  else
+    if (getMarkerCount(mSetPdr) = 1)
+    {
+      var cTmp: comp;
+      GetMarker(mSetPdr, 0, cTmp);
+        result := iCatFunc.GetCatalogsName(cTmp);
+    }
+    else
+      result := 'Несколько подразделений (' + string(getMarkerCount(mSetPdr)) + ')';
+}
+
+function sSetKatName(mSetKat: TPtr): string;
+{
+  if (getMarkerCount(mSetKat) = 0)
+  {
+    result := 'Не выбраны категории';
+    exit;
+  }
+  else
+    if (getMarkerCount(mSetKat) = 1)
+    {
+      var cTmp: comp;
+      GetMarker(mSetKat, 0, cTmp);
+      if GetFirst KlKatego where (( cTmp == KlKatego.NRec )) = tsOk
+        result := KlKatego.NaiKat;
+      else
+        result := '';
+    }
+    else
+      result := 'Несколько категорий (' + string(getMarkerCount(mSetKat)) + ')';
+}
+
+function sSetTypName(mSetAny: TPtr): string;
+{
+  if (getMarkerCount(mSetAny) = 0)
+  {
+    result := 'Не задано';
+    exit;
+  }
+  else
+    if (getMarkerCount(mSetAny) = 1)
+    {
+      var cTmp: comp;
+      GetMarker(mSetAny, 0, cTmp);
+        result := iCatFunc.GetCatalogsName(cTmp);
+    }
+    else
+      result := 'Несколько значений (' + string(getMarkerCount(mSetAny)) + ')';
+}
+
+function isDept4Report(cRecDep : comp) : boolean; cacheable;
+{
+  if isFilterPodr
+  {
+    result := false;
+    if (FoundMarker(mPodr1,cRecDep))
+      result := true;
+  }
+  else
+    result := true;
+}
+
+function wAddKatCol(cKateg : comp) : word; cacheable;
+{
+  result := 999;
+  if cKateg <> 0
+  {
+    if FoundMarker(mKatWorker1, cKateg)
+    {result := 0}
+      else
+    if FoundMarker(mKatWorker2, cKateg)
+    {result := 1}
+      else
+    if FoundMarker(mKatWorker3, cKateg)
+    {result := 2}
+      else
+    if FoundMarker(mKatWorker4, cKateg)
+    {result := 3}
+  }
+#ifdef RKSTATDEBUG
+LogFile.WriteLN('for cKateg='+to_char(cKateg)+' wAddKatCol='+result);
+#endif
+}
+
+function wWhatKatCol(cType, cKateg : comp) : word; cacheable;
+var wAddKat : word;
+{
+  result := 999;
+  wAddKat := wAddKatCol(cKateg);
+  if FoundMarker(mKatType1, cType)
+    if wAddKat < 3
+      result := 4+wAddKat;
+  if FoundMarker(mKatType2, cType)
+    if wAddKat < 2
+      result := 7+wAddKat;
+  if FoundMarker(mKatType3, cType)
+    result := 9;
+  if FoundMarker(mKatType4, cType)
+    result := 10;
+  if FoundMarker(mKatType5, cType)
+    result := 11;
+  if FoundMarker(mKatType6, cType)
+    if wAddKat < 4
+      result := 12+wAddKat;
+#ifdef RKSTATDEBUG
+LogFile.WriteLN('for cType='+to_char(cType)+' and cKateg='+to_char(cKateg)+' wWhatKatCol='+result);
+#endif
+}
+
+function wWhatAgeBlock(dBorn, dLast : date; sSex : string[1]) : word;
+var wAgePsn : word;
+{
+  wAgePsn := Year(Sub_Date(dLast, dBorn))-1;
+  if wAgePsn <= 39
+    result := 1
+  else
+    if wAgePsn >= 40
+      if (sSex = 'М' and wAgePsn >= wPensM) or (sSex = 'Ж' and wAgePsn >= wPensF)
+        result := 3
+      else
+        result := 2;
+}
+
+function wEduLevel(cEdu : comp) : word; cacheable;
+{
+  result := 0;
+  if cEdu <> 0
+  {
+    if FoundMarker(mKatEdu1, cEdu)
+    {result := 1;}
+    else
+      if FoundMarker(mKatEdu2, cEdu)
+      {result := 2;}
+      else
+        if FoundMarker(mKatEdu3, cEdu)
+        {result := 3;}
+  }
+#ifdef RKSTATDEBUG
+LogFile.WriteLN('for cEdu='+to_char(cEdu)+' wEduLevel='+result);
+#endif
+}
+
+/*
+wMode
+1 - Kategoiya i dop char
+2 - Education
+3 - Degree
+*/
+procedure SetRowSpecError(_cEduError: comp);
+{
+  clearbuffer(#ttSpecRK);
+  if getfirst ttSpecRK where((Persons.nRec == ttSpecRK.cPsn)) <> tsOk
+  {
+    ttSpecRK.cPsn     := Persons.nRec;
+    ttSpecRK.sFIO     := Persons.FIO;
+    ttSpecRK.dBorn    := Persons.BornDate;
+    ttSpecRK.dAppoint := Persons.AppDate;
+    ttSpecRK.dDismiss := Persons.DisDate;
+    ttSpecRK.dPens    := Persons.PensionDate;
+    insert current ttSpecRK;
+  }
+  if isValid(#AppLS)
+    case AppLS.Sovm of
+    0: ttSpecRK.sPlWrk[0] := 'Осн.'
+    7: ttSpecRK.sPlWrk[0] := 'Стаж.'
+    else
+       ttSpecRK.sPlWrk[0] := 'Проч.'
+    end;
+  if isvalid(#AppStaff)
+    if isvalid(#StaffApp)
+    {
+      ttSpecRK.cKat[0]    := StaffApp.EmpCategory;
+      if ( StaffApp.cInf3 <> 0 )
+        ttSpecRK.cAdChar[0] := StaffApp.cInf3
+      else
+        ttSpecRK.cAdChar[0] := AppStaff.cRef3;
+    }
+  ttSpecRK.isError  := true;
+  ttSpecRK.sWhatError += 'Обр ';
+  ttSpecRK.cLevel[0] := _cEduError;
+  update current ttSpecRK;
+}
+procedure SetRowSpec(wMode, wPeriod : word);
+{
+  if wPrintRash = 0 exit;
+
+  clearbuffer(#ttSpecRK);
+  if getfirst ttSpecRK where((Persons.nRec == ttSpecRK.cPsn)) <> tsOk
+  {
+    ttSpecRK.cPsn     := Persons.nRec;
+    ttSpecRK.sFIO     := Persons.FIO;
+    ttSpecRK.dBorn    := Persons.BornDate;
+    ttSpecRK.dAppoint := Persons.AppDate;
+    ttSpecRK.dDismiss := Persons.DisDate;
+    ttSpecRK.dPens    := Persons.PensionDate;
+    insert current ttSpecRK;
+  }
+  if isValid(#AppLS)
+    case AppLS.Sovm of
+    0: ttSpecRK.sPlWrk[wPeriod] := 'Осн.'
+    7: ttSpecRK.sPlWrk[wPeriod] := 'Стаж.'
+    else
+       ttSpecRK.sPlWrk[wPeriod] := 'Проч.'
+    end;
+  case wMode of
+  0:
+  {
+    ttSpecRK.isInRep := true;
+  }
+  1:
+  {//StaffApp.cInf3,StaffApp.EmpCategory,AppStaff.cRef3;
+    if isvalid(#AppStaff)
+      if isvalid(#StaffApp)
+      {
+        ttSpecRK.cKat[wPeriod]    := StaffApp.EmpCategory;
+        if ( StaffApp.cInf3 <> 0 )
+          ttSpecRK.cAdChar[wPeriod] := StaffApp.cInf3
+        else
+          ttSpecRK.cAdChar[wPeriod] := AppStaff.cRef3;
+
+        if ( wWhatKatCol(ttSpecRK.cAdChar[wPeriod], ttSpecRK.cKat[wPeriod]) = 999 )
+        {
+          ttSpecRK.isError := true;
+          ttSpecRK.sWhatError += 'Хар ';
+        }
+      }
+#ifdef RKSTATDEBUG
+LogFile.WriteLN('ttSpecRK.cKat['+wPeriod+']='+to_char(ttSpecRK.cKat[wPeriod])+' ttSpecRK.cAdChar['+wPeriod+']='+to_char(ttSpecRK.cAdChar[wPeriod]));
+#endif
+//    ttSpecRK.wAge[wPeriod]    := Year(Sub_Date(dRepV, ttSpecRK.dBorn))-1;
+  }
+  2:
+  {
+    ttSpecRK.cLevel[wPeriod] := Education.Level;
+    ttSpecRK.dEduc[wPeriod]  := Education.ToDate;
+  }
+  3:
+  {
+    if wPeriod = 0
+    {
+      if isvalid(#NameK)
+        ttSpecRK.cDegree[0] := NameK.Appoint;
+      ttSpecRK.dDegree[0] := StrToDate(DateK.Code,'DD/MM/YY');
+    }
+    else
+    {
+      if isvalid(#NameD)
+        ttSpecRK.cDegree[1] := NameD.Appoint;
+      ttSpecRK.dDegree[1] := StrToDate(DateD.Code,'DD/MM/YY');
+    }
+  }
+  end;
+  ttSpecRK.wAge[wPeriod] := Year(Sub_Date(dRepV, ttSpecRK.dBorn))-1;
+  update current ttSpecRK;
+}
+
+function isATitle(dLastP, dLastC : date; wTypeTit : word; var wTitP : word ; var wTitC : word) : boolean;
+var
+  dTit : date;
+{
+  result := false;
+  if wTypeTit = 1
+  {
+    if isvalid(#DateK)
+    {
+      dTit := StrToDate(DateK.Code,'DD/MM/YY');
+      if dTit <= dLastP
+        wTitP := wTitC := 4;
+      if dTit > dLastP and dTit <= dLastC 
+        wTitC := 4;
+      if wTitC <> 0
+        SetRowSpec(3,0);
+    }
+  }
+  else
+  {
+    if isvalid(#DateD)
+    {
+      dTit := StrToDate(DateD.Code,'DD/MM/YY');
+      if dTit <= dLastP
+        wTitP := wTitC := 5;
+      if dTit > dLastP and dTit <= dLastC 
+        wTitC := 5;
+      if wTitC <> 0
+        SetRowSpec(3,1);
+    }
+  }
+  if wTitC <> 0
+    result := true;
+}
+
+function isSetBestEdu(dLastP, dLastC : date; var wEduP : word ; var wEduC : word) : boolean;
+var
+  wEduLevelT : word;
+  cEduError  : comp = 0;
+{
+  result := false;
+  wEduP := wEduC := 0;
+//  if not isvalid(#Education)
+//    SetRowSpecError(0);
+  _loop Education
+  {
+    wEduLevelT := wEduLevel(Education.Level);
+    if ( wEduLevelT = 0 )
+      cEduError := Education.Level;
+    if Education.ToDate <= dLastP
+    {
+      if wEduP < wEduLevelT
+      {
+        wEduP := wEduLevelT;
+        SetRowSpec(2, 1);
+        SetRowSpec(1, 1);
+/*
+        if wEduC < wEduLevelT
+        {
+          wEduC := wEduLevelT; 
+          SetRowSpec(2, 0);
+          SetRowSpec(1, 0);
+        }
+*/
+      }
+    }
+    if /*Education.ToDate > dLastP and */Education.ToDate <= dLastC
+    {
+      if wEduC < wEduLevelT
+      {
+        wEduC := wEduLevelT;
+        SetRowSpec(2, 0);
+        SetRowSpec(1, 0);
+      }
+    }
+  }
+  if wEduC <> 0
+    result := true
+  else
+    SetRowSpecError(cEduError);
+}
+
+procedure LocateSetRow(wAgeBlT, wEduRwT, wColT, wPeriod : word);//LocateSetRow(4,wParamResultC[5],16+wParamResultC[4],0);
+{
+  ClearBuffer(#ttStatRK);
+
+  if ( wColT = 999 or wColT = 0 )
+    exit;
+
+  if getfirst ttStatRK where((wAgeBlT  == ttStatRK.wAgeBl and wEduRwT == ttStatRK.wEduRw and wColT == ttStatRK.wCol)) <> tsOk
+  {
+    ttStatRK.wAgeBl := wAgeBlT;
+    ttStatRK.wEduRw := wEduRwT;
+    ttStatRK.wCol   := wColT  ;
+    insert current ttStatRK;
+  }
+  
+  ttStatRK.lVal[wPeriod] += 1;
+  update current ttStatRK;
+#ifdef RKSTATDEBUG
+LogFile.WriteLN('wAgeBlT='+wAgeBlT+' wEduRwT='+wEduRwT+' wPeriod='+wPeriod+' ttStatRK.lVal['+wPeriod+']='+ttStatRK.lVal[wPeriod]);
+LogFile.WriteLN('wColT='+wColT);
+#endif
+//  if wColT <> 999 and wColT <> 0
+//    SetRowSpec(0,0);
+}
+
+procedure LocateSetRowValue(wAgeBlT, wEduRwT, wColT, wPeriod : word; liVal: longint);
+{
+  ClearBuffer(#ttStatRK);
+
+  if ( wColT = 999 or wColT = 0 )
+    exit;
+
+  if getfirst ttStatRK where((wAgeBlT  == ttStatRK.wAgeBl and wEduRwT == ttStatRK.wEduRw and wColT == ttStatRK.wCol)) <> tsOk
+  {
+    ttStatRK.wAgeBl := wAgeBlT;
+    ttStatRK.wEduRw := wEduRwT;
+    ttStatRK.wCol   := wColT  ;
+    insert current ttStatRK;
+  }
+  
+  ttStatRK.lVal[wPeriod] += liVal;
+  update current ttStatRK;
+}
+
+procedure MakeRK;
+var
+  wParamResultP
+ ,wParamResultC  : array [0..5] of word;
+  i : integer;
+{
+// добавить если будет надо
+//    if isvalid(#AppLS)
+//    if AppLS.Sovm <> 1 and AppLS.Sovm <> 2 and AppStaff.Rate<>0
+#ifdef RKSTATDEBUG
+LogFile.OpenFile(GetStringParameter('Files','TmpFilesDirectory', 0)+'RKSTAT.log',stCreate);
+//LogFile.WriteLN('Version = '+sVerResource);
+#endif
+
+  if (GetMarkerCount(mPodr1) > 0) isFilterPodr:=true else isFilterPodr:=false;
+//  dRepP := date(31,12,Year(dRep)-1);
+  dRepP := date(Day(dRep),Month(dRep),Year(dRep)); //dRepP := date(Day(dRep),Month(dRep),Year(dRep)-1);
+  if ExistTune('UP.PENSFOND.AGEMALENEW')
+    wPensM := word(doGetTune('UP.PENSFOND.AGEMALENEW'))
+  else
+    wPensM := word(doGetTune('UP.PENSFOND.AGEMALE'));
+  if ExistTune('UP.PENSFOND.AGEFEMALENEW')
+    wPensF := word(doGetTune('UP.PENSFOND.AGEFEMALENEW'))
+  else
+    wPensF := word(doGetTune('UP.PENSFOND.AGEFEMALE'));
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Формируются данные для Листа 12-к.', 0);
+  if ( wFromExistFile = 1 )
+  {
+    var wRow  : word;
+    var liFrom: longint;
+    if OpenFromRKS
+    {
+      if xlSetActiveSheetByName('12-к')
+      {
+        for(wBl:=1;wBl<=4;wBl++)
+          for(wEdu:=1;wEdu<=5;wEdu++)
+            for(wCol:=4;wCol<=20;wCol++)
+            {
+              if (not NextVisual) break;
+              liFrom := 0;
+              wRow := 8 + 15*(wBl-1) + 3*(wEdu-1);
+              if xlGetCellValue(wRow, wCol, liFrom)
+                LocateSetRowValue(wBl, wEdu, wCol, 1, liFrom);
+            }
+      }
+      if CloseFromRKS {}
+    }
+  }
+
+  //=====================================
+  // собираем данные
+  _loop Persons
+  {
+    if (not NextVisual) break;
+#ifdef RKSTATDEBUG
+LogFile.WriteLN('FIO='+Persons.FIO);
+#endif
+//    if (getlast AppStaff = tsOk)
+    for(i:=0;i<=5;i++) wParamResultP[i]:=0;
+    //----------------------------
+    set dRepV := dRepP;
+    set dRepV:= date(31,12,year(dRepV));
+    //set dRepV1:= date(31,12,year(dRepV)+1);
+    // предыдущий период
+    //set __cRecAppoint := iAppFuncs.GetAppNrec_OnDate(Persons.nRec, dRepV);
+    set __cRecAppoint := iAppFuncs.GetOldAppNrec_OnDate(Persons.nRec, dRepV);
+
+/*if username = 'dmitrii.lapygin' *///lOGsTRtOfILE('RkStat12_dmitrii_lapygin','FIO='+Persons.FIO + '|persons.nrec='+string(Persons.nRec,0,0) + '|dRepV='+datetostr(dRepV,'DD/MM/YYYY') + '|__cRecAppoint='+string(__cRecAppoint,0,0));
+
+    if ( wFromExistFile = 0 )
+    {
+      var isOkP: boolean = true;
+      
+      if isvalid(#AppStaff)
+      { if true //Getfirst AppNext<>tsok // есть прием в следующем году
+        { if ( AppStaff.DismissDate = dRepV )
+            if isvalid(#DisDocCheck)
+              if iChRPD.isConfirmed(DisDocCheck.nRec)
+                isOkP := false;
+        }
+
+        // все-таки ен работал на дату отчета
+        if not ( ( dRep <= AppStaff.DismissDate or AppStaff.DismissDate = 0 ) and dRep >= AppStaff.AppointDate )
+         {
+          //isOkP := false;
+          continue;
+         }
+
+        if not isValid(#StaffApp)
+          isOkP := false;
+        if isDept4Report(AppStaff.Department)
+        {
+          if isvalid(#AppLS)
+            if ( AppLS.Sovm <> 0 and AppLS.Sovm <> 7 )
+              isOkP := false;
+          if isOkP
+          {
+            //wParamResultP[0] := if(Persons.DisDate=0 or Persons.DisDate > dRepV,1,0);
+            wParamResultP[0] := if(AppStaff.DismissDate=0 or AppStaff.DismissDate >= dRep,1,0);
+            wParamResultP[1] := wWhatAgeBlock(Persons.BornDate,dRepV,Persons.Sex);
+            wParamResultP[2] := 0;
+            var cRec3: comp = StaffApp.cInf3;
+            if ( cRec3 = 0 )
+              cRec3 := AppStaff.cRef3;
+            wParamResultP[3] := wWhatKatCol(cRec3, StaffApp.EmpCategory);
+            wParamResultP[4] := wAddKatCol(StaffApp.EmpCategory);
+          }
+
+  //        if wParamResultP[0] = 1
+  //          SetRowSpec(1, 1);
+
+        }
+      }
+    } //if ( wFromExistFile = 0 )
+
+
+    // текущий период
+    for(i:=0;i<=5;i++) wParamResultC[i]:=0;
+    set dRepV := dRep;
+    set dRepV := date(31,12,year(dRepV));
+    //set dRepV1:= date(31,12,year(dRepV)+1);
+    //set __cRecAppoint := iAppFuncs.GetAppNrec_OnDate(Persons.nRec, dRepV);
+    set __cRecAppoint := iAppFuncs.GetOldAppNrec_OnDate(Persons.nRec, dRepV);
+//    if (getlast AppStaff = tsOk)
+/*if username = 'dmitrii.lapygin'*/// lOGsTRtOfILE('RkStat12_dmitrii_lapygin','FIO='+Persons.FIO + '|persons.nrec='+string(Persons.nRec,0,0) + '|dRepV='+datetostr(dRepV,'DD/MM/YYYY') + '|__cRecAppoint='+string(__cRecAppoint,0,0));
+    //----------------------------
+    if isvalid(#AppStaff)
+    {
+      var isOkC: boolean = true;
+      if true //Getfirst AppNext<>tsok // есть прием в следующем году
+      { if ( AppStaff.DismissDate = dRepV )
+          if isvalid(#DisDocCheck)
+            if iChRPD.isConfirmed(DisDocCheck.nRec)
+             isOkC := false;
+      }
+        if not ( ( dRep <= AppStaff.DismissDate or AppStaff.DismissDate = 0 ) and dRepV >= AppStaff.AppointDate )
+         {
+          //isOkP := false;
+          continue;
+         }
+
+      if not isValid(#StaffApp)
+        isOkC := false;
+      if isDept4Report(StaffApp.Department)
+      {
+        if isvalid(#AppLS)
+          if ( AppLS.Sovm <> 0 and AppLS.Sovm <> 7 )
+            isOkC := false;
+        if isOkC
+        {
+          //wParamResultC[0] := if(Persons.DisDate=0 or Persons.DisDate > dRepV,1,0);
+          wParamResultC[0] := if(AppStaff.DismissDate=0 or AppStaff.DismissDate >= dRep,1,0);
+          wParamResultC[1] := wWhatAgeBlock(Persons.BornDate,dRepV,Persons.Sex);
+          wParamResultC[2] := 0;
+          var cRec3: comp = StaffApp.cInf3;//AppStaff.cRef3;
+          if ( cRec3 = 0 )
+            cRec3 := AppStaff.cRef3;
+          wParamResultC[3] := wWhatKatCol(cRec3, StaffApp.EmpCategory);
+          wParamResultC[4] := wAddKatCol(StaffApp.EmpCategory);
+        }
+
+//        if wParamResultC[0] = 1
+//          SetRowSpec(1, 0);
+
+      }
+    } //if isvalid(#AppStaff)
+    if wParamResultP[0] = 1 or wParamResultC[0] = 1
+    {
+//  Добавляем данные по виду образования  
+      if isSetBestEdu(dRepP, dRep, wParamResultP[2], wParamResultC[2])
+      {
+        if wParamResultP[0] = 1
+        {
+          LocateSetRow(wParamResultP[1],wParamResultP[2],wParamResultP[3],1);
+          if ( wParamResultP[1] = 3 )
+            LocateSetRow(2,wParamResultP[2],wParamResultP[3],1);
+          if wParamResultP[1] < 4
+          {
+            LocateSetRow(4,wParamResultP[2],wParamResultP[3],1);
+            if wParamResultP[3] <> 999
+              LocateSetRow(4,wParamResultP[2],16+wParamResultP[4],1);
+          }
+        }
+        if wParamResultC[0] = 1
+        {
+          LocateSetRow(wParamResultC[1],wParamResultC[2],wParamResultC[3],0); //LocateSetRow(wAgeBlT, wEduRwT, wColT, wPeriod : word);
+          if ( wParamResultC[1] = 3 )
+            LocateSetRow(2,wParamResultC[2],wParamResultC[3],0);
+          if wParamResultC[1] < 4
+          {
+            LocateSetRow(4,wParamResultC[2],wParamResultC[3],0);
+            if wParamResultC[3] <> 999
+              LocateSetRow(4,wParamResultC[2],16+wParamResultC[4],0);
+          }
+        }
+      }
+//  Добавляем данные кандидаты 
+      wParamResultP[5] := wParamResultC[5] := 0;
+      if isATitle(dRepP, dRep, 1, wParamResultP[5], wParamResultC[5])
+      {
+        if wParamResultP[0] = 1 and wParamResultP[2] = 3 and wParamResultP[5] <> 0 and wParamResultP[3] <> 999
+        {
+          LocateSetRow(wParamResultP[1],wParamResultP[5],wParamResultP[3],1);
+          if ( wParamResultP[1] = 3 )
+            LocateSetRow(2,wParamResultP[5],wParamResultP[3],1);
+          if wParamResultP[1] < 4
+          {
+            LocateSetRow(4,wParamResultP[5],wParamResultP[3],1);
+            if wParamResultP[3] <> 999
+              LocateSetRow(4,wParamResultP[5],16+wParamResultP[4],1);
+          }
+        }
+        if wParamResultC[0] = 1 and wParamResultC[2] = 3 and wParamResultC[5] <> 0 and wParamResultC[3] <> 999
+        {
+          LocateSetRow(wParamResultC[1],wParamResultC[5],wParamResultC[3],0);
+          if ( wParamResultC[1] = 3 )
+            LocateSetRow(2,wParamResultC[5],wParamResultC[3],0);
+          if wParamResultC[1] < 4
+          {
+            LocateSetRow(4,wParamResultC[5],wParamResultC[3],0);
+            if wParamResultC[3] <> 999
+              LocateSetRow(4,wParamResultC[5],16+wParamResultC[4],0);
+          }
+        }
+      }
+//  Добавляем данные доктора 
+      wParamResultP[5] := wParamResultC[5] := 0;
+      if isATitle(dRepP, dRep, 2, wParamResultP[5], wParamResultC[5])
+      {
+        if wParamResultP[0] = 1 and wParamResultP[2] = 3 and wParamResultP[5] <> 0
+        {
+          LocateSetRow(wParamResultP[1],wParamResultP[5],wParamResultP[3],1);
+          if ( wParamResultP[1] = 3 )
+            LocateSetRow(2,wParamResultP[5],wParamResultP[3],1);
+          if wParamResultP[1] < 4
+          {
+            LocateSetRow(4,wParamResultP[5],wParamResultP[3],1);
+            if wParamResultP[3] <> 999
+              LocateSetRow(4,wParamResultP[5],16+wParamResultP[4],1);
+          }
+        }
+        if wParamResultC[0] = 1 and wParamResultC[2] = 3 and wParamResultC[5] <> 0
+        {
+          LocateSetRow(wParamResultC[1],wParamResultC[5],wParamResultC[3],0);
+          if ( wParamResultC[1] = 3 )
+            LocateSetRow(2,wParamResultC[5],wParamResultC[3],0);
+          if wParamResultC[1] < 4
+          {
+            LocateSetRow(4,wParamResultC[5],wParamResultC[3],0);
+            if wParamResultC[3] <> 999
+              LocateSetRow(4,wParamResultC[5],16+wParamResultC[4],0);
+          }
+        }
+      }
+    }
+  }
+  StopVisual;
+#ifdef RKSTATDEBUG
+LogFile.Close;
+#endif
+}
+
+function isDataRK : boolean;
+{
+  if isvalid(#ttStatRK)
+    result := true
+  else
+    result := false;
+}
+
+procedure PrintRK;
+var
+  wRow : word;
+{
+
+  if isDataRK
+  {
+    if xlSetActiveSheetByName('12-к')
+    {
+      StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Выгружаю данные для Листа 12-к в Excel.', 0);
+      TOA.Bind(0);
+      xlSetCellStringValue(Trim(TOA1.GetNaming.GetFullName()),2,4,2,4);
+      xlSetCellDateValue(dRep,3,4,3,4);
+      for(wBl:=1;wBl<=4;wBl++)
+        for(wEdu:=1;wEdu<=5;wEdu++)
+          for(wCol:=4;wCol<=20;wCol++)
+            if getfirst ttStatRK where((wBl == ttStatRK.wAgeBl and wEdu == ttStatRK.wEduRw and wCol == ttStatRK.wCol)) = tsOk
+            {
+              if (not NextVisual) break;
+              wRow := 8 + 15*(wBl-1) + 3*(wEdu-1);
+              xlSetCellNumberValue(ttStatRK.lVal[0], wRow,wCol,wRow,wCol);
+              xlSetCellNumberValue(if(ttStatRK.lVal[1]<>0,ttStatRK.lVal[0]/ttStatRK.lVal[1],0), wRow+2,wCol,wRow+2,wCol);
+            }
+      StopVisual;
+    }
+  }
+}
+
+procedure SaveRK;
+{
+  iUDR.SaveMarker('RKS12__mPodr1', mPodr1);
+  DoneMarker(mPodr1, '');
+
+  iUDR.SaveDate  ('RKS12__dRep', dRep);
+  iUDR.SaveWord  ('RKS12_wToExistFile',   wToExistFile);
+  iUDR.SaveWord  ('RKS12_wPrintRash',     wPrintRash);
+  iUDR.SaveString('RKS12_sToExistFile',   sToExistFile);
+  iUDR.SaveWord  ('RKS12_wFromExistFile', wFromExistFile);
+  iUDR.SaveString('RKS12_sFromExistFile', sFromExistFile);
+
+  iUDR.SaveMarker('RKS12__mKat1', mKatWorker1);
+  iUDR.SaveMarker('RKS12__mKat2', mKatWorker2);
+  iUDR.SaveMarker('RKS12__mKat3', mKatWorker3);
+  iUDR.SaveMarker('RKS12__mKat4', mKatWorker4);
+  DoneMarker(mKatWorker1, '');
+  DoneMarker(mKatWorker2, '');
+  DoneMarker(mKatWorker3, '');
+  DoneMarker(mKatWorker4, '');
+
+  iUDR.SaveMarker('RKS12__mKatType1', mKatType1);
+  iUDR.SaveMarker('RKS12__mKatType2', mKatType2);
+  iUDR.SaveMarker('RKS12__mKatType3', mKatType3);
+  iUDR.SaveMarker('RKS12__mKatType4', mKatType4);
+  iUDR.SaveMarker('RKS12__mKatType5', mKatType5);
+  iUDR.SaveMarker('RKS12__mKatType6', mKatType6);
+  iUDR.SaveMarker('RKS12__mKatEdu1',  mKatEdu1 );
+  iUDR.SaveMarker('RKS12__mKatEdu2',  mKatEdu2 );
+  iUDR.SaveMarker('RKS12__mKatEdu3',  mKatEdu3 );
+  DoneMarker(mKatType1, '');
+  DoneMarker(mKatType2, '');
+  DoneMarker(mKatType3, '');
+  DoneMarker(mKatType4, '');
+  DoneMarker(mKatType5, '');
+  DoneMarker(mKatType6, '');
+  DoneMarker(mKatEdu1 , '');
+  DoneMarker(mKatEdu2 , '');
+  DoneMarker(mKatEdu3 , '');
+}
+procedure ClearRK;
+{
+  delete all from ttStatRK;
+}
+procedure initRK;
+{
+  set dRep := iUDR.ReadDate('RKS12__dRep');
+  if dRep = 0
+    set dRep := To_Date(31,12,Year(Cur_Date));
+
+  set wPrintRash   := iUDR.ReadWord  ('RKS12_wPrintRash'  );
+  set sToExistFile := iUDR.ReadString('RKS12_sToExistFile');
+  set wToExistFile := iUDR.ReadWord  ('RKS12_wToExistFile');
+  set sFromExistFile := iUDR.ReadString('RKS12_sFromExistFile');
+  set wFromExistFile := iUDR.ReadWord  ('RKS12_wFromExistFile');
+
+  if wToExistFile = 1 
+    ToggleFieldVisible(#sToExistFile,true )
+  else
+    ToggleFieldVisible(#sToExistFile,false);
+  if wFromExistFile = 1 
+    ToggleFieldVisible(#sFromExistFile,true )
+  else
+    ToggleFieldVisible(#sFromExistFile,false);
+
+  mPodr1     := iUDR.ReadMarker('RKS12__mPodr1');
+  set sPodr1 := sSetPodrName(mPodr1);
+
+  mKatWorker1 := iUDR.ReadMarker('RKS12__mKat1');
+  mKatWorker2 := iUDR.ReadMarker('RKS12__mKat2');
+  mKatWorker3 := iUDR.ReadMarker('RKS12__mKat3');
+  mKatWorker4 := iUDR.ReadMarker('RKS12__mKat4');
+
+  set sKatWorker1 := sSetKatName(mKatWorker1);
+  set sKatWorker2 := sSetKatName(mKatWorker2);
+  set sKatWorker3 := sSetKatName(mKatWorker3);
+  set sKatWorker4 := sSetKatName(mKatWorker4);
+
+  mKatType1  := iUDR.ReadMarker('RKS12__mKatType1');
+  mKatType2  := iUDR.ReadMarker('RKS12__mKatType2');
+  mKatType3  := iUDR.ReadMarker('RKS12__mKatType3');
+  mKatType4  := iUDR.ReadMarker('RKS12__mKatType4');
+  mKatType5  := iUDR.ReadMarker('RKS12__mKatType5');
+  mKatType6  := iUDR.ReadMarker('RKS12__mKatType6');
+  mKatEdu1   := iUDR.ReadMarker('RKS12__mKatEdu1' );
+  mKatEdu2   := iUDR.ReadMarker('RKS12__mKatEdu2' );
+  mKatEdu3   := iUDR.ReadMarker('RKS12__mKatEdu3' );
+
+  set sKatType1  := sSetTypName(mKatType1 );
+  set sKatType2  := sSetTypName(mKatType2 );
+  set sKatType3  := sSetTypName(mKatType3 );
+  set sKatType4  := sSetTypName(mKatType4 );
+  set sKatType5  := sSetTypName(mKatType5 );
+  set sKatType6  := sSetTypName(mKatType6 );
+  set sKatEdu1   := sSetTypName(mKatEdu1  );
+  set sKatEdu2   := sSetTypName(mKatEdu2  );
+  set sKatEdu3   := sSetTypName(mKatEdu3  );
+}
+
+function isCheckRepParam(isStayAlone : boolean) : boolean;
+{
+  result := false;
+  if dRep = 0
+  {if isStayAlone message('Не задана дата!'); exit;}
+  if ( Day(dRep) = 31 and Month(dRep) = 12 ) {}
+  else
+  {
+    if isStayAlone
+      if ( message('Дата формирования отчета отличается от регламентной (31 декабря)!'#3+chr(13)+'Продолжить?'#3, Information+yesNo) <> cmYes )
+        exit;
+  }
+//  {if isStayAlone message('Некорректно задана дата!'+chr(13)+'Дата формирования отчета - 31 декабря.', Error ); exit;}
+  if GetMarkerCount(mKatWorker1) = 0
+  or GetMarkerCount(mKatWorker2) = 0
+  or GetMarkerCount(mKatWorker3) = 0
+  or GetMarkerCount(mKatWorker4) = 0 
+  or GetMarkerCount(mKatType1 ) = 0 
+  or GetMarkerCount(mKatType2 ) = 0 
+  or GetMarkerCount(mKatType3 ) = 0 
+  or GetMarkerCount(mKatType4 ) = 0 
+  or GetMarkerCount(mKatType5 ) = 0 
+  or GetMarkerCount(mKatType6 ) = 0 
+  or GetMarkerCount(mKatEdu1 ) = 0 
+  or GetMarkerCount(mKatEdu2 ) = 0 
+  or GetMarkerCount(mKatEdu3 ) = 0 
+  {if isStayAlone message('Не задан один из обязательных параметров!'); exit;}
+  if wToExistFile = 1
+  if not ExistFile(sToExistFile)
+  {if isStayAlone message('Ошибка открытия файла!'); exit;}
+  if wFromExistFile = 1
+  if not ExistFile(sFromExistFile)
+  {if isStayAlone message('Ошибка открытия входного файла!'); exit;}
+  result := true;
+}
+//++++++++++++++++++++++++++++++++++++++++++++++++
+window WinRKParamEx 'Параметры формирования. Лист 12-к.' Gray;
+  show at (,,95,34);
+Screen sEx(,,sci1Esc);
+  fields
+    dRep   ('Дата формирования'): {Font = {BackColor = if(dRep = 0, ColorNeed, 0)}}, noprotect;
+    sPodr1 ('Выбранные подразделения',hcStaffAppDepartment,sci13Esc): Protect, PickButton ;
+    sKatWorker1 ('Руководители',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatWorker1 = 'Не выбраны категории', ColorNeed, 0)}},protect;
+    sKatWorker2 ('Специалисты' ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatWorker2 = 'Не выбраны категории', ColorNeed, 0)}},protect;
+    sKatWorker3 ('Служащие'    ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatWorker3 = 'Не выбраны категории', ColorNeed, 0)}},protect;
+    sKatWorker4 ('Рабочие'     ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatWorker4 = 'Не выбраны категории', ColorNeed, 0)}},protect;
+    sKatType1   ('Административно управленческий персонал',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType1 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType2   ('ИТР'                                    ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType2 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType3   ('Основные рабочие'                       ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType3 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType4   ('Производственные рабочие'               ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType4 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType5   ('Вспомогательные рабочие'                ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType5 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType6   ('Персонал непромышленной сферы'          ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType6 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatEdu1    ('Общее образование'                      ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatEdu1  = 'Не задано', ColorNeed, 0)}},protect;
+    sKatEdu2    ('Среднее профессиональное образование'   ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatEdu2  = 'Не задано', ColorNeed, 0)}},protect;
+    sKatEdu3    ('Высшее образование'                     ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatEdu3  = 'Не задано', ColorNeed, 0)}},protect;
+    wFromExistFile('Считать данные за прошлый период из файла'), noprotect;
+    sFromExistFile('Считать данные за прошлый период из файла',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sToExistFile = '', ColorNeed, 0)}},protect;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+<< 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ `Соответствие категорий`
+  `Руководители`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Специалисты `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Служащие    `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Рабочие     `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ `Административно управленческий персонал      `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Основной производственный персонал         `
+   `ИТР                                        `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   `Основные рабочие                           `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   `Производственные рабочие                   `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   `Вспомогательные рабочие                    `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Персонал непромышленной сферы                `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  `Виды образований                           `
+   `Общее образование                          `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   `Среднее профессиональное образование       `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   `Высшее образование                         `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  [.] Считать данные за прошлый период из файла`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   <. ~С~охранить .>                                                        <. ~З~акрыть .>
+>>
+end;
+HandleEvent
+  cmOK:
+  {
+    SaveRK;
+    initRK;
+    if not isCheckRepParam(true)
+      exit;
+    CloseWindowEx(CurWindow,cmDefault);
+  }
+  cmCancel:
+  {
+    SaveRK;
+    CloseWindowEx(CurWindow,cmCancel);
+  }
+end;
+end;//WinRKParamEx
+//++++++++++++++++++++++++++++++++++++++++++++++++
+//++++++++++++++++++++++++++++++++++++++++++++++++
+window WinRKParam 'Параметры формирования. Лист 12-к.' Gray;
+  show at (,,95,32);
+Screen s1(,,sci1Esc);
+  fields
+    dRep   ('Дата формирования'): {Font = {BackColor = if(dRep = 0, ColorNeed, 0)}}, noprotect;
+    sPodr1 ('Выбранные подразделения',hcStaffAppDepartment,sci13Esc): Protect, PickButton ;
+    sKatWorker1 ('Руководители',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatWorker1 = 'Не выбраны категории', ColorNeed, 0)}},protect;
+    sKatWorker2 ('Специалисты' ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatWorker2 = 'Не выбраны категории', ColorNeed, 0)}},protect;
+    sKatWorker3 ('Служащие'    ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatWorker3 = 'Не выбраны категории', ColorNeed, 0)}},protect;
+    sKatWorker4 ('Рабочие'     ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatWorker4 = 'Не выбраны категории', ColorNeed, 0)}},protect;
+    sKatType1   ('Административно управленческий персонал',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType1 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType2   ('ИТР'                                    ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType2 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType3   ('Основные рабочие'                       ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType3 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType4   ('Производственные рабочие'               ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType4 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType5   ('Вспомогательные рабочие'                ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType5 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatType6   ('Персонал непромышленной сферы'          ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatType6 = 'Не задано', ColorNeed, 0)}},protect;
+    sKatEdu1    ('Общее образование'                      ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatEdu1  = 'Не задано', ColorNeed, 0)}},protect;
+    sKatEdu2    ('Среднее профессиональное образование'   ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatEdu2  = 'Не задано', ColorNeed, 0)}},protect;
+    sKatEdu3    ('Высшее образование'                     ,, scStaffKatPodrRefsPick): {Font = {BackColor = if(sKatEdu3  = 'Не задано', ColorNeed, 0)}},protect;
+    wPrintRash  ('Печать расшифровки'), noprotect;
+    wToExistFile('Добавить в существующий файл'), noprotect;
+    sToExistFile('Добавить в существующий файл',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sToExistFile = '', ColorNeed, 0)}},protect;
+    wFromExistFile('Считать данные за прошлый период из файла'), noprotect;
+    sFromExistFile('Считать данные за прошлый период из файла',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sToExistFile = '', ColorNeed, 0)}},protect;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+<< 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   `Соответствие категорий`
+    `Руководители`                            .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Специалисты `                            .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Служащие    `                            .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Рабочие     `                            .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Административно управленческий персонал    `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Основной производственный персонал         `
+    `ИТР                                     `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Основные рабочие                        `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Производственные рабочие                `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Вспомогательные рабочие                 `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Персонал непромышленной сферы              `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  `Виды образований                           `
+    `Общее образование                       `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Среднее профессиональное образование    `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    `Высшее образование                      `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   [:] Печать расшифровки`
+   [:] Добавить в существующий файл             `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+   [:] Считать данные за прошлый период из файла`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   <. ~С~формировать .>                                                     <. ~З~акрыть .>
+>>
+end;
+
+HandleEvent
+  cmOK:
+  {
+    if not isCheckRepParam(true)
+      exit;
+    CloseWindowEx(CurWindow,cmDefault);
+  }
+end;
+end;//WinRKParam
+//++++++++++++++++++++++++++++++++++++++++++++++++
+
+function OpenNewRKS : boolean;
+{
+  result := false;
+  sToExistFile := TranslatePath('%ClientStartPath%') +'XLS_ЭМ\Staff\RKStat.xltm';
+  if xlCreateExcelWithTemplate(sToExistFile, true)
+    result := true;
+}
+function OpenExistRKS : boolean;
+{
+  result := false;
+  if xlOpenExcel(true)
+  {
+    // только ради того, чтобы прибить Книгу1, которая непонятно чем открывается и висит 2 файла
+    if xlGetActiveWorkBookName('Книга1')
+      xlCloseWorkBookByName('Книга1');
+    // только ради того, чтобы прибить Книгу1, которая непонятно чем открывается и висит 2 файла
+    if xlOpenWorkBook(sToExistFile)
+      result := true;
+  }
+}
+
+function SetParamRK : boolean;
+{
+  result := false;
+  if RunWindowModal(WinRKParam)=cmDefault
+    result := true;
+}
+
+function sKatEmpl(cAny : comp) : string; cacheable;
+{
+  result := '';
+  if GetFirst KlKatego where ((cAny == KlKatego.NRec)) = tsOk
+    result := KlKatego.NaiKat;
+}
+
+procedure PrintRash;
+{
+  var lLine : longint;
+  var lRB, lRE, lCB, lCE : longint = 1;
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Печать расшифровки.', 0);
+  lRB := lRE := 2;
+  lCB := 1;
+  lLine:=0;
+  xlMergeCells(1,1,1,4);
+  xlSetCellStringValue('Расшифровка листа 12-к. Данные на '+datetostr(dRep,'DD.MM.YYYY')+'.',1,1,1,1);
+  if isvalid(#ttSpecRK)
+  {
+/*
+    var lRecCount: longint = recordsintable(#ttSpecRK);
+*/
+    
+    lCE := 0;
+    //'+chr(10)+'
+    lCE++; xlSetCellStringValue('№пп',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('ФИО',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Вид'+chr(10)+'работы',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'приема'+chr(10)+'на работу',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'увольнения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Вид'+chr(10)+'образования',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'окончания',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'рождения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Возраст',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'оформления'+chr(10)+'пенсии',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Категория персонала',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Доп.характеристика ставки',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Ученая степень',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Ошибка',lRE,lCE,lRE,lCE);
+//    lCE++; xlSetCellStringValue('Дата'+chr(10)+'присвоения'+chr(10)+'ученой'+chr(10)+'степени',lRE,lCE,lRE,lCE);
+    lRE++;
+    var wMatrixSizeRow: word = 100;
+    if (not xlCreateMatrix(wMatrixSizeRow, lCE))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    var lRowMatrix: longint = 1;
+    var lRowCurMx : longint = lRE;
+    
+    /*#define FrmCl lRE, lCE, lRE, lCE*/
+    #define FrmCl lRowMatrix, lCE
+    _loop ttSpecRK ordered index ttSpecRK01
+    {
+//      if not ttSpecRK.isInRep continue; ttSpecRK.sPlWrk[wPeriod]
+
+      if (not NextVisual) break;
+      lCE := 0;//datetostr(dRep,'DD.MM.YYYY')
+      lCE++; xlStWriteToMatrix(#FrmCl, ++lLine); //xlSetCellStringValue(++lLine, #FrmCl);
+      lCE++; xlStWriteToMatrix(#FrmCl, ttSpecRK.sFIO); //xlSetCellStringValue(sFIO, #FrmCl);
+      lCE++; if ( wFromExistFile = 0 )
+               xlStWriteToMatrix(#FrmCl,
+                 if(ttSpecRK.sPlWrk[1]<>'',datetostr(dRepP,'На DD.MM.YYYY : ')+ttSpecRK.sPlWrk[1]+chr(10),'')+
+                 if(ttSpecRK.sPlWrk[0]<>'',datetostr(dRep ,'На DD.MM.YYYY : ')+ttSpecRK.sPlWrk[0],''))
+             else
+               xlStWriteToMatrix(#FrmCl, ttSpecRK.sPlWrk[0]);
+/*
+               xlSetCellStringValue(
+                 if(ttSpecRK.sPlWrk[1]<>'',datetostr(dRepP,'На DD.MM.YYYY : ')+ttSpecRK.sPlWrk[1]+chr(10),'')+
+                 if(ttSpecRK.sPlWrk[0]<>'',datetostr(dRep ,'На DD.MM.YYYY : ')+ttSpecRK.sPlWrk[0],'')
+                 , #FrmCl)
+             else
+               xlSetCellStringValue(ttSpecRK.sPlWrk[0], #FrmCl);
+*/
+      lCE++; if ( ttSpecRK.dAppoint <> 0 ) xlDtWriteToMatrix(#FrmCl, ttSpecRK.dAppoint); //xlSetCellDateValue(ttSpecRK.dAppoint, #FrmCl);
+      lCE++; if ( ttSpecRK.dDismiss <> 0 ) xlDtWriteToMatrix(#FrmCl, ttSpecRK.dDismiss); //xlSetCellDateValue(ttSpecRK.dDismiss, #FrmCl);
+      lCE++; if ( wFromExistFile = 0 )
+               xlStWriteToMatrix(#FrmCl,
+                 if(ttSpecRK.cLevel[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cLevel[1])+chr(10),'')+
+                 if(ttSpecRK.cLevel[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cLevel[0]),''))
+             else
+               xlStWriteToMatrix(#FrmCl, iCatFunc.GetCatalogsName(ttSpecRK.cLevel[0]));
+/*
+               xlSetCellStringValue(
+                 if(ttSpecRK.cLevel[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cLevel[1])+chr(10),'')+
+                 if(ttSpecRK.cLevel[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cLevel[0]),'')
+                 , #FrmCl)
+             else
+               xlSetCellStringValue(iCatFunc.GetCatalogsName(ttSpecRK.cLevel[0]), #FrmCl);
+*/
+      lCE++; if ( wFromExistFile = 0 )
+               xlStWriteToMatrix(#FrmCl,
+                 if(ttSpecRK.dEduc[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+datetostr(ttSpecRK.dEduc[1],'DD.MM.YYYY')+chr(10),'')+
+                 if(ttSpecRK.dEduc[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+datetostr(ttSpecRK.dEduc[0],'DD.MM.YYYY'),''))
+             else
+               if ( ttSpecRK.dEduc[0] <> 0 )
+                 xlDtWriteToMatrix(#FrmCl, ttSpecRK.dEduc[0]);
+/*
+               xlSetCellStringValue(
+                 if(ttSpecRK.dEduc[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+datetostr(ttSpecRK.dEduc[1],'DD.MM.YYYY')+chr(10),'')+
+                 if(ttSpecRK.dEduc[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+datetostr(ttSpecRK.dEduc[0],'DD.MM.YYYY'),'')
+                 , #FrmCl)
+             else
+               if ( ttSpecRK.dEduc[0] <> 0 )
+                 xlSetCellDateValue(ttSpecRK.dEduc[0], #FrmCl);
+*/
+      lCE++; if ( ttSpecRK.dBorn <> 0 ) xlDtWriteToMatrix(#FrmCl, ttSpecRK.dBorn);// xlSetCellDateValue(ttSpecRK.dBorn, #FrmCl);
+      lCE++; if ( wFromExistFile = 0 )
+               xlStWriteToMatrix(#FrmCl, 
+                 if(ttSpecRK.wAge[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+ttSpecRK.wAge[1]+chr(10),'')+
+                 if(ttSpecRK.wAge[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+ttSpecRK.wAge[0],''))
+             else
+               xlStWriteToMatrix(#FrmCl, ttSpecRK.wAge[0]);
+/*
+               xlSetCellStringValue(
+                 if(ttSpecRK.wAge[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+ttSpecRK.wAge[1]+chr(10),'')+
+                 if(ttSpecRK.wAge[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+ttSpecRK.wAge[0],'')
+                 , #FrmCl)
+             else
+               xlSetCellStringValue(ttSpecRK.wAge[0], #FrmCl);
+*/
+      lCE++; if ( ttSpecRK.dPens <> 0 ) xlDtWriteToMatrix(#FrmCl, ttSpecRK.dPens); //xlSetCellDateValue(ttSpecRK.dPens, #FrmCl);
+      lCE++; if ( wFromExistFile = 0 )
+               xlStWriteToMatrix(#FrmCl,
+                 if(ttSpecRK.cKat[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+sKatEmpl(ttSpecRK.cKat[1])+chr(10),'')+
+                 if(ttSpecRK.cKat[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+sKatEmpl(ttSpecRK.cKat[0]),''))
+             else
+               xlStWriteToMatrix(#FrmCl, sKatEmpl(ttSpecRK.cKat[0]));
+/*
+               xlSetCellStringValue(
+                 if(ttSpecRK.cKat[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+sKatEmpl(ttSpecRK.cKat[1])+chr(10),'')+
+                 if(ttSpecRK.cKat[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+sKatEmpl(ttSpecRK.cKat[0]),'')
+                 , #FrmCl)
+             else
+               xlSetCellStringValue(sKatEmpl(ttSpecRK.cKat[0]), #FrmCl);
+*/
+      lCE++; if ( wFromExistFile = 0 )
+               xlStWriteToMatrix(#FrmCl,
+                 if(ttSpecRK.cAdChar[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cAdChar[1])+chr(10),'')+
+                 if(ttSpecRK.cAdChar[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cAdChar[0]),''))
+             else
+               xlStWriteToMatrix(#FrmCl, iCatFunc.GetCatalogsName(ttSpecRK.cAdChar[0]));
+/*
+               xlSetCellStringValue(  //here
+                 if(ttSpecRK.cAdChar[1]<>0,datetostr(dRepP,'На DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cAdChar[1])+chr(10),'')+
+                 if(ttSpecRK.cAdChar[0]<>0,datetostr(dRep ,'На DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cAdChar[0]),'')
+                 , #FrmCl)
+             else
+               xlSetCellStringValue(iCatFunc.GetCatalogsName(ttSpecRK.cAdChar[0]), #FrmCl);
+*/
+      lCE++; if ( wFromExistFile = 0 )
+               xlStWriteToMatrix(#FrmCl,
+                 if(ttSpecRK.cDegree[0]<>0,datetostr(ttSpecRK.dDegree[0],'Присвоено DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cDegree[0]),'')+
+                 if(ttSpecRK.cDegree[1]<>0,chr(10)+datetostr(ttSpecRK.dDegree[1],'Присвоено DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cDegree[1]),'')
+                 )
+             else
+               if ( ttSpecRK.cDegree[0] <> 0 ) or ( ttSpecRK.cDegree[1] <> 0 )
+                 xlStWriteToMatrix(#FrmCl,
+                   if(ttSpecRK.cDegree[0]<>0,datetostr(ttSpecRK.dDegree[0],'Присвоено DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cDegree[0]),'')+
+                   if(ttSpecRK.cDegree[1]<>0,chr(10)+datetostr(ttSpecRK.dDegree[1],'Присвоено DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cDegree[1]),'')
+                 );
+/*
+               xlSetCellStringValue(
+                 if(ttSpecRK.cDegree[0]<>0,datetostr(ttSpecRK.dDegree[0],'Присвоено DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cDegree[0])+chr(10),'')+
+                 if(ttSpecRK.cDegree[1]<>0,datetostr(ttSpecRK.dDegree[1],'Присвоено DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cDegree[1]),'')
+                 , #FrmCl)
+             else
+               if ( ttSpecRK.cDegree[0] <> 0 )
+                 xlSetCellStringValue(datetostr(ttSpecRK.dDegree[0],'Присвоено DD.MM.YYYY : ')+iCatFunc.GetCatalogsName(ttSpecRK.cDegree[0]), #FrmCl);
+*/
+      lCE++; xlStWriteToMatrix(#FrmCl, ttSpecRK.sWhatError); //xlSetCellStringValue(ttSpecRK.sWhatError, #FrmCl);
+      if ttSpecRK.isError
+        insert mtForError set mtForError.lRowError := lRE;
+//        xlSetFontColor(-16776961, lRE, 1, lRE, lCE);
+
+      lRE++;
+      lRowMatrix++;
+      
+      if ( lRowMatrix > wMatrixSizeRow )
+      {
+        if (not xlWriteMatrixToExcel(lRowCurMx, 1))
+          message('Ошибка функции xlWriteMatrixToExcel.', error);
+        xlFreeMatrix;
+        lRowCurMx += wMatrixSizeRow;
+        lRowMatrix := 1;
+        if (not xlCreateMatrix(wMatrixSizeRow, lCE))
+        {
+          message('Ошибка функции xlCreateMatrix.', error);
+          xlKillExcel;
+          StopVisual;
+          exit;
+        }
+      }
+    }
+    if (not xlWriteMatrixToExcel(lRowCurMx, 1))
+      message('Ошибка функции xlWriteMatrixToExcel.', error);
+    xlFreeMatrix;
+  }
+
+  
+  lRE--;
+
+  lCE := 1;
+  xlSetColumnWidth( 5,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(30,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(20,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(15,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(15,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(40,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(25,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(15,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(16,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(15,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(55,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(70,lRB,lCE,lRE,lCE); lCE++;
+  xlSetColumnWidth(40,lRB,lCE,lRE,lCE); lCE++;
+  xlSetRowHeight(30,lRB+1,lCB,lRE,lCE); 
+  _loop mtForError
+    xlSetFontColor(-16776961, mtForError.lRowError, 1, mtForError.lRowError, lCE);
+  
+  
+  xlAlignCellsEx(xlCenter,xlCenter,lRB,lCB,lRB,lCE);
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0, lRB,lCB,lRE,lCE);
+  StopVisual;
+}
+
+procedure PrintRepPage(isStayAlone : boolean);
+{
+  var isOkFile : boolean = false;
+  var isDoRep  : boolean = false; 
+  
+  ClearRK;
+  initRK;
+
+  if isStayAlone
+    if SetParamRK
+      isDoRep := true;
+  if not isStayAlone
+    isDoRep := isCheckRepParam(true);
+
+  if isDoRep
+  {
+    MakeRK;
+    if isDataRK
+    {
+      if isStayAlone
+      {
+        if wToExistFile = 0 {isOkFile := OpenNewRKS  ;}
+        if wToExistFile = 1 {isOkFile := OpenExistRKS;}
+      }
+      else
+      {
+        isOkFile := true;
+      }
+      if isOkFile
+      {
+        PrintRK;
+
+        if (wPrintRash = 1) and isStayAlone
+        {
+          var i, j : integer = 0;
+          var s    : string = '';
+          xlGetSheetsCount(j);
+          while i<=j
+          {
+            xlSetActiveSheet(++i);
+            xlGetSheetName(i,s);
+            if s='12-к' break;
+          }
+          xlSetActiveSheet(++i);
+          xlAddSheet;
+          xlSetSheetName(i,'Расшифровка 12-к'); 
+          xlSetActiveSheet(i);
+          PrintRash;
+        }
+
+        xlSetActiveSheetByName('12-к');
+        if wToExistFile = 0 {sToExistFile:='';}
+        if isStayAlone
+          xlKillExcel;
+      }
+      else if isStayAlone message('Проверте наличие файла шаблона по пути EXE\XLS_ЭМ\Staff');
+    }
+    else if isStayAlone message('Нет данных для отчета.');
+  }
+  SaveRK;
+  ClearRK;
+  closeinterface(cmDefault);
+}
+//++++++++++++++++++++++++++++++++++++++++++++++++
+//--------------------------------------------------------
+function bSetRepParam : boolean;  
+{
+  result := false;
+  if RunWindowModal(WinRKParamEx)=cmDefault
+    result := true;
+}//function bSetRepParam
+Function GetReportName: String;
+{
+  GetReportName := '#(GPNam) (ЭМ)';
+}
+function GetPriority : Integer;
+{
+  GetPriority := 12;
+}
+procedure initRKStatRepParam;
+{
+  initRK;
+}
+function dRepOnDateParam : date;
+{
+  dRepOnDateParam := dRep;
+}
+//--------------------------------------------------------
+handleevent
+  cmInit:
+  {
+    isStayAloneAll := true;
+    PrintRepPage(true);
+  }
+  cmPick:
+  {
+    case CurField of
+      #sKatWorker1:
+        if (RunInterface('PICKKAT1', 0, mKatWorker1, vfMultipleSelection) = cmDefault)
+          set sKatWorker1 := sSetKatName(mKatWorker1);
+      #sKatWorker2:
+        if (RunInterface('PICKKAT1', 0, mKatWorker2, vfMultipleSelection) = cmDefault)
+          set sKatWorker2 := sSetKatName(mKatWorker2);
+      #sKatWorker3:
+        if (RunInterface('PICKKAT1', 0, mKatWorker3, vfMultipleSelection) = cmDefault)
+          set sKatWorker3 := sSetKatName(mKatWorker3);
+      #sKatWorker4:
+        if (RunInterface('PICKKAT1', 0, mKatWorker4, vfMultipleSelection) = cmDefault)
+          set sKatWorker4 := sSetKatName(mKatWorker4);
+
+      #sKatType1:
+        if (RunInterface('PICKCATALOGEX', -375, 0, Comp(100), mKatType1) = cmDefault)
+          set sKatType1 := sSetTypName(mKatType1);
+      #sKatType2:
+        if (RunInterface('PICKCATALOGEX', -375, 0, Comp(100), mKatType2) = cmDefault)
+          set sKatType2 := sSetTypName(mKatType2);
+      #sKatType3:
+        if (RunInterface('PICKCATALOGEX', -375, 0, Comp(100), mKatType3) = cmDefault)
+          set sKatType3 := sSetTypName(mKatType3);
+      #sKatType4:
+        if (RunInterface('PICKCATALOGEX', -375, 0, Comp(100), mKatType4) = cmDefault)
+          set sKatType4 := sSetTypName(mKatType4);
+      #sKatType5:
+        if (RunInterface('PICKCATALOGEX', -375, 0, Comp(100), mKatType5 ) = cmDefault)
+          set sKatType5 := sSetTypName(mKatType5 );
+      #sKatType6:
+        if (RunInterface('PICKCATALOGEX', -375, 0, Comp(100), mKatType6 ) = cmDefault)
+          set sKatType6 := sSetTypName(mKatType6 );
+
+      #sKatEdu1:
+        if (RunInterface('PICKCATALOGEX', 701, 0, Comp(100), mKatEdu1 ) = cmDefault)
+          set sKatEdu1 := sSetTypName(mKatEdu1 );
+      #sKatEdu2:
+        if (RunInterface('PICKCATALOGEX', 701, 0, Comp(100), mKatEdu2 ) = cmDefault)
+          set sKatEdu2 := sSetTypName(mKatEdu2 );
+      #sKatEdu3:
+        if (RunInterface('PICKCATALOGEX', 701, 0, Comp(100), mKatEdu3 ) = cmDefault)
+          set sKatEdu3 := sSetTypName(mKatEdu3 );
+
+      #sPodr1:
+        if (RunInterface('PICKCATALOGEX', -11, 0, Comp(100), mPodr1) = cmDefault)
+          set sPodr1 := sSetPodrName(mPodr1);
+      #sToExistFile:
+      {
+        set sToExistFile := GetFileName('*.xls;*.xlsx;*.xlsm','Выбор файла...');
+      }
+      #sFromExistFile:
+      {
+        set sFromExistFile := GetFileName('*.xls;*.xlsx;*.xlsm','Выбор файла...');
+      }
+    end;
+  }
+  cmDelOnprotect:
+  {
+    case CurField of
+      #sKatWorker1: {ClearMarker(mKatWorker1); set sKatWorker1 := sSetKatName (mKatWorker1);}
+      #sKatWorker2: {ClearMarker(mKatWorker2); set sKatWorker2 := sSetKatName (mKatWorker2);}
+      #sKatWorker3: {ClearMarker(mKatWorker3); set sKatWorker3 := sSetKatName (mKatWorker3);}
+      #sKatWorker4: {ClearMarker(mKatWorker4); set sKatWorker4 := sSetKatName (mKatWorker4);}
+
+      #sKatType1:   {ClearMarker(mKatType1 );  set sKatType1   := sSetTypName (mKatType1 );}
+      #sKatType2:   {ClearMarker(mKatType2 );  set sKatType2   := sSetTypName (mKatType2 );}
+      #sKatType3:   {ClearMarker(mKatType3 );  set sKatType3   := sSetTypName (mKatType3 );}
+      #sKatType4:   {ClearMarker(mKatType4 );  set sKatType4   := sSetTypName (mKatType4 );}
+      #sKatType5:   {ClearMarker(mKatType5 );  set sKatType5   := sSetTypName (mKatType5 );}
+      #sKatType6:   {ClearMarker(mKatType6 );  set sKatType6   := sSetTypName (mKatType6 );}
+
+      #sKatEdu1:    {ClearMarker(mKatEdu1 );   set sKatEdu1    := sSetTypName (mKatEdu1 );}
+      #sKatEdu2:    {ClearMarker(mKatEdu2 );   set sKatEdu2    := sSetTypName (mKatEdu2 );}
+      #sKatEdu3:    {ClearMarker(mKatEdu3 );   set sKatEdu3    := sSetTypName (mKatEdu3 );}
+
+      #sPodr1:      {ClearMarker(mPodr1);      set sPodr1      := sSetPodrName(mPodr1);}
+      #sToExistFile:{set sToExistFile:='';}
+      #sFromExistFile:{set sFromExistFile:='';}
+    end;
+  }
+  cmCheckField:
+  {
+    case CurField of
+      #wToExistFile:
+      {
+        if wToExistFile = 1 
+          ToggleFieldVisible(#sToExistFile,true )
+        else
+          ToggleFieldVisible(#sToExistFile,false);
+      }
+      #wFromExistFile:
+      {
+        if wFromExistFile = 1 
+          ToggleFieldVisible(#sFromExistFile,true )
+        else
+          ToggleFieldVisible(#sFromExistFile,false);
+      }
+    end;
+  }
+end;
+
+
+End.
+//---------------------------------------------------------------------------------
+#include UserReport.vih
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+Procedure Run;
+{
+  runinterface(#(GPInt));
+}
+Function GetReportName: String;
+{
+  GetReportName := '#(GPNam) (ЭМ)';
+}
+Function GetGroupName (Level : Word) : String;
+{
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Формы "Роскосмоса"';
+  End;
+}
+function GetPriority : Integer;
+{
+  GetPriority := 3;
+}
+function VisibleInModule(Ind : Byte) : String;
+{
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+}
+End.

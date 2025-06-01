@@ -1,0 +1,249 @@
+/*************************************************************************************************\
+* Наименование: Алгоритм ТХО Резерв премии, выплата                                               *
+* Контур/Модуль: ЗП                                                                               *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#5181         |16/04/19|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+function  D_Quart  (Date):                        byte;    external 'atllib_.dll#D_Quart';
+//#include AtlLib_.vih
+
+#include Query.vih
+#include TxoApi.vih
+
+VipInterface Txo_GP_PremResP Implements ObjTxoIdentPlugin Licensed(Free);
+Interface Txo_GP_PremResP;
+
+var PremiumType, Res:word;
+
+table struct tPremium (
+  PersonsNrec: comp,
+  KatPodrNrec: comp,
+  Schet: tSchet19,
+  SubSchet: tSubSch,
+  MnplanNrec: comp,
+  Summa: double
+);
+
+create view
+from
+  tPremium,
+  PlPor, PlansSch
+;
+
+sql query qPremium =
+  select
+    t.PersonsNrec,
+    t.KatPodrNrec,
+    t.Schet,
+    t.SubSchet,
+    t.MnplanNrec,
+    sum(t.Summa) as Summa
+  from
+    ( select
+        n.tPerson  as PersonsNrec,
+        n.Cex      as KatPodrNrec,
+        case when n.cSchetD <> '96' then n.cSchetD  else ls.cSchetD  end as Schet,
+        case when n.cSchetD <> '96' then n.cSubSchD else ls.cSubSchD end as SubSchet,
+        case when n.cSchetD <> '96' then n.cKauD[1] else ls.cKauD[1] end as MnplanNrec,
+        n.Summa    as Summa
+      from
+        NachislZakaz n
+        join LSchet ls on ls.nrec = n.cLSch
+      where
+        n.YearN = :PremYear and n.MesN = :PremMonth and n.VidOpl = :PremVidopl
+     ) t
+  group by
+    t.PersonsNrec,
+    t.KatPodrNrec,
+    t.Schet,
+    t.SubSchet,
+    t.MnplanNrec
+;
+
+sql query qTaxes =
+  select
+    t.PersonsNrec,
+    t.KatPodrNrec,
+    t.Schet,
+    t.SubSchet,
+    t.MnPlanNrec,
+    Sum(t.Summa) as Summa
+  from (
+      select
+        p.tPerson  as PersonsNrec,
+        p.Cex      as KatPodrNrec,
+        Perech.cSchetK as Schet,
+        Perech.cSubSchK as SubSchet,
+        case when p.cSchetD <> '96' then p.cKauD[1] else ls.cKauD[1] end as MnPlanNrec,
+        p.SumPer   as Summa
+      from
+        PerevodTekZakaz p
+        join LSchet ls on ls.nrec = p.cLSch
+        join Perech on Perech.VidPer = p.VidPer
+      where
+        p.VidOpl = :PremVidopl and p.YearN = :PremYear and p.MesN = :PremMonth and p.cSchetK = '69'
+     ) t
+  group by
+    t.PersonsNrec,
+    t.KatPodrNrec,
+    t.Schet,
+    t.SubSchet,
+    t.MnplanNrec
+;
+
+function ExecQuery(CurDate:date; premVidOpl:word):boolean;
+{
+  result := false;
+
+  var rs: IResultSet;
+  if (Res=0) {
+    rs := queryManager.createQuery(qPremium)
+                      .setParam('PremYear'     , Year(CurDate))
+                      .setParam('PremMonth'    , Month(CurDate))
+                      .setParam('PremVidOpl'   , premVidOpl)
+                      .getResultSet;
+  } else if (Res=1) {
+    rs := queryManager.createQuery(qTaxes)
+                      .setParam('PremYear'     , Year(CurDate))
+                      .setParam('PremMonth'    , Month(CurDate))
+                      .setParam('PremVidOpl'   , premVidOpl)
+                      .getResultSet;
+  } else {
+    result := true;
+    exit;
+  }
+
+  if (rs.count>0)
+    result := sqlCopyInto(rs, #tPremium, false) = tsOk
+  else
+    result := true;
+}
+
+Window WinParam 'Параметры' Gray, EscClose, DoAccept;
+Show at (25,5,70,14);
+
+tabbedsheet tbParam;
+Screen scParams 'Параметры' (,,sci1Esc);
+NoTableNavigation;
+fields
+  PremiumType :NoProtect;
+  Res (,,sci13Esc):[list 'Премия', 'Налоги'], Protect;
+buttons
+  cmOk, Default,, 'Ввод выбранных параметров';
+  cmCancel,,,'Отмена выбранных параметров';
+<<
+ `Тип премии`
+   (.) квартальная`
+   (.) годовая`
+
+ `Результат`.@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  <.Продолжить.>               <.  Отмена  .>
+>>
+end;
+
+screen scInfo 'Информация' (,,sci1Esc);
+<<
+ Циклическая аналитика:
+   <режим 0> - Счет, субсчет, заказ
+   <режим 1> - Подразделение, МВЗ,
+             Сотрудник
+>>
+end;
+end;
+
+HandleEvent
+cmInit:{
+  PremiumType:=0;
+  Res:=0;
+}
+cmOk:{
+  PutCommand(cmDefault);
+}
+end;
+end;//WinParam
+
+function GetInfo:string;
+{
+  result := 'Резерв премии, выплата';
+}
+
+function ParamGen:string;
+{
+  result := '[Тип:'+string(PremiumType)+'][Рез:'+string(Res)+']';
+}
+
+procedure ParamParser(hTxo:longint);
+var i:longint;
+{
+  PremiumType:=0;
+  Res:=0;
+
+  for(i:=1; i <= TxoParamCount(hTxo); i++) {
+    case TxoParamName(hTxo, i) of
+      'ТИП': PremiumType := word(TxoParamValue(hTxo, i));
+      'РЕЗ': Res := word(TxoParamValue(hTxo, i));
+    end;
+  }
+}
+
+function ParamMaster:string;
+{
+  result := '';
+
+  if (RunWindowModal(WinParam) = cmDefault)
+    result := ParamGen;
+}
+
+procedure StoreCycles(hTxo:longint; buf:TTxoApiInfoDoc);
+{
+  TxoAllowRecallStoreCycles(hTxo);
+
+  ParamParser(hTxo);
+
+  delete all tPremium;
+
+  //Ограничение по ТХО
+  if (getfirst fastfirstrow PlPor where((buf.cSoprDoc==PlPor.NRec))<>tsok) {
+    TxoDebugMsg(hTxo,'exit','Не найдена бух справка с NRec='+string(buf.cSoprDoc,0,0)+'!');
+    exit;
+  }
+  if (getfirst fastfirstrow PlansSch where((buf.cPlansSch==PlansSch.NRec))<>tsok) {
+    TxoDebugMsg(hTxo,'exit','Не найден план счетов с NRec='+string(buf.cPlansSch,0,0)+'!');
+    exit;
+  }
+
+  var premVidOpl: word;
+  premVidOpl := if(PremiumType = 0,
+                   coGetTune('NPOEM_OWN.BU.RezervKvartPrem.VidOpl'),
+                   coGetTune('NPOEM_OWN.BU.RezervGodPrem.VidOpl'));
+
+  var r:boolean;
+  r:=ExecQuery(PlPor.DatVip, premVidOpl);
+  if (not r) {
+    TxoDebugMsg(hTxo,'exit','Ошибка выполнения DSQL запроса.');
+    exit;
+  }
+
+  _loop tPremium {
+    TxoBodyClear(hTxo);
+
+    TxoBodyAddSchet(hTxo, wFlKau_Mode0, PlansSch.Kod+tPremium.Schet, tPremium.SubSchet);
+    TxoBodyAddKau(hTxo, wFlKau_Mode0, cgKau_Zakaz, tPremium.MnplanNrec);
+
+    TxoBodyAddKau(hTxo, wFlKau_Mode1, cgKau_KatPodr, tPremium.KatPodrNrec);
+    TxoBodyAddKau(hTxo, wFlKau_Mode1, 10044, tPremium.KatPodrNrec);
+
+    TxoBodyAddKau(hTxo, wFlKau_Mode1, cgKau_Persons, tPremium.PersonsNrec);
+
+    TxoBodySetSum(hTxo, tPremium.Summa, 0, 0);
+
+    TxoBodyInsert(hTxo);
+  }//_loop tPremium
+}
+
+End.

@@ -1,0 +1,298 @@
+/*************************************************************************************************\
+* Наименование:  Связь со скудом                                                                  *
+*                РПД № 90 Работа в выходные и праздничные                                         *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание: 175 Доработки для учета в СКУД                                                      *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#175          |18/10/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include GetKau.vih
+#include RPD.Vih
+#include Marker.Vih
+#include GP_SCUD_EventsEdit.Vih
+#include GP_RPD_90_Helper.vih
+#component "Z_STAFFORDERS"
+#doc
+#end
+
+//******************************************************************************
+Alter Interface RPD_90 ('');
+//******************************************************************************
+OverLoad
+function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+Procedure IRPD_Base.EnableDisable;
+Procedure IRPD_Base.MyDel;
+end;
+var
+  iGP_SCUD_EventsEdit:GP_SCUD_EventsEdit;//для работы с картотекой в СКУД
+  _rpd90Helper: GP_RPD_90_Helper;
+
+//******************************************************************************
+create view
+as select GP_SCUD_PERS.Nrec
+From GP_SCUD_PERS, Catalogs GP_CatDep
+where ((
+   ContDoc.Person == GP_SCUD_PERS.cPersons and
+   ContDoc.cDopRef == GP_CatDep.Nrec
+))
+; //create view
+
+//используется в DeleteOneOrder
+//для удаления внешних атрибутов заявок, включенных в текущий приказ
+//и для пересчета текста этих заявок
+create view vDel
+var
+  _contDocNrec: comp;
+  _attrNamNrec: comp;
+  _titleDocNrec: comp;
+as select SalScale.Nrec
+from SalScale,
+     AttrVal,
+     SalScale SalScale190,
+     ContDoc ContDoc190,
+     PartDoc PartDoc190,
+     TitleDoc TitleDoc190,
+     TitleDoc TitleDocByNrec
+where ((
+  0                 == SalScale.wTblCode and
+  _contDocNrec      == SalScale.cUnit and
+  _attrNamNrec      == AttrVal.cAttrNam and (AttrVal.vString = string(vDel.SalScale.Nrec)) and
+  AttrVal.cRec      == SalScale190.Nrec and
+  SalScale190.cUnit == ContDoc190.Nrec and
+  ContDoc190.cPart  == PartDoc190.Nrec and
+  PartDoc190.cDoc   == TitleDoc190.Nrec and
+  _titleDocNrec     == TitleDocByNrec.Nrec
+));
+
+//******************************************************************************
+// можно вынести в RPD_BASE, но тогда начинают идти 6 предупреждений на base_Payment
+// да и EnableDisable в 8 перехвачена
+//******************************************************************************
+Create view vNotes
+var
+  nRecTable:comp;
+  wChoice  :word;
+From Notes
+where ((
+      wChoice     == Notes.choice
+  and nRecTable   == Notes.Owner
+));
+
+File FMemo;
+
+Function MyCheckNotes(_wChoice:word):boolean;
+{ Result:=false;
+  vNotes.nRecTable:=ContDoc.Nrec;
+  vNotes.wChoice  :=_wChoice;
+  Result:=vNotes.Getfirst Notes=tsok;
+  if not Result exit;
+  if FMemo.OpenMemo(vNotes.Notes.NOTE)
+  { Result:=FMemo.GetSize()<>0;
+    FMemo.Close;
+  }
+} //Function MyCheckNotes(_wChoice:word):boolean;
+//******************************************************************************
+// Установить надписи на кнопках
+//******************************************************************************
+Procedure MySetButtonTitle(_nm_screen:string='');
+{ //'Z_STAFFORDERS::NOTESFORCONTDOC.Memo_NOTES.NOTE'
+  var ww_str:string;
+  if _nm_screen='' _nm_screen:='b_scrFoundation';
+  //cmViewAdvance1
+  //ww_str:=if(MyCheckNotes(3002),'Примечан.+','Примечание');
+  //cfsSetProp(_nm_screen+'_Примечание',cfpTitle,ww_str);
+  //--
+  ww_str:=if(MyCheckNotes(3005),'Доп.условия+','Доп. условия');
+  cfsSetProp(_nm_screen+'_Доп._условия',cfpTitle,ww_str);
+  ReScanPanel(#PERSONS);
+} //Procedure MySetButtonTitle;
+
+
+
+//******************************************************************************
+// Процедура открытия\закрытия полей для редактирования
+//******************************************************************************
+Procedure IRPD_Base.EnableDisable;
+{ MySetButtonTitle();
+  Inherited::EnableDisable;
+}//Procedure EnableDisable;
+
+//Удаляет ContDoc из приказа
+//Удаляет связи (внешние атрибуты) позиций заявок на работу в выходные дни и позиций приказа
+//Обновляет текст заявок (включены / не включены в приказ)
+Procedure IRPD_Base.MyDel;
+{
+  vDel._contDocNrec := ContDoc.Nrec;
+  vDel._attrNamNrec := viEA.AttrId(coSalScale, 'LinkedSalScaleNrec');
+  vDel._loop SalScale
+    vDel._loop AttrVal
+    {
+      var isAttrValDeleted: boolean = false;
+      if vDel.getfirst SalScale190 = tsOk
+        if vDel.getfirst ContDoc190 = tsOk
+          if vDel.getfirst PartDoc190 = tsOk
+            if vDel.getfirst TitleDoc190 = tsOk
+            {
+              vDel._titleDocNrec := vDel.TitleDoc190.Nrec;
+              isAttrValDeleted := vDel.delete current AttrVal = tsOk;
+              if vDel.getfirst TitleDocByNrec = tsOk
+                vDel.update current TitleDocByNrec
+                  set TitleDocByNrec.DocText := _rpd90Helper.CalcClaimDocText(vDel._titleDocNrec);
+            }
+      if not isAttrValDeleted
+        vDel.delete current AttrVal;
+    }
+
+  Inherited::MyDel;
+}
+
+//******************************************************************************
+//  Процедура утверждения индивидуального приказа по текущему работнику (по таблице ContDoc)
+//******************************************************************************
+function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+{ Result:=Inherited::ChildConfirmOneOrder(cNrec);
+  if Result
+  { //iGP_SCUD_PersEdit.MakeBufferPers(Persons.Nrec,ContDoc.ObjNrec,TitleDoc.Nrec,Contdoc.Nrec,PartDoc.TypeOper)
+    if getfirst GP_SCUD_PERS=tsok
+    _Loop fullcache SALSCALE
+    { iGP_SCUD_EventsEdit.CalcAll(GP_SCUD_PERS.Nrec
+           ,year(SALSCALE.LASTDATE)
+           ,month(SALSCALE.LASTDATE)
+           ,2 //1
+           ,true
+           ,0
+           );
+    }
+  }
+} //function IRPD_Base.ChildConfirmOneOrder(cNrec : comp = 0): boolean;
+
+//------------------------------------------------
+//
+//------------------------------------------------
+Function Import_From_Scud:boolean;
+var _chas:double;
+    _Day:word;
+    _EnhancedTimeFormat:boolean;
+    _Mes:string;
+{ Result:=False;
+  UpdateTable;
+  PushPos(#SalScale);
+  PushPos(#ContDoc);
+  StartNewVisual(vtNumericVisual,vfTimer + vfBreak + vfConfirm,'Подготовка данных',0);
+  _EnhancedTimeFormat:=boGetTune('UP.ZAR.WT.EnhancedTimeFormat');
+
+  _Loop fullcache ContDoc
+  { if ContDoc.Person=0 continue;
+    if not iNextVisual('Подготовка данных'+chr(13)+Persons.Fio)
+    { break;
+    }
+    if getfirst GP_SCUD_Pers<>tsok
+    { displ('Не нашли запись в справочнике сотрудников СКУД для '+Persons.Fio)
+
+    }
+
+    _Loop fullcache SALSCALE
+    { _Day:=day(SALSCALE.LASTDATE);
+      _Mes:='Заменили часы для "'+Persons.Fio+ '" c '+fHoursAll+' на ';
+      if getfirst GP_SCUD_PERS<>tsok
+      { _Mes:='Не нашли карточку в СКУД '+Persons.Fio;
+        displ(_mes);
+        break;
+      }
+      iGP_SCUD_EventsEdit.CalcAll(GP_SCUD_PERS.Nrec
+           ,year(SALSCALE.LASTDATE)
+           ,month(SALSCALE.LASTDATE)
+           ,1
+           ,true
+           ,_Day
+           );
+      _chas:=iGP_SCUD_EventsEdit.GetCalc_CH_Holiday_Day(_Day);
+      if _EnhancedTimeFormat
+      { SalScale.fSum0:=iGP_SCUD_EventsEdit.GetTimeFromDouble(_chas);
+        _mes:=_mes+TimeToStr(iGP_SCUD_EventsEdit.GetTimeFromDouble(_chas),'HH:MM');
+      }
+      else
+      { SalScale.fSum0:=double(string(_chas,0,2));
+        _mes:=_mes+string(_chas,0,2)
+      }
+      update current SalScale;
+      displ(_mes);
+    } //_Loop fullcache SALSCALE
+  } //_Loop fullcache ContDoc
+
+  PopPos(#ContDoc);
+  ReScanPanel(#ContDoc);
+  PopPos(#SalScale);
+  ReScanPanel(#SalScale);
+
+  StopVisual('',0);
+  ShowErrors;
+  Result:=true;
+
+} //Function Import_From_Scud:boolean;
+
+//------------------------------------------------
+OverloadFormats scrFoundation;
+//------------------------------------------------
+screen scrFoundation(,hcStaffWinPr,);
+show at (,5,,6);
+table ContDoc;
+fields
+  ContDoc.sBottom ('Основание',, sci1Esc): noprotect;
+buttons
+  cmValue21, [singleline],,, 'Дополнительные условия по приказу';
+//GP
+  cmValue41, [singleline],,, 'Забрать часы из СКУД';
+//GP
+<<
+Основание.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ <.Доп. условия.> <.Часы из СКУД.>
+
+>>
+end;
+
+ExtendFormats brPsn;
+
+browse brPsn (, hcStaffWinPr, sci1378Esc);
+table ContDoc;
+fields
+  SubStr(GP_CatDep.Code, 1, 3) 'Код отдела': [5], protect;
+end;
+
+
+//------------------------
+// События интерфейса
+//------------------------
+handleevent
+/*
+cmViewAdvance1: //просмотр примечания к приказу
+{ if  inherited :: handleEvent (cmViewAdvance1)=heAbort then Abort;
+  MySetButtonTitle;
+}
+*/
+cmValue21: //доп. условия
+{ if  inherited :: handleEvent (cmValue21)=heAbort then Abort;
+  MySetButtonTitle;
+  // почему то сразу не обновляется
+  EnableDisable;
+}
+//GP
+cmValue41: //часы из скуд
+{ if TitleDoc.wStatus <>0
+  { message('Приказ не в оформляемом статусе'
+         +', импорт часов запрещен!'
+    ) ;
+    exit;
+  }
+
+  if(sgettune('UP.ZAR.WT.ENHANCEDTIMEFORMATPREC') != '2')
+    message('Требуется переключить формат отображения времени!', warning);
+  else
+    Import_From_Scud;
+
+}
+//GP
+end;
+
+
+END.

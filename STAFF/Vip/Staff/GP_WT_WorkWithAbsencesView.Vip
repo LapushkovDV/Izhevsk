@@ -1,0 +1,780 @@
+/*************************************************************************************************\
+* Наименование: Скуд - Справка о затратах на С, РВ и В(из таб.учета)                              *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание: На базе #1860                                                                       *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2517         |16/02/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#             |08/06/22|kurennykh                |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#DEFINE NO_GP_WT_WorkWithA_PER_BY_MES
+
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+#include CLSFUNCS.VIH // ф-ии пересканирования текущих л/с
+#include PAFILTER.VIH // функц-л работы с подразделениями и тек. лицевыми счетами
+#include ChoiseYourPersons.vih
+#include Query.vih
+#include CatFunc.Vih
+#include GetKau.Vih
+//-------------------------
+#include GP_QueryBuilder.vih
+#include GP_SCUD_StateMentOnAbsent.Vih
+#include GP_SCUD_Function.Vih
+#doc
+  представление АНАЛИТИЧЕСКИЙ ОТЧЕТ ПО ФАКТИЧЕСКИ ОТРАБОТАННОМУ  ВРЕМЕНИ С УЧЕТОМ НЕЯВОК для триафлай
+#end
+
+Interface GP_WT_WorkWithAbsencesView 'Факт отработанного времени + Неявки';
+#IFDEF GP_WT_WorkWithA_PER_BY_MES
+Show at (,,50,19);
+#ELSE
+Show at (,,50,18);
+#ENDIF
+
+table struct local tmp_report_sp
+(  nrec     :comp
+ , pr       :Integer
+ , sortname :string // для сортировки
+ , cRec     :comp   // ссылка на заголовок
+ , FIo      :string
+ , cPers    :comp
+ , cPost    :comp
+ , cPodr    :comp
+ , Kateg    :word
+ , MesN     :word
+ , YearN    :word
+ , dmd : array[1..38] of double
+ , dms : array[1..38] of string
+)
+with index
+( tmp_report_sp01  = nrec (AutoInc, Unique),
+  tmp_report_sp03  = cRec+sortname+YearN+MesN,
+  tmp_report_sp04  = cRec+cPers+cPodr+cPost+YearN+MesN+Kateg
+);
+//------------------
+// Для предвыборки табеля
+Table Struct local tmp_LsTab
+( cLstab  :comp
+ ,cPerexod:comp
+ ,cKatPodr:comp
+ ,cAppoint:comp
+ ,Kateg   :word
+ ,Fio     :string[100]
+ ,cPersons:comp
+ ,cLschet :comp
+ ,Podr_Kod:string[10]
+ ,STRTABN:string[10]
+ ,Podr_KodAll:string[10]
+ ,Podr_Name:string
+ ,Podr_Nrec:comp
+ ,sPost   :string
+ ,MesN    :word
+ ,YearN   :word
+)
+with index
+( tmp_LsTab01 = cLsTab + cPerexod
+);
+
+//------------------
+// Для предвыборки заявлений
+Table Struct local tmp_Zauv
+(   EventDate:date //   : date "Дата события"
+  , EventTmB :time //  : time "Время события с"
+  , EventTmE :time //  : time "Время события по"
+  , wType    :word //  0 - личные невыходы,1 - служебные
+  , cPersons :comp
+  , cGP_SCUD_PERS :comp
+  //, DocNumber:string[30]
+  //, DocDate:date
+  , cGp_SCUD_DOC_SP :comp
+  , cGp_SCUD_DOC    :comp
+
+)
+with index
+( tmp_Zauv01 = cPersons + EventDate
+);
+//============================================
+#include GP_SCUD_StateMentOnAbsent.Var
+#include GP_SCUD_Function.Var
+#include GetKau.Var
+//============================================
+var
+  CS: IContextSession; // для захвата прикладного контекста табеля
+  //---------------
+  iCatFunc            : CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+  iQBuilder:GP_QueryBuilder new;
+  //для стандартного фильтра по подразделению
+  PAF:  TraditionalPersonalAccountFilter;
+  CLSF:      CurLSFunctions;
+  //-----------------------
+  viCYPersons         : ChoiseYourPersons;
+  //-----------------------
+  pStatus_GetDefault :comp; // статус по умолчанию
+
+  wMesB,wMesE, wMes:word;
+  DTB,DTE,DTB_Period,DTE_Period,DT_Calc:date;
+  DayB,DayE:word;
+  wYear:word;
+  wYearB:word;
+  wYearE:word;
+  sPopdis  :string;// подпись отчета
+  sDolg    :string;// подпись отчета
+  maxColCount:Longint;
+  pNotationRV1,pNotationRV2:comp;
+
+#include Excel_Var.vpp
+//-----------------------------------------
+   wOption:word;
+   wVivod :word;
+//-----------------------------------------
+// Фильтры
+//-----------------------------------------
+   wFilter:word;
+   Marker_Count :longint;
+    wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   KauMarkerName:string;
+   Marker_Tmp :longint;
+   #mrkfld_(Persons)
+   //---------------
+   DepList :longint;
+   //------------------------
+   VidKat      : string[100];
+   MarkKat:longint;
+   //------------------------
+
+Create view
+var
+  pRep       :comp;
+  pRep_Main  :comp;
+  pPost      :comp;
+  pDepartMent:comp;
+  pLschet    :comp;
+  sUserName:string;
+as select KlKatego.Nrec
+, (PAF.GetDepartmentFilterStr)  (fieldname = FiltrPodr)
+, tmp_LsTab.*
+, tmp_Zauv.*
+From KlKatego,  tmp_report_sp(tmp_report_sp03)
+, ZAR_USER
+, StaffStruct
+, tmp_LsTab(tmp_LsTab01)
+// подхватим переработку
+, GP_Scud_Saldo
+//------- фильтры
+ , Persons    Persons_Flt
+where
+((
+   sUserName == Zar_User.OwnName
+//---------------
+and pDepartment == StaffStruct.Department
+and pPost       == StaffStruct.POST
+and DTE_Period >>= StaffStruct.DInPut
+and ( StaffStruct.DClose=ZeroDate
+     or StaffStruct.DClose>=DTB
+  )
+ and  0 == tmp_report_sp.cRec
+// подхватим переработку
+and tmp_LsTab.cPersons == GP_SCUD_PERS.cPersons
+//and GP_SCUD_PERS.Nrec  == GP_Scud_Saldo.cGP_SCUD_PERS
+and tmp_LsTab.cPersons  == GP_Scud_Saldo.cPersons
+and wYear               == GP_Scud_Saldo.Yearn
+and tmp_LsTab.MesN      == GP_Scud_Saldo.MESN
+and tmp_LsTab.cPersons  == tmp_Zauv.cPersons
+and DTB        <<= tmp_Zauv.EventDate
+and DTE        >>= tmp_Zauv.EventDate
+//------- фильтры
+and wc_nrec == Persons_Flt.Nrec
+
+))
+;
+
+//------------------------------------
+Create view vSpr
+var
+  pPerson :comp;
+From Persons, Appointments
+where
+((  pPerson == Persons.Nrec
+and Persons.Appointcur == Appointments.Nrec
+));
+
+//------------------------------------
+create view vPodr
+var
+ sPodr_kod:string;
+From KatPodr
+where (( sPodr_kod == KatPodr.kod));
+
+
+ Screen scrParam 'Параметры формирования' (,,sci1Esc);
+Table Zar_User;
+Fields
+  DTB_Period : noprotect;
+  DTE_Period : noprotect;
+Buttons
+  cmOk,default,,'Сформировать отчет', hcOplTrudhlp, sci1Esc;
+<<
+  `Период`
+  `c` .@@@@@@@@@@@@@@  `по`.@@@@@@@@@@@@@
+          <.~С~формировать.>
+>>
+end; //scrParam 'Параметры формирования' (,,sci1Esc), Cyan;
+
+//------------------------------------
+#include Excel_Fun.vpp
+//------------------------------------
+
+Procedure InsTabel(_Change:comp);
+var ii,jj:word;
+    _ChafF:double;
+    _Mes,_Year:word;
+{ WT_ResetFilter;
+  // если включено раздельное ведение табелей
+  //    if (SeparateTableKeeping)
+  // установим фильтр по данному переходу в межпериод
+  WT_SetAttributeFilter(wtaChange, _Change);
+  WT_AddDayRangeFilter(DayB,DayE);
+  _Mes:=0;_Year:=0;
+  if IsBitCTW(wOption,2)
+  { _Mes :=wMes;
+    _Year:=wYear;
+  }
+  var _boIns:boolean=false;
+  if getfirst tmp_report_sp where (( 0 == tmp_report_sp.cRec
+     and tmp_LsTab.cPersons == tmp_report_sp.cPers
+     and tmp_LsTab.Podr_nrec== tmp_report_sp.cPodr
+     and tmp_LsTab.cAppoint == tmp_report_sp.cPost
+     and _Year             == tmp_report_sp.YearN
+     and _Mes              == tmp_report_sp.MesN
+     //and tmp_LsTab.Kateg    == tmp_report_sp.Kateg
+     ))<>tsok
+  { ClearBuffer(#tmp_report_sp);
+    tmp_report_sp.cRec:=0;
+    tmp_report_sp.SortName:=tmp_LsTab.Fio;
+    tmp_report_sp.Kateg   :=tmp_LsTab.Kateg;
+    tmp_report_sp.cPers   :=tmp_LsTab.cPersons;
+    tmp_report_sp.cPodr   :=tmp_LsTab.Podr_Nrec;
+    tmp_report_sp.cPost   :=tmp_LsTab.cAppoint;
+    tmp_report_sp.dms[1]  :=tmp_LsTab.Podr_kod;
+    tmp_report_sp.dms[36]  :=tmp_LsTab.Podr_kodAll;
+    tmp_report_sp.dms[37]  :=tmp_LsTab.STRTABN;
+    tmp_report_sp.dms[2]  :=tmp_LsTab.Podr_name;
+    tmp_report_sp.dms[3]  :=tmp_LsTab.FIO;
+    tmp_report_sp.dms[4]  :=tmp_LsTab.sPost;
+    tmp_report_sp.dms[5]  :=string(tmp_LsTab.Kateg);
+    tmp_report_sp.YearN   :=tmp_LsTab.YearN; //_Year;
+    tmp_report_sp.MesN    :=tmp_LsTab.MesN;  //_Mes ;
+    insert current tmp_report_sp;
+
+  }
+
+  //------------------
+  // Здесь вычислим часы
+  //------------------
+  //плановые часы по графику
+  //tmp_report_sp.dmd[5]:=tmp_report_sp.dmd[5]+WT_GetHoursEx(hkworking,stPlanned,0);
+  tmp_report_sp.dmd[5]:=tmp_report_sp.dmd[5]+WT_GetHoursBwDaysEx(hkworking,0,0,stPlanned,1,31,0) ;
+  //фактически отработанное время, час.
+  tmp_report_sp.dmd[6]:=tmp_report_sp.dmd[6]+WT_GetHoursEx(hkworking,stActual,0);
+  if WT_LoadMonthlyAbsences = 0
+  { var _AbsenceCount:longint=WT_GetAbsenceCount(atMonthly);
+    for(jj := 0; jj < _AbsenceCount; Inc(jj))
+    { var pNotation: comp=0;
+      var _aaMark:string;
+      _aaMark:='';
+      // if not WT_GetAbsenceAttribute(atMonthly, jj, aaNotation, pNotation)
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaMark, _aaMark) then continue;
+      var _aaBeginning , _aaEnding :date=ZeroDate;
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaBeginning, _aaBeginning) then continue;
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaEnding   , _aaEnding   ) then continue;
+
+      ii:=0;
+      case _aaMark of
+        'ОТ' : ii:=07;
+        'ОД' : ii:=08;
+        'У'  : ii:=09;
+        'УД' : ii:=10;
+        'ДО' : ii:=11;
+        'Д'  : ii:=12;
+        'Г'  : ii:=13;
+        'ПР' : ii:=14;
+        'Б'  : ii:=15;
+        'К'  : ii:=16;
+        'ПК' : ii:=17;
+        'ПМ' : ii:=18;
+        'Т'  : ii:=19;
+        'ОТГ': ii:=20;
+        'РВ' : ii:=21; //РВ
+        'РО' : ii:=22;
+        'ОВК' : ii:=27;
+        'НД'  : ii:= 28;
+        'РП'  : ii:= 29;
+        // 30 должно быть  НБ вроде как
+        'НН'  : ii:= 31; // впереди оставлена дырка под НБ
+      else continue;
+      end;
+      _ChafF:=0;
+      WT_GetAbsenceAttribute(atMonthly, jj, aaHours,_ChafF);
+      if _ChafF=0
+        _ChafF:=WT_GHBDEx(1,0,0,-1,_aaBeginning , _aaEnding,0);
+
+      tmp_report_sp.dmd[ii]+=_ChafF;
+    } //for(jj := 0; jj < WT_GetAbsenceCount(atMonthly); Inc(jj))
+  } //if WT_LoadMonthlyAbsences = 0
+
+  //сверхурочка
+  tmp_report_sp.dmd[23]+=WT_GetHours(hkOverwork,stActual)+WT_GetHours(hkOverworkRest,stActual);
+  //------------------------
+  // подхватим переработку
+  if true //_boIns //только первый раз
+  { if getfirst GP_Scud_Saldo =tsok
+    { for(jj := 1; jj <=31 ; jj++)
+      { if WT_TestDayEx(jj
+         ,dkWorking //2
+         ,stPlanned //0
+         ,0
+         )
+       {  tmp_report_sp.dmd[26]+=GP_Scud_Saldo.CH_OVERWORK2[jj];
+       }
+     } //for(jj := 1; jj <=31 ; jj++)
+    } //if getfirst GP_Scud_Saldo
+    //---------------- Заявления
+    _Loop  tmp_Zauv
+    { jj:=Day(tmp_Zauv.EventDate);
+      if not WT_TestDayEx(jj
+        ,dkWorking //2
+        ,stPlanned //0
+        ,0
+         ) then continue;
+      if not pGP_SCUD_A.SetDocPosition(0,tmp_Zauv.cGP_SCUD_DOC,tmp_Zauv.cGP_SCUD_DOC_SP) then continue;
+     _ChafF:=iGP_SCUD_Function.GetDoubleFromTime(
+               pGP_SCUD_A.GetPlanTime(tmp_Zauv.cGp_SCUD_PERS
+                  ,tmp_Zauv.EventDate //_DT:date;
+                  ,tmp_Zauv.EventTMB , tmp_Zauv.EventTME)
+                   );
+     case tmp_Zauv.wType of
+     2: tmp_report_sp.dmd[24]+=_ChafF;
+     1: tmp_report_sp.dmd[25]+=_ChafF;
+     end;
+
+    } //_Loop  tmp_Zauv
+  }
+
+  update current tmp_report_sp;
+} //Function InsTabel(_Change:comp);
+
+//==========================
+Procedure Tabel_Init;
+{
+  Loadworkingtable(tmp_lstab.clschet,wMes,wYear);
+  WT_ResetFilter;
+}
+
+//==============================
+// сбор данных
+//==============================
+Function SborData : boolean;
+var _pLsTab:comp;
+    wErr:longint;
+{ SborData:=False;
+
+
+  DTB:=date(1,wMes,wYear);
+  DTE:=date(Last_Day(DTB),wMes,wYear);
+  if DTB<DTB_Period DTB:=DTB_Period;
+  if DTE>DTE_Period DTE:=DTE_Period;
+  DayB:=Day(DTB);
+  DayE:=Day(DTE);
+
+
+  if not iNextVisual('Сбор данных за '+string(wMes)+' мес. '+string(wYear)+' год' ) exit;
+  delete all tmp_LsTab;
+  _Try
+  { var hStrFilter,hStrFilter1:longint=0;
+    var hStrFilter_kat :longint=0;
+    var hStrFilter_Pers:longint=0;
+    var Q: IQuery;
+    //-------------------
+    Q:=queryManager.createQuery(SQLQuery(
+      select  Distinct
+       Lstab.Nrec as cLstab // :comp
+      ,#Comp(0) as cPerexod//:comp
+      ,CASE WHEN LsTab.Cexoz=#Comp(0) then LsTab.cex else LsTab.Cexoz End as cKatPodr//:comp
+      ,CASE WHEN LsTab.cAppoint=#COMP(0) THEN Lschet.cAppoint ELSE LsTab.cAppoint END as cAppoint//:comp
+      ,LsTab.Kateg as Kateg //  :word
+      ,Persons.Fio as Fio   ///  :string[100]
+      ,LsTab.tPerson as cPersons//:comp
+      ,LsTab.cLschet as cLschet // :comp
+      ,COALESCE(SubString(KatPodr.Kod,1,3),'-') as Podr_kod
+      ,KatPodr.Kod as Podr_kodAll
+      ,Persons.STRTABN as STRTABN
+      ,COALESCE(KatPodr.Name,'-') as Podr_name
+      ,COALESCE(KatPodr.Nrec,#Comp(0)) as Podr_nrec
+
+      ,COALESCE(Catalogs.Name,'') as sPost
+      ,LsTab.MesN  as mesn//   :word
+      ,LsTab.YearN as yearn//
+      From LsTab
+      Inner join Persons on Persons.Nrec = LsTab.tPerson
+      Inner join Lschet  on Lschet.Nrec = LsTab.cLschet
+        and (Lschet.DatUv=#Date(0,0,0)  or Lschet.DatUv>=:(DTB) )
+        and Lschet.Sovm<>3
+
+      Left outer join KatPodr on KatPodr.Nrec = LsTab.cex
+      left outer join Catalogs on Catalogs.Nrec = CASE WHEN LsTab.cAppoint=#COMP(0) THEN Lschet.cAppoint ELSE LsTab.cAppoint END
+      left outer join KlKatego on KlKatego.Kod = LsTab.Kateg
+      left outer join MOVELSC on MOVELSC.CLSCHET =Lschet.nrec
+          and MOVELSC.DATPOS<=:(DTE)
+          and MOVELSC.DATUV >=:(DTB)
+      where lstab.yearn =:(wYear)
+         and LsTab.mesn =:(wMes)
+         and (Lschet.DAtPos<=:(DTE) or COALESCE(MOVELSC.Nrec,#comp(0))<>#comp(0) )
+         %Filter_LsTab
+         %Filter_Kat
+         %Filter_Pers
+      Union
+      SELECT   Distinct
+       Lstab.Nrec as  cLstab // :comp
+      ,Perexod.Nrec as cPerexod//:comp
+      ,Perexod.Cexp as cKatPodr//:comp
+      ,Perexod.cAppoint as cAppoint//:comp
+      ,Perexod.Kateg as Kateg //  :word
+      ,Persons.Fio as Fio   ///  :string[100]
+      ,LsTab.tPerson as cPersons//:comp
+      ,LsTab.cLschet   as cLschet // :comp
+      ,COALESCE(SubString(KatPodr.Kod,1,3),'-') as Podr_kod
+      ,KatPodr.Kod as Podr_kodAll
+      ,Persons.STRTABN as STRTABN
+      ,COALESCE(KatPodr.Name,'-') as Podr_name
+      ,COALESCE(KatPodr.Nrec,#Comp(0)) as Podr_nrec
+      ,COALESCE(Catalogs.Name,'') as sPost
+      ,LsTab.MesN as mesn//   :word
+      ,LsTab.YearN as yearn//
+      From LsTab
+      inner join Perexod on PEREXOD.CLSCH = lstab.cLSchet
+          and PEREXOD.DATIZM>=:(DTB) and PEREXOD.DATIZM<=:(DTE)
+      Inner join Persons on Persons.Nrec = LsTab.tPerson
+      Inner join Lschet  on Lschet.Nrec = LsTab.cLschet
+        and (Lschet.DatUv=#Date(0,0,0)  or Lschet.DatUv>=:(DTB) )
+      Left outer join KatPodr on KatPodr.Nrec = Case
+             when Perexod.Cexp = #Comp(0) then LsTab.cex else Perexod.Cexp end
+      left outer join Catalogs on Catalogs.Nrec = Case
+             when Perexod.cAppoint = #Comp(0) then LsTab.cAppoint else Perexod.cAppoint end
+      left outer join KlKatego on KlKatego.Kod = Perexod.Kateg
+      where lstab.yearn =:(wYear)
+         and LsTab.mesn =:(wMes)
+         %Filter_Perexod
+         %Filter_Kat
+         %Filter_Pers
+    ));
+    if IsBitCTW(wFilter,1)
+    {
+      sqlAddStr(hStrFilter ,iQBuilder.MakeCriteriaFromMarker(' and LsTab.cex  ',DepList));
+      sqlAddStr(hStrFilter1,iQBuilder.MakeCriteriaFromMarker(' and Perexod.cexp ',DepList));
+
+    }
+    //---------------------
+    if (hStrFilter<>0)
+    { Q.setMacro('Filter_LsTab',hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    else
+    { Q.setMacro('Filter_LsTab','');
+    }
+    //---------------------
+    if (hStrFilter1<>0)
+    { Q.setMacro('Filter_Perexod',hStrFilter1);
+      sqlFreeStr(hStrFilter1);
+    }
+    else
+    { Q.setMacro('Filter_Perexod','');
+    }
+    //---------------------
+    if IsBitCTW(wFilter,2)
+    { sqlAddStr(hStrFilter_kat ,iQBuilder.MakeCriteriaFromMarker(' and KlKatego.Nrec ',MarkKat));
+
+    }
+    if (hStrFilter_Kat<>0)
+    { Q.setMacro('Filter_Kat',hStrFilter_Kat);
+      sqlFreeStr(hStrFilter_Kat);
+    }
+    else
+    { Q.setMacro('Filter_Kat','');
+    }
+    //---------------------
+    if IsBitCTW(wFilter,3)
+    { sqlAddStr(hStrFilter_Pers ,iQBuilder.MakeCriteriaFromMarker(' and Lstab.tPerson ',Marker_Persons));
+
+    }
+    if (hStrFilter_Pers<>0)
+    { Q.setMacro('Filter_Pers',hStrFilter_Pers);
+      sqlFreeStr(hStrFilter_Pers);
+    }
+    else
+    { Q.setMacro('Filter_Pers','');
+    }
+
+    //---------------------
+
+    if (Q.Execute.ErrorCode<>0)
+    { message('Ошибка выполнения DSQL запроса 1 при отборе значений ('+string(Q.ErrorCode)+').',error);
+      Exit;
+    }
+    else
+    { wErr:=sqlCopyInto(Q.getResultSet,TNtmp_LsTab,true);
+
+    }
+  }
+  _except
+  else
+  {
+  }
+  _finally
+  {
+  }
+  StopVisual('',0);
+  StartNewVisual(vtIndicatorVisual,vfTimer + vfBreak + vfConfirm
+        ,'Сбор данных за '+string(wMes)+' мес. '+string(wYear)+' год'
+        ,RecordsInTable(#tmp_Lstab));
+  _pLsTab:=0;
+  var cnt : word = 1;
+  _loop fullcache tmp_lstab
+  {
+    if not nextvisual then exit;
+    //logstrtofile('666.log', 'step = ' + cnt);
+    if _pLsTab<>tmp_lsTab.cLstab
+    {
+      //logstrtofile('666.log', 'in if _pLsTab = ' + _pLsTab);
+      _pLsTab:=tmp_lsTab.cLstab;
+      Tabel_Init;
+    }
+    //logstrtofile('666.log', 'tmp_lsTab.cPerexod = ' + tmp_lsTab.cPerexod);
+    InsTabel(tmp_lsTab.cPerexod);
+    //logstrtofile('666.log', '------------------------------------------------------------------------');
+    cnt++;
+  } // _loop lstab
+  SborData:=true;
+} //Function SborData : boolean;
+
+//=======================================
+Function HideShowColumnXLS(hideColumn:longint; _width:word=0):boolean;
+{ Result:=xlSetColumnWidth(_width, 1,hideColumn, 1,hideColumn);
+}
+
+//=======================================
+// Печать данных
+//---------------------------------------
+Function PrintDoc(_wTP:word; _wLev:word; _Prec:comp):longint;
+var
+    ii:word;
+    ww_str:string;
+{ #__UNUSED__(_wTP,_wLev,_Prec)
+  Result:=0;
+
+  set PRep:=_Prec;
+
+  maxColCount:=37;//29 + 2 на месяц/год
+
+  sqlDropTmpTable('TempWorkAbs');
+
+  var w: word ;
+  if ( sqlFlushIntoTmp(tntmp_report_sp, 'TempWorkAbs', FIT_ByName Or FIT_Create) <> 0 ) then
+  {
+    Message('Ошибка экспорта во временную таблицу');
+  }
+
+  var objQuery: iQuery;
+  var strID   : LongInt;
+  sqlFreeStr(strID);
+  strID := 0;
+
+  sqlAddStr(strID, ' insert EM_WORKWITHABS                                                                                                                               ');
+  sqlAddStr(strID, ' (                                                                                                                                                   ');
+  sqlAddStr(strID, '   podr, uchastok, podrname, fio, strtabn                                                                                                            ');
+  sqlAddStr(strID, ' , position, kateg, yearn, mesn                                                                                                                      ');
+  sqlAddStr(strID, ' , plan_days, fact_days, ot_days, od_days, u_days                                                                                                    ');
+  sqlAddStr(strID, ' , ud_days, do_days, d_days, g_days, pr_days                                                                                                         ');
+  sqlAddStr(strID, ' , b_days, k_days, pk_days, pm_days, t_days                                                                                                          ');
+  sqlAddStr(strID, ' , otg_days, rv_days, ro_days, c_days, por_ruk_days                                                                                                  ');
+  sqlAddStr(strID, ' , lich_zayav_days, pererab_days, ovk_days, nd_days, rp_days                                                                                         ');
+  sqlAddStr(strID, ' , nb_days, nn_days, resstr1)                                                                                                                                 ');
+  sqlAddStr(strID, ' select distinct                                                                                                                                    ');
+  sqlAddStr(strID, '   TempWorkAbs.dms[1], TempWorkAbs.dms[36], TempWorkAbs.dms[2], TempWorkAbs.dms[3], TempWorkAbs.dms[37]                                    ');
+  sqlAddStr(strID, ' , TempWorkAbs.dms[4], TempWorkAbs.Kateg, TempWorkAbs.Yearn, TempWorkAbs.MesN                                                              ');
+  sqlAddStr(strID, ' , TempWorkAbs.dmd[5]  / 8.0, TempWorkAbs.dmd[6]  / 8.0, TempWorkAbs.dmd[7]  / 8.0, TempWorkAbs.dmd[8]  / 8.0, TempWorkAbs.dmd[9]  / 8.0   ');
+  sqlAddStr(strID, ' , TempWorkAbs.dmd[10] / 8.0, TempWorkAbs.dmd[11] / 8.0, TempWorkAbs.dmd[12] / 8.0, TempWorkAbs.dmd[13] / 8.0, TempWorkAbs.dmd[14] / 8.0   ');
+  sqlAddStr(strID, ' , TempWorkAbs.dmd[15] / 8.0, TempWorkAbs.dmd[16] / 8.0, TempWorkAbs.dmd[17] / 8.0, TempWorkAbs.dmd[18] / 8.0, TempWorkAbs.dmd[19] / 8.0   ');
+  sqlAddStr(strID, ' , TempWorkAbs.dmd[20] / 8.0, TempWorkAbs.dmd[21] / 8.0, TempWorkAbs.dmd[22] / 8.0, TempWorkAbs.dmd[23] / 8.0, TempWorkAbs.dmd[24] / 8.0   ');
+  sqlAddStr(strID, ' , TempWorkAbs.dmd[25] / 8.0, TempWorkAbs.dmd[26] / 8.0, TempWorkAbs.dmd[27] / 8.0, TempWorkAbs.dmd[28] / 8.0, TempWorkAbs.dmd[29] / 8.0   ');
+  sqlAddStr(strID, ' , TempWorkAbs.dmd[30] / 8.0, TempWorkAbs.dmd[31] / 8.0, coalesce(depfunc.NMFUNC, '''')                                                                                    ');
+  sqlAddStr(strID, ' from TempWorkAbs                                                                                                                                          ');
+  sqlAddStr(strID, ' inner join katpodr on  TempWorkAbs.dms[1] = katpodr.kod                                                                                                   ');
+  sqlAddStr(strID, ' left join DEPFUNC on katpodr.cfunc = DEPFUNC.cfunc                                                                                                        ');
+
+  objQuery := queryManager.createQuery(strID);
+  if (objQuery.execute.errorCode <> tsOk) then
+  {
+    Message('Ошибка вставки в постоянную таблицу ' + objQuery.errorCode,error);
+    Exit;
+    sqlFreeStr(strID);
+  }
+  sqlFreeStr(strID);
+
+
+
+
+
+
+
+
+
+
+
+
+
+}
+
+
+//------------------------------------
+// Установить период в датах
+//------------------------------------
+Procedure SetPeriodDT;
+{ DTB_Period:=date(1,wMesB,wYearE);
+  DTE_Period:=date(Last_Day(Date(1,wMesE,wYearE)),wMesE,wYearE);
+}
+//------------------------------------
+//
+//------------------------------------
+Function FormDoc:boolean;
+var
+   werr:word;
+{
+  if IsBitCTW(wFilter,1)
+  { if DepList <> 0
+      DoneMarker(DepList, '');
+    DepList := CLSF.LoadCurrentDepartmentList;
+  }
+  ClearFuncCache;
+  pStatus_GetDefault:=pGP_SCUD_A.GetStatus_Default();
+#IFDEF GP_WT_WorkWithA_PER_BY_MES
+  SetPeriodDT;
+
+  if DTB_Period>DTE_Period
+  { Message('Начало периода не может быть больше окончания');
+    Exit;
+  }
+#ELSE
+  wMesB :=Month(DTB_Period);
+  wYearB:=Year (DTB_Period);
+  wMesE :=Month(DTE_Period);
+  wYearE:=Year (DTE_Period);
+#ENDIF
+  DT_Calc:=DTB_Period;
+  LogFileNm:=GetStringParameter('Files','OutputFilesDirectory',0)
+                               +'!GP_WT_OVER.log';
+  nmtemplate:='GP_WT_WorkWithAbsences.xlsm';
+  if isBitCTW(wOption,1)
+  { nmtemplate:='GP_WT_WorkWithAbsences_H_MM.xlsm';
+  }
+  werr:=ExcelInit(nmtemplate,true);
+
+  if FileExist(LogFileNm) DeleteFile(LogFileNm);
+
+
+  matrixkl:=false;
+  //----------------------------
+  ResetBounds(#tmp_Report_sp);
+  Delete all tmp_Report_sp;
+  Delete all tmp_Report_sp;
+  SetBounds(#tmp_Report_sp);
+
+  ResetBounds(#tmp_Zauv);
+  Delete all tmp_Zauv;
+  Delete all tmp_Zauv;
+  SetBounds(#tmp_Zauv);
+
+  //----------------------------
+  // Инициализация
+  //----------------------------
+
+
+  //----------------------------
+  // Сбор данных
+  //----------------------------
+  //--- соберем заявления
+  _TRY
+  { SQL Select
+       GP_SCUD_Doc.DocDate                as EventDate // : date "Дата события"
+     , GP_SCUD_Doc_SP.EventTmB            as EventTmB  // : time "Время события с"
+     , GP_SCUD_Doc_SP.EventTmE            as EventTmE  //  : time "Время события по"
+     , COALESCE(GP_SCUD_Reason.wType,0)   as wType
+     , GP_SCUD_PERS.cPersons              as cPersons
+     , GP_SCUD_Doc_SP.cGP_Scud_Pers       as cGP_Scud_Pers
+     , Gp_SCUD_DOC_SP.Nrec as cGp_SCUD_DOC_SP// :comp
+     , Gp_SCUD_DOC.Nrec as cGp_SCUD_DOC //    :comp
+    FROM
+      Gp_SCUD_DOC
+    Inner join GP_SCUD_Doc_SP on GP_SCUD_Doc_SP.cGP_SCUD_Doc = GP_SCUD_Doc.Nrec
+    inner join GP_SCUD_PERS   on GP_SCUD_PERS.Nrec = GP_SCUD_Doc_SP.cGP_SCUD_PERS
+    inner join GP_SCUD_Reason on GP_SCUD_Reason.Nrec = GP_SCUD_Doc.cReason
+    WHERE  GP_SCUD_Doc.wType=1010 //GP_iSC_statement_on_absence;//1010
+      and (GP_SCUD_Doc.cStatus<>:(pStatus_GetDefault) )
+      and :(DTB_Period)<=GP_SCUD_Doc.DocDate
+      and :(DTE_Period)>=GP_SCUD_Doc.DocDate
+    into Tmp_ZAUV ;
+  }
+  _except
+  else
+  {
+  }
+  _finally
+  {
+  }
+  //------------------------------
+
+
+  //for(wMes:=wMesB;wMes<=wMesE;wMes++)
+  DT_Calc:=DTB_Period;
+  do
+  { wMes :=month(DT_CALC);
+    wYear:=year(DT_CALC);
+
+    Result:=SborData;
+    if not Result exit;
+    DT_CALC:=Add_months(DT_CALC,1);
+  } //for(wMes:=wMesB;wMes<=wMesE;wMes++)
+  while DT_Calc<DTE_Period
+  //---------------------------------
+  /*delete tmp_report_sp where
+      tmp_report_sp.dmd[06]=0 and tmp_report_sp.dmd[07]=0 and tmp_report_sp.dmd[08]=0 and tmp_report_sp.dmd[09]=0 and tmp_report_sp.dmd[10]=0
+  and tmp_report_sp.dmd[11]=0 and tmp_report_sp.dmd[12]=0 and tmp_report_sp.dmd[13]=0 and tmp_report_sp.dmd[14]=0 and tmp_report_sp.dmd[15]=0
+  and tmp_report_sp.dmd[16]=0 and tmp_report_sp.dmd[17]=0 and tmp_report_sp.dmd[18]=0 and tmp_report_sp.dmd[19]=0 and tmp_report_sp.dmd[20]=0
+  and tmp_report_sp.dmd[21]=0 and tmp_report_sp.dmd[22]=0 and tmp_report_sp.dmd[23]=0 and tmp_report_sp.dmd[24]=0 and tmp_report_sp.dmd[25]=0
+  ;  */
+  //---------------------------------
+
+  //StopVisual('',0);
+  PrintDoc(0,0,0);
+
+} //Function FormDoc:boolean;
+
+HandleEvent
+cmOk:
+{  //xlKillExcel;
+   var CL: ContextList;
+    if (not CL.Add(CS, 'WorkingTable'))
+    { abort;
+      exit;
+    }
+    sUserName:=UserName();
+
+   StartNewVisual(vtNumericVisual,vfTimer + vfBreak + vfConfirm,'Подготовка данных для отчета',0);
+   if not FormDoc then message('Ошибки при формировании GP_WT_WorkWithAbsencesView');
+   StopVisual('',0);
+   //xlKillExcel;
+   //CloseInterFace(cmDone);
+}
+end;
+
+end.

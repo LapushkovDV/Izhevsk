@@ -1,0 +1,358 @@
+/*************************************************************************************************\
+* Наименование: Реестр заявок доступа на территорию работу в выходные и праздничные дни                              *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи |Дата    |Исполнитель             |Проект                             *
+* ----------------------------------------------------------------------------------------------- *
+\*************************************************************************************************/
+#include OrdersFiltr.vih
+#include OrdersList.vih
+#include ContainerOfOrders.vih
+#include GP_RPD_90_Helper.vih
+#include DepTree.vih
+
+#component "Z_StaffOrders"
+
+#doc
+Интерфейс фильтрации в реестре приказов. Наследник от стандартного.
+Устанавливает фильтр по РПД 290
+#end
+
+vipinterface GP_OrdersFiltrRPD290(OrdersFiltr);
+
+#doc
+Содержимое приказа для заявок на работу в выходные и праздничные дни.
+Наследник от стандартного контейнера приказа.
+Заблокировано добавление и удаление РПД в приказе.
+#end
+vipinterface GP_ContainerOfOrdersRPD290(ContainerOfOrders);
+
+#doc
+Реестр заявок на работу в выходные и праздничные дни. Наследник от стандартного списка приказов.
+Установлен фильтр по РПД 290, изменен заголовок окна. 290-е РПД формируется при создании приказа.
+#end
+vipinterface GP_OrdersListRPD290(OrdersList);
+
+
+//Реестр заявок на работу в выходные и праздничные дни
+interface GP_OrdersListRPD290;
+
+var
+  FO290: GP_OrdersFiltrRPD290; //Объект фильтра приказов по РПД 290
+
+procedure GP_SetDocText(Sender: comp);
+{
+  if Sender != Sender {};
+  update current TitleDoc
+  set TitleDoc.DocText := _rpd90helper.CalcClaimDocText(TitleDoc.Nrec);
+
+  update current TmpTitleDoc
+  set TmpTitleDoc.DocText := TitleDoc.DocText;
+}
+
+//Обновляет заголовок окна интерфейса
+procedure RefreshIfcTitle;
+{
+  var sTitle: string = '';
+  cfsSetCurrentContainer(cfsGetCurrentContainerSelf);
+  cfsGetProp('GP_OrdersListRPD290', cfpTitle, sTitle);
+  cfsSetProp('GP_OrdersListRPD290', cfpTitle, Replace(sTitle, 'приказов','заявок доступа на территорию в выходные дни'));
+}
+
+//Подменяет контейнер РПД в приказе на наш, в котором заблокировано создание удаление РПД.
+procedure InjectContainerRPD290;
+{
+  if not NullVipRef(COO)
+  {
+    UnbindEmbeddedInterface(mdf);
+    UnbindAllEvents(COO);
+    FreeVipInterface(COO);
+  }
+  if not LoadVipRef(COO, 'GP_ContainerOfOrdersRPD290')
+  {
+    Message('Не найден интерфейс содержания документов.', Error);
+    abort;
+    exit;
+  }
+  else
+  {
+    IContainerOfOrders7(COO).SetToolbarID(curToolBar); // записать текущий тулбар в контейнер
+    BindEmbeddedInterface(mdf, COO);// связать область с реализацией
+    BindEvent(InsideReScan, COO.InsideReScan); // связать динамичные события
+    BindEvent(GP_SetDocText, COO.InsideReScan); // после изменений в РПД будем обновлять текст приказа по своему
+  }
+}
+
+//Копипаста из CreateNewOrderByParam - создание нового приказа
+//Вызывается при cmInsertRecord TmpTitleDoc
+//При создании приказа не вызывается окно выбора РПД, добавляется РПД 290
+function GP_CreateNewOrderByParam: boolean;
+{
+  if (PersNrec <> 0) and (wTypeRPD <> 0)
+    result := CreateNewOrderByParam;
+  else
+  {
+    wMy := 290; //вместо вызова интерфейса выбора РПД - прописываем жестко РПД-290. Дальше идет стандартный код.
+
+    if (m_sCurrentBarKod <> '') // создание связи с архивом
+    {
+      oArchiveFuncs.CreateLinkDocWithBarkod(m_sCurrentBarKod, TmpTitleDoc.nRec, 1800);
+      m_sCurrentBarKod := '';
+    }
+
+    var bRuki: boolean;
+    bRuki := false;
+
+    if StafUserOrder.Flag1 = '0' // только для индивидуальных
+      if not FO.FoundMarkerRPD(wMy)
+      {
+        Message('Установленный фильтр не позволяет выбирать данное РПД', Information);
+        bRuki := true;
+      }
+
+    if not bRuki
+    {
+      // вставим в физическую таблицу данные
+      ClearBuffer(tnTitleDoc);
+      CopyFieldsFromTmpToTitleDoc;
+
+      if ( boGetTune('UP.STAFF.DIFF_NMB_FOR_FILIALS') )    //если идет нумерация по филиалам
+      {
+        //Filial := 'Отдельная нумерация по филиалам';
+        set TitleDoc.DocMemo := FltDept; //для нумерации по филиалам
+      }
+
+      // обновляем тип приказа
+      if trim(TitleDoc.DocNmb) = ''
+      {
+        TitleDoc.DocNmb := UNOO.GetNmbPrWithYear(wMy, Year(TitleDoc.DocDate));
+
+        if getfirst tTypePr where ((wMy == tTypePr.CodOper)) = tsOk
+          TitleDoc.DocText := tTypePr.NOper;
+
+        update current TmpTitleDoc
+          set TmpTitleDoc.DocNmb := TitleDoc.DocNmb;
+              TmpTitleDoc.DocText := TitleDoc.DocText;
+      }
+
+      // надо вставить и в хранилище всех приказов эту запись
+      if insert current TitleDoc = tsOk
+        fnLockCurrAndMsg(false);
+      //  запускаем окно содержания приказа
+      // предварительно заполнив базово таблицу PartDoc
+      PartDoc.cDoc := TitleDoc.Nrec;
+      PartDoc.TypeOper := integer(wMy);   // hard: form T1
+      PartDoc.NRazd := 1;
+      insert current PartDoc;
+
+      /*окно и так запущено, просто не указана точка входа и  пустой скрин */
+      COO.SetRelation(TitleDoc.NRec); // установить точку входа
+      SelectFormat(mdf);
+
+      result := true;
+    }
+  }
+}
+
+tableevent table TmpTitleDoc;
+
+  cmInsertRecord:
+  {
+    //Копипаста стандартного кода обработчика события
+    if not epStaffOrder_AccessInsertDelete (cmInsertRecord, TmpTitleDoc.DocDate, PartDoc.TypeOper) {
+      abort; exit;
+    }
+
+    if insert current TmpTitleDoc = tsOk
+    {
+      cNewRecord4DocText := tmpTitleDoc.nRec;
+
+      while true
+      {
+        ClearMarker(DummyMarker);
+        if (GP_CreateNewOrderByParam)   //Вместо использования стандартной функции формирования нового приказа используем свою
+          break;
+      } //while true
+      ClearMarker(DummyMarker);
+      SetWindowTitle(WhatIsInOrder, 'Заявка доступа  № ' + TitleDoc.DocNmb + ' (' + TitleDoc.DocText + ')');
+      ReScanPanel(tnTmpTitleDoc);
+    }
+  }
+
+end;
+
+handleevent
+
+  cmFilterSave:
+  {
+    inherited::handleevent(cmFilterSave);
+    RefreshIfcTitle;
+  }
+
+  cmOnVipLoad:
+  {
+    //Подменяем стандартный интерфейс фильтрации интерфейсом фильтрации по РПД 290
+    FO := FO290;
+    if Inherited::HandleEvent(cmOnVipLoad) = heAbort Abort;
+    //В заголовке окна заменяем "приказ" на "заявка"
+    RefreshIfcTitle;
+    //Подменяем ContainerOfOrders
+    InjectContainerRPD290;
+    //Запрещаем выполнение команды "Создание сводного приказа на работу в вых. дни"
+    DisableCommand(cmValue34);
+  }
+
+  cmInit:
+  {
+    //Подменяем стандартный интерфейс фильтрации интерфейсом фильтрации по РПД 290
+    FO := FO290;
+    if Inherited::HandleEvent(cmInit) = heAbort Abort;
+    //В заголовке окна заменяем "приказ" на "заявка"
+    RefreshIfcTitle;
+    //Подменяем ContainerOfOrders
+    InjectContainerRPD290;
+    //Запрещаем выполнение команды "Создание сводного приказа на работу в вых. дни"
+    DisableCommand(cmValue34);
+  }
+
+  cmPrintDoc:
+  {
+    var m: TPtr;
+    m := InitMarker('', 8, 10, 20, true);
+    if GetMarkerCount(PrMarkers) > 0
+      CopyMarker(m, PrMarkers);
+    else
+      InsertMarker(m, tmpTitleDoc.Nrec);
+    RunInterface(GP_Staff::GP_NFormRD90_Claim, m);
+    DoneMarker(m, '');
+  }
+
+end;
+
+end.
+
+//Интерфейс фильтрации в реестре приказов по РПД 290
+interface GP_OrdersFiltrRPD290;
+
+var
+  mAvailableDepartments: TPtr; //маркер с доступными структурными единицами штатного расписания
+                               //согласно зарплатных настроек доступности подразделений.
+
+//Связь подразделений и структурных единиц штатного расписания
+create view vExtCatLinks
+var
+  _cKatPodr: comp;
+as select ExtCatLinks.Nrec
+from ExtCatLinks, Catalogs
+where ((
+  11                   /== ExtCatLinks.ObjType and
+  1                    /== ExtCatLinks.ModType and
+  _cKatPodr            /== ExtCatLinks.ExtCat and
+  ExtCatLinks.StaffCat /== Catalogs.Nrec
+));
+
+//добавляет в маркер с доступными структурными единицами штатного расписания
+//структурную единицу штатного расписания, соответствующую подразделению B
+function InsertDepartmentIntoMarker(B: TKatPodr): boolean;
+{
+  vExtCatLinks._cKatPodr := B.Nrec;
+//  if vExtCatLinks.getfirst ExtCatLinks = tsOk
+  vExtCatLinks._Loop ExtCatLinks
+    InsertMarker(mAvailableDepartments, vExtCatLinks.ExtCatLinks.StaffCat);
+  result := true;
+}
+
+procedure FilterMarkerPodr;
+{
+  var i: longint = 0;
+  var c: comp = 0;
+  var mTmp: TPtr = InitMarker('', 8, 100, 100, true);
+  for(i := 0; GetMarker(mAvailableDepartments, i, c); i++)
+    if FoundMarker(MarkerPodr, c)
+      InsertMarker(mTmp, c);
+  if GetMarkerCount(mTmp) = 0
+    CopyMarker(MarkerPodr, mAvailableDepartments);
+  else
+    CopyMarker(MarkerPodr, mTmp);
+  DoneMarker(mTmp, '');
+}
+
+WindowEvent YourChoise;
+
+  cmPick:
+  {
+    case inherited::handleevent(cmPick) of
+      heAbort: Abort;
+      heStop: Stop;
+    end;
+    case CurField of
+      #FilPodrName:// подразделение
+      {
+        FilterMarkerPodr;
+        AboutPodrStr;
+      }
+    end;
+  }
+
+end; //WindowEvent YourChoise
+
+handleevent
+
+  cmOnVipLoad:
+  {
+    if Inherited::HandleEvent(cmOnVipLoad)=heAbort then Abort;
+    //Устанавливаем в качестве доступных РПД только 290ое
+    ClearMarker(MarkerAccessRPD);
+    InsertMarker(MarkerAccessRPD, 290);
+    nMAR := GetMarkerCount(MarkerAccessRPD);
+    //Устанавливаем фильтр по 290му РПД
+    ClearMarker(MarkerRPD);
+    InsertMarker(MarkerRPD, 290);
+    //Формируем маркер с доступными пользователю структурными единицами штатного расписания согласно
+    //настроек доступности подразделений в модуле Заработная плата.
+    mAvailableDepartments := InitMarker('', 8, 500, 100, true);
+    var DI: IDepartmentIterator;
+    LoadVipRef(DI, 'DepartmentIterator');
+    BindEvent(InsertDepartmentIntoMarker, DI.CollectDepartment);
+    DI.IterateDepartments(0, ifTreatAsPlainList);
+    UnBindEvent(InsertDepartmentIntoMarker, DI.CollectDepartment);
+    FilterMarkerPodr;
+    //Скрываем поле выбора РПД для фильтрации
+    ClearFieldState(#FilNOper, sfVisible);
+  }
+
+  cmOnVipUnload:
+  {
+    inherited::handleevent(cmOnVipUnload);
+    DoneMarker(mAvailableDepartments, '');
+  }
+
+  cmDelOnProtect:
+  {
+    case inherited::handleevent(cmDelOnProtect) of
+      heAbort: Abort;
+      heStop: Stop;
+    end;
+    case CurField of
+      #FilPodrName:// подразделение
+      {
+        FilterMarkerPodr;
+        AboutPodrStr;
+      }
+    end;
+  }
+
+end;
+
+end.
+
+//Содержимое приказа-заявки
+interface GP_ContainerOfOrdersRPD290;
+
+handleevent
+  cmInsert: Stop;
+  cmDelete: Stop;
+end;
+
+end.

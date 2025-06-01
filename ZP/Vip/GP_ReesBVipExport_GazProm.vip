@@ -1,0 +1,181 @@
+#component "GP_ZP"
+#include GP_ReesBVipExportObj.vih
+#include LoadReesByGroup.vih
+#include ReesByGroup.Tbl
+
+interface GP_ReesBVipExport_GazProm;
+
+table struct SpPlBanTmp 
+(
+  FIO    : string
+, NomLsh : string
+, NomCard: string
+, sOrder : string
+, PasSer : string
+, PasNum : string
+, SumUd  : double
+, SumOpl : double
+, Sbor   : double
+, SumAlim: double
+)
+(i1 = sOrder, i2 = NomLSh + FIO + NomCard);
+
+var oLoadGr: LoadReesByGroup;
+create view
+var cOrg: comp;
+as select * from
+  KatOrg
+, Passports
+, Persons
+, SbBan
+, SpPlBanTmp
+, tp_rees
+;
+property GP_ReesBVipExportObj.Caption: string read 'ГазПромБанк';
+function ChooseReesToApply(mRee: TPtr): TPtr;
+var m: TPtr;
+    i: longint;
+    cRec: comp;
+{
+  m := InitMarker('', 8, 1, 1);
+  for (i := 0; i < GetMarkerCount(mRee); i++)
+  {
+    GetMarker(mRee, i, cRec);
+    if getfirst SbBan where ((cRec == SbBan.NRec)) = tsOk
+      if SbBan.cPol = cOrg
+        InsertMarker(m, cRec);
+  }
+  Result := m;
+}
+
+function GetData(cSbBan: comp): boolean;
+var boIns: boolean;
+{
+  Result := false;
+  oLoadGr.pLoadRees(cSbBan);
+  mtClear(tnSpPlBanTmp, mfNormal);
+  _loop tp_Rees
+  {
+    boIns := false;
+    var _NomLsh : tNomLSch = tp_Rees.NomLsh;
+    if ( SbBan.Prefix <> 'R$D' )
+      _NomLsh := LTrim(_NomLsh, '0');
+    _NomLsh := ZeroFiller(_NomLsh, tp_Rees.FilialNo);
+    if GetFirst SpplbanTmp where (( _NomLsh           == SpplbanTmp.NomLsh and
+                                    Trim(tp_Rees.FIO) == SpplbanTmp.FIO and
+                                    tp_Rees.NomCard   == SpplbanTmp.NomCard)) <> tsOk
+    {
+      boIns := true;
+      ClearBuffer( #SpplbanTmp );
+      SpplbanTmp.FIO     := Replace(UpCase(trim(tp_Rees.FIO)),'Ё','Е');
+      SpplbanTmp.NomLsh  := _NomLsh;
+      SpplbanTmp.NomCard := tp_Rees.NomCard;
+      SpplbanTmp.sOrder  := tp_Rees.FIO;
+      if getfirst Persons where ((tp_Rees.tPerson == Persons.NRec)) = tsOk
+      {
+        if getfirst Passports where ((Persons.PasspRus == Passports.nrec))= tsOk
+        {
+          SpplbanTmp.PasSer := Passports.Ser;
+          SpplbanTmp.PasNum := Passports.Nmb;
+        }
+      } //  if getfirst Persons = tsOk
+    } // if
+    SpplbanTmp.SumUd  += tp_Rees.SumUd;
+    SpplbanTmp.SumOpl += tp_Rees.SumOpl;
+    SpplbanTmp.Sbor   += tp_Rees.Sbor;
+    SpplbanTmp.SumAlim += tp_Rees.SumAlim;
+    if ( boIns )
+      insert current SpplbanTmp;
+    else
+      update current SpplbanTmp;
+  } //  _loop tp_Rees
+  Result := true;
+}
+
+function SumToString(doSum: double): string;
+{
+  Result := DoubleToStr(Round(doSum, 2),'''' + '[|-]6666666666.88');
+}
+
+function Export(cRec: comp; sPath: string; var fileName: string): boolean;
+var sTemplate: string;
+    i, j, kolR, kolC: longint;
+    doSum: double;
+{
+  Result := false;
+  if getfirst SbBan where ((cRec == SbBan.NRec)) <> tsOk
+    exit;
+  GetData(cRec);
+  if sPath[length(sPath)] <> '\' sPath += '\';
+  sTemplate := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' + 'GP_ReestrToGazprom.xls' ;
+  if (not ExistFile(sTemplate))
+  { 
+    message('Не найден шаблон файла "'+sTemplate+'"',error);
+    exit;
+  }
+
+  if (not xlCreateExcelWithTemplate(sTemplate, false))
+  { 
+    message('Ошибка создания нового файла в Excel"' + sTemplate + '".', error);
+    exit;
+  }
+  kolC := 12;
+  kolR := 1;
+  _loop SpplbanTmp
+    kolR++;
+  xlCreateMatrix(kolR, kolC);
+  i := 0; 
+  doSum := 0; 
+  _loop SpplbanTmp ordered by SpplbanTmp.sOrder
+  {
+    i++;
+    j := 0;
+    xlStWriteToMatrix(i, ++j, i                                               ); // Номер п/п
+    xlStWriteToMatrix(i, ++j, '1337'                                          ); // Код организации
+    xlStWriteToMatrix(i, ++j, 'Паспорт гражданина РФ '                        ); // Тип паспорта
+    xlStWriteToMatrix(i, ++j, SpplbanTmp.PasSer                               ); // Серия паспорта
+    xlStWriteToMatrix(i, ++j, '''' + SpplbanTmp.PasNum                        ); // Номер паспорта
+    xlStWriteToMatrix(i, ++j, ExtractWord(1, SpplbanTmp.FIO, ' ')             ); // Фамилия
+    xlStWriteToMatrix(i, ++j, ExtractWord(2, SpplbanTmp.FIO, ' ')             ); // Имя
+    xlStWriteToMatrix(i, ++j, ExtractWord(3, SpplbanTmp.FIO, ' ')             ); // Отчество
+    xlStWriteToMatrix(i, ++j, '''' + SpplbanTmp.NomLsh                        ); // Номер карточного счёта Держателя
+    xlStWriteToMatrix(i, ++j, SumToString(SpplbanTmp.SumOpl - SpplbanTmp.Sbor)); // Сумма
+    doSum += SpplbanTmp.SumOpl - SpplbanTmp.Sbor;
+    ++j;
+    if SpplbanTmp.SumAlim <> 0
+      xlStWriteToMatrix(i, ++j, SumToString(SpplbanTmp.SumAlim)); // Сумма
+  }
+  ++i;
+  xlStWriteToMatrix(i, 2, 'ИТОГО ЗАЧИСЛЕНИЙ:' + string(i - 1));
+  xlStWriteToMatrix(i, 3, 'ИТОГО СУММА:' + doSum);
+  xlWriteMatrixToExcel(2, 1);
+  
+  xlGetActiveWorkBookName(sTemplate); // Узнать текущее имя Excel-файла
+//  Имя файла в формате  "VYYMMDDN.1337.xlsx" N - пусто для первого, затем A,B,C,D,E...
+  var gozAbbr: string = sGetAttr(covPlan, coGetAttr(coSbBan, cRec, 'Группа заказов'), 'Аббревиатура');
+  fileName := DateToStr(Cur_Date,'VYYMMDD');
+  if not ExistFile(sPath + fileName + gozAbbr + '.1337.xlsx')
+    fileName := fileName + gozAbbr + '.1337.xlsx';
+  else
+  {
+    var ii: byte = 65;
+    While ExistFile(sPath + fileName + CHR(ii) + gozAbbr + '.1337.xlsx')
+      ii++;
+    fileName := fileName + CHR(ii) + gozAbbr + '.1337.xlsx';
+  }
+  xlSaveAsWorkBookByName(sTemplate, sPath + fileName);
+  xlGetActiveWorkBookName(sTemplate);
+  xlCloseWorkBookByName(sTemplate);
+  xlKillExcel;
+  sSetAttr(coSbBan,cRec,'Имя файла',fileName);
+  Result := true;
+}
+
+handleEvent
+  cmOnVipLoad:
+  {
+    if getfirst KatOrg where (('Банк ГПБ (АО)' == KatOrg.Name)) = tsOk
+      cOrg := KatOrg.NRec;
+  }
+end;
+end.

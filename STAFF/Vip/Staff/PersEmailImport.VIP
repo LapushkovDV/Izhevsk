@@ -1,0 +1,344 @@
+/*************************************************************************************************\
+* Наименование:  Разработка автоматической загрузки рабочих адресов e-mail, присваиваемых вновь   *
+*                принятым работникам (либо переведенным, получившим адрес электронной почты)      *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:    Управление персоналом -> Отчеты -> Отчеты пользователя ->                        *
+*                      Папка "Ведение картотеки сотрудников" ->                                   *
+*                      Импорт e-mail в картотеку сотрудников из Excel по ФИО.                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#251          |30/07/17|Валента А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+Interface iPersEmailImport 'Импорт e-mail' EscClose, cyan;
+  Show at ( , , 120, 20);
+
+//******************************************************************************
+Create View
+var
+  Dir_Name     : string;     // номер документа
+  totalRows
+, errorRows
+, importRows   : longint;
+
+  CharacterClockNumbers : boolean;
+As Select
+ *
+from
+  Persons
+, Persons Persons2
+, Catalogs
+, Catalogs CatalogsCom
+, Communications
+where
+((
+    -14           == Catalogs.SysCode
+AND 0             == CatalogsCom.LPr
+AND Catalogs.NRec == CatalogsCom.MainLink
+AND 'e-mail'      == CatalogsCom.Name
+))
+;
+
+//******************************************************************************
+form frmErr('PersEmailImport.OUT', 'ERRR') with novisual;
+//******************************************************************************
+// читаем дск
+
+Procedure ReadMyParam;
+{
+  if NOT ReadMyDSK(Dir_Name , 'iPersEmailImport_DirName' , TRUE)
+    set Dir_Name := '';
+
+  ReReadRecord;
+}
+
+//******************************************************************************
+// сохраняем в дск
+
+Procedure SaveMyParam;
+{
+  SaveMyDSK(Dir_Name , 'iPersEmailImport_DirName' );
+}
+
+//******************************************************************************
+// импорт документов из Excel
+
+Function OpenExcel : boolean;
+{
+
+  OpenExcel := FALSE;
+
+  if NOT xlOpenExcel(FALSE)
+    {
+      Message('Не открылся Excel');
+      Exit;
+    }
+  else
+    if NOT xlIsExcelValid
+      {
+        Message('Не инициализирован Excel');
+        xlKillExcel;
+        Exit;
+      }
+    else
+      if NOT xlSetActiveWorkBookByName(Dir_Name)
+        if NOT xlOpenWorkBook(Dir_Name)
+          {
+            Message('Не открылась книга Excel ' + Dir_Name);
+            xlKillExcel;
+            Exit;
+          }
+
+  OpenExcel := TRUE;
+}
+
+//*****************************************************************************
+Function GetTabNum : string;
+{
+  if CharacterClockNumbers
+    result := Persons2.strTabn;
+  else
+    result := string(Persons2.Tabnmb);
+}
+
+//*****************************************************************************
+//
+Procedure LoadDataXLS;
+var
+  j : longint;
+{
+  j := 1;
+
+  do
+    {
+      inc(j);
+      NextVisual;               
+      var sFirstName  : string; sFirstName  := '';
+      var sSurname    : string; sSurname    := '';
+      var sFatherName : string; sFatherName := '';
+      var sEMail      : string; sEMail      := '';
+
+      xlGetCellValue(j, 1, sFirstName );
+      xlGetCellValue(j, 2, sSurname   );
+      xlGetCellValue(j, 3, sFatherName);
+      xlGetCellValue(j, 4, sEMail     );
+
+      var sFIO : string; sFIO := Trim(Trim(sFirstName) + ' ' + Trim(sSurname) + ' ' + Trim(sFatherName));
+
+      if (sFIO + Trim(sEMail) = '')
+         break;
+      else
+        { 
+          inc(totalRows);
+    
+          if (sFIO = '')
+            {
+              inc(errorRows);
+              frmErr.write('Строка № ' + string(j) + ': отсутствует ФИО сотрудника!');
+              continue;
+            }
+          else
+            if (Trim(sEMail) = '')
+              {
+                inc(errorRows);
+                frmErr.write('Строка № ' + string(j) + ': отсутствует EMail!');
+                continue;
+              } 
+            else
+              if (GetFirst Persons where((sFIO == Persons.FIO (NoIndex))) <> tsOk)
+                {
+                  inc(errorRows);
+                  frmErr.write('Строка № ' + string(j) + ': ФИО ' + sFIO + ' отсутствует в картотеке!' );
+                  continue;
+                }
+              else
+                {
+                  if (GetFirst Persons2 where((sFIO == Persons2.FIO (NoIndex)
+                                          AND (Persons.NRec <> Persons2.NRec))) = tsOk)
+                    {
+                      inc(errorRows);
+                      frmErr.write('Строка № ' + string(j) + ': ФИО : ' + sFIO + ', в картотеке существуют двойники: ' );
+                      _LOOP Persons2 where((sFIO == Persons2.FIO (NoIndex)))
+                         {
+                           frmErr.write('    - табельный номер ' + GetTabNum);
+                         }
+
+                      continue;
+                    }
+
+                  if (GetFirst Communications where ((Persons.NRec     == Communications.Person
+                                                  AND CatalogsCom.NRec == Communications.ComType
+                                                  AND ''               << Communications.EMail (NoIndex))) = tsOk)
+                    {
+                      inc(errorRows);
+                      frmErr.write('Строка № ' + string(j) + ': для ФИО : ' + sFIO + ', в картотеке имеется EMail ' +  Communications.EMail);
+                      continue;
+                    } 
+                  else
+                    {
+                      ClearBuffer(#Communications);
+                      Communications.Person   := Persons.NRec;
+                      Communications.ComType  := CatalogsCom.NRec;
+                      Communications.EMail    := Trim(sEMail);
+                      Communications.ObjType  := 3;   
+                      if (insert current Communications = tsOk)
+                        {
+                          frmErr.write('Строка № ' + string(j) + ': для ФИО : ' + sFIO + ' импортирован EMail ' +  Trim(sEMail));
+                          inc(importRows);
+                          
+                        }
+                      else
+                        inc(errorRows);
+                    }
+                }
+        }
+    }
+  while (true);
+
+  frmErr.write('Количество строк с ошибками    : ' + string(errorRows));
+  frmErr.write('Количество строк импортировано : ' + string(importRows));
+  frmErr.write('Всего обработанно строк        : ' + string(totalRows));
+
+  if (frmErr.error)
+    frmErr.AbortForm;
+  else
+    frmErr.ShowFile('Протокол импорта');
+}
+
+//*****************************************************************************
+Procedure LoadData;
+{
+  StartNewVisual(vtRotateVisual, vfTimer + vfConfirm, 'Идет выгрузка данных...', 1);
+
+  if OpenExcel
+    {
+      LoadDataXls;
+      xlKillExcel;
+    }
+
+  StopVisual('', 0);
+}
+
+//******************************************************************************
+Window winParam 'Параметры импорта' EscClose DoAccept;
+  Show at (,, 50, 8);
+
+screen scr ('',, sci13Esc) ;
+
+Fields
+  //------------------------------------------------------------------------------
+  Dir_Name     ('Путь к имортируемому документу'               , , sci13Esc) : Protect,
+  { Font = { BackColor = if(Dir_Name = '', ColorNeed, 0) } };
+  //------------------------------------------------------------------------------
+
+Buttons
+  cmOk    , Default, , 'Импорт'    , ,;
+  cmCancel,        , , 'Отмена'    , ,;
+<<
+
+  Документ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  <.  Импорт  .>                    <.  Отмена  .>
+>>
+end;
+
+//******************************************************************************
+
+HandleEvent
+cmOk:
+  {
+    if (Dir_Name = '')
+      {
+        Message('Не задан файл!', CancelButton);
+        SelectField(#Dir_Name);
+        Abort;
+        Exit;
+      }
+
+    SaveMyParam;
+
+    LoadData;
+    PutCommand(cmDefault);
+  }
+
+end;
+end;
+
+
+//*****************************************************************************
+
+HandleEvent
+
+cmInit :
+  {
+    if (GetFirst CatalogsCom <> tsOk)
+      {
+        Message('Отсутствует вид коммуникации "email"!');
+        Abort;
+        Exit; 
+      }
+
+    CharacterClockNumbers := wGetTune('FormatClockNumber') <> 0;
+    ReadMyParam;
+
+    RunWindowModal(winParam);
+    abort;
+  }
+
+cmPick:
+  {
+    case CurField of
+      #Dir_Name:
+        Dir_Name  := GetFileName('*.xls', 'Выберите документ для импорта');
+        end;
+
+    ReReadRecord;
+  }
+
+
+end;
+end.
+
+//******************************************************************************
+//******************************************************************************                                                 
+//******************************************************************************     
+#include UserReport.vih
+                                            
+vipinterface UserReport_iPersEmailImport implements IUserReport licensed(free);
+
+interface UserReport_iPersEmailImport;
+
+create view
+  var
+    Dummy: Byte;
+;
+
+procedure Run;
+begin
+  RunInterface(iPersEmailImport);
+end;
+
+function GetReportName: String;
+begin
+  GetReportName := 'Импорт e-mail в картотеку сотрудников из Excel по ФИО';
+end;
+
+function GetGroupName(Level: Word): String;
+begin
+#__UNUSED__(Level)
+  GetGroupName := 'Ведение картотеки сотрудников';
+end;
+
+function GetPriority: Integer;
+begin
+  GetPriority := 0;
+end;
+
+function VisibleInModule(Ind: Byte): String;
+begin
+#__UNUSED__(Ind)
+  VisibleInModule := 'StaffMainMenu';
+end;
+
+end.

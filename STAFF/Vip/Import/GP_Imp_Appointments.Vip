@@ -1,0 +1,925 @@
+/*************************************************************************************************\
+* Наименование: Загрузка истории назначений                                                       *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+* Не импортируются записи после 01.12.2017 включительно                                           *
+* загрузить архив с минимальным набором полей                                                     *
+* 1.Подразделение                                                                                 *
+* 2.Должность 3.Разряд 4.Договор 5.Приказ.                                                        *
+* 6.Вне ШР.                                                                                       *
+* 7.Категория                                                                                     *
+* 8. Может быть оклад.                                                                            *
+* Не грузить при этом назначения после 01.09. или с открытой датой При                            *
+* загрузке следует поступать так Если первые 4 поля совпадают, то брать                           *
+* последнее назначение(в том числе и Nrec), а дату брать из первого.                              *
+* Не менять основное назначение.                                                                  *
+* Полностью загрузить все в историю.                                                              *                                  *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1606         |26/12/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include GP_Status.vih
+#include GP_KPI_RaiseEdit.Vih
+#DEFINE IMP_APP_FROM_PERS
+/*
+SQL select cast(Appointments.Nrec as longint), cast(persons.nrec as longint), SubString(Persons.Fio,1,40), Appointments.AppointDate, Appointments.Post, SubString(Catalogs.name,1,40)
+From Persons
+inner join  Appointments on Appointments.Person = Persons.Nrec
+left outer  join Catalogs on Catalogs.Nrec = Appointments.Post
+where catalogs.nrec is null or catalogs.name=''
+//628754
+Абинсков Вячеслав Иванович
+Алексеев Алексей Александрович
+Бойкова Татьяна Викторовн
+*/
+VipInterface GP_Imp_Appointments Licensed(free);
+#doc
+Загрузка назначений
+Папонова Ольга Владимировна - не встали подразделения.
+#end
+Interface GP_Imp_Appointments 'Загрузка истории назначений' , EscClose;
+//---------------------------------------
+Table struct tmp_appoint
+( IdApp    :comp "13" //NEWEMPID
+ ,IdKIS    :comp "2"  //CITEZENID
+ ,NrecSHR  :comp "3"  //NEWSTR
+ ,DataNachS:date "4"  //INDATE
+ ,DataNachSD:date "4"  //INDATE
+ ,sDataNachS:string[20] "4"  //INDATE
+ ,DataOkonS:date "5"  //OUTDATE
+ ,NumberDogS:string[50] "7" //AGREEMENTNUMB
+ ,DatDogS   :date       "8" //AGREEMENTDATE
+ ,kolvo     :double     "20" //AMOUNT
+ ,StatusNazn:string     "6"  //WORKUNITTYPE
+ ,VidNazn   :longint    "10" //DEPTID
+ ,Fio       :string[100] "21" //FIOFULL
+ ,OrderDat  :date     "24"
+ ,OrderNum  :string   "25"
+ ,BornDate  :date
+ ,NrecPodr  :comp "17"
+ ,NamePodr  :string "18"
+ ,CodePodr  :string "44"
+ ,IdDolzhn  :comp "9"
+ // увольнение
+ ,Uv_OrderDat:date     "12"
+ ,Uv_OrderNum:string   "13"
+ ,Uv_Reason  :string   "14"
+
+ //==================
+ ,cPodr    :comp
+ ,cPost    :comp
+ ,cKlkatego:comp
+ ,PAYMODEL :word
+ ,TAXRATE  :double
+ ,CATEGORY :word
+ ,AppMain  :comp
+ ,WORKCOND :comp
+ ,workregime:comp
+
+)
+with index
+(  tmp_appoint01 = IdKIS + StatusNazn + DataNachS
+  ,tmp_appoint02 = DataNachS // Будут удалены записи после 01.12.2017
+);
+
+//----------------------------------
+table struct tmp_staff
+(  NrecSHR   :comp "2"
+  ,NrecSetki :comp "3"
+  ,NrecPodr  :comp "5"
+  ,CodePodr  :string "6"
+  ,NamePodr  :string "7"
+  ,IdDolzhn  :comp "9"
+  ,NameDolzhn:string "11"
+  ,KodKateg  :longint "12"
+  ,Oklad     :double  "13"
+  ,UslTruda  :string "14"
+  ,kolvo     :double "15"
+  ,OtpVredn  :double "16"
+  ,DopOtpKolDog :double "17"
+  ,Status1   :string "18"
+  ,ProcVredn :double "21"
+  ,Status2   :string "23"
+  ,Razr      :word //???
+  ,DInPut    :date//8
+)
+with index
+( tmp_staff01 = NrecSHR
+);
+//----------------------------------
+table struct tmp_jour
+(  CitezenID:comp// CitezenID
+  ,Fio :string[60]
+  ,BornDate:date
+  ,APPID  :longint
+  ,STAFFID:longint
+  ,DEPTID :longint
+  ,POSTID :longint
+  ,sSovm:string
+  ,FLD :string[100]
+  ,PRIM:string
+)
+with index
+( tmp_jour01 = Fio + BornDate
+);
+//----------------------------------
+Table struct tmp_CatHist
+( Nrec :comp
+ ,Code :string
+ ,Name :string
+ ,DTIZM:date
+)
+with index
+( tmp_CatHist01 = Nrec +DTIZM
+ ,tmp_CatHist02 = Code+ DTIZM
+);
+//----------------------------------
+var
+  nm_file  :string;
+  nm_file_s:string;
+  //logfilenm:string;
+  //logfilekl:boolean;
+  cat_main_M11 :comp;// ПОДРАЗДЕЛЕНИЕ
+  cat_main_M22 :comp;// ДОЛЖНОСТЬ
+  cat_main_M123:comp;// ХАРАКТЕР НАЗНАЧЕНИЙ
+  cat_XarNaznSovm :comp;
+//-----------
+Main_dolzhn:comp;
+cparentDolzhn:comp;
+RaiseNrec:comp;//для уникальности нреков ШР
+RaiseNrecD:comp;//для уникальности нреков должн
+Nrec_NPO_Z:comp;
+Nrec_NPO_K:comp;
+Main_podr:comp;
+#include excel_var.vpp
+//----------------------------------
+Create view
+var
+  Podr_kod:string;
+as select Catalogs.Nrec
+From  Catalogs
+ ,tmp_appoint(tmp_appoint01)
+ ,tmp_staff
+ ,Klkatego
+ ,Persons, Appointments, AppHist
+ ,CatHist
+ ,SPALLSTAFF
+ ,tmp_jour(tmp_jour01)
+ ,tmp_CatHist
+ ,InfPsn1
+
+;
+
+#include excel_Fun.vpp
+#include Excel_Imp.Vpp
+
+Procedure Ins_Jour(
+   _FLD :string
+  ;_PRIM:string
+);
+{
+  tmp_jour.CitezenID:=tmp_appoint.IdKIS;// CitezenID
+  tmp_jour.Fio      :=tmp_appoint.Fio;
+  tmp_jour.BornDate :=tmp_appoint.BornDate;
+  tmp_jour.APPID    :=tmp_appoint.IdApp;
+  tmp_jour.STAFFID  :=tmp_appoint.NrecSHR;
+  tmp_jour.DEPTID   :=tmp_appoint.NrecPodr;
+  tmp_jour.POSTID   :=tmp_appoint.IdDolzhn;
+  tmp_jour.sSovm    :=tmp_appoint.statusNazn;
+  tmp_jour.FLD      :=_Fld ;
+  tmp_jour.PRIM     :=_Prim;
+  insert current tmp_jour;
+} //Procedure Ins_Jour
+
+Procedure InsCatHist(ww_WFLD1:word; ww_cCat :comp; ww_CPARENT:comp; ww_NAME:string;ww_NPARENT:string;ww_CODE:string;ww_DAT1:date);
+{ clearbuffer(#CatHist) ;
+  CatHist.cCat   :=ww_cCat;
+  CatHist.CPARENT:=ww_CPARENT;
+  CatHist.NAME   :=ww_NAME;
+  CatHist.NPARENT:=ww_NPARENT;
+  CatHist.CODE   :=ww_CODE;
+  CatHist.DAT1   :=ww_DAT1;
+  CatHist.WFLD1  := ww_WFLD1;
+  CatHist.WPICK  :=55;
+  insert current CatHist;
+} //Procedure InsCatHist(ww_WFLD1:word; ww_cCat :comp; ww_CPARENT:comp; ww_NAME:string;ww_NPARENT:string;ww_CODE:string;ww_DAT1:date);
+
+
+Function MyDate(s:string):date;
+{ Result:=ZeroDate;
+  s:=trim(s);
+  if s='' exit;
+  Result:=date(substr(S,1,2),substr(S,4,2),substr(S,7,4))
+}
+
+Function FormDoc:boolean;
+{ Result:=False;
+  logfilekl:=true;
+  logfilenm:=GetStringParameter('Files','OutputFilesDirectory',0)+'\!Imp_Appointments.log';
+  if FileExist(logfilenm) DeleteFile(logfilenm);
+
+  if not FileExist(nm_file)
+  { message('Не нашли файл '
+     +chr(13)+nm_file );
+    Exit;
+  }
+  if not FileExist(nm_file_s)
+  { message('Не нашли файл '
+     +chr(13)+nm_file_s );
+    Exit;
+  }
+  cat_main_M11:=0;
+  if getfirst Catalogs where (( -11 == Catalogs.syscode ))=tsok
+  { var _nrec:comp=catalogs.nrec;
+    cat_main_M11:=_nrec;
+  }
+  if cat_main_M11=0
+  { Message('Не нашли точку входа для -11 каталога(СЕШР)' );
+    Exit;
+  }
+  cat_main_M123:=0;
+  cat_XarNaznSovm:=0;
+  if getfirst Catalogs where (( -123 == Catalogs.syscode ))=tsok
+  { var _nrec:comp=catalogs.nrec;
+    cat_main_M123:=_nrec;
+    if getfirst Catalogs where (( cat_main_M123 == Catalogs.MainLink
+       and 0 == Catalogs.Lpr
+       and 'Совместительство' == Catalogs.Name
+       ))=tsok
+       cat_XarNaznSovm:=Catalogs.Nrec
+  }
+
+  //----------------------------
+  delete all tmp_appoint;
+  delete all tmp_staff;
+  delete all tmp_CatHist;
+  //------------------------------
+  logfilekl:=true;
+  //------------------------------
+  var isAllOk:boolean=true;
+  //====================================
+  v_Imp.num_col:=60;// иначе первые 50
+  Timelog('GP_Imp_Appointments->ReadDataFromExcel:Start');
+  XlKillExcel;
+  //=-------------------------------------
+  var wexrow_:longint;
+  wexrow_:=0;
+  var wkl_err:boolean;
+  wkl_err:=false;
+  //================================================
+  // Штатное
+  //================================================
+  if not ReadDataFromExcel(0,nm_file_s,'Select cs_v_schedule_structure_',False,true)
+  { message('Ошибка импорта из'+chr(13)+nm_file);
+    exit ;
+  }
+  wexrow_:=0;
+  wkl_err:=false;
+  v_imp._loop tmp_excel
+  { if not nextvisual then
+    { isAllOk:=false;
+        break;
+    }
+    wexrow_++ ;
+    if wexrow_=1
+    { continue;
+    }
+    clearbuffer(#tmp_staff);
+    tmp_staff.NrecSHR   :=comp(v_imp.tmp_excel.dmcell[2]);
+    tmp_staff.NrecSetki :=comp(v_imp.tmp_excel.dmcell[3]);
+    tmp_staff.NrecPodr  :=comp(v_imp.tmp_excel.dmcell[5]);
+    tmp_staff.CodePodr  :=v_imp.tmp_excel.dmcell[6];
+    tmp_staff.NamePodr  :=v_imp.tmp_excel.dmcell[7];
+    tmp_staff.IdDolzhn  :=comp(v_imp.tmp_excel.dmcell[9]);
+    tmp_staff.NameDolzhn:=Replace(v_imp.tmp_excel.dmcell[11],'  ',' ');
+    tmp_staff.KodKateg  :=longint(v_imp.tmp_excel.dmcell[12]);
+    tmp_staff.Oklad     :=Mydouble(v_imp.tmp_excel.dmcell[13]);
+    tmp_staff.UslTruda  :=v_imp.tmp_excel.dmcell[14];
+    tmp_staff.kolvo     :=Mydouble(v_imp.tmp_excel.dmcell[15]);
+    tmp_staff.OtpVredn  :=Mydouble(v_imp.tmp_excel.dmcell[16]);
+    tmp_staff.DopOtpKolDog :=Mydouble(v_imp.tmp_excel.dmcell[17]);
+    tmp_staff.Status1   :=v_imp.tmp_excel.dmcell[18];
+    tmp_staff.ProcVredn :=Mydouble(v_imp.tmp_excel.dmcell[21]);
+    tmp_staff.Status2   :=v_imp.tmp_excel.dmcell[23];
+    tmp_staff.DInPut    :=MyDate(v_imp.tmp_excel.dmcell[08]);
+    insert current tmp_staff;
+    /*
+    do
+    { if getlast tmp_cathist where (( tmp_staff.NrecPodr == tmp_cathist.Nrec
+       and tmp_staff.DInPut >= tmp_cathist.DTIZM )) =tsok
+      { if tmp_cathist.Name=tmp_staff.NamePodr
+        { break;
+        }
+        insert into tmp_cathist set
+          tmp_cathist.Nrec:=tmp_staff.NrecPodr
+         ,tmp_cathist.Name:=tmp_staff.NamePodr
+         ,tmp_cathist.Code:=tmp_staff.CodePodr
+        ;
+      }
+    } while false;
+    */
+  }//v_imp._loop tmp_excel
+
+  //================================================
+  //Назначения
+  //================================================
+  if not ReadDataFromExcel(0,nm_file,'SQL Results',False,true)
+
+  { message('Ошибка импорта из'+chr(13)+nm_file);
+      exit ;
+  }
+  //Select hr_v_orderappoint
+  Timelog('GP_Imp_Appointments->ReadDataFromExcel:Finish');
+  //====================================
+  RaiseNrec :=100000;//для уникальности нреков ШР 1628722
+  RaiseNrecD:=1000000;//для уникальности нреков должн
+  Nrec_NPO_Z:=2814749767106566;
+  Nrec_NPO_K:=2814749767342785;
+  Main_dolzhn:=2814749767342543;
+  cparentDolzhn:=2814749767342548;
+  main_podr:=2814749767342636;
+
+  wexrow_:=0;
+  wkl_err:=false;
+  Timelog('GP_Imp_Appointments->Import:Start');
+  XlKillExcel;
+  v_imp._loop tmp_excel
+  { if not nextvisual then
+    { isAllOk:=false;
+        break;
+    }
+    wexrow_++ ;
+    if wexrow_=1
+    { continue;
+    }
+
+#IFDEF IMP_APP_FROM_PERS
+    if v_imp.tmp_excel.dmcell[03]='' then continue;
+    //if v_imp.tmp_excel.dmcell[04]='' then continue;
+#ELSE
+    if v_imp.tmp_excel.dmcell[21]='' then continue;
+#ENDIF
+    clearbuffer(#tmp_appoint);
+#IFDEF IMP_APP_FROM_PERS
+    tmp_appoint.IdApp     :=comp(v_imp.tmp_excel.dmcell[02]); //ID
+    tmp_appoint.IdKIS     :=comp(v_imp.tmp_excel.dmcell[31]);  //CITEZENID
+    tmp_appoint.NrecSHR   :=comp(v_imp.tmp_excel.dmcell[32]);  //STRUCTUREID
+    tmp_appoint.DataNachS :=MyDate(v_imp.tmp_excel.dmcell[04]);  //INDATE
+    tmp_appoint.DataNachSD:=tmp_appoint.DataNachS;
+    tmp_appoint.sDataNachS:=v_imp.tmp_excel.dmcell[04];//
+    tmp_appoint.DataOkonS :=MyDate(v_imp.tmp_excel.dmcell[10]);  //OUTDATE
+    tmp_appoint.NumberDogS:=v_imp.tmp_excel.dmcell[36]; //AGREEMENTNUMB
+    tmp_appoint.DatDogS   :=MyDate(v_imp.tmp_excel.dmcell[37]); //AGREEMENTDATE
+    tmp_appoint.kolvo     :=MyDouble(v_imp.tmp_excel.dmcell[20]); //AMOUNT
+    tmp_appoint.StatusNazn:=v_imp.tmp_excel.dmcell[8];  //WORKUNITTYPEROW
+    tmp_appoint.VidNazn   :=comp(v_imp.tmp_excel.dmcell[17]); //DEPTID
+    tmp_appoint.Fio       :=v_imp.tmp_excel.dmcell[03];  //FIOFULL
+    tmp_appoint.AppMain   :=tmp_appoint.IdApp;
+    tmp_appoint.OrderDat  :=MyDate(v_imp.tmp_excel.dmcell[38]);
+    tmp_appoint.OrderNum  :=v_imp.tmp_excel.dmcell[39];
+    tmp_appoint.BornDate  :=MyDate(v_imp.tmp_excel.dmcell[06]);
+    tmp_appoint.NrecPodr  :=comp(v_imp.tmp_excel.dmcell[17]);
+    tmp_appoint.NamePodr  :=v_imp.tmp_excel.dmcell[18];
+    tmp_appoint.CodePodr  :=v_imp.tmp_excel.dmcell[44];
+
+    tmp_appoint.Uv_OrderDat:=MyDate(v_imp.tmp_excel.dmcell[12]);
+    tmp_appoint.Uv_OrderNum:=v_imp.tmp_excel.dmcell[13];
+    tmp_appoint.Uv_Reason  :=v_imp.tmp_excel.dmcell[14];
+
+#ELSE
+    tmp_appoint.IdApp     :=comp(v_imp.tmp_excel.dmcell[13]); //NEWEMPID
+    tmp_appoint.IdKIS     :=comp(v_imp.tmp_excel.dmcell[02]);  //CITEZENID
+    tmp_appoint.NrecSHR   :=comp(v_imp.tmp_excel.dmcell[03]);  //NEWSTR
+    tmp_appoint.DataNachS :=MyDate(v_imp.tmp_excel.dmcell[04]);  //INDATE
+    tmp_appoint.DataOkonS :=MyDate(v_imp.tmp_excel.dmcell[05]);  //OUTDATE
+    tmp_appoint.NumberDogS:=v_imp.tmp_excel.dmcell[07]; //AGREEMENTNUMB
+    tmp_appoint.DatDogS   :=MyDate(v_imp.tmp_excel.dmcell[8]); //AGREEMENTDATE
+    tmp_appoint.kolvo     :=MyDouble(v_imp.tmp_excel.dmcell[20]); //AMOUNT
+    tmp_appoint.StatusNazn:=v_imp.tmp_excel.dmcell[6];  //WORKUNITTYPE
+    tmp_appoint.VidNazn   :=comp(v_imp.tmp_excel.dmcell[10]); //DEPTID
+    tmp_appoint.Fio       :=v_imp.tmp_excel.dmcell[21];  //FIOFULL
+    tmp_appoint.AppMain   :=tmp_appoint.IdApp;
+    tmp_appoint.OrderDat  :=MyDate(v_imp.tmp_excel.dmcell[24]);
+    tmp_appoint.OrderNum  :=v_imp.tmp_excel.dmcell[25];
+#ENDIF
+    if tmp_appoint.OrderDat=ZeroDate
+      tmp_appoint.OrderDat  :=tmp_appoint.DatDogS ;
+    if tmp_appoint.OrderNum=''
+      tmp_appoint.OrderNum  :=tmp_appoint.NumberDogS;
+
+    insert current tmp_appoint;
+    IF tmp_appoint.DataNachS=ZeroDate
+    { Ins_Jour('Пустая дата назначения','ID='+string(tmp_appoint.IdApp)+','+tmp_appoint.sDataNachS);
+      MyLog('Пустая дата назначения '+tmp_appoint.Fio+',ID='+string(tmp_appoint.IdApp)+','+tmp_appoint.sDataNachS);
+      delete current tmp_appoint;
+      continue;
+    }
+    MyLog('Загрузили '+tmp_appoint.Fio+','+DateToStr(tmp_appoint.DataNachS,'DD/MM/YYYY')+','+tmp_appoint.NamePodr);
+ //==================
+    if getfirst tmp_staff where (( tmp_appoint.NrecSHR == tmp_staff.NrecSHR ))  =tsok
+    {
+      if getfirst KLkatego where ((tmp_staff.KodKateg==Klkatego.kod))=tsok
+  		{
+     		tmp_appoint.cKlkatego:=klkatego.nrec;
+   		}
+      if tmp_staff.oklad>1000 or tmp_staff.oklad=0
+    	{
+       	tmp_appoint.paymodel:=30;
+     	}
+    	else
+    	{
+       	tmp_appoint.paymodel:=20;
+    	}
+      //tmp_appoint.NrecPodr  :=tmp_staff.NrecPodr;
+      tmp_appoint.IdDolzhn  :=tmp_staff.IdDolzhn;
+      tmp_appoint.TAXRATE  :=tmp_staff.Oklad;
+      tmp_appoint.CATEGORY :=tmp_staff.Razr;
+      if tmp_appoint.NamePodr=''
+      { tmp_appoint.NamePodr:=tmp_staff.NamePodr;
+      }
+      if tmp_staff.UslTruda<>''
+     	{
+       	if getfirst catalogs where ((0==lpr and 000A000000039A30h==catalogs.mainlink
+           and tmp_staff.UslTruda==catalogs.code))=tsok
+    		{
+       		tmp_appoint.WORKCOND:=catalogs.nrec;
+    		}
+    	}
+      tmp_appoint.workregime:=0;
+
+      //--------------------------------------------
+      if getfirst catalogs where (((RaiseNrec+tmp_appoint.NrecPodr)==catalogs.nrec))=tsok
+	    { tmp_appoint.cPodr    :=catalogs.nrec;
+        Ins_Jour('СЕШР по nrec',string(tmp_appoint.NrecPodr));
+        if Catalogs.Name='ЯЯЯ ДД/ММ/ГГГГ'
+        { if tmp_appoint.NamePodr<>'ДД/ММ/ГГГГ' and tmp_appoint.NamePodr<>''
+          { update current Catalogs set Catalogs.Name:='ЯЯЯ '+tmp_appoint.NamePodr;
+            if tmp_appoint.CodePodr<>Catalogs.Code and tmp_appoint.CodePodr<>''
+              update current Catalogs set Catalogs.Name:='ЯЯЯ '+tmp_appoint.NamePodr;
+            Ins_Jour('Исправление СЕШР',catalogs.code+', '+Catalogs.Name);
+            if (getfirst CatHist where (( Catalogs.Nrec == CatHist.cCat )) ordered by index CATHIST02) =tsok
+            { if cathist.Dat1>tmp_appoint.DataNachS
+              { update current cathist set cathist.Name:=tmp_appoint.NamePodr;
+              }
+            }
+          }
+        }
+      } //if getfirst catalogs where (((RaiseNrec+tmp_appoint.NrecPodr)==catalogs.nrec))=tsok
+      else
+      { var dept_code:string='';
+        if length(tmp_appoint.CodePodr)>0 and length(tmp_appoint.CodePodr)<7
+        {  dept_code:=tmp_appoint.CodePodr;
+        }
+        else
+        { if pos(' ',tmp_staff.NamePodr )>0
+          { dept_code:=substr(tmp_staff.NamePodr,1,pos(' ',tmp_staff.NamePodr )-1);
+            if substr(dept_code,1,1)>'9'
+              dept_code:='';
+          }
+        }
+        if dept_code=''
+        { dept_code:=tmp_staff.CodePodr; //100922
+        }
+        if getfirst catalogs where (( cat_main_M11 == Catalogs.MainLink
+            and 0 == Catalogs.Lpr
+            and dept_code == Catalogs.Code )) <>tsok
+        {   clearbuffer(#Catalogs);
+            Catalogs.Nrec:=RaiseNrec+tmp_appoint.NrecPodr;
+            Catalogs.MainLink:=cat_main_M11;
+            Catalogs.cParent :=cat_main_M11;
+            Catalogs.Code:=dept_code;
+            //для правильной сортировки
+            Catalogs.Name:='ЯЯЯ '+if(tmp_appoint.NamePodr='',dept_code,tmp_appoint.NamePodr);
+            Catalogs.DatOk:=Date(31,08,2017);
+            Catalogs.DATN :=tmp_appoint.DataNachS;
+            Catalogs.CATDATA:='АРХИВ';
+            if insert current Catalogs=tsok
+            { tmp_appoint.cPodr    :=catalogs.nrec;
+              Ins_Jour('Создание СЕШР',catalogs.code+', '+Catalogs.Name);
+              InsCatHist(1, Catalogs.Nrec, Catalogs.cParent,if(tmp_appoint.NamePodr='',dept_code,tmp_appoint.NamePodr)
+                 ,''
+                 ,Catalogs.Code,tmp_appoint.DataNachS )
+
+            }
+            else
+            { Ins_Jour('ошибка Создание СЕШР',catalogs.code+', '+Catalogs.Name);
+            }
+
+        }
+        else
+        { tmp_appoint.cPodr    :=catalogs.nrec;
+          Ins_Jour('Подразделение по коду',catalogs.code+', '+Catalogs.Name);
+        }
+      } //else if getfirst catalogs where (((RaiseNrec+tmp_staff.NrecPodr)==catalogs.nrec))=tsok
+      if (getfirst CatHist where (( tmp_appoint.cPodr == CatHist.cCat )) ordered by index CATHIST02) =tsok
+      { if cathist.Dat1>tmp_appoint.DataNachS
+        { update current cathist set cathist.Dat1:=tmp_appoint.DataNachS;
+        }
+      }
+      if catalogs.DatN>tmp_appoint.DataNachS
+      { update current catalogs set catalogs.DatN:=tmp_appoint.DataNachS;
+      }
+
+
+      //--------------------------------------------
+      if getfirst catalogs where (( RaiseNrecD+tmp_staff.IdDolzhn == catalogs.nrec ))<>tsok
+      { if getfirst catalogs where ((0==catalogs.lpr and
+         main_dolzhn==catalogs.mainlink
+         and tmp_staff.NameDolzhn==catalogs.name
+         //(tmp_staff.NameDolzhn=trim(catalogs.name) )
+         ))<>tsok
+  		  {
+	      	clearbuffer(#catalogs);
+    		  Catalogs.nrec:=RaiseNrecD+tmp_staff.IdDolzhn;
+  		    Catalogs.CPARENT:=cparentdolzhn;
+      		Catalogs.GROUPCODE:=2;
+		      Catalogs.name:=tmp_staff.NameDolzhn;
+    	  	Catalogs.MAINLINK:=main_dolzhn;
+		      if insert current catalogs=tsok
+          { tmp_appoint.cPost:=catalogs.nrec;
+            Ins_Jour('Создание должности',catalogs.code+', '+Catalogs.Name);
+          }
+          else
+          { Ins_Jour('ошибка Создание должности',catalogs.code+', '+Catalogs.Name);
+
+          }
+        }
+        else
+        { tmp_appoint.cPost:=catalogs.nrec;
+          Ins_Jour('Должность по наименованию',catalogs.code+', '+Catalogs.Name);
+        }
+   		}
+      else
+      { tmp_appoint.cPost:=catalogs.nrec ;
+        Ins_Jour('Должность по nrec',catalogs.code+', '+Catalogs.Name);
+      }
+      update current tmp_appoint;
+    } //if getfirst tmp_staff where (( tmp_appoint.NrecSHR == tmp_staff.NrecSHR ))  =tsok
+    else
+    { Ins_Jour('не нашли штатное расписание',string(tmp_appoint.NrecSHR));
+    }
+  } //v_imp._loop tmp_excel
+
+  //----------------
+  // проверим историю
+  /*
+  _Loop catalogs where (( cat_main_M11 == Catalogs.MainLink
+           and 0 == Catalogs.Lpr
+            ))
+  { _Lopp tmp_cathist where (( catalogs.code == tmp_cathist.Code )) ordered by imdex tmp_cathist01
+    { do
+      { var _wType:word;
+        if getlast cathist where (( catalogs.nrec == CatHist.cCat
+        and tmp_cathist.DtIzm >>= CatHist.Dat1 )) =tsok
+        { _wType:=3
+          if cathist.name=tmp_cathist.Name break;
+        }
+
+        InsCatHist(3, CatDep1.Nrec, CatDep1.cParent,CatDep1.Name
+            ,if(CatDep1.cParent=Cat_main  or CatDep1.cParent=Cat_main2,cat_MainName, CatDep1.Name)
+            ,CatDep1.CODE,cur_date )
+      } while false;
+    }
+
+  } //_Loop catalogs where (( cat_main_M11 == Catalogs.MainLink
+  */
+
+
+  //*********************************************
+  // Удалим после 1 декабря - там вроде вносили руками
+  //*********************************************
+
+  delete tmp_appoint where (( date(1,12,2017) <<= tmp_appoint.DataNachS)) ;
+
+  //********************************************
+
+  //покатимся назад
+  var _IdKIS     :comp=0;
+  var _DataNachS :date=ZeroDate;
+  var _cPodr     :comp=0;
+  var _cPost     :comp=0;
+  var _statusNazn:string=0;
+  var _AppMain   :comp=0;
+  var _wSovm     :word=0;
+  var _DatDogS   :date=ZeroDate;
+  var _NumberDogS:string='';
+  if not iNextVisual('Сортировка назначений')
+  { Exit;
+  }
+  var _ww_Prohod:word;
+  for(_ww_Prohod:=1;_ww_Prohod<=1;_ww_Prohod++)
+  if getlast tmp_appoint=tsok
+  do
+  {
+    if not Nextvisual then exit;
+    if _IdKIS <>tmp_appoint.IdKIS
+    { if getfirst persons where (( tmp_appoint.IdKIS == Persons.Nrec )) <>tsok continue ;
+    }
+    if _IdKIS <>tmp_appoint.IdKIS
+      or _cPodr  <>tmp_appoint.cPodr
+      or _cPost  <>tmp_appoint.cPost
+      or _statusNazn<>tmp_appoint.statusNazn
+      or (_DataNachS>=persons.AppDate and tmp_appoint.DataNachS<persons.AppDate )
+      or (tmp_appoint.DataOkonS<>ZeroDate and tmp_appoint.DataOkonS<Sub_Day(_DataNachS,1) )
+      or _NumberDogS<>tmp_appoint.NumberDogS
+      {
+        _AppMain:=tmp_appoint.IdApp
+      }
+    _IdKIS     :=tmp_appoint.IdKIS;
+    _DataNachS :=tmp_appoint.DataNachS;
+    _cPodr     :=tmp_appoint.cPodr;
+    _cPost     :=tmp_appoint.cPost;
+    _statusNazn:=tmp_appoint.statusNazn;
+    _wSovm     :=if(tmp_appoint.statusNazn='Совм.' or tmp_appoint.statusNazn='Совместитель',3,0);
+    _DatDogS   :=tmp_appoint.DatDogS;
+    _NumberDogS:=tmp_appoint.NumberDogS;
+    /*
+      if _wSovm=0
+      if  tmp_appoint.DataNachS<Persons.AppDate
+      and tmp_appoint.DataOkonS<>ZeroDate
+      and tmp_appoint.DataOkonS<Persons.AppDate
+      { _wSovm:=100;
+      }
+    */
+    if _ww_Prohod=1
+    { if tmp_appoint.AppMain<>_AppMain
+      { tmp_appoint.AppMain:=_AppMain;
+        update current tmp_appoint;
+
+      }
+      //continue;
+    }
+    MyLog('Обрабатываем '+tmp_appoint.Fio+','+DateToStr(tmp_appoint.DataNachS,'DD/MM/YYYY')
+       +','+string(tmp_appoint.IdKIS)+',tmp_appoint.AppMain='+string(tmp_appoint.AppMain));
+
+    do {
+      if getfirst persons where (( tmp_appoint.IdKIS == Persons.Nrec )) <>tsok break ;
+      if tmp_appoint.DataNachS>=date(1,11,2017) break;
+      MyLog(' Persons.Fio= '+persons.Fio);
+
+      if getfirst  Appointments where (( tmp_appoint.AppMain == Appointments.Nrec))<>tsok
+      { if getfirst Appointments where (( Persons.Nrec == Appointments.Person
+         and tmp_appoint.DataNachSD==appointments.APPOINTDATE(noindex)
+         and (_wSovm = Appointments.LPrizn
+           or (100=Appointments.LPrizn
+             and if(_wSovm=3,Appointments.KindApp=cat_XarNaznSovm,Appointments.KindApp<>cat_XarNaznSovm )
+             )
+           )
+         )) <>tsok
+        { clearbuffer(#appointments);
+          Ins_Jour('создали назначение',DateToStr(tmp_appoint.DataNachS,'DD/MM/YYYY')+', '+string(_wSovm));
+
+          MyLog(' создали назначение ');
+      	  appointments.nrec:=tmp_appoint.AppMain;
+        	appointments.PERSON:=persons.nrec;
+        	appointments.APPOINTDATE:=tmp_appoint.DataNachS;
+        	appointments.DISMISSDATE:=tmp_appoint.DataOkonS;
+        	appointments.DEPARTMENT :=tmp_appoint.cPodr;
+      	  appointments.POST       :=tmp_appoint.cPost;
+        	appointments.EMPCATEGORY:=tmp_appoint.cKlKatego;
+        	appointments.PAYMODEL:=tmp_appoint.paymodel;
+        	appointments.TAXRATE:=tmp_appoint.TAXRATE;
+        	//appointments.TARIFF:=staffstruct.tariff;
+      	  appointments.CATEGORY:=tmp_appoint.CATEGORY;
+        	appointments.EMPRATE:=tmp_appoint.Kolvo;
+        	appointments.STAFFSTR:=0;
+        	appointments.RATE:=tmp_appoint.kolvo;
+          appointments.WADDWORD1:=2;// Вне ШР
+      	  appointments.WORKCOND:=tmp_appoint.WORKCOND;
+      	  appointments.WORKREGIME:=tmp_appoint.workregime;
+          appointments.lPrizn:=_wSovm;
+          appointments.ORDERDATE :=tmp_appoint.OrderDat;
+          appointments.ORDERNMB  :=tmp_appoint.OrderNum;
+          if _wSovm=3
+            Appointments.KindApp:=cat_XarNaznSovm;
+          if (appointments.lPrizn=0 or (appointments.lPrizn=3 and cat_XarNaznSovm>0) )
+            if  appointments.APPOINTDATE<Persons.AppDate
+            and appointments.DISMISSDATE<>ZeroDate
+            and appointments.DISMISSDATE<Persons.AppDate
+            { appointments.lPrizn:=100;
+            }
+          appointments.strTabn:=Persons.Strtabn;
+          if insert current appointments=tsok
+        	{ clearbuffer(#SPALLSTAFF);
+          	SPALLSTAFF.RESCOMP[1]:=000A000000039921h;//предположительно нрек трудового договора
+          	spallstaff.RESDATE[1]:=_DatDogS;//date(substr(DatDogS,1,2),substr(DatDogS,4,2),substr(DatDogS,7,4));
+          	SPALLSTAFF.RESSTRING[1]:=tmp_appoint.NumberDogS;
+          	SPALLSTAFF.wnocon:=5;
+          	SPALLSTAFF.CBASET:=persons.nrec;
+        	  SPALLSTAFF.RESCOMP[2]:=apphist.nrec;//проверить
+          	insert current SPALLSTAFF;
+
+          	appointments.CDOG:=SPALLSTAFF.RESCOMP[1];
+          	appointments.RESCOMP[1]:=SPALLSTAFF.nrec;
+          	appointments.CONTRACTNMb:=NumberDogS;
+          	appointments.CONTRACTDAte:=spallstaff.RESDATE[1];
+            update current appointments;
+          }
+          else
+          { Ins_Jour('создали назначение - ошибка',DateToStr(tmp_appoint.DataNachS,'DD/MM/YYYY')+', '+string(_wSovm));
+          }
+        } //if getfirst Appointments where (( Persons.Nrec == Appointments.Person
+      } //if getfirst  Appointments where (( tmp_appoint.AppMain == Appointments.Nrec))<>tsok
+      else
+      { if appointments.APPOINTDATE>tmp_appoint.DataNachS
+        {
+
+          Ins_Jour('обновили дату назначения',DateToStr(appointments.APPOINTDATE,'DD/MM/YYYY')+DateToStr(tmp_appoint.DataNachS,'->DD/MM/YYYY')+', '+string(_wSovm));
+          appointments.APPOINTDATE:=tmp_appoint.DataNachS;
+          update current appointments;
+          MyLog(' обновили назначение ');
+        }
+        if tmp_appoint.AppMain=tmp_appoint.IdApp
+        { if appointments.DISMISSDATE<>tmp_appoint.DataOkonS
+          and appointments.DISMISSDATE=ZeroDate
+          { Ins_Jour('обновили дату ухода',DateToStr(appointments.DISMISSDATE,'DD/MM/YYYY')+DateToStr(tmp_appoint.DataOkonS,'->DD/MM/YYYY')+', '+string(_wSovm));
+            update current appointments set appointments.DISMISSDATE:=tmp_appoint.DataOkonS;
+          }
+        }
+      } //else if getfirst  Appointments where (( tmp_appoint.AppMain == Appointments.Nrec))<>tsok
+      // уволен
+      if Appointments.LPrizn=100
+      { // увольнение
+        if getfirst InfPsn1 where (( AppointMents.nRec == InfPsn1.cPers
+              and comp(skkRPD1VidRab) == InfPsn1.cRef2
+              ))<>tsok
+        {
+           clearbuffer(#InfPsn1);
+           /*
+      InfPsn1.cRef3 := cParDisReason; //Persons.DisReason Основание увольнения
+      InfPsn1.cRef4 := cParDisMotive;//Persons.DisMotive Причина увольнения
+      InfPsn1.dBeg  := dParDisDate;//Persons.DisDatePr Дата увольнения
+      InfPsn1.str1  := sDisPersNmb;
+      InfPsn1.str2  := sDisProfDate;
+           */
+           InfPsn1.cPers:=AppointMents.nRec;
+           InfPsn1.cRef2:=comp(skkRPD1VidRab);
+           if _wSovm=3
+           { InfPsn1.cRef3:=3;
+           }
+           else
+           { InfPsn1.cRef3:=Persons.cSovm;
+           }
+
+           InfPsn1.dBeg:=tmp_appoint.Uv_OrderDat;// "12"
+           InfPsn1.str1:=tmp_appoint.Uv_OrderNum;// "13"
+           //InfPsn1.str1:=tmp_appoint.Uv_Reason;// "14"
+
+           insert current InfPsn1;
+        }
+
+
+      } //if Appointments.LPrizn=100
+      if getfirst APPHIST where (( appointments.nrec == APPHIST.CAPPOINT
+        and tmp_appoint.DataNachS == APPHIST.DREC )) <>tsok
+      {	clearbuffer(#APPHIST);
+        Ins_Jour('создали историю',DateToStr(tmp_appoint.DataNachS,'->DD/MM/YYYY')+', '+string(_wSovm));
+      	APPHIST.CAPPOINT  :=appointments.nrec;
+       	APPHIST.CODOPER   :=1;
+        APPHIST.DREC      :=tmp_appoint.DataNachS;
+      	APPHIST.WSTATE    :=1;
+       	APPHIST.PAYMODEL  :=tmp_appoint.paymodel;
+      	APPHIST.TARIFF    :=0;
+      	APPHIST.CATEGORY  :=tmp_appoint.category;
+       	APPHIST.TAXRATE   :=tmp_appoint.TAXRATE;
+      	APPHIST.COEF1     :=tmp_appoint.kolvo;
+      	apphist.WORKCOND  :=tmp_appoint.WORKCOND;
+      	apphist.WORKREGIME:=tmp_appoint.workregime;
+        apphist.cSpr4     :=tmp_appoint.cKlKatego;
+        apphist.DOCDate   :=tmp_appoint.OrderDat;
+        apphist.DOCNMB    :=tmp_appoint.OrderNum;
+
+      	insert current APPHIST;
+      } //if getfirst APPHIST where (( appointments.nrec == APPHIST.CAPPOINT
+    } while false;
+  } while getprev tmp_appoint=tsok
+  Timelog('GP_Imp_Appointments->Import:Finish');
+  ReScanPanel(#Catalogs);
+  ExcelInit('GP_IMP_JOUR.Xlsx',true);
+  wexrow:=1;;
+  HeaderStrCount:=wexrow;
+  MyXlCreaMatrix(1000, 12);
+  matrixkl:=true;
+  MyPutExcel('CitezenID',10,0,-1,-1);// CitezenID
+  MyPutExcel('Fio'      ,10,0,-1,-1);
+  MyPutExcel('BornDate' ,10,0,-1,-1);
+  MyPutExcel('APPID'    ,10,0,-1,-1);
+  MyPutExcel('STAFFID'  ,10,0,-1,-1);
+  MyPutExcel('DEPTID'   ,10,0,-1,-1);
+  MyPutExcel('POSTID'   ,10,0,-1,-1);
+  MyPutExcel('sSovm'    ,10,0,-1,-1);
+  MyPutExcel('FLD'      ,10,0,-1,-1);
+  MyPutExcel('PRIM'     ,10,0,-1,-1);
+  StopVisual('',0);
+  StartNewVisual(vtIndicatorVisual, vfTimer, 'Вывод протокола', RecordsInTable(#tmp_jour));
+  Timelog('GP_Imp_Appointments->Вывод протокола '+ string(RecordsInTable(#tmp_jour)));
+
+  iNextVisual('Вывод протокола');
+  _Loop tmp_jour
+  { //---------------------
+    timelog('Журнал '+tmp_jour.Fio);
+    wexrow++;
+    wexcol:=1;
+    nextvisual;
+    MyPutExcel(tmp_jour.CitezenID,10,0,-1,-1);// CitezenID
+    MyPutExcel(tmp_jour.Fio      ,10,0,-1,-1);
+    MyPutExcel(tmp_jour.BornDate ,10,0,-1,-1);
+    MyPutExcel(tmp_jour.APPID    ,10,0,-1,-1);
+    MyPutExcel(tmp_jour.STAFFID  ,10,0,-1,-1);
+    MyPutExcel(tmp_jour.DEPTID   ,10,0,-1,-1);
+    MyPutExcel(tmp_jour.POSTID   ,10,0,-1,-1);
+    MyPutExcel(tmp_jour.sSovm    ,10,0,-1,-1);
+    MyPutExcel(tmp_jour.FLD      ,10,0,-1,-1);
+    MyPutExcel(tmp_jour.PRIM     ,10,0,-1,-1);
+  }
+  MyxlWriteMatrix(wexrow);
+  xlFreeMatrix;
+  matrixkl:=false;
+  MyxlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0, HeaderStrCount+1 ,1,wexrow,10); //Обрамление
+
+  MyXLEnd;
+  Result:=true;
+} //FomdDoc
+
+
+
+
+
+Screen scrParam;
+Table Catalogs;
+Fields
+  'SQL Results' :Protect,NoDel;
+  nm_file  :NoProtect, PickButton;
+  'Select cs_v_schedule_structure_':Protect,NoDel;
+  nm_file_s:NoProtect, PickButton;
+Buttons
+  cmOk    ,,, 'Установить фильтр', hcAllBOk, scGalDial;
+  cmCancel,,, 'Отмена', hcAllBCancel, scGalDial;
+
+<<
+#IFDEF IMP_APP_FROM_PERS
+  Файл c картотекой(PERSON.xlsx)     Лист .@@@@@@@@@@@@@@@@@@@@@@@@
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+#ELSE
+  Файл назначений(APPOINTMENT)    Лист .@@@@@@@@@@@@@@@@@@@@@@@@
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+#ENDIF
+  Файл штатного расписаний   Лист .@@@@@@@@@@@@@@@@@@@@@@@@
+  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ <. Продолжить .>  <.   Отмена   .>
+>>
+end;
+
+
+HandleEvent
+  cmInit:
+  { nm_file:='';
+    if not ReadMyDsk(nm_file,'GP_Imp_Appointments_nm_file',False)
+#IFDEF IMP_APP_FROM_PERS
+      nm_file:='d:\Galaxy\RedMine\_GP\Import\PERSON_result.xlsx';
+#ELSE
+      nm_file:='d:\Galaxy\RedMine\_GP\Import\APPOINTMENT_FIO_result.xlsx';
+#ENDIF
+    if not ReadMyDsk(nm_file_s,'GP_Imp_Appointments_nm_file_s',False)
+      nm_file_s:='d:\Galaxy\RedMine\_GP\Import\STAFFSTRUCT_CIS1_1.xlsx' ;
+    logfilenm:=GetStringParameter('Files','OutputFilesDirectory',0)
+                               +'!TimeLog.log';
+    timelog_init;
+  }
+  cmDone:
+  {
+
+  }
+  cmOk:
+  { SaveMyDsk(nm_file  ,'GP_Imp_Appointments_nm_file');
+    SaveMyDsk(nm_file_s,'GP_Imp_Appointments_nm_file_s');
+
+    StartNewVisual(vtNumericVisual, vfTimer, 'Ждите, идет сбор данных', 0);
+    FormDoc;
+    StopVisual('',0);
+  }
+  cmCheckField:
+  { case curField of
+    #nm_file:
+    { if not FileExist(nm_file) message('Файл не найден!');
+    }
+    #nm_file_s:
+    { if not FileExist(nm_file_s) message('Файл не найден!');
+    }
+    end;
+  }
+  cmPick:
+  { case CurField of
+    #nm_file:
+    { var ww_str:string=GetFileName('*.xlsx','Выберите файл назначений');
+      if ww_str<>'' set nm_file:=ww_str;
+    }
+    #nm_file_s:
+    { var ww_str:string=GetFileName('*.xlsx','Выберите файл штатного расписаний ');
+      if ww_str<>'' set nm_file:=ww_str;
+    }
+    end;
+  }
+  end;
+
+end.

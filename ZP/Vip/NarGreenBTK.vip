@@ -1,0 +1,471 @@
+/*************************************************************************************************\
+* Наименование: Формирование нарядов с зеленой полосой по расхождениям между табелем и нарядами   *
+* Контур/Модуль: Z                                                                                *
+* Вид работы  |Номер           |Дата    |Исполнитель              |Проект                         *
+*  -----------------------------------------------------------------------------------------------*
+* Разработка  |#NaN            |25/02/22|kurennykh                |НПО Энергомаш                  *
+\*************************************************************************************************/
+
+#doc
+  Берем время отработанное по табелю, вычитаем из него сумму времени по утвержденным нарядам
+  Формируем на дельту наряды с зеленой полосой
+#end
+
+#include Query.vih
+#include GetKau.Vih
+#include Marker.Vih
+
+VipInterface NarGreenBTK Licensed(free);
+
+Interface NarGreenBTK 'Наряды с зеленой полосой БТК' EscClose;
+Show At(,,66,8);
+
+Const
+  //раскраска
+  xlGreenCol = 0C1F7ADh;
+End;
+
+Table Struct tmpPodr
+(
+    cPodr : comp
+  , sPodr : string
+)
+with index
+(
+    i01 = cPodr
+);
+
+Table Struct tmpHrs
+(
+    cPodr   : comp
+  , clSchet : comp
+  , sTabN   : string
+  , dTabHrs : double
+  , dNarHrs : double
+)
+with index
+(
+    i01 = cPodr
+  , i02 = clSchet
+);
+
+Create View rView
+
+var
+  _log           : string = '';
+  _dOtch         : date;
+  _dEnd          : date;
+  _sPeriod       : string;
+  _sPodr, _sMnPlan  : string;
+  _SchDt : string;
+  _cPodr, _cMnPlan  : comp;
+
+  _getKau : GetKau;
+
+As
+
+select
+  1
+from
+  KatPodr
+, MnPlan
+, FpPeriod
+, tmpPodr
+, tmpHrs
+, lSchet
+, Sys_Nar
+, PrNaryad
+, LastNumD
+, BuhSchet
+;
+
+
+Screen scr1 'Наряды с зеленой полосой БТК' (,,sci13Esc);
+Show At(,,,);
+
+Fields
+
+  _sPeriod    ('Текущий период')          : Protect, noPickButton;
+  _sPodr      ('Подразделение')           : Protect,   PickButton;
+  //_sMnPlan    ('Производственный заказ')  : Protect,   PickButton;
+
+Buttons
+  cmOk    ,,,'Сформировать',,sci1Esc;
+  cmCancel,,,'Отмена'      ,,sci1Esc;
+<<
+
+ Текущий период  .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ Подразделение   .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+! Пр. заказ       .@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  <. Сформировать .>  <. Отмена .>
+
+>>
+End; //scr1
+
+
+Procedure MyLog(_str: string);
+{
+  if _log = '' then _log := 'GreenBTK' + DateToStr(cur_date,'_YYYYMMDD') + timetostr(cur_time,'_HHMMSS') + '.log';
+  LogStrToFile(_log, _str);
+}
+
+Procedure MysqlAddStr(var query_handle: longInt; add_query_str: string);
+{
+  sqlAddStr(query_handle, add_query_str);
+  MyLog('sql: ' + add_query_str);
+}
+
+Procedure DelPick(_w : word; _s : string);
+{
+  var objQuery: iQuery;
+  var strID   : LongInt;
+
+  sqlFreeStr(strID);
+  strID := 0;
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Очистка фильтра', 0);
+
+  MysqlAddStr(strID, ' delete from ' + _s + ' where wKau = ' + string(_w));
+
+  objQuery := queryManager.createQuery(strID);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка очистки ' + _s + ' (DelPick) ' + objQuery.errorCode,error);
+    StopVisual;
+    Exit;
+  }
+  StopVisual;
+}
+
+Procedure InsPick(_w : word; _s : string; _c : comp);
+{
+  var objQuery: iQuery;
+  var strID   : LongInt;
+
+  sqlFreeStr(strID);
+  strID := 0;
+
+  MysqlAddStr(strID, ' insert ' + _s + ' (wKau, cRec)                                                                         ');
+  MysqlAddStr(strID, ' select ' + string(_w) + ', #comp(' + string(_c) + ')                                                   ');
+  MysqlAddStr(strID, ' where #comp(' + string(_c) + ') not in (select cRec from ' + _s + ' where wKau = ' + string(_w) + ' )  ');
+
+  objQuery := queryManager.createQuery(strID);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка заполнения ' + _s + ' (InsPick) ' + objQuery.errorCode,error);
+    Exit;
+  }
+  sqlFreeStr(strID);
+}
+
+Procedure CreateTmpFlt();
+{
+  var objQuery: iQuery;
+  var strID   : LongInt;
+
+  strID := 0;
+  sqlFreeStr(strID);
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Создание временной таблицы для фильтров', 0);
+
+  MysqlAddStr(strID, ' table tmpFlt21');
+  MysqlAddStr(strID, ' (                      ');
+  MysqlAddStr(strID, '     wKau : word        ');
+  MysqlAddStr(strID, '   , cRec : comp        ');
+  MysqlAddStr(strID, ' )                      ');
+  MysqlAddStr(strID, ' with index             ');
+  MysqlAddStr(strID, ' (                      ');
+  MysqlAddStr(strID, '     i01 = wKau + cRec  ');
+  MysqlAddStr(strID, ' );                     ');
+
+  sqlDropTmpTable('tmpFlt21');
+
+  if sqlCreateTmpTable(strID, ctmNormal) <> tsOk
+  {
+    Message('Ошибка создания временной таблицы (CreateTmpFlt) tmpFlt21', error);
+    StopVisual;
+    Exit;
+  }
+
+  sqlFreeStr(strID);
+  StopVisual;
+}
+
+Function GetNarHrs(_c : comp) : double;
+{
+  var dNar : double = 0.0;
+  var qStr : longint = 0;
+  var oResultSet : IResultSet;
+
+  sqlFreeStr(qStr);
+
+  MysqlAddStr(qStr, ' select                                                                                             ');
+  MysqlAddStr(qStr, '   sum(prnaryad.chasf) as dNar                                                                      ');
+  MysqlAddStr(qStr, ' from sys_nar                                                                                       ');
+  MysqlAddStr(qStr, ' inner join prnaryad on sys_nar.nrec = prnaryad.mnrec                                               ');
+  MysqlAddStr(qStr, ' where prnaryad.tperson = #comp(' + string(_c) + ')                                                 ');
+  //31/03/23 т/н 003213
+  //Чойс = 3 означает, что это наряды текущего периода, а значит фильтровать по дате не нужно. Был случай, когда человеку в март впихнули наряды февраля
+  //MysqlAddStr(qStr, '       and sys_nar.datan >= #date(' + Day(_dOtch) + ', ' + Month(_dOtch) + ', ' + Year(_dOtch) + ') ');
+  //MysqlAddStr(qStr, '       and sys_nar.datok <= #date(' + Day(_dEnd)  + ', ' + Month(_dEnd)  + ', ' + Year(_dEnd)  + ') ');
+  MysqlAddStr(qStr, '       and sys_nar.choice = 3                                                                       ');
+
+  var objQuery: iQuery;
+      objQuery := queryManager.createQuery(qStr);
+  if (objQuery.execute.errorCode != tsOk) then
+  {
+    Message('Ошибка определения часов по нарядам '+ objQuery.errorCode,error);
+    sqlFreeStr(qStr);
+    result := 0.0;
+  }
+  else
+  {
+    oResultSet := objQuery.getResultSet;
+    if (oResultSet.getFirst = tsOk) then
+    {
+      dNar := oResultSet.row.val('dNar');
+    }
+    sqlFreeStr(qStr);
+    result := dNar;
+  }
+}
+
+Procedure GetTabHrs();
+{
+  var dH : double = 0.0;
+  if (InitWorkingTable)
+  {
+    _Loop tmpPodr
+    {
+      StartNewVisual(vtRotateVisual, vfTimer, 'Обработка лицевых счетов'#13 +
+                                              'Подразделение ' + tmpPodr.sPodr  , 0);
+
+      _Loop lSchet where ((tmpPodr.cPodr == lSchet.Cex))
+      {
+        dH := 0.0;
+        if (LoadWorkingTable(lSchet.nRec, Month(_dOtch), Year(_dOtch)) = 0)
+        {
+          dh := GetNarHrs(lSchet.tPerson);
+          if (dH = 0.0) then
+          {
+            continue;
+          }
+          else
+          {
+            ClearBuffer(#tmpHrs);
+              tmpHrs.cPodr := tmpPodr.cPodr;
+              tmpHrs.clSchet := lSchet.nRec;
+              tmpHrs.sTabN := lSchet.StrTabN;
+              tmpHrs.dTabHrs := WT_GetHoursBwDates(hkWorking+hkWeekend+hkOverwork, 0, 0, stActual, _dOtch, dEnd);
+              tmpHrs.dNarHrs := dH;
+            Insert Current tmpHrs;
+          }
+        }
+      }
+      StopVisual;
+    }
+  }
+  DoneWorkingTable;
+}
+
+Procedure CreateHead();
+{
+  var _s : string = '';
+
+  if (getFirst LastNumD where ((2003 == LastNumD.LndType)) = tsOk) then
+  {
+    _s := LastNumD.LndNum;
+  }
+
+  Update Current LastNumD Set LastNumD.LndNum := '0' + String(LongInt(_s) + 1);
+
+
+  ClearBuffer(#Sys_Nar);
+    Sys_Nar.nRec    := 0h;
+    Sys_Nar.MNREC   := LongInt(_s) + 1;
+    Sys_Nar.NMNEM   := 'Наряд №' + String(LongInt(_s) + 1);
+    Sys_Nar.NMPODR  := TimeToStr(Cur_Time(), 'HH:MM:SS');
+    Sys_Nar.CEX     := tmpPodr.cPodr;
+    Sys_Nar.PRKAUOT := 3;
+    Sys_Nar.CHOICE  := 3;
+    Sys_Nar.DATAN   := _dOtch;
+    Sys_Nar.DATOK   := _dEnd;
+  Insert Current Sys_Nar;
+
+  coSetAttr(coSys_Nar, Sys_Nar.nRec, '.Причина несоответствия' , 000A00000000037Ah, 'Указание причины не требуется');
+  coSetAttr(coSys_Nar, Sys_Nar.nRec, '.Шифр затрат на качество', 000A000000000F12h, 'Затраты на качество отсутствуют');
+  coSetAttr(coSys_Nar, Sys_Nar.nRec, 'Общий код брака'         , 0001000000000948h, 'Указание кода брака не требуется');
+}
+
+Procedure CreateBody();
+{
+  if ((tmpHrs.dTabHrs - tmpHrs.dNarHrs) <= 0.0) then
+  {
+    Exit;
+  }
+  ClearBuffer(#PrNaryad);
+    PrNaryad.nRec     := 0h;
+    PrNaryad.CEXOZ    := tmpPodr.cPodr;
+    PrNaryad.CPODR    := lSchet.cAppoint;
+    PrNaryad.MNREC    := Sys_Nar.nRec;
+    PrNaryad.VIDOPL	  := 7;
+    PrNaryad.VIDPREM  := 7;
+    PrNaryad.MES		  := Month(_dOtch);
+    PrNaryad.DATAN	  := _dOtch;
+    PrNaryad.DATOK	  := _dEnd;
+    PrNaryad.CHASF		:= tmpHrs.dTabHrs - tmpHrs.dNarHrs;
+    PrNaryad.SISOPL   := lSchet.SisOpl;
+    PrNaryad.TARIF    := lSchet.Tarif;
+    PrNaryad.CSCHETD  := lSchet.CSCHETD;
+    PrNaryad.CSUBSCHD := lSchet.CSUBSCHD;
+    PrNaryad.CKAUD[1]	:= lSchet.CKAUD[1];
+    PrNaryad.TBLD[1]	:= 7;
+    PrNaryad.TBLD[2]	:= 13;
+    PrNaryad.TBLD[3]	:= 5017;
+    PrNaryad.TBLD[4]	:= 10044;
+    PrNaryad.TBLD[5]	:= 10000;
+    PrNaryad.NRMTIME	:= tmpHrs.dTabHrs - tmpHrs.dNarHrs;
+    PrNaryad.CLSCH		:= lSchet.nRec;
+    PrNaryad.TPERSON	:= lSchet.tPerson;
+    PrNaryad.STRTABN	:= lSchet.strTabN;
+
+  Insert Current PrNaryad;
+
+  Update Current PrNaryad Set PrNaryad.CKAUD[6] := PrNaryad.nRec;
+}
+
+HandleEvent
+cmInit:
+{
+  //CreateTmpFlt();
+  //DelPick(cgKau_KatPodr, 'tmpFlt21');
+  //DelPick(cgKau_Zakaz  , 'tmpFlt21');
+
+  _sPeriod := sGetTune('UP.DATOTCH');
+  _dOtch := dGetTune('UP.DATOTCH');
+
+  if (getFirst FpPeriod where ((_dOtch == FpPeriod.dBeg and 4h == FpPeriod.ctPer)) = tsOk) then
+  {
+    set _dEnd := FpPeriod.dEnd;
+  }
+}
+
+cmPick:
+{
+  var _i : longint;
+  case CurField of
+    #_sPodr:
+    {
+      //DelPick(cgKau_KatPodr, 'tmpFlt21');
+      Delete All tmpPodr;
+      var _tmpMarkerName : string;
+      var stMarker       : longint;
+
+      if (iGetKau.GetCodeKau(cgiMulti, cgKau_KatPodr, _cPodr) <> 0) then
+      {
+        _tmpMarkerName := iGetKau.GetMarkerName(cgKau_KatPodr);
+        stMarker       := InitMarker(_tmpMarkerName, 8, 10, 100, true);
+        _i             := 0;
+        while getmarker(stMarker, _i, _cPodr)
+        {
+          //InsPick(cgKau_KatPodr, 'tmpFlt21', _cPodr);
+          if (getFirst KatPodr where ((_cPodr == KatPodr.nRec)) = tsOk) then
+          {
+            ClearBuffer(#tmpPodr);
+              set tmpPodr.cPodr := KatPodr.nRec;
+              set tmpPodr.sPodr := KatPodr.Kod;
+            Insert Current tmpPodr;
+          }
+          _i++;
+        }
+        DoneMarker(stMarker, _tmpMarkerName);
+      }
+      if (getFirst KatPodr where ((_cPodr == KatPodr.nRec)) = tsOk) then
+      {
+        set _sPodr := KatPodr.Kod + if((_i-1) > 0, ' и еще ' + string(_i-1), '');
+      }
+    }
+    #_sMnPlan:
+    {
+      /*DelPick(cgKau_Zakaz, 'tmpFlt21');
+      var _tmpMarkerName : string;
+      var stMarker       : longint;
+
+      if (iGetKau.GetCodeKau(cgiMulti, cgKau_Zakaz, _cMnPlan) <> 0) then
+      {
+        _tmpMarkerName := iGetKau.GetMarkerName(cgKau_Zakaz);
+        stMarker       := InitMarker(_tmpMarkerName, 8, 10, 100, true);
+        _i             := 0;
+        while getmarker(stMarker, _i, _cMnPlan)
+        {
+          InsPick(cgKau_Zakaz, 'tmpFlt21', _cMnPlan);
+          _i++;
+        }
+        DoneMarker(stMarker, _tmpMarkerName);
+      }
+      if (getFirst MnPlan where ((_cMnPlan == MnPlan.nRec)) = tsOk) then
+      {
+        set _sMnPlan := MnPlan.Number + if((_i-1) > 0, ' и еще ' + string(_i-1), '');
+      }*/
+      if (iGetKau.GetCodeKau(cgiPick, cgKau_Zakaz, _cMnPlan) <> 0) then
+      {
+        if (getFirst MnPlan where ((_cMnPlan == MnPlan.nRec)) = tsOk) then
+        {
+          set _sMnPlan := MnPlan.Number;
+          if (getFirst BuhSchet where ((MnPlan.cAnVal2 == BuhSchet.nRec)) = tsOk)
+          {
+            set _SchDt := SubStr(BuhSchet.Schet, 2, 2);
+          }
+        }
+      }
+
+    }
+  end;
+  ReReadRecord;
+}
+
+cmDelOnProtect:
+{
+  case CurField of
+    #_sPodr:
+    {
+      //DelPick(cgKau_KatPodr, 'tmpFlt21');
+      set _cPodr := 0h;
+      set _sPodr := '';
+      Delete All tmpPodr;
+    }
+    #_sMnPlan:
+    {
+      //DelPick(cgKau_Zakaz, 'tmpFlt21');
+      set _cMnPlan := 0h;
+      set _sMnPlan := '';
+    }
+  end;
+  ReReadRecord;
+}
+
+cmOk:
+{
+  GetTabHrs();
+  _Loop tmpPodr
+  {
+    StartNewVisual(vtRotateVisual, vfTimer, 'Создание нарядов'#13 +
+                                            'Подразделение ' + tmpPodr.sPodr  , 0);
+    CreateHead();
+    _Loop tmpHrs where ((tmpPodr.cPodr == tmpHrs.cPodr))
+    {
+      if (getFirst lSchet where ((tmpHrs.clSchet == lSchet.nRec)) = tsOk)
+      {
+        CreateBody();
+      }
+    }
+
+    StopVisual;
+  }
+}
+
+end;
+
+End.

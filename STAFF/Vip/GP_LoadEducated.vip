@@ -1,0 +1,356 @@
+/*************************************************************************************************\
+* Наименование: Импорт данных по обученным в базу Галактики из Excel                                               *
+* Контур/Модуль: Управление персоналом                                                                                *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#88246        |22/01/25|Семичев П.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+/* SD_88246
+Функционал формирование приказа по РД = 35 (Направление на обучение) на основе данных из Excel файла
+со списком обученных студентов
+*/
+
+#include UniqueNumberOfOrders.vih
+#define IntName GP_LoadEducated
+
+Interface #(IntName) 'Импорт данных по обученным в базу Галактики из Excel' EscClose, Gray;
+show at (,,63,6);
+
+var
+  ccCatType
+, ccCatKind
+, ccCatUnivers
+, ccCatThemMain : comp;
+  ssFile        : string;
+  oUNOO         : UniqueNumberOfOrders;  // объект для работы с нумерацией приказов
+//*****************************************************************************
+table struct tTemp
+(
+  cPerson : comp
+, sFio    : string
+, bErr    : boolean
+, dBegin  : date
+, dEnd    : date
+, iHours  : integer
+, cCatThem: comp
+, sThem   : string
+)
+with index
+(
+  i1 = bErr + sFio
+);
+
+//*****************************************************************************
+create view
+as select *
+from
+  TitleDoc
+, ContDoc
+, Education
+, PartDoc
+, Persons
+, Appointments
+, tTemp
+, Catalogs, Catalogs Catalogs2
+;
+
+Screen scrMain '' ;
+ notablenavigation;
+  fields
+    ssFile            : Protect, PickButton, {Font = {BackColor = if(Trim(ssFile) = '', ColorNeed, 0)}};
+  buttons
+    cmOk,,,'Сформировать Приказа РПД_35';
+    cmCancel,default,,'';
+  << 'Параметры формирования'
+  `Excel-файл:`     .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+           <. Импортировать .>           <. Отмена  .>
+  >>
+ end;
+
+function LoadData : byte;
+var bErr : boolean;
+    i, r1, r2, c1, c2: longInt;
+    sVal: string;
+    iVal : integer;
+{
+  Result := 4;
+
+  delete all from tTemp;
+
+  bErr := false;
+  _try
+  {
+    if not ExistFile(ssFile)
+    {
+      Message('Не найден файл: ' + ssFile);
+      exit;
+    }
+    if not xlOpenExcel(false)
+    {
+      Message('Ошибка инициализации Excel');
+      exit;
+    }
+    if not xlOpenWorkBook(ssFile)
+    {
+      Message('Не удалось открыть файл: ' + ssFile);
+      exit;
+    }
+    r1 := r2 := c1 := c2 := 0;
+    xlGetUsedRange(r1, c1, r2, c2);
+    StartNewVisual(vtIndicatorVisual, vfTimer,'Чтение данных...',r2 - 2);
+    xlReadMatrixFromExcel(1, 1, r2, c2);
+    for (i := 3; i <= r2; i++)
+    {
+      NextVisual;
+      xlReadFromMatrix(i, 2, sVal);
+      if sVal = ''
+        break;
+
+      ClearBuffer(#tTemp);
+      tTemp.sFio    := sVal;
+      tTemp.bErr    := false;
+      if getfirst fastfirstrow Persons where (('С' == Persons.ISEMPLOYEE and tTemp.sFio == Persons.Fio))=tsOK
+        tTemp.cPerson := Persons.nRec
+      else
+        tTemp.bErr    := true;
+
+      xlReadFromMatrix(i, 8, sVal);
+      tTemp.dBegin  := StrToDate(sVal, 'DD.MM.YYYY');
+      xlReadFromMatrix(i, 9, sVal);
+      tTemp.dEnd    := StrToDate(sVal, 'DD.MM.YYYY');
+
+      xlReadFromMatrix(i, 10, iVal);
+      tTemp.iHours  := iVal;
+
+      xlReadFromMatrix(i, 6, sVal);
+      tTemp.sThem   := sVal;
+      if Getfirst fastfirstrow Catalogs where ((0 == Catalogs.lpr and ccCatThemMain == Catalogs.MainLink and tTemp.sThem == Catalogs.Name))=tsOK
+        tTemp.cCatThem := Catalogs.nRec;
+      /*else
+        tTemp.bErr    := true;*/
+
+      insert current tTemp;
+    }
+  }
+  _finally
+  {
+    xlKillExcel;
+    StopVisual('',0);
+  }
+
+  if(RecordsInTable(#tTemp)=0)
+    Result := 3; //Вообще нет строк
+  else
+  {
+    if (getfirst tTemp where ((true == tTemp.bErr))!=tsOk)
+      Result := 0;//Ошибок нет
+    else
+    {
+      if (getfirst tTemp where ((false == tTemp.bErr))!=tsOk)
+        Result := 2;//Нет строк без ошибок
+      else
+        Result := 1;//часть строк с ошибками, часть без
+    }
+  }
+}
+
+function IntInter : boolean;
+{
+  Result := false;
+  Result := true;
+
+  ccCatType := ccCatKind := ccCatUnivers := ccCatThemMain :=0h;
+
+  if (getfirst Catalogs where ((712 == Catalogs.SysCode))=tsOK)
+    ccCatThemMain := Catalogs.nRec;
+
+  if (getfirst Catalogs where ((-24 == Catalogs.SysCode))=tsOK)
+    if (getfirst Catalogs2 where ((0 == Catalogs2.Lpr and Catalogs.nRec == Catalogs2.MainLink and
+                                   'Отдел оценки и обучения персонала АО "НПО Энергомаш"' == Catalogs2.Name))=tsOK)
+      ccCatUnivers := Catalogs2.nRec;
+
+  if (getfirst Catalogs where ((-15 == Catalogs.SysCode))=tsOK)
+    if (getfirst Catalogs2 where ((0 == Catalogs2.Lpr and Catalogs.nRec == Catalogs2.MainLink and 'Очная' == Catalogs2.Name))=tsOK)
+      ccCatType := Catalogs2.nRec;
+
+  if (getfirst Catalogs where ((-9 == Catalogs.SysCode))=tsOK)
+    if (getfirst Catalogs2 where ((0 == Catalogs2.Lpr and Catalogs.nRec == Catalogs2.MainLink and 'Повышение квалификации' == Catalogs2.Name))=tsOK)
+      ccCatKind := Catalogs2.nRec;
+
+/*  if (ccCatKind = 0h)
+  {
+    message('Не найден Вид образования "Повышение квалификации"');
+    Result := false;
+  }
+
+  if (ccCatType = 0h)
+  {
+    message('Не найдена Форма обучения "Очная"');
+    Result := false;
+  }
+
+  if (ccCatType = 0h)
+  {
+    message('Не найдена Форма обучения "Очная"');
+    Result := false;
+  }
+
+  if (ccCatUnivers = 0h)
+  {
+    message('Не найдено Учебное заведение Отдел оценки и обучения персонала АО "НПО Энергомаш"');
+    Result := false;
+  }  */
+}
+
+//Формирование Приказа об обучении
+procedure Crate_RPD35;
+var wMy, i, j : word;
+{
+  wMy := 35;
+  i := 0;
+  _loop tTemp where ((false == tTemp.bErr))
+    i++;
+
+  StartNewVisual(vtIndicatorVisual, vfTimer, 'Формирование приказа...', i);
+
+  ClearBuffer(#TitleDoc);
+  TitleDoc.DocDate  := Cur_Date;
+  TitleDoc.DocYear  := Year(TitleDoc.DocDate);
+  TitleDoc.DocNmb   := oUNOO.GetNmbPrWithYear(wMy, Year(TitleDoc.DocDate));
+  TitleDoc.DocText  := 'Направление на обучение';
+  insert current TitleDoc;
+
+  ClearBuffer(#PartDoc);
+  PartDoc.cDoc     := TitleDoc.Nrec;
+  PartDoc.TypeOper := wMy;
+  PartDoc.NRazd    := 1;
+  PartDoc.cRef2    := UserId;
+  insert current PartDoc;
+
+  j := 0;
+  _loop tTemp where ((false == tTemp.bErr)) ordered by tTemp.sFIO
+  {
+    j++;
+    NextVisual;
+    ClearBuffer(#ContDoc);
+    ContDoc.wYearPr  := 0;
+    ContDoc.wRec     := j;
+    ContDoc.cPart    := PartDoc.Nrec;
+    ContDoc.TypeOper := PartDoc.TypeOper;
+    ContDoc.NumPart  := PartDoc.NRazd;
+    ContDoc.Person   := tTemp.cPerson;
+    ContDoc.ObjType  := 1;
+    ContDoc.SeqNmb   := 1;
+    if (getlast Appointments where ((ContDoc.Person == Appointments.Person and 0 == Appointments.LPrizn and TitleDoc.DocDate >>= Appointments.AppointDate)) ) = tsOk
+    {
+      ContDoc.cStr := Appointments.nrec;
+      ContDoc.cDopRef := Appointments.Department;
+    }
+    //ContDoc.cNew6    := UserId;
+    insert current ContDoc;
+
+    ClearBuffer(#EDUCATION);
+    EDUCATION.cContDoc  := ContDoc.nRec;
+    EDUCATION.Level     := ccCatKind;//Вид образования
+    EDUCATION.Mode      := ccCatType;//форма обучения
+    EDUCATION.Name      := ccCatUnivers;//Учебное заведение
+    EDUCATION.FROMDATE  := tTemp.dBegin;
+    EDUCATION.TODATE    := tTemp.dEnd;
+    EDUCATION.NMB2      := tTemp.iHours;
+    EDUCATION.cAddInf1  := tTemp.cCatThem;//Тема обучения
+    insert current EDUCATION;
+
+  }
+
+  StopVisual('',0);
+
+  message('Сформирован Приказ №'+TitleDoc.DocNmb);
+}
+//*****************************************************************************
+HandleEvent
+cmInit :
+{
+  if not IntInter
+  {
+    abort;
+    exit;
+  }
+}
+
+cmPick:
+{
+  Case curfield of
+    #ssFile : Set ssFile := GetFileName('*.xls;*.xlsm;*.xlsx;*.xlt;*.xltm', 'Выберите файл-источник');
+  end;
+}
+
+cmDelOnProtect:
+{
+  Case curfield of
+    #ssFile : Set ssFile := '';
+  end;
+}
+
+cmOk:
+{
+  if (Trim(ssFile) = '')
+  {
+    message('Необходимо указать Файл, из которого выгружать данные');
+    exit;
+  }
+
+  case LoadData of
+    0: Crate_RPD35;
+    1: if (Message('По некоторым строкам не удалось определить Сотрудника. Создать приказ без них?', YesNo) = cmYes) Crate_RPD35;
+    2: Message('По всем строкам не удалось определить Сотрудника.');
+    3: Message('Нет данных для формирования приказа');
+    4: {/*прочая ошибка, сообщение не выводим*/};
+  end;
+
+  set ssFile := '';
+}
+
+end;
+end.
+
+#include UserReport.vih
+
+VipInterface UserReport_#(IntName) Implements IUserReport;
+Interface UserReport_#(IntName);
+
+Procedure Run;
+Begin
+  runinterface(#(IntName));
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'ЭМ. Импорт данных по обученным в базу Галактики из Excel';
+End;
+
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  /*Case Level of
+    1 : GetGroupName := 'Перенос затрат по зарплате с одного заказа на другой';
+  End;  */
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+end;
+
+End.

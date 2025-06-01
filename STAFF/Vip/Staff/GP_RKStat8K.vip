@@ -1,0 +1,1263 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                лист 8-К "Состояние работы с кадровым резервом"                                  *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#367          |29/05/18|Тищенко Р.Н.             |НПО Энергомаш                    *
+* Разработка  |#367          |20/07/18|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_RKStat.vih
+#include CatFunc.vih
+#include AppFuncs.vih
+#include Query.vih
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include GP_QueryBuilder.vih
+#include GP_UDR_RKStat.vih //potapov
+
+#define GPInt GP_RKStat_List8K // #(GPInt)
+#define GPNam 08-К "Состояние работы с кадровым резервом" ЭМ // #(GPNam)
+
+vipInterface #(GPInt) implements IGP_RKStat;
+
+interface #(GPInt);
+
+  // #include TotalOrganizationAttributes.var
+  const
+    APP_START = 0; // Назначение на начало отчётного периода
+    APP_MOVE  = 1; // Назначение перемещения в течение отчетного периода
+    RES_OWN_ORG = 0; // Тип организации в записи резерва = Собственная
+    RES_OTHER_ORG = 1; // Тип организации в записи резерва = Другая
+    DATA_TYPE_RESERVE = 0; // Тип данных - резерв
+    DATA_TYPE_CRITICAL = 1; // Тип данных - критические должности
+  end;
+
+  table struct SData
+  (
+    cFuturePost: comp, // Ссылка на cFuturePost
+    FIO: string,       // Фамилия Имя Отчество
+    Dat1: date,        // Дата зачисления
+    Dat2: date,        // Дата выбытия
+    AgeM: word,        // Возраст в месяцах
+    TimeInKRM: word,   // Время пребывания в кадровом резерве в месяцах
+    CRLevel: string,   // Код уровня КР
+    IsOtrRes: word,    // Признак отраслевого кадрового резерва
+    DataType: word     // Тип данных
+  )
+  with index
+  (
+    SData01 = FIO + Dat1 + Dat2
+  );
+
+  table struct SApp
+  (
+    cPerson: tNRec,  // Ссылка на Persons
+    DateBeg: date,   // Дата назначения
+    cApp: tNRec,     // Ссылка на назначение
+    AppRecType: byte // Тип записи (APP_START - на начало периода, APP_MOVE - перемещение)
+  )
+  with index
+  (
+    SApp01 = cPerson + AppRecType + DateBeg
+  );
+
+  table struct SEducation
+  (
+    cPerson: tNRec,      // Ссылка на Persons
+    DateBeg: date,       // Дата назначения
+    cEducation: tNRec,   // Ссылка на таблицу Education
+    Subject: string,     // Тема
+    Institution: string  // Название учебного заведения
+  )
+  with index
+  (
+    SEducation01 = cPerson + DateBeg
+  );
+
+  // Таблица, в которой сохраняется список работников, включенных в строку Row
+  table struct SRowPers
+  (
+    Row: byte,      // Номер строки
+    cPerson: tNRec  // Ссылка на Persons
+  )
+  with index
+  (
+    SRowPers01 = Row + cPerson
+  );
+
+  var
+    dRep: date;
+    dBeg: date;
+    iCatFunc: CatalogsFunctions;
+    iAppFuncs: AppointmentsFunctions;
+    oExtClass: IExtClass;
+    iQBuilder: GP_QueryBuilder new;
+    iUDR     : GP_UDR_RKStat; //potapov
+    ClOtrRes: word;
+    // sFullName: string;
+    sPodr1: string;
+    mPodr1: TPtr;
+    wPrintRash: word;
+    wToExistFile: word;
+    sToExistFile: string;
+    IsAborted: boolean;
+    // Общие показатели по форме 8-к
+    Val03: Integer;
+    Val04: Integer;
+    Val05: Integer;
+    Val07: Integer;
+    Val08: Integer;
+    Val09: Integer;
+    Val10: Integer;
+    Val11: Integer;
+    Val12: Integer;
+    Val161: Integer;
+    Val162: Integer;
+    Val17: Integer;
+    Val18: Integer;
+    Val20: Integer;
+    Val231: Integer;
+    Val232: Integer;
+
+  #include GP_Log.var
+
+  create view
+    var
+      pLevCatRezerv: tNRec;
+    as select
+      if(FuturePost.iPrizn = RES_OWN_ORG, StaffStruct.Department, FuturePost.cStaffStr) (FieldName = cPlanDep),
+      if(FuturePost.iPrizn = RES_OWN_ORG, StaffStruct.Post, FuturePost.cRef1) (FieldName = cPlanPost)
+    from
+      SData (SData01),
+      SApp (SApp01),
+      SEducation (SEducation01),
+      SRowPers,
+      Catalogs,
+      FuturePost,
+      StaffStruct,
+      Appointments (ApntByDate),
+      Education (EducByDate),
+      synonym Catalogs EduSubjectCat,
+      synonym Catalogs EduSubGrpCat,
+      synonym Catalogs ReasonCat,
+      synonym Education EducationR,
+      synonym Appointments AppointmentsR
+    where ((
+          SData.cFuturePost        == FuturePost.NRec
+      and FuturePost.cPers         == Persons.NRec
+      and FuturePost.cRef2         == ReasonCat.NRec
+      and FuturePost.cStaffStr     == StaffStruct.NRec
+      and FuturePost.cStaffStr     == CompetenceStaffStr.CSTAFFSTR
+      and Education.cAddInf1       == EduSubjectCat.NRec
+      and EduSubjectCat.cParent    == EduSubGrpCat.NRec
+      and SApp.cApp                == AppointmentsR.NRec
+      and SEducation.cEducation    == EducationR.NRec
+    ));
+
+  function sSetPodrName(mSetPdr: TPtr): string;
+  {
+    if (GetMarkerCount(mSetPdr) = 0)
+    {
+      result := 'Все подразделения';
+      exit;
+    }
+    else
+      if (GetMarkerCount(mSetPdr) = 1)
+      {
+        var cTmp: tNRec;
+        GetMarker(mSetPdr, 0, cTmp);
+        result := iCatFunc.GetCatalogsName(cTmp);
+      }
+      else
+        result := 'Несколько подразделений (' + To_Char(GetMarkerCount(mSetPdr)) + ')';
+  }
+
+  // Заполняет с помощью DirectSQL запроса таблицу SData
+  procedure FillSData;
+  {
+    if (IsAborted)
+      exit;
+    var Q: IQuery New;
+    Q := QueryManager.createQuery(SQLQuery(
+      SELECT
+        FuturePost.NRec as cFuturePost , // Ссылка на cFuturePost
+        Persons.FIO as FIO, // Фамилия Имя Отчество
+        FuturePost.Dat1 as Dat1, // Дата зачисления
+        FuturePost.Dat2 as Dat2, // Дата выбытия
+        0 as AgeM, // Возраст в месяцах
+        0 as TimeInKRM, // Время пребывания в кадровом резерве в месяцах
+        '' as CRLevel, // Код уровня КР
+        0 as IsOtrRes, // Признак отраслевого кадрового резерва
+        0 as DataType // Тип данных
+      FROM
+        FuturePost
+        INNER JOIN Persons ON Persons.NRec = FuturePost.cPers
+      WHERE
+            (FuturePost.Dat1 <> 0 AND FuturePost.Dat1 <= :(dRep))
+        AND (FuturePost.Dat2 = 0 OR FuturePost.Dat2 >= :(dBeg))
+        %Filter
+      ORDER BY
+        Persons.FIO, FuturePost.Dat1, FuturePost.Dat2
+    ));
+    // Если установлен фильтр по подразделению
+    var hStrFilter: longint = 0;
+    if (GetMarkerCount(mPodr1) > 0)
+      sqlAddStr(hStrFilter, iQBuilder.MakeCriteriaFromMarker('and Persons.Department ', mPodr1));
+    if (hStrFilter <> 0)
+    {
+      Q.setMacro('Filter', hStrFilter);
+      sqlFreeStr(hStrFilter);
+    }
+    if (Q.Execute.ErrorCode != 0)
+    {
+      oGP_Log.Error('Ошибка выполнения DSQL запроса (' + String(Q.ErrorCode) + ')');
+    }
+    else
+    {
+      var wErr: longint = SqlCopyInto(Q.getResultSet, tnSData, true);
+      if (wErr = 30003)
+        oGP_Log.Error('Обнаружена ошибка при отборе данных по реестрам' + chr(13) + 'Закройте все окна и повторите запуск');
+    }
+  }
+
+  procedure LocateLevCatRezerv;
+  {
+    pLevCatRezerv := 0;
+    if (getFirst Catalogs where ((100 == Catalogs.SysCode)) = tsOk)
+    {
+      var cMainLink: tNRec = Catalogs.NRec;
+      if (getFirst Catalogs where ((
+            0                          == Catalogs.LPr
+        and cMainLink                  == Catalogs.MainLink
+        and 'Уровни кадрового резерва' == Catalogs.Name
+      )) = tsOk)
+      {
+        pLevCatRezerv := Catalogs.NRec;
+      }
+    }
+  }
+
+  // Подсчитывает количество заявок в отраслевой кадровый резерв,
+  // поданных от организации за отчетный период
+  // Анализируются все записи справочника "Резерв", с учетом вложенных групп.
+  // Подсчитывается количество записей у которых к родительской записи привязан внешний
+  // классификатор "Отраслевой кадровый резерв" со значением "да" и в наименовании
+  // встречается фрагмент, равный отчетному году.
+  function CalcApplNumber(cParent: tNRec): Word;
+  {
+    result := 0;
+    if (cParent != 0)
+    {
+      PushPos(#Catalogs);
+      if (getFirst Catalogs where ((cParent == Catalogs.NRec)) = tsOk)
+      {
+        var ParentHasResAttr: boolean = (LoCase(oExtClass.GetSegCode(ClOtrRes, Catalogs.NRec)) = 'да');
+        var sYear: string = To_Char(Year(dRep));
+        _loop Catalogs where ((cParent == Catalogs.cParent))
+        {
+          // Если у родительской записи значение внешней классификации "Отраслевой кадровый резерв" = "да"
+          if (ParentHasResAttr)
+          {
+            // Если в наименовании встречается фрагмент, равный отчетному году
+            if (InStr(sYear, Catalogs.Name) > 0)
+            {
+              result++;
+            }
+          }
+          // Рекурсивно проверим вложенные записи
+          result += CalcApplNumber(Catalogs.NRec);
+        }
+      }
+      PopPos(#Catalogs);
+    }
+  }
+
+  // Функция вычисления возраста в полных месяцах
+  function CalcAge(BirthDate: date; CurDate: date): word;
+  {
+    result := 0;
+    if (BirthDate = ZeroDate)
+      exit;
+    if (CurDate < BirthDate)
+      exit;
+    var wMonths: word = Months_Between(CurDate, BirthDate);
+    var dAge   : date = add_months(BirthDate, wMonths);
+    if (dAge > CurDate)
+      wMonths--;
+    result := wMonths;
+/*
+    var FullYears: Byte = 0;
+    var FullMonths: Byte = 0;
+    var YC: word = Year(CurDate);
+    var YB: word = Year(BirthDate);
+    var MC: byte = Month(CurDate);
+    var MB: byte = Month(BirthDate);
+    var DC: byte = Day(CurDate);
+    var DB: byte = Day(BirthDate);
+    FullYears := YC - YB - 1;
+    if ((MC > MB) or (MC = MC and DC >= DB))
+      FullYears++;
+    if (MC > MB)
+      FullMonths := MC - MB;
+    else
+      if (MC < MB)
+        FullMonths := 12 - Month(BirthDate) + Month(CurDate)
+      else
+        if (DC >= DB)
+          FullMonths++;
+    result := FullYears * 12 + FullMonths;
+*/
+  };
+
+  // Преобразовывает возраст в месяцах в строку формата "XXX лет XX мес."
+  function AgeMToStr(_AgeM: Word): string;
+  {
+    result := '';
+    if (_AgeM > 0)
+    {
+      var FullYears: Byte = _AgeM div 12;
+      var FullMonths: Byte = _AgeM mod 12;
+      if (FullYears > 0)
+      {
+        result += To_Char(FullYears) + ' ';
+        case (FullYears mod 10) of
+          1: result += 'год';
+          2, 3, 4: result += 'года';
+          else
+            result += 'лет';
+        end;
+      }
+      result += if(result != '', ' ', '') + To_Char(FullMonths) + ' мес.';
+    }
+  }
+
+  // Вычисляет уровень кадрового резерва
+  function GelCRLevel: String;
+  {
+    result := '';
+    if (pLevCatRezerv >= 0)
+      if (getFirst Catalogs where ((
+            CompetenceStaffStr.cName == Catalogs.NRec
+        and pLevCatRezerv            == Catalogs.cParent (noIndex)
+      )) = tsOk)
+        result := Catalogs.Code;
+  }
+
+  procedure AddSApp(_AppRecType: byte);
+  {
+    ClearBuffer(#SApp);
+    SApp.cPerson := Persons.NRec;
+    SApp.DateBeg := Appointments.AppointDate;
+    SApp.cApp := Appointments.NRec;
+    SApp.AppRecType := _AppRecType;
+    if (insert current SApp != tsOk)
+      oGP_Log.Error('Не удалось добавить запись в таблицу SApp');
+  }
+
+  procedure AnalyseApp(var FoundMove: boolean; var DateOutMove: Date);
+  {
+    FoundMove := false;
+    DateOutMove := ZeroDate;
+    // Если этот работник уже раньше встречался в отчёте, повторно его назначения не обрабатываем
+    if (getFirst SApp where ((Persons.NRec == SApp.cPerson)) = tsOk)
+    {
+      if (getFirst SApp where ((Persons.NRec == SApp.cPerson and APP_MOVE == SApp.AppRecType)) = tsOk)
+        FoundMove := true;
+      exit;
+    }
+    // Определяем назначение работника на начало года
+    var _cCurApp: tNRec = iAppFuncs.GetAppNRec_OnDate(Persons.NRec, dBeg);
+    if (_cCurApp != 0)
+    {
+      if (getfirst Appointments where ((_cCurApp == Appointments.NRec)) = tsOK)
+        AddSApp(APP_START);
+      else
+        _cCurApp := 0;
+    }
+    // Проходим по всем назначениям работника за год
+    _loop Appointments where ((
+          Persons.NRec  == Appointments.Person
+      and 0             == Appointments.lPrizn
+      and dBeg         <<= Appointments.AppointDate
+    ))
+    {
+      if (Appointments.AppointDate > dRep)
+        break;
+      // Если рабоника принят в течении отчетного периода
+      if (_cCurApp = 0)
+      {
+        _cCurApp := Appointments.NRec;
+        AddSApp(APP_START);
+      }
+      else
+      {
+        AddSApp(APP_MOVE);
+        FoundMove := true;
+        // Если работник выбыл из кадрового резерва
+        if (SData.Dat2 != ZeroDate)
+          // Если еще не найдена дата первого назначения после выбытия из кадрового резерва
+          if (DateOutMove = ZeroDate)
+            if (Appointments.AppointDate >= SData.Dat2)
+              DateOutMove := Appointments.AppointDate;
+      }
+    }
+  }
+
+  // Возвращает тип данных
+  function GetDataType(_Age: Byte): byte;
+  {
+    // Тип данных - резерв
+    result := DATA_TYPE_RESERVE;
+    // Если возраст больше или равен 65
+    if (_Age >= 65)
+    {
+      // Определяем назначение работника на конец отчётного периода
+      var _cCurApp: tNRec = iAppFuncs.GetAppNRec_OnDate(Persons.NRec, dRep);
+      if (_cCurApp != 0)
+      {
+        if (getfirst Appointments where ((_cCurApp == Appointments.NRec)) = tsOK)
+          // Если для этой должности, заполнено значение внешней классификации "Отраслевой кадровый резерв", равное "Да"
+          if (LoCase(oExtClass.GetSegCode(ClOtrRes, Appointments.Post)) = 'да')
+            // Тип данных - критические должности 
+            result := DATA_TYPE_CRITICAL; 
+      }
+    }
+  }
+
+  function AnalyseEduc: boolean;
+  {
+    result := false;
+    // Если этот работник уже раньше встречался в отчёте, повторно его обучение не обрабатываем
+    if (getFirst SEducation where ((Persons.NRec == SEducation.cPerson)) = tsOk)
+    {
+      result := true;
+      exit;
+    }
+    var _Institution: string;
+    // Проходим по всем образованиям начиная с начала отчетного года
+    _loop Education where((Persons.NRec == Education.Person))
+    {
+       // Если образование закончено в отчетном году
+       if not (Education.ToDate != ZeroDate and Education.ToDate >= dBeg and Education.ToDate <= dRep)
+         continue;
+       _Institution := iCatFunc.GetCatalogsName(Education.Name);
+       // Если введена тема обучения
+       if (not IsValid(tnEduSubGrpCat))
+         continue;
+       // И тема обучения содержит слово "резерв"
+       if (InStr('резерв', EduSubGrpCat.Name) = 0)
+         continue;
+       // Если учебное заведение "АО ИПК Машприбор"
+       if (InStr('Машприбор', _Institution) = 0)
+         continue;
+       ClearBuffer(#SEducation);
+       SEducation.cPerson := Persons.NRec;
+       SEducation.DateBeg := Education.FromDate;
+       SEducation.cEducation := Education.NRec;
+       SEducation.Subject := EduSubjectCat.Name;
+       SEducation.Institution := _Institution;
+       if (insert current SEducation != tsOk)
+         oGP_Log.Error('Не удалось добавить запись в таблицу SEducation');
+       result := true;
+    }
+  }
+
+  // Возвращает true, если работник с NRec _cPerson уже включался в строку _Row
+  function IsPersonIncInRow(_cPerson: tNRec; _Row: byte): boolean;
+  {
+    result := (getFirst SRowPers where((
+         _Row == SRowPers.Row
+     and _cPerson == SRowPers.cPerson)) = tsOk);
+  }
+
+  // Запоминает, что работник с NRec _cPerson уже включался в строку _Row
+  procedure SetPersonIncInRow(_cPerson: tNRec; _Row: byte);
+  {
+    // ClearBuffer(#SRowPers); // Чистить нет нужды - все поля присваиваются
+    SRowPers.Row := _Row;
+    SRowPers.cPerson := _cPerson;
+    if (insert current SRowPers != tsOk)
+      oGP_Log.Error('Не удалось добавить запись в таблицу SRowPers');
+  }
+
+  // Увеличивает значение показателя _RowValue на значение _IncValue в случае, если работник
+  // с NRec _cPerson еще не включался в строку _Row
+  procedure AddIfUniq(_cPerson: tNRec; _Row: byte; var _RowValue: Integer; _IncValue: Integer);
+  {
+    if (not IsPersonIncInRow(_cPerson, _Row))
+    {
+      SetPersonIncInRow(_cPerson, _Row);
+      _RowValue += _IncValue;
+    }
+  }
+
+  // Расчет показателей по форме 8-к
+  procedure CalcValues;
+  {
+    Val03 := CalcApplNumber(ICatFunc.GetCatalogsNRec(2300));
+    Val04 := 0;
+    Val05 := 0;
+    Val07 := 0;
+    Val08 := 0;
+    Val09 := 0;
+    Val10 := 0;
+    Val11 := 0;
+    Val12 := 0;
+    Val161 := 0;
+    Val162 := 0;
+    Val17 := 0;
+    Val18 := 0;
+    Val20 := 0;
+    Val231 := 0;
+    Val232 := 0;
+    // Итого человек по собственной организации
+    var TotalPersOwn: Integer = 0;
+    // Суммарный возраст по собственной организации (в месяцах)
+    var TotalAgeM: longint = 0; //Integer = 0; // надо лонгинт иначе вылезает минус, превышение размера.
+    // Возраст: полных лет
+    var AgeY: byte = 0;
+    // Суммарное время нахождения в кадровом резерве (в месяцах)
+    var TotalTimeInKRM: Integer = 0;
+    // Найдено повышение квалификации
+    var FoundEduc: boolean = false;
+    // Найдено перемещение
+    var FoundMove: boolean = false;
+    // Дата назначения на должность после выбытия из кадрового резерва
+    var DateOutMove: Date = ZeroDate;
+    _loop fullcache SData
+    {
+      AnalyseApp(FoundMove, DateOutMove);
+      SData.AgeM := CalcAge(Persons.BornDate, dRep);
+      AgeY := SData.AgeM div 12;
+      SData.CRLevel := GelCRLevel;
+      if (IsValid(tnReasonCat))
+        SData.IsOtrRes := if(LoCase(oExtClass.GetSegCode(ClOtrRes, ReasonCat.cParent)) = 'да', 1, 0);
+      SData.DataType := GetDataType(AgeY);
+      // В поле Организация кадрового резерва, выбрано значение "собственная"
+      if (FuturePost.iPrizn = RES_OWN_ORG)
+      {
+        TotalPersOwn++;
+        // Подсчитываем суммарный возраст для расчета среднего возраста
+        TotalAgeM += SData.AgeM;//AgeM;
+        // Время нахождения в кадровом резерве (в месяцах) рассчитываем по тому же алгоритму, что и возраст
+        SData.TimeInKRM := CalcAge(SData.Dat1, if(DateOutMove != ZeroDate, DateOutMove, dRep));
+        TotalTimeInKRM += SData.TimeInKRM;
+      }
+      update current SData;
+      FoundEduc := AnalyseEduc;
+      // Отраслевой резерв и в наименовании основания зачисления встречается фрагмент, равный отчетному году
+      // if (SData.IsOtrRes = 1 and InStr(To_Char(Year(dRep)), ReasonCat.Name) > 0)
+      //   Val03++;
+      // В поле Организация кадрового резерва, выбрано значение "другая";
+      // дата зачисления лежит в пределах отчетного периода;
+      if (FuturePost.iPrizn = RES_OTHER_ORG and SData.Dat1 >= dBeg and SData.Dat1 <= dRep)
+        AddIfUniq(FuturePost.cPers, 4, Val04, 1);
+      // Тип данных - критические должности
+      if (SData.DataType = DATA_TYPE_CRITICAL)
+        AddIfUniq(FuturePost.cPers, 5, Val05, 1);
+      // В поле Организация кадрового резерва, выбрано значение "собственная"
+      if (FuturePost.iPrizn = RES_OWN_ORG)
+      {
+        if (not IsPersonIncInRow(FuturePost.cPers, 7))
+        {
+          SetPersonIncInRow(FuturePost.cPers, 7);
+          Val07++;
+          if (AgeY > 0)
+          {
+            if (AgeY <= 29)
+              Val08++;
+            else if (AgeY <= 39)
+              Val09++;
+            else if (AgeY <= 49)
+              Val10++;
+            else if (AgeY <= 59)
+              Val11++;
+            else if (AgeY >= 60)
+              Val12++;
+          }
+        }
+        // Есть завершенное в отчетном периоде повышение квалификации 
+        if (FoundEduc)
+          AddIfUniq(FuturePost.cPers, 17, Val17, 1);
+        // Дата выбытия лежит в пределах отчетного периода
+        if (SData.Dat2 != ZeroDate and SData.Dat2 >= dBeg and SData.Dat2 <= dRep)
+          // Основание не равно "назначение на целевую должность"
+          if (LoCase(ReasonCat.Name) != 'назначение на целевую должность')
+            AddIfUniq(FuturePost.cPers, 18, Val18, 1);
+        // Дата выбытия не заполнена, либо лежит в пределах отчетного периода
+        if (SData.Dat2 = ZeroDate or (SData.Dat2 >= dBeg and SData.Dat2 <= dRep))
+        {
+          // Есл были переводы в отчетом периоде
+          if (FoundMove)
+          {
+            AddIfUniq(FuturePost.cPers, 20, Val20, 1);
+          }
+          else
+            // или основание отчисления равно "назначение на целевую должность",
+            if (IsValid(tnReasonCat))
+            {
+              if (LoCase(ReasonCat.Name) = 'назначение на целевую должность')
+              {
+                AddIfUniq(FuturePost.cPers, 20, Val20, 1);
+              }
+            }
+        }
+      }
+    }
+    // Средний возраст работников, находящихся в кадровом резерве организации
+    if (TotalPersOwn > 0)
+    {
+       // Средний возраст в месяцах
+       var AvAgeM: integer = TotalAgeM div TotalPersOwn;
+       Val161 := AvAgeM div 12; // Полных лет
+       Val162 := AvAgeM mod 12; // Полных месяцев
+       // Подсчитываем среднее время назначения на должность работника из кадрового резерва
+       var AvTimeInKRM: integer = TotalTimeInKRM div TotalPersOwn;
+       Val231 := AvTimeInKRM div 12; // Полных лет
+       Val232 := AvTimeInKRM mod 12; // Полных месяцев
+    }
+  }
+
+  // Анализ данных
+  procedure Make8K;
+  {
+    IsAborted := false;
+    ClOtrRes := oExtClass.GetClassCode(coCatalogs, 'Отраслевой кадровый резерв');
+    dBeg := To_Date(1, 1, Year(dRep));
+    LocateLevCatRezerv;
+    FillSData;
+    CalcValues;
+  }
+
+  // Проверка наличия данных для вывода в отчёт
+  function isData8K: boolean;
+  {
+    if (RecordsInTable(#SData) > 0)
+      result := true
+    else
+      result := false;
+  }
+
+  // Заполнение закладки "8-К"
+  procedure Print8K;
+  {
+    var iRow: integer = 6;
+
+    if (isData8K)
+    {
+      if (xlSetActiveSheetByName('8-к'))
+      {
+        // Дата представления
+        xlSetCellDateValue(dRep, 2, 6, 2, 6);
+        // 2. Наименование / Предприятие
+        xlSetCellStringValue(Trim(sGetTune('MYORG')), 5, 3, 5, 3);
+        // 3. Количество заявок в отраслевой кадровый резерв, поданных от организации за отчетный период
+        xlSetCellNumberValue(Val03, 7, 3, 7, 3);
+        // 4. Численность работников организации, зачисленных в отраслевой кадровый резерв, поданных
+        // от организации за отчетный период
+        xlSetCellNumberValue(Val04, 8, 3, 8, 3);
+        // 5. Численность работников в возрасте 65 лет и старше, занимающих должности, на которые
+        // распространяется действие отраслевого кадрового резерва, чел. 
+        xlSetCellNumberValue(Val05, 9, 3, 9, 3);
+
+        // 7. Численность работников в кадровом резерве организации на последнюю дату отчетного периода, чел.
+        xlSetCellNumberValue(Val07, 11, 3, 11, 3);
+        // 8. Из строки 7 в возрасте до 29 лет, чел.;
+        xlSetCellNumberValue(Val08, 12, 3, 12, 3);
+        // 9. Из строки 7 в возрасте от 30 до 39 лет, чел.;
+        xlSetCellNumberValue(Val09, 13, 3, 13, 3);
+        // 10. Из строки 7 в возрасте от 40 до 49 лет, чел.;
+        xlSetCellNumberValue(Val10, 14, 3, 14, 3);
+        // 11. Из строки 7 в возрасте от 50 до 59 лет, чел.
+        xlSetCellNumberValue(Val11, 15, 3, 15, 3);
+        // 12. Из строки 7 в возрасте от 60 лет и старше, чел.
+        xlSetCellNumberValue(Val12, 16, 3, 16, 3);
+
+        // 13. Количество работников, планируемых ко включению в кадровый резерв организации в периоде,
+        // следующим за отчетным, чел. 
+        // не заполняется
+
+        // 16. Средний возраст работников, находящихся в кадровом резерве организации, лет, месяцев
+        xlSetCellNumberValue(Val161, 20, 3, 20, 3); // Лет
+        xlSetCellNumberValue(Val162, 20, 4, 20, 4); // Месяцев
+
+        // 17. Численность работников, завершивших обучение по программам кадрового резерва в
+        // АО "ИПК Машприбор" за отчетный период, чел. 
+        xlSetCellNumberValue(Val17, 21, 3, 21, 3);
+
+        // 18. Исключенных из кадрового резерва организации за отчетный период по всем основаниям, кроме
+        // назначения на целевую должность, чел.
+        xlSetCellNumberValue(Val18, 22, 3, 22, 3);
+
+        // 20. Количество работников из кадрового резерва организации, назначенных на какие-либо
+        // должности переводом внутри организации за отчетный период, чел.
+        xlSetCellNumberValue(Val20, 24, 3, 24, 3);
+
+        // 23. Среднее время назначения на должность работника из кадрового резерва, лет, месяцев
+        xlSetCellNumberValue(Val231, 27, 3, 27, 3); // Лет
+        xlSetCellNumberValue(Val232, 27, 4, 27, 4); // Месяцев
+      }
+    }
+  }
+
+  // Сохранение параметров формирования формы в DSK-файле
+  procedure Save8K;
+  {
+    iUDR.SaveMarker('RKS8_mPodr1', mPodr1);
+    iUDR.SaveDate  ('RKS8_dRep', dRep);
+    iUDR.SaveWord  ('RKS8_wToExistFile', wToExistFile);
+    iUDR.SaveString('RKS8_sToExistFile', sToExistFile);
+    iUDR.SaveWord  ('RKS8_wPrintRash', wPrintRash);
+    DoneMarker(mPodr1, '');
+/*
+    DoneMarker(mPodr1, 'RKS8_mPodr1_' + UserName());
+    SaveMyDsk(dRep, 'RKS8_dRep');
+    SaveMyDsk(wToExistFile, 'RKS8_wToExistFile');
+    SaveMyDsk(sToExistFile, 'RKS8_sToExistFile');
+    SaveMyDsk(wPrintRash, 'RKS8_wPrintRash');
+*/
+  }
+
+  procedure init8K;
+  {
+    //potapov b
+    set dRep := iUDR.ReadDate('RKS8_dRep');
+    if dRep = 0
+      set dRep := To_Date(31, 12, Year(Cur_Date));
+
+    set wPrintRash   := iUDR.ReadWord  ('RKS8_wPrintRash');
+    set sToExistFile := iUDR.ReadString('RKS8_sToExistFile');
+    set wToExistFile := iUDR.ReadWord  ('RKS8_wToExistFile');
+    if wToExistFile = 1 
+      ToggleFieldVisible(#sToExistFile,true )
+    else
+      ToggleFieldVisible(#sToExistFile,false);
+
+    mPodr1 := iUDR.ReadMarker('RKS8_mPodr1'); set sPodr1 := sSetPodrName(mPodr1);
+    //potapov e
+
+/* potapov
+    
+    if (not (ReadMyDsk(dRep, 'RKS8_dRep', false)))
+      set dRep := To_Date(31, 12, Year(Cur_Date));
+    if (not (ReadMyDsk(wToExistFile, 'RKS8_wToExistFile', false)))
+      set wToExistFile := 0;
+    if (wToExistFile = 1)
+      ToggleFieldVisible(#sToExistFile, true)
+    else
+      ToggleFieldVisible(#sToExistFile, false);
+    if (not (ReadMyDsk(sToExistFile, 'RKS8_sToExistFile', false)))
+      set sToExistFile := '';
+    if (not (ReadMyDsk(wPrintRash, 'RKS8_wPrintRash', false)))
+      set wPrintRash := 1;
+    mPodr1 := initMarker('RKS8_mPodr1_' + UserName(), 8, 1000, 100);
+    set sPodr1 := sSetPodrName(mPodr1);
+*/
+  }
+
+  function isCheckRepParam(isStayAlone: boolean): boolean;
+  {
+    result := false;
+    if (dRep = 0)
+    {
+      if (isStayAlone)
+        Message('Не задана дата!');
+      exit;
+    }
+    if (not (Day(dRep) = 31 and Month(dRep) = 12))
+    {
+      if (isStayAlone)
+        if (Message('Некорректно задана дата!'#13 +
+         'Отчет ежегодный.'#13 +
+         'Дата формирования отчета - последний день года.'#13 + 
+         'Продолжить?', YesNo) != Yes)
+        {
+           exit;
+        }
+    }
+    if (wToExistFile = 1)
+      if (not ExistFile(sToExistFile))
+      {
+        if (isStayAlone)
+          oGP_Log.Error('Не удалось открыть файл ' + sToExistFile);
+        exit;
+      }
+    result := true;
+  }
+  
+  window Win8KParamEx 'Параметры формирования. Лист 8-К.' Gray;
+    show at (,, 80, 6);
+
+    screen sEx(,,sci1Esc);
+      fields
+        dRep ('Дата формирования'): {font = {backColor = if(dRep = 0, colorNeed, 0)}}, noProtect;
+        sPodr1 ('Выбранные подразделения', hcStaffAppDepartment, sci13Esc):
+         {font = {backColor = if(sPodr1 = 'Не выбраны подразделения', colorNeed, 0)}}, protect, pickButton;
+      buttons
+        cmOk, default,, 'Запуск';
+        cmCancel,,, 'Выход';
+      << 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  <. ~С~охранить .>                                              <. ~З~акрыть .>
+      >>
+    end;
+
+    handleEvent
+      cmOK:
+      {
+        Save8K;
+        init8K;
+        if (not isCheckRepParam(true))
+          exit;
+        CloseWindowEx(CurWindow,cmDefault);
+      }
+      cmCancel:
+      {
+        Save8K;
+        CloseWindowEx(CurWindow,cmCancel);
+      }
+    end;
+
+  end;
+  
+  window Win8KParam 'Параметры формирования. Лист 8-К.' Gray;
+    show at (,, 80, 10);
+
+    Screen s1(,, sci1Esc);
+      fields
+        dRep ('Дата формирования'): {font = {backColor = if(dRep = 0, colorNeed, 0)}}, noProtect;
+        sPodr1 ('Выбранные подразделения', hcStaffAppDepartment, sci13Esc):
+         {font = {backColor = if(sPodr1 = 'Не выбраны подразделения', colorNeed, 0)}}, protect, pickButton;
+        wPrintRash ('Печать расшифровки'), noProtect;
+        wToExistFile('Добавить в существующий файл'), noProtect;
+        sToExistFile('Добавить в существующий файл',, scStaffKatPodrRefsPick):
+         {font = {backColor = if(sToExistFile = '', colorNeed, 0)}}, protect;
+      buttons
+        cmOk, default,, 'Запуск';
+        cmCancel,,, 'Выход';
+    << 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   [.] Печать расшифровки`
+
+   [.] Добавить в существующий файл`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  <. ~С~формировать .>                                           <. ~З~акрыть .>
+    >>
+    end;
+
+    HandleEvent
+      cmOK:
+      {
+        if (not isCheckRepParam(true))
+          exit;
+        CloseWindowEx(CurWindow, cmDefault);
+      }
+    end;
+  end;
+
+  function OpenNewRKS: boolean;
+  {
+    result := false;
+    sToExistFile := TranslatePath('%ClientStartPath%') +'XLS_ЭМ\Staff\RKStat.xltm';
+    if xlCreateExcelWithTemplate(sToExistFile, true)
+      result := true;
+  }
+
+  function OpenExistRKS: boolean;
+  {
+    result := false;
+    if (xlOpenExcel(true))
+    {
+      // только ради того, чтобы прибить Книгу1, которая непонятно чем открывается и висит 2 файла
+      if (xlGetActiveWorkBookName('Книга1'))
+        xlCloseWorkBookByName('Книга1');
+      if (xlOpenWorkBook(sToExistFile))
+        result := true;
+    }
+  }
+
+  function SetParam8K: boolean;
+  {
+    result := false;
+    if (RunWindowModal(Win8KParam) = cmDefault)
+      result := true;
+  }
+
+  // Возвращает код СЕ ШР + Наименование СЕ ШР
+  function GetDepDef(_cDep: tNRec): String;
+  {
+    if (getFirst Catalogs where((_cDep == Catalogs.NRec)) = tsOk)
+      result := Trim(Catalogs.Code + ' ' + Catalogs.Name);
+    else
+      result := '';
+  }
+
+  // Возвращает должность в формате: Наименование должности + код СЕ ШР + Наименование СЕ ШР
+  function GetPostDef(_cDep: tNRec; _cPost: tNRec; _FromDate: Date): String;
+  {
+    if (_FromDate != ZeroDate)
+      result := 'с ' + DateToStr(_FromDate, 'DD.MM.YYYY');
+    else
+      result := '';
+    result += if(result != '', ' ', '') + iCatFunc.GetCatalogsName(_cPost);
+    result += if(result != '', ' ', '') + GetDepDef(_cDep);
+  }
+
+  // Возвращает строку с описанием должности на начало отчетного периода или список должностей перемещений
+  function GetAppStr(_AppRecType: byte): string;
+  {
+    result := '';
+    _loop SApp where((Persons.NRec == SApp.cPerson and _AppRecType == SApp.AppRecType))
+    {
+      result += if(result != '', '; ', '') + GetPostDef(AppointmentsR.Department, AppointmentsR.Post,
+       AppointmentsR.AppointDate);
+    }
+  }
+
+  // Возвращает строку с описанием образования
+  function GetEducStr: string;
+  {
+    result := '';
+    _loop SEducation where((Persons.NRec == SEducation.cPerson))
+    {
+      // Дата окончания обучения + Наименование учебного заведения + Вид образования + Тема обучения
+      result += if(result != '', '; ', '') + DateToStr(EducationR.ToDate, 'DD.MM.YYYY') + ', ' + SEducation.Institution + ', ' 
+       + iCatFunc.GetCatalogsName(EducationR.Level) + ', ' + SEducation.Subject;
+    }
+  }
+
+  // Печать расшифровки
+  procedure PrintRash;
+  {
+    var NPP: longint;
+    var R, C: longint;
+    var FirstHeadRow, LastHeadRow: longint;
+    var FirstBodyRow, LastBodyRow: longint;
+    var FirstRow: longint;
+    var FirstCol, LastCol: longint;
+
+    FirstRow := 1;
+    FirstCol := 1;
+
+    StartNewVisual(vtNumericVisual, vfTimer + vfBreak + vfConfirm, 'Печать расшифровки.', 0);
+    NPP := 0;
+    R := FirstRow;
+    xlSetCellStringValue('Расшифровка листа 8-К. Данные на ' + DateToStr(dRep,'DD.MM.YYYY') + '.', R, 1, R, 1);
+    // Шапка отчета
+    R++;
+    FirstHeadRow := R;
+    LastHeadRow := FirstHeadRow;
+    FirstBodyRow := LastHeadRow + 1;
+    LastBodyRow := FirstBodyRow + RecordsInTable(#SData) - 1;
+    C := FirstCol - 1;
+
+    // № п/п
+    xlSetCellStringValue('№ п/п', R, ++C, R, C);
+    xlSetColumnWidth(6, R, C, R, C);
+    // Тип данных
+    xlSetCellStringValue('Тип данных', R, ++C, R, C);
+    xlSetColumnWidth(15, R, C, R, C);
+    // Табельный номер
+    xlSetCellStringValue('Табельный номер', R, ++C, R, C);
+    xlSetColumnWidth(10, R, C, R, C);
+    xlSetNumberFormat('@', FirstBodyRow, C, LastBodyRow, C);
+    xlAlignCellsEx(xlCenter, xlBottom, FirstBodyRow, C, LastBodyRow, C);
+    // ФИО
+    xlSetCellStringValue('ФИО', R, ++C, R, C);
+    xlSetColumnWidth(35, R, C, R, C);
+    // Дата приема на работу
+    xlSetCellStringValue('Дата приема на работу', R, ++C, R, C);
+    xlSetColumnWidth(10, R, C, R, C);
+    xlAlignCellsEx(xlCenter, xlBottom, FirstBodyRow, C, LastBodyRow, C);
+    // Дата увольнения
+    xlSetCellStringValue('Дата уволь-нения', R, ++C, R, C);
+    xlSetColumnWidth(10, R, C, R, C);
+    xlAlignCellsEx(xlCenter, xlBottom, FirstBodyRow, C, LastBodyRow, C);
+    // Дата рождения
+    xlSetCellStringValue('Дата рож-дения', R, ++C, R, C);
+    xlSetColumnWidth(10, R, C, R, C);
+    xlAlignCellsEx(xlCenter, xlBottom, FirstBodyRow, C, LastBodyRow, C);
+    // Возраст, лет
+    xlSetCellStringValue('Возраст, лет', R, ++C, R, C);
+    xlSetColumnWidth(8, R, C, R, C);
+    // Возраст, полных лет и месяцев
+    xlSetCellStringValue('Возраст, полных лет и месяцев на ' + DateToStr(dRep, 'DD.MM.YYYY'), R, ++C, R, C);
+    xlSetColumnWidth(15, R, C, R, C);
+    xlAlignCellsEx(xlCenter, xlBottom, FirstBodyRow, C, LastBodyRow, C);
+    // Организация
+    xlSetCellStringValue('Организация', R, ++C, R, C);
+    xlSetColumnWidth(50, R, C, R, C);
+    // Целевая должность
+    xlSetCellStringValue('Целевая должность', R, ++C, R, C);
+    xlSetColumnWidth(60, R, C, R, C);
+    // Уровень КР
+    xlSetCellStringValue('Уровень КР', R, ++C, R, C);
+    xlSetColumnWidth(9, R, C, R, C);
+    xlAlignCellsEx(xlCenter, xlBottom, FirstBodyRow, C, LastBodyRow, C);
+    // Дата зачисления в кадровый резерв
+    xlSetCellStringValue('Дата зачисления в кадровый резерв', R, ++C, R, C);
+    xlSetColumnWidth(10, R, C, R, C);
+    xlAlignCellsEx(xlCenter, xlBottom, FirstBodyRow, C, LastBodyRow, C);
+    // Дата выбытия из кадрового резерва
+    xlSetCellStringValue('Дата выбытия из кадрового резерва', R, ++C, R, C);
+    xlSetColumnWidth(10, R, C, R, C);
+    xlAlignCellsEx(xlCenter, xlBottom, FirstBodyRow, C, LastBodyRow, C);
+    // Время пребывания в кадровом резерве
+    xlSetCellStringValue('Время пребывания в кадровом резерве на ' + DateToStr(dRep, 'DD.MM.YYYY'), R, ++C, R, C);
+    xlSetColumnWidth(15, R, C, R, C);
+    xlAlignCellsEx(xlCenter, xlBottom, FirstBodyRow, C, LastBodyRow, C);
+    // Основание зачисления (выбытия) из кадрового 
+    xlSetCellStringValue('Основание зачисления (выбытия) из кадрового ', R, ++C, R, C);
+    xlSetColumnWidth(22, R, C, R, C);
+    // Должность на начало отчетного года
+    xlSetCellStringValue('Должность на начало отчетного года', R, ++C, R, C);
+    xlSetColumnWidth(60, R, C, R, C);
+    // Было перемещение
+    xlSetCellStringValue('Было перемещение', R, ++C, R, C);
+    xlSetColumnWidth(60, R, C, R, C);
+    // Обучение кадрового резерва
+    xlSetCellStringValue('Обучение кадрового резерва', R, ++C, R, C);
+    xlSetColumnWidth(60, R, C, R, C);
+    LastCol := C;
+
+    xlWrapText(FirstHeadRow, FirstCol, LastBodyRow, LastCol);
+    xlAlignCellsEx(xlCenter, xlTop, FirstHeadRow, FirstCol, LastHeadRow, LastCol);
+    // xlAutoFit(FirstBodyRow, FirstCol, LastBodyRow, LastCol);
+    xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin, 0, 0,
+     FirstHeadRow, FirstCol, LastBodyRow, LastCol);
+    // Тело отчета
+    _loop SData
+    {
+      if (not NextVisual)
+        break;
+      R++;
+      C := FirstCol - 1;
+      // № п/п
+      xlSetCellStringValue(++NPP, R, ++C, R, C);
+      // Тип данных
+      // для записей кадрового резерва выводится текст "Резерв"
+      // Для расшифровки строки 5, выводить текст "Критические должности"
+      xlSetCellStringValue(if(SData.DataType = DATA_TYPE_CRITICAL, 'Критические должности', 'Резерв'), R, ++C, R, C);
+      // Табельный номер
+      xlSetCellStringValue(GetStrTabN(Persons.TabNmb, Persons.StrTabN), R, ++C, R, C);
+      // ФИО
+      xlSetCellStringValue(Persons.FIO, R, ++C, R, C);
+      // Дата приема на работу
+      xlSetCellDateValue(Persons.AppDate, R, ++C, R, C);
+      // Дата увольнения
+      xlSetCellDateValue(Persons.DisDate, R, ++C, R, C);
+      // Дата рождения
+      xlSetCellDateValue(Persons.BornDate, R, ++C, R, C);
+      // Возраст, лет
+      xlSetCellStringValue(SData.AgeM div 12, R, ++C, R, C);
+      // Возраст, полных лет и месяцев
+      xlSetCellStringValue(if (FuturePost.iPrizn = RES_OWN_ORG, AgeMToStr(SData.AgeM), ''), R, ++C, R, C);
+      // Организация
+      xlSetCellStringValue(GetDepDef(cPlanDep), R, ++C, R, C);
+      // Целевая должность
+      xlSetCellStringValue(GetPostDef(cPlanDep, cPlanPost, ZeroDate), R, ++C, R, C);
+      // Уровень КР
+      xlSetCellStringValue(SData.CRLevel, R, ++C, R, C);
+      // Дата зачисления в кадровый резерв
+      xlSetCellDateValue(SData.Dat1, R, ++C, R, C);
+      // Дата выбытия из кадрового резерва
+      xlSetCellDateValue(SData.Dat2, R, ++C, R, C);
+      // Время пребывания в кадровом резерве
+      xlSetCellStringValue(AgeMToStr(SData.TimeInKRM), R, ++C, R, C);
+      // Основание зачисления (выбытия) из кадрового 
+      xlSetCellStringValue(ReasonCat.Name, R, ++C, R, C);
+      // Должность на начало отчетного года
+      xlSetCellStringValue(GetAppStr(APP_START), R, ++C, R, C);
+      // Было перемещение
+      xlSetCellStringValue(GetAppStr(APP_MOVE), R, ++C, R, C);
+      // Обучение кадрового резерва
+      xlSetCellStringValue(GetEducStr, R, ++C, R, C);
+    }
+    StopVisual;
+  }
+
+  procedure PrintRepPage(isStayAlone: boolean);
+  {
+    var isOkFile: boolean = false;
+    var isDoRep: boolean = false;
+
+    oGP_Log.Init('#(GPInt).log', true, true, true);
+    init8K;
+
+    if (isStayAlone)
+      if (SetParam8K)
+        isDoRep := true;
+    if (not isStayAlone)
+      isDoRep := isCheckRepParam(true);
+
+    if (isDoRep)
+    {
+      Make8K;
+      if (isData8K)
+      {
+        if (isStayAlone)
+        {
+          if (wToExistFile = 0)
+            isOkFile := OpenNewRKS;
+          if (wToExistFile = 1)
+            isOkFile := OpenExistRKS;
+        }
+        else
+          isOkFile := true;
+
+        if (isOkFile)
+        {
+          Print8K;
+          if ((wPrintRash = 1) and isStayAlone)
+          {
+            var i, j: integer = 0;
+            var s: string = '';
+            xlGetSheetsCount(j);
+            while (i <= j)
+            {
+              xlSetActiveSheet(++i);
+              xlGetSheetName(i,s);
+              if (s = '8-к')
+                break;
+            }
+            xlSetActiveSheet(++i);
+            xlAddSheet;
+            xlSetSheetName(i, 'Расшифровка 8-к');
+            xlSetActiveSheet(i);
+            PrintRash;
+          }
+          xlSetActiveSheetByName('8-к');
+          if (wToExistFile = 0)
+          {
+            sToExistFile := '';
+          }
+          if (isStayAlone)
+            xlKillExcel;
+        }
+        else
+          if (isStayAlone)
+            Message('Проверьте наличие файла шаблона по пути EXE\XLS_ЭМ\Staff');
+      }
+      else
+        if (isStayAlone)
+          Message('Нет данных для отчета.');
+    }
+    Save8K;
+    oGP_Log.Done(true);
+    closeinterface(cmDefault);
+  }
+
+  //--------------------------------------------------------
+
+  function bSetRepParam: boolean;
+  {
+    result := false;
+    if RunWindowModal(Win8KParamEx)=cmDefault
+      result := true;
+  }
+
+  function GetReportName: string;
+  {
+    GetReportName := '#(GPNam) (ЭМ)';
+  }
+
+  function GetPriority: integer;
+  {
+    GetPriority := 6;
+  }
+
+  procedure initRKStatRepParam;
+  {
+    init8K;
+  }
+
+  function dRepOnDateParam: date;
+  {
+    dRepOnDateParam := dRep;
+  }
+
+  //--------------------------------------------------------
+
+  handleevent
+    cmInit:
+      PrintRepPage(true);
+    cmPick:
+      case CurField of
+        #sPodr1:
+          if (RunInterface('PickCatalogEx', -11, 0, 100, mPodr1) = cmDefault)
+            set sPodr1 := sSetPodrName(mPodr1);
+        #sToExistFile:
+          set sToExistFile := GetFileName('*.xls;*.xlsx;*.xlsm','Выбор файла...');
+      end;
+    cmDelOnprotect:
+      case CurField of
+        #sPodr1:
+        {
+          ClearMarker(mPodr1);
+          set sPodr1 := sSetPodrName(mPodr1);
+        }
+        #sToExistFile:
+          set sToExistFile := '';
+      end;
+    cmCheckField:
+      case CurField of
+        #wToExistFile:
+        {
+          if wToExistFile = 1
+            ToggleFieldVisible(#sToExistFile, true)
+          else
+            ToggleFieldVisible(#sToExistFile, false);
+        }
+      end;
+  end;
+
+end.
+//---------------------------------------------------------------------------------
+
+#include UserReport.vih
+
+vipInterface UserReport_#(GPInt)R Implements IUserReport;
+
+interface UserReport_#(GPInt)R;
+
+  procedure Run;
+  {
+    RunInterface(#(GPInt));
+  }
+
+  function GetReportName: string;
+  {
+    result := '#(GPNam) (ЭМ)';
+  }
+
+  Function GetGroupName (Level: word): string;
+  {
+    result := '';
+    case Level of
+      1: result := 'Формы "Роскосмоса"';
+    end;
+  }
+
+  function GetPriority: integer;
+  {
+    GetPriority := 3;
+  }
+
+  function VisibleInModule(Ind: byte): string;
+  {
+    result := '';
+    case Ind of
+      1: result := 'STAFFMAINMENU';
+    end;
+  }
+
+end.

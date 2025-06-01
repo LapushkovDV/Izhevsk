@@ -1,0 +1,804 @@
+#include userreport.vih
+#include adrFunc.vih
+#include RunStaj.vih         // Функции расчета стажей
+#include Contexts.vih // прикладные контексты
+
+#component "EM"
+const
+ coStrAllPodr = '--ВСЕ--';
+end;
+interface EM_Nachisl_ESOT 'Начисления с группировкой по ЕСОТ' gray
+Show at (,,43,5);
+
+table struct SRANGE
+(
+  NUM: longint,
+  BEGINNING: Date,
+  ENDING: Date,
+  CHANGE: comp
+)
+with index
+(
+  ByNUM = NUM,
+  ByCHANGE = CHANGE
+);
+
+table struct tReport
+(
+  Tabn           : string
+, lsNrec         : comp
+, cPerson        : comp
+, PodrUp         : string
+, Podr           : string
+, cPodr          : comp
+, Dolj           : string
+, cDolj          : comp
+, Kategor        : string
+, KategorKod     : word
+, YearN          : word
+, MesN           : word
+, SisOpl         : string
+, SisOplKod      : word
+, VidOplp        : word
+, Vyrabotka      : double
+, summa          : double
+)
+with index
+(
+  index0 = lsNrec + cPodr + cDolj + KategorKod + SisOplKod + YearN + MesN
+)
+;
+table struct tReportPers
+(
+  Tabn       : string
+, cPerson    : comp
+, lsNrec     : comp
+, PodrUp     : string
+, Podr       : string
+, cPodr      : comp
+, Dolj       : string
+, cDolj      : comp
+, Kategor    : string
+, KategorKod : word
+, YearN      : word
+, MesN       : word
+, SisOpl     : string
+, SisOplKod  : word
+
+, Vozrast        : word   // возраст
+, StajNaOrg      : string // стаж на предприятии
+, UrochTime      : double // Урочное время (часы)
+, SverhUrochTime : double // Сверх. уроч. (часы)
+, VihodnTime     : double // Вых. дни (часы)
+, Vyrabotka      : double // Объем выработки (н/ч)
+, PlanNormTime   : double // Плановая норма рабочего времени
+
+)
+with index
+(
+ index0 = lsNrec + cPodr + cDolj + KategorKod + SisOplKod + YearN + MesN
+)
+;
+table struct tColumns
+(
+   name      : string
+ , nppColumn : word
+ , nrec      : comp
+ , cParent   : comp
+ , TypeRec   : byte
+ , Summa     : double
+ , VidOplp   : word
+)
+with index
+(
+   index0 = nppColumn
+ , index1 = nrec + TypeRec
+ , index2 = Vidoplp + TypeRec
+)
+;
+create view
+
+var
+    CS: IContextSession;
+
+   iRunStaj   : RunStaj;             // Переменная типа интерфейс RunStaj
+
+   _logFile
+ , _fPodr : string = '';
+   _DateBeg
+ , _DateEnd : date;
+
+  _cCatStajOnOrg : comp;
+
+  _nppColumn : word;
+
+   SelectedRange           : longint;
+   SelectedChange          : comp;
+   SelectedRangeFirstDay   : byte;
+
+select
+tReport.lsnrec
+from
+   exclassseg ecs
+ , exclassval ecv
+ , klvidopl kvo
+ , Catalogs
+ , Persons
+
+ , tReport
+ , tColumns
+ , tColumns tColumns1
+ , tReportPers
+ , SRANGE
+ , SRANGE SRANGE2
+;
+
+screen scr 'Начисления с группировкой по ЕСОТ' ('Параметры отчета',,sci13Esc);
+  fields
+  _DateBeg  , noprotect;
+  _DateEnd  , noprotect;
+  _fPodr   , protect, PickButton;
+ buttons
+    cmOk    , ,, 'Сформировать' ,,;
+    cmCancel, ,, 'Отмена' ,,;
+<<'Начисления с группировкой по ЕСОТ'
+
+    В период с:.@@@@@@@@@@  по:.@@@@@@@@@@
+
+ Подразделения: .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    <.Сформировать.>     <.  Отмена  .>
+
+>>
+end;
+
+Procedure myLog(_STR : string);
+{
+  if wgettune('NPOEM_OWN.TIMELOG') = 0 then exit ;
+ if _logFile = '' then _logFile := GetStringParameter('Files','OutputFilesDirectory',0)  + '\EM_Nachisl_ESOT'+DateToStr(cur_date,'_YYYYMMDD_')+'_'+timetostr(Cur_time,'HHMMSS')+'.log';
+ LogStrtofile(_logFile, shortstrtowin(_STR));
+}
+#include EM_Nachisl_ESOT_PrintToExcel.vpp
+procedure MysqlAddStr(var query_handle: longInt; add_query_str: string);
+{
+  sqlAddStr(query_handle, add_query_str);
+  MyLog(add_query_str);
+}
+
+
+procedure SelectCurrentRange;
+{
+  SelectedRange := SRANGE.NUM;
+  set SelectedChange := SRANGE.CHANGE;
+//    set SelectedRangeFirstDay := if((SelectedRange = -1) and (RecordsInTable(#SRANGE) = 1), 0, AD_DayNo(SRANGE.BEGINNING));
+}
+
+ procedure SetupDayMask(FirstDay, LastDay: byte; Enabled: boolean = true);
+  {
+    var I: byte;
+    for(I := FirstDay; I <= LastDay; I++)
+      WT_SetupDayMask(I, Enabled);
+  }
+
+
+//------------------------------------------------------------------------------
+// Вычисляет необходимость установки на табель фильтра по переходу в м/п
+// Возвращает true, если необходимо пересчитать суммарные величины
+// Несовпадение текущего подразделения, если по нему установлен фильтр,
+// и подразделения, прописанного в табеле есть признак необходимости установки
+// фильтра
+//------------------------------------------------------------------------------
+procedure UpdateChangeFilter;
+  {
+    var AttributeFilter: byte;
+    var AttributeFilterValue: comp;
+
+    AttributeFilterValue := 0;
+    AttributeFilter := WT_GetAttributeFilter(AttributeFilterValue);
+
+
+
+      WT_ReSetFilter;
+      WT_UndoDayMask;
+
+      if SelectedChange <> -1 then WT_SetAttributeFilter(wtaChange, SelectedChange);
+
+      SetupDayMask(1, 31, false);
+
+      if SelectedRange = -1 {
+        // все доступные
+        _loop SRANGE2 where ((0 <<= SRANGE2.NUM))
+          SetupDayMask(AD_DayNo(SRANGE2.BEGINNING), AD_DayNo(SRANGE2.ENDING));
+      }
+      else {
+        if getfirst SRANGE2 where ((SelectedRange == SRANGE2.NUM)) = tsOk
+         {
+//          MyLog('getfirst SRANGE2 where ((SelectedRange == SRANGE2.NUM '+SRANGE2.BEGINNING +' ' +SRANGE2.ENDING);
+          SetupDayMask(AD_DayNo(SRANGE2.BEGINNING), AD_DayNo(SRANGE2.ENDING));
+         }
+      }
+
+      WT_ApplyDayMask;
+
+  } // procedure UpdateChangeFilter
+
+
+procedure ReReadWorkingTable;
+{
+
+    LoadWorkingTable(tReportPers.lsNrec, tReportPers.MESN, tReportPers.YEARN);
+//   mylog('ReReadWorkingTable ' + tReportPers.Tabn)   ;
+    // Настройка для вычисления параметров ЛС по дню текущего месяца табеля
+    PA_Assign(tReportPers.lsNrec);
+    PA_SetMonthYear(tReportPers.MESN, tReportPers.YEARN);
+
+    WT_LoadPeriods(cfChanges or cfDisregardHired);
+
+    delete all SRANGE;
+
+    var P: integer;
+    var PeriodBeginning: date;
+    var PeriodEnding: date;
+    var _Change: comp;
+
+    for(P := 0; P < WT_GetPeriodCount; P++)
+    {
+//      MyLog('for(P := 0; P < WT_GetPeriodCount; P++) ' + p );
+      if WT_GetPeriod(P, PeriodBeginning, PeriodEnding)
+      {
+//       MyLog('WT_GetPeriod(P, PeriodBeginning, PeriodEnding) ' + PeriodBeginning+ ' '+ PeriodEnding);
+        _Change := PA_Perexod(PeriodBeginning);//WT_GetChange(AD_DayNo(PeriodBeginning));
+        insert SRANGE set
+          SRANGE.NUM := RecordsInTable(#SRANGE) + 1
+          , SRANGE.BEGINNING := PeriodBeginning
+          , SRANGE.ENDING := PeriodEnding
+          , SRANGE.CHANGE := _Change
+          ;
+      }
+    }
+
+    if (RecordsInTable(#SRANGE) > 1) or (RecordsInTable(#SRANGE) = 0)
+    {
+      var ChangeCount: byte;
+      var MinBeginning: date;
+      var MaxEnding: date;
+
+      ChangeCount := 0;
+      _Change := -1;
+
+      MinBeginning := AM_LastDate(tReportPers.MESN, tReportPers.YEARN);
+      MaxEnding := AM_FirstDate(tReportPers.MESN, tReportPers.YEARN);
+
+      _loop SRANGE2 ordered by SRANGE2.CHANGE{
+        if _Change <> SRANGE2.CHANGE {
+          _Change := SRANGE2.CHANGE;
+          ChangeCount++;
+        }
+
+        if MinBeginning > SRANGE2.BEGINNING
+          MinBeginning := SRANGE2.BEGINNING;
+        if MaxEnding < SRANGE2.ENDING
+          MaxEnding := SRANGE2.ENDING
+      }
+
+      // есть ссылки на несколько переходов, в том числе и на основной период
+      if (ChangeCount > 1)
+        _Change := -1;
+      insert SRANGE set
+          SRANGE.NUM       := -1
+        , SRANGE.CHANGE    := _Change
+        , SRANGE.BEGINNING := MinBeginning
+        , SRANGE.ENDING    := MaxEnding
+       ;
+    }
+//        tReportPers.cntDaysMonth := last_day(date(01,tReportPers.MESN, tReportPers.YEARN))
+
+    _loop SRANGE
+     {
+//     MyLog('_loop SRANGE ' + SRANGE.BEGINNING + ' ' + SRANGE.ENDING + ' ' + SRANGE.CHANGE);
+
+      SelectCurrentRange;
+      UpdateChangeFilter;
+
+   var _hoursWorkingPlan, _hoursWorking,  _hoursOverWork, _hoursWeekEnd : double = 0;
+/* пока только часы считаем
+   var  _daysWorkingPlan, _daysWorking, _daysOverWork, _daysWeekEnd,
+      _daysWorkingPlan  :=  WT_GetDays(dkWorking, stPlanned);
+      _daysWorking  :=  WT_GetDays(dkWorking, stActual);
+      _daysOverWork  := WT_GetDays(dkOverWork, stActual);
+      _daysWeekEnd  := WT_GetDays(dkWeekEnd, stActual);
+*/
+      _hoursWorkingPlan := WT_GetHours(hkWorking, stPlanned);
+      _hoursWorking := WT_GetHours(hkWorking, stActual);
+      _hoursOverWork := WT_GetHours(hkOverWork, stActual);
+      _hoursWeekEnd := WT_GetHours(hkWeekEnd, stActual);
+
+/*      MyLog('_hoursWorkingPlan = ' + _hoursWorkingPlan
+           +'_hoursWorking = ' + _hoursWorking
+           +'_hoursOverWork = ' + _hoursOverWork
+           +'_hoursWeekEnd = ' + _hoursWeekEnd
+           );
+*/
+//     MyLog('_loop SRANGE _days ='+  _days);
+//     MyLog('_loop SRANGE _hours=' + _hours);
+
+      if SRANGE.NUM = -1
+       {
+//        tReportPers.TotalDays  += _days;
+//        tReportPers.TotalHours += _hours;
+       }
+       else
+       {
+         // тепероь проверим все фильтры, т.е. попытаемся учесть все переходы.. сравниваем подразделения, должности, категории, систему оплаты
+/*
+      MyLog('  tReportPers.cPodr      = ' +tReportPers.cPodr      + ' | PA_DepartmentOnDay(SRANGE.BEGINNING)  =' +PA_DepartmentOnDay(SRANGE.BEGINNING));
+      MyLog('  tReportPers.cDolj      = ' +tReportPers.cDolj      + ' | PA_AppointmentOnDay(SRANGE.BEGINNING) =' +PA_AppointmentOnDay(SRANGE.BEGINNING));
+      MyLog('  tReportPers.KategorKod = ' +tReportPers.KategorKod + ' | PA_CategoryOnDay(SRANGE.BEGINNING)    =' +PA_CategoryOnDay(SRANGE.BEGINNING));
+      MyLog('  tReportPers.SisOplKod  = ' +tReportPers.SisOplKod  + ' | PA_PaymentModeOnDay(SRANGE.BEGINNING) =' +PA_PaymentModeOnDay(SRANGE.BEGINNING));
+*/
+
+
+         if tReportPers.cPodr      <> PA_DepartmentOnDay(SRANGE.BEGINNING)  then continue;
+         if tReportPers.cDolj      <> PA_AppointmentOnDay(SRANGE.BEGINNING) then continue;
+         if tReportPers.KategorKod <> PA_CategoryOnDay(SRANGE.BEGINNING)    then continue;
+         if tReportPers.SisOplKod  <> PA_PaymentModeOnDay(SRANGE.BEGINNING) then continue;
+
+          tReportPers.UrochTime      := tReportPers.UrochTime      + _hoursWorking;   // Урочное время (часы)
+          tReportPers.SverhUrochTime := tReportPers.SverhUrochTime + _hoursOverWork;   // Сверх. уроч. (часы)
+          tReportPers.VihodnTime     := tReportPers.VihodnTime     + _hoursWeekEnd;    // Вых. дни (часы)
+          tReportPers.PlanNormTime   := tReportPers.PlanNormTime   + _hoursWorkingPlan;// Плановая норма рабочего времени
+/*          case PA_OperatingModeOnDay(SRANGE.BEGINNING) of
+           13, 34-36,43, 61, 90-95, 119, 124-125 : {
+                   tReport.TotalDays6 += _days;
+                   tReport.TotalHours6 +=_hours;
+                 }
+           else {// 5 dnevka
+                   tReport.TotalDays5 += _days ;
+                   tReport.TotalHours5 +=_hours;
+                }
+           end;
+*/
+       }
+     }
+    update current tReport;
+  } // procedure ReReadWorkingTabl
+
+
+function getStajOnOrg(_cPerson: comp) : string;
+{
+   result := iRunStaj.NGetStajYears(_cPerson, _cCatStajOnOrg, Cur_Date) + 'г. '+ iRunStaj.NGetStajMonths(_cPerson, _cCatStajOnOrg, Cur_Date) + 'мес.'
+}
+
+function GetTableName(kodKau : word) : string;
+{
+ result := 'tblFilt_'+string(kodKau)
+}
+
+function CreateTMPFiltTable(kodKau : word) : boolean;
+{
+  result := false;
+//  _fMC := _fPodr := _fMOL := _fParty := co_strAll;
+MyLog('CreateTMPFiltTable: ' + kodKau );
+  var strID   : LongInt;  strID   := 0;
+  sqlFreeStr(strID);
+  strID:=0;
+    var lKauMar :longint= InitMarker(iGetKau.GetMarkerName(kodKau), 8, 100, 10);
+    var lKol:longint=GetMarkerCount(lKauMar);
+        if lKol<>0
+        {
+        MyLog('CreateTMPFiltTable : lKol = ' + lKol );
+            var tablename : string= GetTableName(kodKau);
+            sqlAddStr(strID, 'table '+tablename);
+            sqlAddStr(strID, '(');
+            sqlAddStr(strID, ' cRec: comp');
+            sqlAddStr(strID, ')');
+            sqlAddStr(strID, 'with index');
+            sqlAddStr(strID, '(');
+            sqlAddStr(strID, ' a0 = cRec');
+            sqlAddStr(strID, ');');
+            sqlDropTmpTable(tablename);
+
+            if sqlCreateTmpTable(strID, ctmNormal) = tsOk
+            {
+                 var lIdx : longint =0;
+                  while lIdx < lKol
+                  {
+                    var _crec : comp = 0h;
+                    GetMarker(lKauMar, lIdx, _crec);
+                    sqlExecDirect('INSERT INTO '+tablename+' (cRec) VALUES (#comp('+string(_crec)+'))');
+                    MyLog('CreateTMPFiltTable : ' + 'INSERT INTO '+tablename+' (cRec) VALUES (#comp('+string(_crec)+'))' );
+                    lIdx++;
+                  }
+              result := true;
+            }
+        }
+   donemarker(lKauMar,iGetKau.GetMarkerName(kodKau));
+}
+
+Procedure FillDataSQL;
+{
+   var CL: ContextList;
+   if ((not CL.Add(CS, 'WorkingTable'))
+       or (not CL.Add(CS, 'PADetailsUtils')))
+     {
+       message('ERROR!! Инициализация табеля учета рабочего времени',error);
+       exit;
+     }
+
+delete all tReport;
+   var hstr : longint = 0;
+  setvisualheader('Просмотр начислений за период');
+    MysqlAddStr(hstr, ' select                                                                              ');
+    MysqlAddStr(hstr, '   Tabn                                                                              ');
+    MysqlAddStr(hstr, ' , lsNrec                                                                            ');
+    MysqlAddStr(hstr, ' , cPerson                                                                            ');
+    MysqlAddStr(hstr, ' , PodrUp                                                                            ');
+    MysqlAddStr(hstr, ' , Podr                                                                              ');
+    MysqlAddStr(hstr, ' , cPodr                                                                              ');
+    MysqlAddStr(hstr, ' , Dolj                                                                              ');
+    MysqlAddStr(hstr, ' , cDolj                                                                              ');
+    MysqlAddStr(hstr, ' , Kategor                                                                           ');
+    MysqlAddStr(hstr, ' , KategorKod                                                                           ');
+    MysqlAddStr(hstr, ' , YearN                                                                             ');
+    MysqlAddStr(hstr, ' , MesN                                                                              ');
+    MysqlAddStr(hstr, ' , SisOpl                                                                            ');
+    MysqlAddStr(hstr, ' , SisOplKod                                                                         ');
+    MysqlAddStr(hstr, ' , VidOplp                                                                           ');
+    MysqlAddStr(hstr, ' , Sum(Vyrabotka) as Vyrabotka                                                       '); // Объем выработки (н/ч) - объем (количество) выработанных работником нормо-часов с учетом сверхурочных и выходных из нарядов (chasf для 1,9,10 во) (для рабочих-сдельщиков и иных работников, работающих по нормированным заданиям, нарядам и т.д.) в отчетном месяце
+    MysqlAddStr(hstr, ' , Sum(Summa) as summa                                                               ');
+    MysqlAddStr(hstr, ' from                                                                                ');
+    MysqlAddStr(hstr, ' (                                                                                   ');
+    MysqlAddStr(hstr, ' select                                                                              ');
+    MysqlAddStr(hstr, '   ls.strtabn as Tabn                                                                ');
+    MysqlAddStr(hstr, ' , ls.nrec as lsNrec                                                                 ');
+    MysqlAddStr(hstr, ' , ls.TPERSON as cPERSON                                                             ');
+    MysqlAddStr(hstr, ' , case when length(podr.kod) = 3 then podr.kod else podrUp.kod end as PodrUp        ');
+    MysqlAddStr(hstr, ' , case when length(podr.kod) = 3 then '''' else podr.kod end as Podr                  ');
+    MysqlAddStr(hstr, ' , podr.nrec as cPodr                                                                ');
+    MysqlAddStr(hstr, ' , dolj.name          as Dolj                                                        ');
+    MysqlAddStr(hstr, ' , dolj.nrec          as cDolj                                                        ');
+    MysqlAddStr(hstr, ' , klkatego.NAIKAT    as Kategor                                                     ');
+    MysqlAddStr(hstr, ' , klkatego.kod       as KategorKod                                                  ');
+    MysqlAddStr(hstr, ' , SvO.YEarN as YearN                                                                ');
+    MysqlAddStr(hstr, ' , SvO.mesN as MesN                                                                  ');
+    MysqlAddStr(hstr, ' , klsisopl.NASISOPL as SisOpl                                                       ');
+    MysqlAddStr(hstr, ' , klsisopl.SISOPL as SisOplKod                                                      ');
+    MysqlAddStr(hstr, ' , kvo.VIDOPLP as VidOplp                                                             ');
+    MysqlAddStr(hstr, ' , Sum(case when kvo.VIDOPLP in (1,9,10) and svo.PROC = 0 then SvO.chasf else 0 end) as Vyrabotka     ');
+    MysqlAddStr(hstr, ' , Sum(SvO.Summa) as summa                                                           ');
+    MysqlAddStr(hstr, ' from sumvidop svo                                                                   ');
+    MysqlAddStr(hstr, '  left join katpodr podr on podr.nrec = svo.cexoz                                    ');
+    MysqlAddStr(hstr, '  left join katpodr podrUp on podrUp.nrec = Podr.CPODR                               ');
+if CreateTMPFiltTable(cgKau_KatPodr) then
+   {
+    MysqlAddStr(hstr, '     join ' + GetTAbleName(cgKau_KatPodr)+ ' on ' + GetTAbleName(cgKau_KatPodr)+'.crec = podr.nrec');
+   }
+    MysqlAddStr(hstr, '  left join catalogs Dolj on Dolj.nrec = svo.CAPPOINT                                ');
+    MysqlAddStr(hstr, '  left join KlKatego on klkatego.kod = svo.KATEG                                     ');
+    MysqlAddStr(hstr, '  left join klSisOpl on klsisopl.SISOPL = svo.SISOPL                                 ');
+    MysqlAddStr(hstr, '  left join lschet ls on ls.nrec = svo.CLSCH                                         ');
+    MysqlAddStr(hstr, '  left join klvidopl kvo on kvo.VIDOPLP = svo.VIDOPLP                                  ');
+    MysqlAddStr(hstr, ' where 1 + 256*SvO.mesN  +svo.yearN*256*256 between #date('+DateToStr(_DateBeg,'DD,MM,YYYY')+') and #date('+DateToStr(_DateEnd,'DD,MM,YYYY')+') ');
+    MysqlAddStr(hstr, '   and SvO.VIDOPLP <> 189 //lолг за предприятием не учитываем тут                     ');
+    MysqlAddStr(hstr, ' group by                                                                             ');
+    MysqlAddStr(hstr, '   ls.strtabn                                                                         ');
+    MysqlAddStr(hstr, ' , ls.nrec                                                                            ');
+    MysqlAddStr(hstr, ' , SvO.YEarN                                                                          ');
+    MysqlAddStr(hstr, ' , SvO.mesN                                                                           ');
+    MysqlAddStr(hstr, ' , case when length(podr.kod) = 3 then podr.kod else podrUp.kod end                   ');
+    MysqlAddStr(hstr, ' , case when length(podr.kod) = 3 then '''' else podr.kod end                           ');
+    MysqlAddStr(hstr, ' , dolj.name                                                                          ');
+    MysqlAddStr(hstr, ' , klkatego.NAIKAT                                                                    ');
+    MysqlAddStr(hstr, ' , klsisopl.NASISOPL                                                                  ');
+    MysqlAddStr(hstr, ' , klsisopl.SISOPL                                                                  ');
+    MysqlAddStr(hstr, ' , kvo.VIDOPLP                                                                        ');
+    MysqlAddStr(hstr, ' , dolj.nrec                                                                          ');
+    MysqlAddStr(hstr, ' , klkatego.kod                                                                       ');
+    MysqlAddStr(hstr, ' , podr.nrec                                                                          ');
+    MysqlAddStr(hstr, ' , ls.TPERSON                                                                         ');
+    MysqlAddStr(hstr, '                                                                                      ');
+    MysqlAddStr(hstr, ' union all                                                                            ');
+    MysqlAddStr(hstr, '                                                                                      ');
+    MysqlAddStr(hstr, ' select                                                                              ');
+    MysqlAddStr(hstr, '   ls.strtabn as Tabn                                                                ');
+    MysqlAddStr(hstr, ' , ls.nrec as lsNrec                                                                 ');
+    MysqlAddStr(hstr, ' , ls.TPERSON as cPERSON                                                             ');
+    MysqlAddStr(hstr, ' , case when length(podr.kod) = 3 then podr.kod else podrUp.kod end as PodrUp        ');
+    MysqlAddStr(hstr, ' , case when length(podr.kod) = 3 then '''' else podr.kod end as Podr                  ');
+    MysqlAddStr(hstr, ' , podr.nrec as cPodr                                                                ');
+    MysqlAddStr(hstr, ' , dolj.name          as Dolj                                                        ');
+    MysqlAddStr(hstr, ' , dolj.nrec          as cDolj                                                        ');
+    MysqlAddStr(hstr, ' , klkatego.NAIKAT    as Kategor                                                     ');
+    MysqlAddStr(hstr, ' , klkatego.kod       as KategorKod                                                  ');
+    MysqlAddStr(hstr, ' , SvO.YEarN as YearN                                                                ');
+    MysqlAddStr(hstr, ' , SvO.mesN as MesN                                                                  ');
+    MysqlAddStr(hstr, ' , klsisopl.NASISOPL as SisOpl                                                       ');
+    MysqlAddStr(hstr, ' , klsisopl.SISOPL as SisOplKod                                                       ');
+    MysqlAddStr(hstr, ' , kvo.VIDOPLP as VidOplp                                                             ');
+    MysqlAddStr(hstr, ' , Sum(case when kvo.VIDOPLP in (1,9,10) and svo.PROC = 0 then SvO.chasf else 0 end) as Vyrabotka     ');
+    MysqlAddStr(hstr, ' , Sum(SvO.Summa) as summa                                                           ');
+    MysqlAddStr(hstr, '                                                                                      ');
+    MysqlAddStr(hstr, ' from nachisl svo                                                                     ');
+    MysqlAddStr(hstr, '  left join katpodr podr on podr.nrec = svo.cexoz                                     ');
+    MysqlAddStr(hstr, '  left join katpodr podrUp on podrUp.nrec = Podr.CPODR                                ');
+if CreateTMPFiltTable(cgKau_KatPodr) then
+   {
+    MysqlAddStr(hstr, '     join ' + GetTAbleName(cgKau_KatPodr)+ ' on ' + GetTAbleName(cgKau_KatPodr)+'.crec = podr.nrec');
+   }
+    MysqlAddStr(hstr, '  left join catalogs Dolj on Dolj.nrec = svo.CAPPOINT                                 ');
+    MysqlAddStr(hstr, '  left join KlKatego on klkatego.kod = svo.KATEG                                      ');
+    MysqlAddStr(hstr, '  left join klSisOpl on klsisopl.SISOPL = svo.SISOPL                                  ');
+    MysqlAddStr(hstr, '  left join lschet ls on ls.nrec = svo.CLSCH                                          ');
+    MysqlAddStr(hstr, '  left join klvidopl kvo on kvo.VIDOPLP = svo.VIDOPL                                  ');
+    MysqlAddStr(hstr, ' where 1 + 256*SvO.mesN  +svo.yearN*256*256 between #date('+DateToStr(_DateBeg,'DD,MM,YYYY')+') and #date('+DateToStr(_DateEnd,'DD,MM,YYYY')+') ');
+    MysqlAddStr(hstr, '   and SvO.VIDOPL <> 189 //lолг за предприятием не учитываем тут                      ');
+    MysqlAddStr(hstr, ' group by                                                                             ');
+    MysqlAddStr(hstr, '   ls.strtabn                                                                         ');
+    MysqlAddStr(hstr, ' , ls.nrec                                                                            ');
+    MysqlAddStr(hstr, ' , SvO.YEarN                                                                          ');
+    MysqlAddStr(hstr, ' , SvO.mesN                                                                           ');
+    MysqlAddStr(hstr, ' , case when length(podr.kod) = 3 then podr.kod else podrUp.kod end                   ');
+    MysqlAddStr(hstr, ' , case when length(podr.kod) = 3 then '''' else podr.kod end                           ');
+    MysqlAddStr(hstr, ' , dolj.name                                                                          ');
+    MysqlAddStr(hstr, ' , klkatego.NAIKAT                                                                    ');
+    MysqlAddStr(hstr, ' , klsisopl.NASISOPL                                                                  ');
+    MysqlAddStr(hstr, ' , klsisopl.SISOPL                                                                  ');
+    MysqlAddStr(hstr, ' , kvo.VIDOPLP                                                                        ');
+    MysqlAddStr(hstr, ' , dolj.nrec                                                                          ');
+    MysqlAddStr(hstr, ' , klkatego.kod                                                                       ');
+    MysqlAddStr(hstr, ' , podr.nrec                                                                          ');
+    MysqlAddStr(hstr, ' , ls.TPERSON                                                                         ');
+    MysqlAddStr(hstr, ' ) t                                                                                  ');
+//    MysqlAddStr(hstr, '   where tabn in (''003752'',''002020'')                                                  ');
+    MysqlAddStr(hstr, ' group by                                                                             ');
+    MysqlAddStr(hstr, '   Tabn                                                                              ');
+    MysqlAddStr(hstr, ' , lsNrec                                                                            ');
+    MysqlAddStr(hstr, ' , cPerson                                                                            ');
+    MysqlAddStr(hstr, ' , PodrUp                                                                            ');
+    MysqlAddStr(hstr, ' , Podr                                                                              ');
+    MysqlAddStr(hstr, ' , cPodr                                                                              ');
+    MysqlAddStr(hstr, ' , Dolj                                                                              ');
+    MysqlAddStr(hstr, ' , cDolj                                                                              ');
+    MysqlAddStr(hstr, ' , Kategor                                                                           ');
+    MysqlAddStr(hstr, ' , KategorKod                                                                           ');
+    MysqlAddStr(hstr, ' , YearN                                                                             ');
+    MysqlAddStr(hstr, ' , MesN                                                                              ');
+    MysqlAddStr(hstr, ' , SisOpl                                                                            ');
+    MysqlAddStr(hstr, ' , SisOplKod                                                                         ');
+    MysqlAddStr(hstr, ' , VidOplp                                                                            ');
+
+
+  var objQuery: iQuery;
+      objQuery := queryManager.createQuery(hstr);
+
+    if objQuery.execute.errorCode != tsOk
+     then {MyLog('Ошибка выполнения запроса '+ objQuery.errorCode);
+           exit;
+          }
+        else
+        {sqlCopyInto(objQuery, tntReport, true);
+        }
+ delete all tReportPers;
+
+ StartNewVisual(vtIndicatorVisual , vfTimer + vfBreak ,'Группировка полученных начислений по перемещениям сотрудников'
+         +''#13''+'Просмотр табелей', recordsintable(tntReport));
+
+  _loop tReport
+  {
+    if not nextvisual then break;
+
+/*
+mylog('========================  Tabn       ' +tReport.Tabn +'|lsNrec = ' +tReport.lsNrec+'|cPerson = ' +tReport.cPerson+'|PodrUp = ' +tReport.PodrUp+'|Podr = ' +tReport.Podr
+  );
+mylog('|cPodr      ' +tReport.cPodr+
++'|Dolj = ' +tReport.Dolj
++'|cDolj = ' +tReport.cDolj
++'|Kategor = ' +tReport.Kategor
++'|KategorKod = ' +tReport.KategorKod
++'|YearN = ' +tReport.YearN
++'|MesN = ' +tReport.MesN
++'|SisOpl = ' +tReport.SisOpl
++'|SisOplKod = ' +tReport.SisOplKod
++'|VidOpl = ' +tReport.VidOpl
++'|Vyrabotka = ' +tReport.Vyrabotka
++'|summa = ' +tReport.summa
+);
+*/
+
+
+   if getfirst tReportPers where ((tReport.lsNrec     == tReportPers.lsNrec
+                               and tReport.cPodr      == tReportPers.cPodr
+                               and tReport.cDolj      == tReportPers.cDolj
+                               and tReport.KategorKod == tReportPers.KategorKod
+                               and tReport.SisOplKod  == tReportPers.SisOplKod
+                               and tReport.YearN      == tReportPers.YearN
+                               and tReport.MesN       == tReportPers.MesN
+                                  )) <> tsOK
+    then {
+         insert tReportPers set
+              tReportPers.Tabn       := tReport.Tabn
+            , tReportPers.lsNrec     := tReport.lsNrec
+            , tReportPers.PodrUp     := tReport.PodrUp
+            , tReportPers.Podr       := tReport.Podr
+            , tReportPers.cPodr      := tReport.cPodr
+            , tReportPers.Dolj       := tReport.Dolj
+            , tReportPers.cDolj      := tReport.cDolj
+            , tReportPers.Kategor    := tReport.Kategor
+            , tReportPers.KategorKod := tReport.KategorKod
+            , tReportPers.YearN      := tReport.YearN
+            , tReportPers.MesN       := tReport.MesN
+            , tReportPers.SisOpl     := tReport.SisOpl
+            , tReportPers.SisOplKod  := tReport.SisOplKod
+            , tReportPers.cPerson    := tReport.cPerson
+            , tReportPers.Vozrast    := if(getfirst persons where ((tReport.cPerson == persons.nrec)) = tsok,year(sub_date(cur_date,BORNDATE))-1,0)
+            , tReportPers.StajNaOrg  := getStajOnOrg(tReport.cPerson)
+          ;
+         ReReadWorkingTable;
+        }
+      update current tReportPers set tReportPers.Vyrabotka  := tReportPers.Vyrabotka + tReport.Vyrabotka;
+  }
+stopvisual;
+
+}
+
+procedure FillKlVidOplByExclassSeg(_cExClasssSeg : comp);
+{
+_loop ecv where ((      1021 == ecv.CLASSCODE
+           and _cExClasssSeg == ecv.CCLASSSEG ))
+ if getfirst KVO where ((ecv.CREC == kvo.nrec)) = tsOK
+ {
+  if getfirst tColumns1 where ((kvo.vidoplp == tColumns1.vidoplp
+                                     and 1 == tColumns1.TypeRec
+                             )) <> tsOK then
+   {
+
+    _nppColumn++;
+     insert tColumns1 set
+        tColumns1.name      := kvo.nVidOpl + ' ('+kvo.VidOplP+')'
+      , tColumns1.nppColumn := _nppColumn
+      , tColumns1.nrec      := kvo.nrec
+      , tColumns1.vidoplp   := kvo.vidoplp
+      , tColumns1.cParent   := _cExClasssSeg
+      , tColumns1.TypeRec   := 1 // Вид оплаты
+     ;
+      mylog('FillKlVidOplByExclassSeg ' +
+      +'|name = '+tColumns1.name
+      +'|nppColumn = '+tColumns1.nppColumn
+      +'|nrec = '+tColumns1.nrec
+      +'|cParent = '+ tColumns1.cParent
+      +'|TypeRec = '+ tColumns1.TypeRec
+      +'|vidoplp = ' + tColumns1.vidoplp
+      );
+
+   }
+ }
+}
+
+procedure FillDataExclasseg(_cGroup : comp);
+{
+  setvisualheader('Просмотр внешней классификации видов оплат');
+  _loop ecs where ((1021 == ecs.classcode and '' << ecs.name)) and ecs.cGroup = _cGroup
+   {
+    if(getfirst tColumns where ((ecs.nrec == tColumns.nrec
+                                    and 0 == tColumns.TypeRec// классификатор
+                               ))
+      ) <> tsOK
+       {
+         _nppColumn++;
+         insert tColumns set
+            tColumns.name      := ecs.name
+          , tColumns.nppColumn := _nppColumn
+          , tColumns.nrec      := ecs.nrec
+          , tColumns.cParent   := ecs.cGroup
+          , tColumns.TypeRec   := 0 // классификатор
+         ;
+          mylog('FillDataExclasseg ' +
+          +'|name = '+tColumns.name
+          +'|nppColumn = '+tColumns.nppColumn
+          +'|nrec = '+tColumns.nrec
+          +'|cParent = '+tColumns.cParent
+          +'|TypeRec = '+tColumns.TypeRec
+          +'|vidoplp = ' + tColumns.vidoplp
+              );
+
+          FillKlVidOplByExclassSeg(ecs.nrec);
+          pushpos(tnEcs);
+           FillDataExclasseg(ecs.nrec);
+          poppos(tnEcs);
+       }
+   }
+}
+handleevent
+cmDelOnProtect:
+ {
+   _fPodr   := coStrAllPodr;
+   rereadrecord;
+ }
+cmPick:{
+  case curfield of
+   #_fPodr : {
+        if iGetKau.GetCodeKau(cgiMulti + cgiNotClear, cgKau_KatPodr, 0h) > 0
+        {
+          var lKauMar :longint= InitMarker(iGetKau.GetMarkerName(cgKau_KatPodr), 8, 100, 10);
+          if GetMarkerCount(lKauMar) = 0
+            then set  _fPodr := coStrAllPodr
+            else set  _fPodr := 'Выбрано '+GetMarkerCount(lKauMar)
+           ;
+         donemarker(lKauMar,iGetKau.GetMarkerName(cgKau_KatPodr));
+        }
+     }
+  end;
+}
+cmInit:
+{
+ if getfirst catalogs where ((89 == catalogs.syscode)) <> tsOK
+  {
+    message('В каталоге не найдена системная запись catalogs.syscode = 89 "Стаж работы на предприятии"',error);
+    stop; abort; exit;
+  }
+
+  _cCatStajOnOrg :=catalogs.nrec;
+
+  _DateBeg := cur_date;
+  _DateEnd := cur_date;
+  _fPodr   := coStrAllPodr; // = '--ВСЕ--'
+}
+
+cmok:
+{
+  StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+
+  delete all tColumns;
+  delete all tReport;
+  delete all tReportPers;
+
+  FillDataSQL;
+  if getfirst tReport <> tsOK then
+  {
+    message('Нет данных для формирования отчета',error);
+    StopVisual;
+    stop; abort; exit;
+  }
+  _nppColumn := 0;
+  FillDataExclasseg(0h);
+
+  PrintReportToExcel;
+    StopVisual;
+}
+
+end;
+end.
+
+VipInterface UserReport_EM_Nachisl_ESOT Implements IUserReport;
+Interface UserReport_EM_Nachisl_ESOT;
+
+Procedure Run;
+Begin
+  runinterface(EM_Nachisl_ESOT);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Начисления с группировкой по ЕСОТ';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+#__UNUSED__(Level)
+  GetGroupName := '';
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'MENUZARP';
+  end;
+end;
+
+End.

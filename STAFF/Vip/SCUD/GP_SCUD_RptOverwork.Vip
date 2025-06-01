@@ -1,0 +1,792 @@
+
+/*************************************************************************************************\
+* Наименование: СКУД Отчет. Отчет о переработках                                                  *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#177          |02/11/17|Шунин А.Г.               |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include StrFunc.vih
+#include GetKau.Vih
+#include marker.vih // описание объекта и объявление интерфейса
+                    // marker c реализацией по умолчанию
+#include GP_SCUD_EventsEdit.Vih
+#include GP_SCUD_StateMentOnAbsent.Vih
+#include CLSFUNCS.VIH // ф-ии пересканирования текущих л/с
+#include GP_xlMatrixUtil.vih
+#include GP_SCUD_Function.Vih
+
+
+//************************************************************
+Interface GP_SCUD_RptOverwork 'Отчет о переработках' (,,sci14Esc), EscClose;
+//************************************************************
+Show At (,,120,30);
+//----------------------------------------
+// Forward
+//----------------------------------------
+//------------------------------------
+// декларация сложного фильтра
+//------------------------------------
+function isFilterAnCorrect(ww_nrec:comp): boolean; forward;
+//-------------------
+#include GetKau.var
+#include GP_SCUD_Function.Var
+var
+  xlMatrixUtil:GP_xlMatrixUtil new;
+
+//-------------------
+  iStrFunc:StringFunctions;     // Переменная типа интерфейс StringFunctions
+
+//-------------------
+// для расчета значений по Сотруднику CalcByPers
+// По событиям СКУД
+  iGP_SCUD_EventsEdit_Cacl :GP_SCUD_EventsEdit New;
+  DateCalc, DateCalcB, DateCalcE  :date;
+  cPerCalc :comp;
+
+// По документам Заявления на отсутствие
+  iGP_SCUD_StateMentOnAbsent_Calc: GP_SCUD_StateMentOnAbsent New;
+//-------------------
+
+// Область вывода "Заявления на отсутствие"
+  iGP_SCUD_StateMentOnAbsent: GP_SCUD_StateMentOnAbsent New;
+
+  isFilterRun  :boolean;////признак работы ограничений
+  isProtect,isProtect2 :boolean; //защищенный выбор
+  wTypeDoc:word; // тип документа - установить в каждом объекте
+  pStatus_GetDefault  : comp; // статус по умолчанию
+
+  //-- пометка подразделения
+  CLSF: CurLSFunctions;
+  DA: IDepartmentAvailability(CurLSFunctions);
+  _PodrMArkerPointer        : Longint; // сам маркер по подразделениям
+
+  isPodrShare               : boolean;
+  wTypeRep:word;// 0 - подробный,1 краткий
+//--- настройки
+  NPOEM_OWN_HEAD_V_VID:word;//В интерфейсе руководителя отображать
+  NPOEM_OWN_SCUD_Pers_Other :boolean;//'Отображать сторонних лиц
+
+//=====================================
+// для работы с Excel
+#include excel_var.vpp
+//-------------------
+  maxColCount   :Longint; //Кол-во колонок в шаблоне
+
+  wIntMode: word;
+  pTmp :comp; // временная для выбора
+
+  cRec    :Comp   ; // ссылка на группу
+  pMarker:IMarker(Marker) new;
+  Marker:longint;
+//-----------------------------------------
+// Фильтры
+//-----------------------------------------
+   wFilter,   wFilter_A:word;
+
+   Marker_Count :longint;
+    wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+
+   KauMarkerName:string;
+   Marker_Tmp :longint;
+
+   #mrkfld_(KatPodr)
+   #mrkfld_(Persons)
+   filtr_Persons_A , filtr_KatPodr_A : String;
+
+//   filtr_Persons      ,filtr_Persons_A       : string;
+   pFlt_Katpodr:comp ;
+   pFlt_Persons :comp;
+
+   sUserName        :string;//= UserName()
+//------------------------------------
+Table Struct mtGroup (
+    nRec: comp, // nRec первого события в течении дня 
+    cGP_SCUD_Pers: comp,
+    FIO          : string[50],
+    cPersons     : comp,
+    cKatPodr     : comp,
+    dFirst   : date,
+    dLast    : date,
+    wYear   : word,
+    wMonth  : word,
+    tOverWork   : time "Сверхурочные",
+    tOverWork2  : time "Переработка",
+    tHoliday    : time "Выходные",
+    tStateMents : time "Выходные",
+    tStateMentsR: time "Поручение руководителя",
+    tGrafCh     : time "Рабочих часов (час)",
+    tFact      : time "Рабочих часов (час)",
+    OverWork   : double "Сверхурочные (час)",
+    OverWork2  : double "Переработка (час)",
+    Holiday    : double "Выходные (час)",
+    StateMents : double "Заявлений (час)",
+    StateMentsR: double "Поручение руководителя (час)",
+    GrafCh     : double "Рабочих часов по графику (час)",
+    Fact       : double "Рабочих часов факт(час)",
+    ItogOver   : double "Чистая Переработка (час)",
+    tItogOver  : time "Чистая Переработка",
+    tItogOverM : time "Использовано сверх переработанного(ч:м)",
+    SortFld: string
+) with index (
+    nRec = nRec (AutoInc, Unique), // nRec, // dFirst = + SortFld
+    ForOut = SortFld + cGP_SCUD_Pers + wYear+ wMonth,
+    ForCalc= cGP_SCUD_Pers + dFirst,
+    ForCalc2 = CGP_SCUD_PERS+WYEAR+WMONTH,
+    ForBounds1 = cKatPodr + SortFld + wYear+ wMonth,
+    ForBounds2 = cPersons + wYear+ wMonth,
+    ForBounds3 = cKatPodr + cPersons+ wYear+ wMonth
+);
+
+Table Struct mtGroupAll = mtGroup;
+
+Table Struct mtMain (
+    cGP_SCUD_Pers: comp,
+    FIO          : string[50],
+    EventDate    : date,
+    wYear   : word,
+    wMonth  : word,
+    Rejim      : string "режим работы",
+    t1: time "Первый вход",
+    t2: time "последний выход",
+    tOverWork   : time "Сверхурочные",
+    tOverWork2  : time "Переработка",
+    tHoliday    : time "Выходные",
+    tStateMents : time "Заявлений",
+    tStateMentsR: time "Поручение руководителя",
+    tMisConDuct : time "Нарушений (час)",
+    tGrafCh     : time "Рабочих часов (час)",
+    OverWork   : double "Сверхурочные (час)",
+    OverWork2  : double "Переработка (час)",
+    Holiday    : double "Выходные (час)",
+    MisConDuct : double "Нарушений (час)",
+    StateMents : double "Заявлений(час)",
+    StateMentsR: double "Поручение руководителя (час)",
+    GrafCh     : double "Рабочих часов (час)",
+    PA :word //1 - Дополнительная запись
+) with index (
+    mtMain01= cGP_SCUD_Pers + wYear+ wMonth + EventDate //ForCalc
+  , mtMain02 = PA +cGP_SCUD_Pers
+);
+
+Table struct mtMain_Add =mtMain;
+
+Create View vM
+Var
+   DTB,  DTE  :date;
+   DTB_A,DTE_A:date;
+   DTB_L,DTE_L:date;  // период за который загружены данные
+
+as select mtGroup.Nrec
+From
+  mtGroup (ForOut)
+ ,mtGroupAll(ForOut)
+ ,mtMain
+ ,mtMain mtMain_tmp
+ ,mtMain_Add
+ ,mtGroup mtGroup_tmp
+ ,mtGroup mtGroup_free
+ ,mtMain mtMain_free
+ ,GP_SCUD_Pers
+ ,GP_SCUD_Podr
+
+//-------------------------------------
+, KatPodr KatPodr_Flt
+, Persons
+, Persons Persons_Flt
+, ZAR_USER
+where
+((  
+
+    mtGroup.cGP_SCUD_Pers == GP_SCUD_Pers.nRec
+and         GP_SCUD_Pers.cKatPodr == KatPodr.nRec
+and         GP_SCUD_Pers.cKatPodr == GP_SCUD_Podr.cKatPodr
+
+and       mtGroup.cPersons == Persons.nrec
+and       mtGroup.cPersons == Appointments.Person
+and       0 == Appointments.LPrizn
+and       DTE >>=Appointments.AppointDate
+and       ( DTB <= Appointments.DismissDate or  Appointments.DismissDate=ZeroDate)
+and   Appointments.Post == Catalogs.NRec
+
+and mtGroup.cGP_SCUD_Pers == mtMain.cGP_SCUD_Pers
+and mtGroup.wYear  == mtMain.wYear
+and mtGroup.wMonth == mtMain.wMonth
+      /*  and   DTB <<= mtMain.EventDate
+        and   DTE >>= mtMain.EventDate       */
+
+and
+   mtGroup.cGP_SCUD_Pers == mtGroup_tmp.cGP_SCUD_Pers
+and     Year(DateCalcB)  == mtGroup_tmp.wYear
+and    Month(DateCalcB)  == mtGroup_tmp.wMonth
+and
+   mtGroup.cGP_SCUD_Pers == mtMain_tmp.cGP_SCUD_Pers
+and     Year(DateCalcB)  == mtMain_tmp.wYear
+and    Month(DateCalcB)  == mtMain_tmp.wMonth
+//        and   DateCalcB <<= mtMain_tmp.EventDate
+//        and   DateCalcE >>= mtMain_tmp.EventDate
+
+and wc_nrec == KatPodr_Flt.Nrec
+and wc_nrec == Persons_Flt.Nrec
+
+and  sUserName == ZAR_USER.OwnName
+
+and root == mtGroup_free.nrec
+and root == mtMain_free.cGP_SCUD_Pers
+
+
+))
+Bounds byPersons pFlt_Persons == mtGroup.cPersons (noindex) ordered by TableOrder
+/*
+Bounds byKatpodr pFlt_KatPodr == mtGroup.cKatPodr ordered by mtGroup.cKatPodr, mtGroup.SortFld, mtGroup.wYear, mtGroup.wMonth
+Bounds byPeriodBeg DTB  <<= mtGroup.dFirst(noindex) ordered by TableOrder
+Bounds byPeriodEnd DTE  >>= mtGroup.dFirst(noindex) ordered by TableOrder
+*/
+Order bySortFld by mtGroup.SortFld
+/*
+condition FilterAn = // использование сложного фильтра
+  (isFilterAnCorrect(mtGroup.Nrec))
+*/
+;
+
+//******************************************************************************
+// Функции
+//******************************************************************************
+//== Функции для DSQL
+#include Sql_Func.Vpp
+#include excel_fun.vpp
+//#include D:\Galaxy\ShuninAG\SCUD\gp_scud_labordiscipline.vpp 
+#include GP_SCUD_RptOverwork.Vpp
+
+//------------------------------------
+// Наименование интерфейса
+//------------------------------------
+  Function GetInterfaceName:string;
+  { Result:=#(__InterfaceName__);
+  }
+//------------------------------------
+// сохранить параметры
+//------------------------------------
+  Procedure SaveParam;
+  {
+    SaveMyDsk(wFilter  ,GetInterfaceName+'_wFilter');
+    SaveMyDsk(DTB      ,GetInterfaceName+'_DTB');
+    SaveMyDsk(DTE      ,GetInterfaceName+'_DTE');
+    SaveMyDsk(wTypeRep ,GetInterfaceName+'_wTypeRep');
+
+    //-----------------------
+    DoneMarker(Marker_Persons_A, '' );
+    DoneMarker(Marker_KatPodr_A, '' );
+    //-----------------------
+
+    DoneMarker(Marker_Persons,GetInterfaceName+'_Persons');
+    DoneMarker(Marker_KatPodr,GetInterfaceName+'_KatPodr');
+  } //Procedure SaveParam;
+
+
+
+//------------------------------------
+// Доступность подразделения по зарплатным правам.
+//------------------------------------
+Function EnablePodr(_cPodr:comp) :boolean; cacheable;
+{ Result:=DA.IsAvailable(_cPodr);
+} //Function AVaiblePodr(_cPodr:comp) :comp; cacheable;
+
+Function GetPodrShare :boolean;
+{ Result:= ZAR_USER.PODRSHARE = '+'
+}//Function PodrShare :boolean;
+
+
+//------------------------------------
+// декларация сложного фильтра
+//------------------------------------
+function isFilterAnCorrect(ww_nrec:comp): boolean; cacheable;
+{ #__UNUSED__(ww_nrec)
+  Result:=true;
+  if isPodrShare
+  {  if not EnablePodr(mtGroup.cKatPodr)
+      { Result:=false;
+        Exit;
+      }
+  }
+  if IsBitCTW(wFilter,2)
+  { if Count_KatPodr>1
+    { If not FoundMarker(Marker_KatPodr_A,mtGroup.cKatPodr)
+      { Result:=false;
+        Exit;
+      }
+    }
+  }
+  //-------------------------------------
+  // Должен быть последним!
+  //-------------------------------------
+  if IsBitCTW(wFilter,3)
+  { if Count_Persons>1
+     If not FoundMarker(Marker_Persons_A,mtGroup.cPersons)
+    { Result:=false;
+      Exit;
+    }
+  }
+
+}//function isFilterAnCorrect(ww_nrec:comp): boolean;
+
+//-------------------------------------------
+// скопировать фильтры в данные для отбора
+//-------------------------------------------
+Procedure CopyToA;
+{ CopyMarker(Marker_Persons_A ,Marker_Persons);
+  CopyMarker(Marker_KatPodr_A ,Marker_KatPodr);
+  wFilter_A   :=wFilter   ;
+  filtr_Persons_A  :=filtr_Persons  ;
+  filtr_KatPodr_A  :=filtr_KatPodr  ;
+  DTB_A:=DTB;
+  DTE_A:=DTE;
+
+} //Procedure CopyToA;
+
+//-------------------------------------------
+// восстановить данные для задания фильтрации
+// из данных для отбора
+//-------------------------------------------
+Procedure RestFromA;
+{ CopyMarker(Marker_Persons ,Marker_Persons_A);
+  CopyMarker(Marker_KatPodr ,Marker_KatPodr_A);
+  wFilter       :=wFilter_A       ;
+  filtr_Persons      :=filtr_Persons_A      ;
+  filtr_KatPodr      :=filtr_KatPodr_A      ;
+  DTB:=DTB_A;
+  DTE:=DTE_A;
+
+} //Procedure RestFromA;
+
+
+//---------------------------------------
+// Установка наименований фильтров
+//---------------------------------------
+Procedure SetFilterNM(_Field:longint=0);
+{ if _Field=0 or _Field=#Filtr_Katpodr
+  { #mrkfiltr_(Katpodr_Flt,Katpodr,Nrec,wc_nrec,Katpodr_Flt.Kod+','+Katpodr_Flt.Name)
+  }
+  if _Field=0 or _Field=#Filtr_Persons
+  { #mrkfiltr_(Persons_Flt,Persons,Nrec,wc_nrec,Persons_Flt.Fio)
+  }
+
+  ReScanPanel(#KatPodr_Flt);
+} //Procedure SetFilterNM(_Field:longint)
+
+//------------------------------------------------------
+// Чтение из DSK Изменение позиции
+//------------------------------------------------------
+Procedure LoadParam;
+{
+ FirstCalc := true;
+  wIntMode := cgiNotEdit or cgiPickMult;
+  sUserName :=UserName();
+  if getfirst Zar_user=tsok {}
+  isPodrShare:=GetPodrShare;
+
+      Marker_KatPodr   :=InitMarker(GetInterfaceName+'_KatPodr', 8, 50, 10, True);
+      Marker_Persons   :=InitMarker(GetInterfaceName+'_Persons' , 8, 50, 10, True);
+
+      Marker_KatPodr_A :=InitMarker('' , 8, 50, 10, True);
+      Marker_Persons_A :=InitMarker('' , 8, 50, 10, True);
+
+      if (wIntMode and cgiPickMult)=cgiPickMult
+      { //DataProtector.ProtectedStatusCtx := sci1EscIns;
+        pMarker.AutoSave := True;
+        pMarker.LoadAuto := True;
+        pMarker.StoreName := 'GP_SCUD_RptOverwork';
+        pMarker.Caption   := (' Отмечено [%d] ');
+      }
+      else  pMarker.Disable:=true;
+
+
+  if not ReadMyDsk(DTE,GetInterfaceName+'_DTE',false) {DTE := Date(Last_Day(Cur_Date),month(Cur_Date),year(Cur_Date));}
+  if not ReadMyDsk(DTB,GetInterfaceName+'_DTB',false) {DTB := Date(01,Month(DTE), Year(DTE));}
+  if not ReadMyDsk(wFilter,GetInterfaceName+'_wFilter',false) wFilter:=1;
+  if not ReadMyDsk(wTypeRep,GetInterfaceName+'_wTypeRep',false) wTypeRep:=1;
+
+  iGP_SCUD_EventsEdit_Cacl.InitParam(cgiNo,0,0,0,0,DTB,DTE);
+
+} //Procedure LoadParam;
+
+Procedure CalcAll;
+{
+  var CurPers: comp;
+  var chet:longint;
+  chet := RecordsInTable(#mtGroup) div 3;
+  delete all mtMain_add;
+  delete mtMain where (( 1 == mtMain.PA )) ;
+  PushPos(#mtGroup);
+
+     StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfconfirm,''#3'Расчет',chet);
+
+       _Loop mtGroup
+       {  CalcByPers(1,mtGroup.cGP_SCUD_Pers, mtGroup.dFirst);
+          chet++;
+          if chet mod 3 = 0
+           if not nextvisual then break;
+       }
+
+     StopVisual('',0);
+   insert into mtmain select mtMain_add.* from mtMain_add;
+   PopPos(#mtGroup);
+   RescanPanel(#mtGroup);
+   RescanPanel(#mtMain);
+}
+
+//------------------------------------------------------
+// Изменение позиции
+//------------------------------------------------------
+Procedure PositionChanged;
+{
+  var _wnrec:comp;
+  _wnrec:=0;
+  _wnrec:=mtGroup.cGP_SCUD_Pers;
+  var _DT:date=ZeroDate;
+  var _TmB,_TmE,_PlanTime:time=ZeroTime;
+  var _wType:word=0;
+  var _cNrec:comp=0;
+  _TmE := Time(24,0,0,0);
+
+   iGP_SCUD_StateMentOnAbsent.GetFirstPeriodWithOutMisConDuct(_wnrec,mtGroup.dFirst,mtGroup.dLast
+          ,_DT,_TMB,_TME,_PlanTime,_wType,_cNrec,true);
+
+// LogStrTofile('StateMentOnAbsent.log', 'GetFirstPeriodWithOutMisConDuct _wnrec=' + _wnrec +'  dFirst='+mtGroup.dFirst+'  mtGroup.dLast='+mtGroup.dLast+'  >> '+
+//          '  _DT='+_DT+' _TMB=' +_TMB +' _TME=' + _TME + ' _wType='+_wType );
+
+//   iGP_SCUD_EventsEdit.InitParam(cgiNotEdit,0,mtGroup.cGP_SCUD_Pers,0,0,mtGroup.dFirst,mtGroup.dFirst);
+} //Procedure PositionChanged
+
+//========================================================
+// Визуальная часть
+//========================================================
+Window wnFilter 'Установите фильтры'  Cyan, EscClose;
+  Show at (,,50,14);
+Screen scrFilter 'Фильтры' ('Фильтры',,sci13Esc);
+Table KatPodr_Flt;
+Fields
+  wFilter :NoProtect;
+  DTB : NoProtect;
+  DTE : NoProtect;
+  Filtr_Katpodr  : PickButton,Protect;
+  Filtr_Persons  : PickButton,Protect;
+Buttons
+  cmOk    ,,, 'продолжить выполнение', hcAllBOk, scGalDial;
+  cmCancel,,, 'Отмена', hcAllBCancel, scGalDial;
+<<
+  `Фильтр по`
+ [.] периоду      ` .@@@@@@@@@@@@@-.@@@@@@@@@@@@@
+ [.] подразделению` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ [.] Сотруднику`    .@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ <. Продолжить .>  <.   Отмена   .>
+>>
+end; //Screen scrFilter (,,sci13Esс);
+HandleEvent
+cmCheckField:
+{
+}
+cmInit:
+{ SetFilterNm(0);
+  wFilter := wFilter or 1;
+  ClusterDisabledField(#wFilter,1); // запрет на изменения 1-ого бита - фильтр на период всегд
+}
+cmDone:
+{
+}
+cmOk:
+{ CloseWindowEx(wnFilter,cmDefault)
+}
+end;// HandleEvent
+end; //Windows wnFilter 'Установите фильтры' , Cyan, EscClose;
+
+Window wnParamPrint 'Параметры печати'  Cyan, EscClose;
+  Show at (,,40,10);
+Screen scrParamPrint 'Фильтры' ('Фильтры',,sci13Esc);
+Table KatPodr_Flt;
+Fields
+  wTypeRep :NoProtect;
+Buttons
+  cmOk    ,,, 'продолжить выполнение', hcAllBOk, scGalDial;
+  cmCancel,,, 'Отмена', hcAllBCancel, scGalDial;
+<<
+  `Выберите тип отчета`
+
+  (.) Подробный по текущей записи `
+  (.) Краткий по всем `
+  (.) Итоговый `
+
+ <. Продолжить .>  <.   Отмена   .>
+>>
+end; //Screen scrFilter (,,sci13Esс);
+HandleEvent
+cmOk:
+{   CloseWindowEx(wnParamPrint,cmDefault)
+}
+end;// HandleEvent
+end; //wnParamPrint
+
+//------------------------------------------------------
+// Списочная часть
+//------------------------------------------------------
+Browse brCalc '' (,,sci14Esc) ;
+show at (,,,15);
+Table mtGroup;
+recMarker=pMarker;
+// fixedLeft (mtGroup.dFirst, GP_SCUD_Pers.Fio);
+Fields
+  KatPodr.kod        'Подр.' :[10],Protect,NoDel,NoAutoSize;
+  GP_SCUD_Pers.Fio   'Ф.И.О. сотрудника'   :[30],Protect,NoDel;
+  persons.StrTabn    'Таб.№' :[10],Protect,NoDel,NoAutoSize;
+  persons.BORNDATE   'Дата','рождения' :[10],Protect,NoDel,NoAutoSize;
+  GetPost(GP_SCUD_Pers.cPersons) 'Должность' :[20],Protect,NoDel;
+  mtGroup.wYear      'Год' :[10],Protect,NoDel,NoAutoSize;
+  mtGroup.wMonth     'Месяц' :[10],Protect,NoDel,NoAutoSize;
+  mtGroup.OverWork    'Сверх','урочные','(час)' :[12,2],Protect,NoDel;
+  mtGroup.OverWork2   'Пере','работка','(час)'  :[12,2],Protect,NoDel;
+  mtGroup.Holiday     'Выход','ные','(час)'     :[12,2],Protect,NoDel;
+  mtGroup.StateMents  'Личное','заявление','(час)'           :[12,2],Protect,NoDel;
+  mtGroup.StateMentsR 'Поручение','руководителя','(час)'     :[12,2],Protect,NoDel;
+  mtGroup.GrafCh      'Рабочих',' часов(час)','по графику'   :[12,2],Protect,NoDel;
+  mtGroup.ItogOver    'Чистая','Переработка','/Сверх (час)'  :[12,2],Protect,NoDel;
+  mtGroup.tItogOver   'Чистая','Перера','ботка':[12],Protect,NoDel;
+  mtGroup.tItogOverM  'Исп.сверх','перера','ботанного':[12],Protect,NoDel;
+end;//Browse brGroupPers
+//------------------------------------------------------
+screen ScrDocSp ;
+show at (,16,80,16);
+<<
+ Содержание заявления на отсутствие
+>>
+end;
+//------------------------------------------------------
+Embedded emDocsAbsence 'Заявления на отсутствие' Interface    iGP_SCUD_StateMentOnAbsent.wnEditPersEmb;
+//Browse brDocSp '' (,,sci178Esc)
+show at (,17,80,);
+end;
+//------------------------------------------------------
+screen ScrDocEvants ;
+show at (81,16,,16);
+<<
+ История сотрудника
+>>
+end;
+//------------------------------------------------------
+// Embedded emDocSP 'Спецификация' Interface    iGP_SCUD_EventsEdit.wnEventsPers;
+Browse brCalcSp '' (,,sci14Esc);
+show at (81,17,,);
+Table mtMain;
+Fields
+  mtMain.EventDate 'Дата'  ('Дата регистрации'): [12] ,Protect,NoDel;
+  mtMain.t1   'Первый вход'          :[20],Protect,NoDel;
+  mtMain.t2   'Последний выход':[20],Protect,NoDel;
+  mtMain.tOverWork2  'Переработка'   :[20] ,Protect,NoDel;
+  mtMain.OverWork2   'Переработка(час)'   :[20,2],Protect,NoDel;
+  mtMain.tOverWork  'Сверхурочные'   :[20] ,Protect,NoDel;
+  mtMain.OverWork   'Сверхурочные(час)'   :[20,2],Protect,NoDel;
+end;//Browse brCalcSp
+
+//------------------------------
+//******************************************************************************
+// HandleEvent таблиц
+//******************************************************************************
+TableEvent table mtGroup ;
+cmSetDefault:
+{
+}
+cmInsertRecord:
+{
+}
+cmUpdateRecord:
+{
+}
+cmDeleteRecord:
+{
+}
+cmPositionChanged:
+{ PositionChanged;
+}
+end; //mtGroup
+
+//******************************************************************************
+// HandleEvent самого интерфейса
+//******************************************************************************
+  HandleEvent
+    //-----------------------------
+    cmInit:
+    { timelog_init;
+      //---------------------------
+      excel_Null_Need:=true;
+      //---------------------------
+      NPOEM_OWN_HEAD_V_VID:=wGetTune('NPOEM_OWN.HEAD_V_VID');//В интерфейсе руководителя отображать
+      NPOEM_OWN_SCUD_Pers_Other :=boGetTune('NPOEM_OWN.SCUD.Pers_Other');//'Отображать сторонних лиц
+      LoadParam;
+      CopyToA;
+      if RunWindowModal(wnFilter)<>cmDefault
+      { CloseInterface(cmDone);
+        exit;
+      }
+      SborData;
+      SetFilterNM(0);
+      if getfirst mtGroup = tsOk {}
+//      If BoundActive(tbByPersons) or BoundActive(tbByKatPodr)
+      CalcAll; // Пересчитать ВСЁ
+//      else
+      ReScanPanel(#mtGroup);
+    }
+    //-----------------------------
+    cmDone:
+    { SaveParam;
+    }
+    //-----------------------------
+    cmDefault:
+    {
+    }
+    //----------------------
+    cmPick:
+    { case curField of
+      #Filtr_Katpodr:
+      { if RunInterface('GetPodaLN',12, Marker_KatPodr, 1)=cmDefault
+        { SetFilterNm(#Filtr_Katpodr);
+          BitOnW(wFilter,2);
+        }
+      }
+      //------------------------------
+      #Filtr_Persons:
+      { KauMarkerName := iGetKau.GetMarkerName(cgKau_Persons);
+
+
+        StoreMarker(Marker_Persons,KauMarkerName);
+        If (iGetKau.GetCodeKau(cgiPickMult,cgKau_Persons,Comp(0)) <> 0)
+        { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+          CopyMarker(Marker_Persons,Marker_Tmp);
+          DoneMarker(Marker_Tmp,'');
+          SetFilterNm(#Filtr_Persons);
+          BitOnW(wFilter,3);
+        }
+      }
+      end; //case curField of
+    } //cmPick
+    //----------------------
+    cmDelOnProtect:
+    { Case Curfield of
+      //------------------------------
+      #Filtr_KatPodr:
+      { ClearMarker(Marker_KatPodr);
+        BitOffW(wFilter,2);
+        SetFilterNm(#Filtr_KatPodr);
+      }
+      //------------------------------
+      #Filtr_Persons:
+      { ClearMarker(Marker_Persons);
+        BitOffW(wFilter,3);
+        SetFilterNm(#Filtr_Persons);
+      }
+      end;
+    }
+    //--------------------------
+    cmPickClass:// внешние классификаторы
+    {
+    }
+    //--------------------------
+    cmFilterSave:
+    { UpdateTable;
+      CopyToA;
+      if RunWindowModal(wnFilter)=cmDefault
+      {
+//        if (DTB <> DTB_L) or (DTE <> DTE_L)
+        SborData;
+        CalcAll;
+
+      }
+      else RestFromA
+    }
+    //--------------------------
+    cmPickAttr:// внешние аттрибуты
+    {
+    }
+    //--------------------------
+    cmHotKeys:
+    {
+      case CurTable of
+      #mtGroup:
+      { ProcessCommand(RunMenu('GP_SCUD_RptOverwork_Main_HotKey'));
+      }
+      end;
+    }
+    cmPrintDoc:
+    { if RunWindowModal(wnParamPrint)=cmDefault
+      { case wTypeRep of
+        0:PrintDoc;
+        1:PrintDoc01;
+        2:PrintDoc02;
+        end;
+      }
+    }
+    cmValue1: // Пересчитать по сотруднику
+    {
+      var chet:longint;
+      var CurPers: comp;
+
+       CurPers := mtMain.cGP_SCUD_Pers;
+       chet := 0;
+       delete all mtMain_Add;
+       PushPos(#mtGroup);
+       _Loop mtGroup where (( CurPers ==  mtGroup.cGP_SCUD_Pers ))
+         if CurPers = mtMain.cGP_SCUD_Pers chet++;
+       delete mtMain where (( 1 == mtMain.PA and CurPers == mtMain.cGP_SCUD_Pers )) ;
+
+       StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfconfirm,''#3'Рачет',chet);
+       cPerCalc :=0; // пересчитать принудительно
+
+             _Loop mtGroup where (( CurPers ==  mtGroup.cGP_SCUD_Pers )) ordered by index ForCalc2
+             {
+                if CurPers = mtMain.cGP_SCUD_Pers
+                CalcByPers(1,mtGroup.cGP_SCUD_Pers, mtGroup.dFirst);
+
+                if not nextvisual then break;
+             }
+
+       PopPos(#mtGroup);
+
+       RescanPanel(#mtGroup);
+       RescanPanel(#mtMain);
+       StopVisual('',0);
+
+    }
+
+    cmValue2: // Пересчитать ВСЁ
+    {
+      CalcAll;
+    }
+
+cmCheckField:
+{
+ case curField of
+  #DTB: if DTB> DTE set DTE := DTB;
+  #DTE: if DTB> DTE set DTB := DTE;
+ end;
+}
+cmValue3: // ТЕСТ
+{
+
+}
+
+  end;
+// cmPRGVersion : message('Трасляция на #__TOOLVERSION__ от #__DATETIME__');
+
+end.
+
+GP_SCUD_RptOverwork_Main_HotKey Menu
+{
+- 'Фильтр на данные'     , cmFilterSave, 'Фильтр на данные', hcProc_NagrKaf, 'Alt+B',kbAltB, scMenuCtx;
+// -----------;
+- '~П~ечать',cmPrintDoc,'Вывод в Excel отчета Дисциплина труда',hcNoContext,'Ctrl+P',kbCtrlP,sci1Esc,,,, bmpPrint;
+- 'Пересчитать по сотруднику', cmValue1   , 'Обновить', hcProc_NagrKaf, ,, scMenuCtx;
+- 'Пересчитать ВСЁ', cmValue2   , 'Обновить', hcProc_NagrKaf, ,, scMenuCtx;
+// -----------;
+//- 'ТЕСТ ТЕСТ ТЕСТ ', cmValue3   , 'UpDate mtGroup_free set ТЕСТ ТЕСТ ТЕСТ ', hcProc_NagrKaf, ,, scMenuCtx;
+}

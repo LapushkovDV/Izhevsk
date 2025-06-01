@@ -1,0 +1,312 @@
+/*************************************************************************************************\
+* Наименование:  Справка к акту инвентаризации резерва на отпуск                                                            *
+* Контур/Модуль: Заработная плата / Отчеты пользователя                                           *
+* Примечание:                                                                                     *
+* Вид работы  |Номер          |Дата    |Исполнитель              |Проект                          *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#0000          |28/01/19|Евдокимов М.А.           |НПО Энергомаш                   *
+\*************************************************************************************************/
+
+#include userreport.vih
+#include XlReport.vih
+#include FeeSigners.vih
+#include Query.vih
+
+#component "GP_ZP"
+
+interface GP_Inv96 'Акт инвентаризации резервов на оплату отпусков' escClose;
+show(,,50, 6);
+
+var
+  _year      : word;
+  _cSelection: comp;
+  _cRezOtp   : string;
+  _cRezNal   : comp;
+  _feeSigners: FeeSigners;
+  pXL        : XLSRepBuilder;
+   _fTypeReport : byte;
+   _name : string;
+   _mess : word;
+create view
+as select
+  Selection.Name
+from
+  Selection
+// ,SpKau
+where ((
+  _cSelection == Selection.Nrec
+));
+
+//#region query
+sql query qTotals =
+  select
+    Sum(SaldVh) as SaldVh: double,
+    Sum(SumK) as SumK: double,
+    Sum(SumD) as SumD: double,
+    Sum(SumCorr) as SumCorr: double
+  from (select
+          Sum(SumS * case when ViOb = 2 then 1 else -1 end) as SaldVh: double,
+          0 as SumK: double,
+          0 as SumD: double,
+          0 as SumCorr: double
+        from SaldMoun
+        where
+          SchetO = '096' and
+          SUBOSSCH = :cRezOtp and
+          //KauOs[1] in ( :cRezOtp, :cRezNal ) and
+          DateSal = :dBeg
+
+        union all
+
+        select
+          0, Sum(SumOb), 0, 0
+        from Oborot
+        left join SoprHoz
+          on SoprHoz.Nrec = Oborot.cSoprHoz
+        where
+          SchetK = '096' and
+          SUBSCHK = :cRezOtp and
+          //KauKs[1] in ( :cRezOtp, :cRezNal ) and
+          Oborot.DatOb between :dBeg and :dEnd and
+          SchetO <> '096' and
+          Coalesce(SoprHoz.NameSHO, '') not like '%Инвентаризация резерва на отпуск%'
+
+        union all
+
+        select
+          0, 0, Sum(SumOb), 0
+        from Oborot
+        left join SoprHoz
+          on SoprHoz.Nrec = Oborot.cSoprHoz
+        where
+          SchetO = '096' and
+          SUBOSSCH = :cRezOtp and
+          //KauOs[1] in ( :cRezOtp, :cRezNal ) and
+          Oborot.DatOb between :dBeg and :dEnd and
+          SchetK <> '096' and
+          Coalesce(SoprHoz.NameSHO, '') not like '%Инвентаризация резерва на отпуск%'
+
+        union all
+
+        select
+          0, 0, 0, Sum(SumOb)
+        from Oborot
+        left join SoprHoz
+          on SoprHoz.Nrec = Oborot.cSoprHoz
+        where
+          SchetK = '096' and
+          SUBSCHK = :cRezOtp and
+          //KauKs[1] in ( :cRezOtp, :cRezNal ) and
+          Oborot.DatOb between :dBeg and :dEnd and
+          SoprHoz.NameSHO like '%Инвентаризация резерва на отпуск%'
+       ) t
+;
+//#endregion query
+
+procedure ShowExcelReport;
+{
+  var dBeg: date = To_Date(1, 1, _year);
+  var dEnd: date = To_Date(31, 12, _year);
+  var sXLTFileName: string = TranslatePath('%StartPath%XLS_ЭМ\ZP\gp_Inv96.xltm');
+  //var sXLSFileName: string = pXL.CreateXLT(sXLTFileName, true);
+  var sXLSFileName: string = pXL.CreateReport(sXLTFileName, true);
+  pXL.CreateVar(sXLSFileName);
+  pXL.SetDateVar  ('dBeg'   , dBeg);
+  pXL.SetStringVar('dBegStr', LoCase(DateToStr(dBeg, 'DD Mon YYYY')));
+  pXL.SetDateVar  ('dEnd'   , dEnd);
+  pXL.SetStringVar('dEndStr', LoCase(DateToStr(dEnd, 'DD Mon YYYY')));
+  pXL.SetNumberVar('Year'   , _year);
+  pXL.SetStringVar('Name'   , _name);
+  pXL.SetNumberVar('Mess'   , _mess);
+
+//, то выводить номер формы  Форма № ИНВ-22ротп-ЭМ
+//Если квартальной или вознаго за год - Форма № ИНВ-22рпр-ЭМ
+  pXL.SetStringVar('FormNumber'   , if (_fTypeReport = 0,'ИНВ-22ротп-ЭМ','ИНВ-22рпр-ЭМ'));
+
+  var rsVar: IResultSet = queryManager.createQuery(qTotals)
+                                      .setParam('cRezOtp', _cRezOtp)
+                                      .setParam('cRezNal', _cRezNal)
+                                      .setParam('dBeg'   , dBeg)
+                                      .setParam('dEnd'   , dEnd)
+                                      .getResultSet;
+  if rsVar = NullRef
+  {
+    Message('Ошибка выполнения запроса', error);
+    exit;
+  }
+
+  if rsVar.getFirst = tsOK
+  {
+    pXL.SetNumberVar('SaldVh' , double(rsVar.row.Val('SaldVh')));
+    pXL.SetNumberVar('SumK'   , double(rsVar.row.Val('SumK')));
+    pXL.SetNumberVar('SumD'   , double(rsVar.row.Val('SumD')));
+    pXL.SetNumberVar('SumCorr', double(rsVar.row.Val('SumCorr')));
+  }
+  else
+  {
+    pXL.SetNumberVar('SaldVh' , 0);
+    pXL.SetNumberVar('SumK'   , 0);
+    pXL.SetNumberVar('SumD'   , 0);
+    pXL.SetNumberVar('SumCorr', 0);
+  }
+  if _feeSigners.GetSignerFirst do
+  {
+    if _feeSigners.GetSignerRole = 'Председатель комиссии'
+    {
+      pXL.SetStringVar('PredsedatelFIO'  ,_feeSigners.GetSignerFIO(1));
+      pXL.SetStringVar('PredsedatelPOST' ,_feeSigners.GetSignerPosition(1));
+      break;
+    }
+  } while _feeSigners.GetSignerNext;
+
+  pXL.PublishVar;
+
+  pXL.CreateTbls(sXLSFileName);
+
+  pXL.CreateTbl('FeeSigners');
+  pXL.CreateTblFld('FIO');
+  pXL.CreateTblFld('FIOShort');
+  pXL.CreateTblFld('Position');
+  pXL.CreateTblFld('Role');
+  pXL.CreateTblFld('TabN');
+  pXL.CreateTblFld('Number');
+  if _feeSigners.GetSignerFirst do
+  {
+    if _feeSigners.GetSignerRole <> 'Председатель комиссии'
+    {
+      pXL.ClearTblBuffer;
+      pXL.SetTblStringFldValue('FIO'     , _feeSigners.GetSignerFIO(1));
+      pXL.SetTblStringFldValue('FIOShort', _feeSigners.GetSignerFIO(7));
+      pXL.SetTblStringFldValue('Position', _feeSigners.GetSignerPosition(1));
+      pXL.SetTblStringFldValue('Role'    , _feeSigners.GetSignerRole);
+//      pXL.SetTblStringFldValue('TabN'    , _feeSigners.GetSignerTabn);
+//      pXL.SetTblStringFldValue('Number'  , _feeSigners.GetSignerNumber);
+//      message('Insert');
+      pXL.InsTblRow;
+    }
+  } while _feeSigners.GetSignerNext;
+  pXL.PublishTbl('FeeSigners');
+
+  pXL.LoadReport(sXLSFileName);
+  pXL.DisConnectExcel;
+}
+
+screen sc1 (,,sci1EnEsc);
+  fields
+    _year: NoProtect, SpinButton [1, 1900, 2100];
+    Selection.Name: Protect, PickButton;
+  _fTypeReport :  NoProtect;
+
+  buttons
+    cmOk, default;
+    cmCancel;
+<<
+
+`Год`       .@@@@@@@@
+`Подписанты`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  (.)  отпусков             `
+  (.)  квартальной премии   `
+  (.)  вознаграждения за год`
+
+                     <. Продолжить .> <. Отмена .>
+>>
+end;
+
+handleevent
+  cmOk:
+  {
+    case _fTypeReport of
+      0: {
+          /*if getfirst SpKau where ((10013 == SpKau.KodGrKau and 'Резерв (фактический) отпуск' == SpKau.Name )) = tsOk
+            _cRezOtp := SpKau.Nrec;
+          if getfirst SpKau where ((10013 == SpKau.KodGrKau and 'Резерв (фактический) отпуск Налоги' == SpKau.Name )) = tsOk
+            _cRezNal := SpKau.Nrec;  */
+            _cRezOtp := '01';
+            _name := 'Резерв на оплату отпусков, включая платежи на социальное страхование и обеспечение';
+            _mess := 12;
+         }
+      1: { /*if getfirst SpKau where ((10013 == SpKau.KodGrKau and 'Резерв (квартальная премия)' == SpKau.Name )) = tsOk
+            _cRezOtp := SpKau.Nrec;
+            _cRezNal := 999999999h;  */
+            _cRezOtp := '02';
+            _name := 'Резерв на выплату квартальной премии руководителям высшего и среднего звена, включая платежи на социальное страхование и обеспечение';
+            _mess := 3;
+
+         }
+      2: {
+          /*if getfirst SpKau where ((10013 == SpKau.KodGrKau and 'Резерв (вознаграждение по итогам работы за год)' == SpKau.Name )) = tsOk
+            _cRezOtp := SpKau.Nrec;
+            _cRezNal := 999999999h; */
+            _cRezOtp := '03';
+            _name := 'Резерв на выплату вознаграждения по итогам работы за год руководителям высшего и среднего звена, включая платежи на социальное страхование и обеспечение';
+            _mess := 12;
+
+         }
+   end;
+    ShowExcelReport;
+  }
+  cmPick:
+  {
+    case curfield of
+      #Selection.Name:
+      {
+        if _feeSigners.RunMainWindow(cgiPick)
+          set _cSelection := _feeSigners.GetFeeSigners;
+      }
+    end;
+  }
+  cmInit:
+  {
+    _fTypeReport := 0;
+    if not ReadMyDSK(_year, 'GP_Inv96_year', false) _year := Year(Cur_Date);
+    if not ReadMyDSK(_cSelection, 'GP_Inv96_cSelection', false) _cSelection := 0;
+    ReadMyDSK(_fTypeReport, 'GP_Inv96_fTypeReport', false);
+    set _cSelection := _cSelection;
+    _feeSigners.InitFeeSigners(cgReport_KASSFRO);
+    _feeSigners.SetFeeSigners(_cSelection);
+
+  }
+  cmDone:
+  {
+    SaveMyDSK(_year, 'GP_Inv96_year');
+    SaveMyDSK(_cSelection, 'GP_Inv96_cSelection');
+    SaveMyDSK(_fTypeReport, 'GP_Inv96_fTypeReport');
+  }
+end;
+
+end.
+
+VipInterface UserReport_GP_Inv96 Implements IUserReport;
+Interface UserReport_GP_Inv96;
+
+Procedure Run;
+Begin
+  RunInterfaceNoModal(GP_ZP::GP_Inv96);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Акт инвентаризации резервов на оплату отпусков/премий';
+End;
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  #__UNUSED__(Level)
+  GetGroupName := '';
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'menuzarp';
+  end;
+end;
+
+End.

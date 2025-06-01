@@ -1,0 +1,199 @@
+/*************************************************************************************************\
+* Наименование: Реализация класса GP_SetWorkCondToOrder "Установка условий труда в приказ"        *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#45           |16/10/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_WorkingConditions.vih
+
+#include GP_SetWorkCondToOrder.vih
+interface GP_SetWorkCondToOrder;
+
+var oWorkingConditions:GP_ObjWorkingConditions(GP_WorkingConditions) New;
+
+create View
+from
+  oWorkingConditions,
+  KlOtpusk,VacationSts,
+  StrPart,StrPart StrPartNmb,
+  StrCont,Str_RHist,RaiseStS;
+
+function AddOrder(CodOper:word;cStrTitle,cStaffStruct,cDep:comp):boolean;
+{
+  result:=false;
+
+  ClearBuffer(tnStrPart);
+  StrPart.cDoc := cStrTitle;
+  if (GetLast StrPartNmb where ((StrPart.cDoc == StrPartNmb.cDoc)) = tsOk)
+    StrPart.NRazd := StrPartNmb.NRazd + 1
+  else
+    StrPart.NRazd := 1;
+  StrPart.wCodOper:=CodOper;
+
+  result:=insert current StrPart = tsok;
+  if (not result) {
+    message('Ошибка вставки записи в таблицу StrPart.',error);
+    exit;
+  }
+
+  ClearBuffer(tnStrCont);
+  StrCont.cPart:=StrPart.NRec;
+  StrCont.wCod:=StrPart.wCodOper;
+  StrCont.cCatStr:=cDep;
+  StrCont.cStr:=cStaffStruct;
+
+  result:=insert current StrCont = tsok;
+  if (not result) {
+    message('Ошибка вставки записи в таблицу StrCont.',error);
+    exit;
+  }
+}
+
+procedure SetPayForHarmWork(cStrTitle,cStaffStruct,cDep:comp;dRaise:date;cRaiseStS:comp=0);
+var IsExistOrder:boolean;
+    CodOper:word;
+{
+  CodOper:=0;
+  if (cRaiseStS=0)
+    CodOper:=30 //Приказ по ШР "Добавление доплаты" (РПД-30)
+  else
+    CodOper:=32;//Приказ по ШР "Изменение доплаты" (РПД-32)
+
+  IsExistOrder:=false;
+  _loop StrPart where((cStrTitle==StrPart.cDoc and CodOper==StrPart.wCodOper)) {
+    _loop StrCont
+    where((
+      StrPart.NRec==StrCont.cPart and
+      cStaffStruct==StrCont.cStr and
+      StrPart.wCodOper==StrCont.wCod(noindex)
+    )) {
+      _loop Str_RHist where((StrCont.Nrec==Str_RHist.cStrCont and 0<<Str_RHist.wHPrizn1(noindex))) {
+        if (StrPart.wCodOper=30)
+          IsExistOrder:=Str_RHist.cHRef1=oWorkingConditions.cPayForHarmWork
+        else
+          IsExistOrder:=Str_RHist.cHRef1=cRaiseStS;
+
+        if (IsExistOrder) break;
+      }
+      if (IsExistOrder) break;
+    }
+    if (IsExistOrder) break;
+  }
+
+  if (not IsExistOrder) {
+    if (not AddOrder(CodOper,cStrTitle,cStaffStruct,cDep)) exit;
+
+    ClearBuffer(tnStr_RHist);
+    Str_RHist.cStrCont:=StrCont.Nrec;
+    if (StrPart.wCodOper=30)
+      Str_RHist.cHRef1:=oWorkingConditions.cPayForHarmWork
+    else
+      Str_RHist.cHRef1:=cRaiseStS;
+    Str_RHist.wHPrizn1:=1;
+  }
+
+  Str_RHist.dRec:=dRaise;
+  Str_RHist.wHAttr:=2;
+  Str_RHist.rHSum:=oWorkingConditions.PayForHarmWorkProc;
+
+  if (IsExistOrder)
+    update current Str_RHist
+  else
+    insert current Str_RHist;
+}
+
+procedure SetVacForHarmWork(cStaffStr:comp;dInput:date);
+var IsVacStr:boolean;
+{
+  if (getfirst fastfirstrow KlOtpusk where((oWorkingConditions.cVacForHarmWork==KlOtpusk.NRec))<>tsok) exit;
+
+  IsVacStr:=getfirst fastfirstrow VacationSts
+            where((cStaffStr==VacationSts.cStaffStruct and KlOtpusk.KOTPUS==VacationSts.cKotPus))=tsok;
+  if (not IsVacStr) {
+    ClearBuffer(tnVacationSts);
+    VacationSts.cStaffStruct:=cStaffStr;
+    VacationSts.cKotPus:=KlOtpusk.KOTPUS;
+  }
+
+  VacationSts.SummOtp  := KlOtpusk.SummOtp;
+  VacationSts.GivOtp   := KlOtpusk.GivOtp;
+  VacationSts.wCountDay:= oWorkingConditions.VacationDays;
+  VacationSts.TypeOtp  := KlOtpusk.TypeOtp;
+  VacationStS.dVacCoef := 1;
+  VacationStS.dBegExist:= dInput;
+
+  if (IsVacStr)
+    update current VacationStS
+  else
+    insert current VacationStS;
+}
+
+procedure RunForRPD20(var bufStr:type$StaffStruct;cStrTitle,cDep:comp);
+{
+  if (bufStr.WorkCond=0) exit;
+  if (getfirst fastfirstrow oWorkingConditions where((bufStr.WorkCond==oWorkingConditions.cCat))<>tsok) exit;
+
+  if (oWorkingConditions.cWorkRegime<>0 and bufStr.WorkRegime<>oWorkingConditions.cWorkRegime)
+    bufStr.WorkRegime:=oWorkingConditions.cWorkRegime;
+
+  if (oWorkingConditions.cVacForHarmWork<>0)
+    SetVacForHarmWork(bufStr.NRec,bufStr.dInput);
+
+  if (oWorkingConditions.cPayForHarmWork<>0)
+    SetPayForHarmWork(cStrTitle,bufStr.NRec,cDep,bufStr.dInput);
+} //procedure RunForRPD20(var bufStr:type$StaffStruct;cStrTitle,cDep:comp);
+
+procedure RunForRPD23(var bufHist:type$HistoryStr;bufStr:type$StaffStruct;cStrTitle,cDep,cStrForVac:comp);
+{
+  if (bufHist.cWorkCond=0) exit;
+  if (getfirst fastfirstrow oWorkingConditions where((bufHist.cWorkCond==oWorkingConditions.cCat))<>tsok) exit;
+
+  if (oWorkingConditions.cWorkRegime<>0) {
+    if (bufStr.WorkRegime<>oWorkingConditions.cWorkRegime)
+      message('Изменен режим.');
+    bufHist.cWorkRegim:=oWorkingConditions.cWorkRegime;
+  }
+
+  if (oWorkingConditions.cVacForHarmWork<>0)
+    if (getfirst fastfirstrow KlOtpusk where((oWorkingConditions.cVacForHarmWork==KlOtpusk.NRec))=tsok)
+    { if (getfirst fastfirstrow VacationSts
+          where((bufStr.NRec==VacationSts.cStaffStruct and KlOtpusk.KOTPUS==VacationSts.cKotPus))<>tsok) {
+        message('Добавлен отпуск "'+oWorkingConditions.VacForHarmWork+'".');
+        SetVacForHarmWork(cStrForVac,bufHist.dHist);
+      }
+      else
+      if VacationSts.wCountDay<> oWorkingConditions.VacationDays
+      { message('Изменено кол-во дней отпуска "'+oWorkingConditions.VacForHarmWork+'".');
+        SetVacForHarmWork(cStrForVac,bufHist.dHist);
+      }
+    }
+  if (oWorkingConditions.cPayForHarmWork<>0) {
+    var cRaiseSts:comp=0;
+    if (getfirst fastfirstrow RaiseStS
+        where((
+          bufStr.NRec==RaiseStS.StaffStr and oWorkingConditions.cPayForHarmWork==RaiseStS.RaiseType and
+          bufHist.dHist>>=RaiseStS.dat1(noindex) and (RaiseStS.dat2=ZeroDate or bufHist.dHist<=RaiseStS.dat2)
+        ))=tsok) {
+      message('Изменена доплата "'+oWorkingConditions.PayForHarmWork+'".');
+      cRaiseSts:=RaiseStS.NRec;
+    }
+
+    SetPayForHarmWork(cStrTitle,bufStr.NRec,cDep,bufHist.dHist,cRaiseSts);
+  }
+  else
+  { if (getfirst fastfirstrow RaiseStS
+        where((
+             bufStr.NRec==RaiseStS.StaffStr //and oWorkingConditions.cPayForHarmWork==RaiseStS.RaiseType and
+        and  bufHist.dHist>>=RaiseStS.dat1(noindex)
+        and (RaiseStS.dat2=ZeroDate or bufHist.dHist<=RaiseStS.dat2)
+        ))=tsok)
+    {  message('Внимание: В ШР по данной ставке есть доплаты!');
+    }
+  }
+} //procedure RunForRPD23(var bufHist:type$HistoryStr;bufStr:type$StaffStruct;cStrTitle,cDep,cStrForVac:comp);
+
+end.

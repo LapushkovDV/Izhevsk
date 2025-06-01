@@ -1,0 +1,910 @@
+/*************************************************************************************************\
+* Наименование:  Инвентаризация резерва на отпуск                                                 *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Формирует бухсправку с корректирующими проводками для выравнивания резерва на 96 *
+*                счете с данными из модуля Управление персоналом (Оценочные обязательства)        *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#0000         |25/08/18|Евдокимов М.А.           |НПО Энергомаш                    *
+* Разработка  |#0000         |21/01/21|kurennykh                |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include Query.vih
+#include GetKau.vih
+#include aTuneIer.vih
+#include Plpor.vih
+#include PlporSimple.vih
+#include AtlProtocol.vih
+#include MainLschetForPersons.vih
+
+#component "GP_ZP"
+
+interface GP_InvVacationReserve 'Инвентаризация резерва на отпуск' escClose;
+show(,,150,);
+
+const
+  PLPOR_TIDK = 10;
+  PLPOR_TIDKGAL = 10;
+  PICKREP_WLIST_MNPLAN = 1;
+end;
+
+table struct tSaldo96 (
+  TblOs      : array[1..6] of word,
+  KauOs      : array[1..6] of comp,
+  KodSpo     : comp,
+  SumS       : double
+) with index (
+  i01 = KauOs[1] + KauOs[2] + KodSpo
+);
+
+table struct tInv (
+  StrTabN : string[20],
+  FIO     : string[60],
+  PodrCode: string[100],
+  PodrName: string,
+  cPerson : comp,
+  cPodr   : comp,
+  SumBuhD : double,
+  SumBuhK : double,
+  NalBuhD : double,
+  NalBuhK : double,
+  SumStaff: double,
+  NalStaff: double,
+  SumDelta: double,
+  NalDelta: double
+) with index (
+ i01 = FIO + PodrCode
+);
+
+table struct tRaspr (
+  wType   : word, //Тип записи: 0-распределение по сотруднику, 1-распределение по подразделению
+  cRec    : comp, //Если wType = 0 - ссылка на сотрудника, если wType = 1 - ссылка на подразделение
+  cRezerv : comp,
+  SchetO  : string[21],
+  SubOsSch: string[21],
+  TblOs   : array[1..6] of word,
+  KauOs   : array[1..6] of comp,
+  KodSpo  : comp,
+  SumOb   : double
+) with index (
+  i01 = wType + cRec + cRezerv
+);
+
+var
+  _getKau      : GetKau;          //объект для выбора аналитик
+  _plporSimple : PlporSimple;     //объект для формирования бухсправки
+  _mlfp        : MainLSchetForPersons; //объект для получения лицевого счета по сотруднику
+  _protocol    : IAtlProtocol(AtlProtocol) new; //протокол для вывода сообщений
+  _dInv        : date;            //дата инвентаризации
+  _cPlansSch   : comp;            //план счетов для анализа проводок
+  cgKau_Rezerv : word;            //код аналитики Резервы
+  _cRezervOtp  : comp;            //Аналитика 96 счета Резервы 'Резерв (фактический) отпуск'
+  _cRezervNal  : comp;            //Аналитика 96 счета Резервы 'Резерв (фактический) отпуск Налоги'
+  _cKatPodrEM  : comp;            //Подразделение Энергомаш
+  _plPorNrec   : comp;            //nrec созданной платежки
+  _cRezerv     : comp;            //Резерв для формирования проводок (отпуск/налоги)
+  _tRasp_wType : word;            //Вид записи в таблице tRaspr (0-по сотрудникам, 1-по подразделениям)
+  _tRasp_cRec  : comp;            //Ссылка на сотрудника/подразделение в таблице tRaspr
+  _lschetNrec  : comp;
+  _cLSKatPodr  : comp;
+  //_cOwnFil     : comp;
+create view
+  (RezervOtpFld,
+   RezervNalFld,
+   KatPodrEMFld)
+as select
+  ShowKau(cgKau_Rezerv, _cRezervOtp),
+  ShowKau(cgKau_Rezerv, _cRezervNal),
+  ShowKau(cgKau_KatPodr, _cKatPodrEM)
+from
+  tSaldo96,
+  tRaspr,
+  UserDeskRep,
+  PickRep PickRepMnPlan,
+  PlansSch,
+  BuhSchet BuhSchet96,
+  PlPor,
+  SoprHoz,
+  LSchet,
+  KatPodr LSKatPodr,
+  KatKau,
+  SpKau,
+  tInv,
+  Oborot,
+  KatPodr
+where ((
+      _cRezerv             == tSaldo96.KauOs[2]
+  and tInv.cPerson         == tSaldo96.KauOs[1]
+  and tInv.cPodr           == tSaldo96.KodSpo
+
+  and _tRasp_wType         == tRaspr.wType
+  and _tRasp_cRec          == tRaspr.cRec
+  and _cRezerv             == tRaspr.cRezerv
+
+  and cgGP_Report_21002    == UserDeskRep.NRep
+  and ''                   == UserDeskRep.OwnName
+
+  and UserDeskRep.Nrec     == PickRepMnPlan.cUserDeskRep
+  and PICKREP_WLIST_MNPLAN == PickRepMnPlan.wList
+
+  and _cPlansSch           == PlansSch.Nrec
+  and PlansSch.Kod + '96'  == BuhSchet96.Schet
+  and '01'                   == BuhSchet96.SubSch
+
+  and _plPorNrec           == PlPor.Nrec
+
+  and PlPor.TiDk           == SoprHoz.TipDoc
+  and PlPor.Nrec           == SoprHoz.cSoprDoc
+
+  and _lschetNrec               == LSchet.Nrec
+  and _cLSKatPodr               == LSKatPodr.Nrec
+));
+;
+
+//******************************************************************************
+//#region Визуальная часть
+
+window wParameters 'Параметры' escClose doAccept;
+  show(,,63, 15);
+
+  screen scParameters (,,sciEn13Esc);
+    show(,,,7) fixed_y;
+    fields
+      PlansSch.Name ('План счетов для анализа проводок'): protect, pickbutton;
+      RezervOtpFld ('Аналитика 96 счета Резервы "Резерв (фактический) отпуск"'): protect, pickbutton;
+      RezervNalFld ('Аналитика 96 счета Резервы "Резерв (фактический) отпуск Налоги"'): protect, pickbutton;
+      KatPodrEMFld ('Подразделение "Энергомаш"'): protect, pickbutton;
+<<
+
+`План счетов`              .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Резерв "отпуск"`          .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Резерв "отпуск Налоги"`   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Подразделение "Энергомаш"`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+Заказы, на которые не распределять корректировку резерва
+>>
+  end;
+
+  browse brExclMnPlan (,,sci1378Esc);
+    show(,8,,);
+    table PickRepMnPlan;
+    fields
+      [ExclMnPlanFld] ShowKau(cgKau_Zakaz, PickRepMnPlan.cRec) 'Исключаемый заказ': protect, pickbutton;
+  end;
+
+  tableevent table PickRepMnPlan;
+    cmInsertRecord: insert current PickRepMnPlan;
+    cmUpdateRecord: update current PickRepMnPlan;
+    cmDeleteRecord: delete current PickRepMnPlan;
+    cmPick:
+    {
+      var c: comp = PickRepMnPlan.cRec;
+      var cnt: longint = _getKau.GetCodeKau(cgiMulti, cgKau_Zakaz, c);
+      if cnt = 1
+        set PickRepMnPlan.cRec := c;
+      else if cnt > 1
+      {
+        var m: TPtr = InitMarker(_getKau.GetMarkerName(cgKau_Zakaz), 8, 10, 10, false);
+        GetMarker(m, 0, c);
+        set PickRepMnPlan.cRec := c;
+        UpDateTable;
+        var i: longint;
+        for (i := 1; GetMarker(m, i, c); i++)
+        {
+          ClearBuffer(tnPickRepMnPlan);
+          PickRepMnPlan.cRec := c;
+          Insert current PickRepMnPlan;
+        }
+        DoneMarker(m, '');
+      }
+      RescanPanel(#PickRepMnPlan);
+    }
+  end;
+
+  handleevent
+
+    cmPick:
+    {
+      case curfield of
+        #PlansSch.Name:
+        {
+          var c: comp = PlansSch.Nrec;
+          if RunInterface(F_PLANSSCH::GetPlansSchEx, c, cgiPick) = cmDefault
+          {
+            set _cPlansSch := c;
+            RereadRecord;
+          }
+        }
+        #RezervOtpFld:
+        {
+          var c: comp = _cRezervOtp;
+          if _getKau.GetCodeKau(cgiPick, cgKau_Rezerv, c) > 0
+          {
+            set _cRezervOtp := c;
+            ReReadRecord;
+          }
+        }
+        #RezervNalFld:
+        {
+          var c: comp = _cRezervNal;
+          if _getKau.GetCodeKau(cgiPick, cgKau_Rezerv, c) > 0
+          {
+            set _cRezervNal := c;
+            ReReadRecord;
+          }
+        }
+        #KatPodrEMFld:
+        {
+          var c: comp = _cKatPodrEM;
+          if _getKau.GetCodeKau(cgiPick, cgKau_KatPodr, c) > 0
+          {
+            set _cKatPodrEM := c;
+            ReReadRecord;
+          }
+        }
+      end;
+    }
+
+  end; //handleevent window wParameters
+
+end; //window wParameters
+
+screen sc1;
+  show (,,,2) fixed_y;
+  fields
+    _dInv: noprotect;
+  buttons
+    cmRefreshInv, default;
+    cmCreateBuhSpr;
+    cmParameters;
+<<
+`Дата инвентаризации`.@@@@@@@@@@ <. Обновить .> <. Сформировать бухсправку .> <. Настройки .>
+>>
+end;
+
+browse br1;
+  show(,3,,);
+  table tInv;
+  fields
+    tInv.StrTabN   '','Табельный','номер'                : [10], protect;
+    tInv.FIO       '','','ФИО'                           : [20], protect;
+    tInv.PodrCode  '','Код','подразделения'              : [10], protect;
+    tInv.PodrName  '','Наименование','подразделения'     : [20], protect;
+    tInv.SumBuhD   'Зарплата','96 cчет','Дебет'          : [12,'\2p[|-]3666`666`666`666.88'], protect, browseSum;
+    tInv.SumBuhK   'Зарплата','96 cчет','Кредит'         : [12,'\2p[|-]3666`666`666`666.88'], protect, browseSum;
+    tInv.NalBuhD   'Налоги','96 cчет','Дебет'            : [12,'\2p[|-]3666`666`666`666.88'], protect, browseSum;
+    tInv.NalBuhK   'Налоги','96 cчет','Кредит'           : [12,'\2p[|-]3666`666`666`666.88'], protect, browseSum;
+    tInv.SumStaff  'Зарплата','оценочные','обязательства': [12,'\2p[|-]3666`666`666`666.88'], protect, browseSum;
+    tInv.NalStaff  'Налоги','оценочные','обязательства'  : [12,'\2p[|-]3666`666`666`666.88'], protect, browseSum;
+    tInv.SumDelta  'Зарплата','корректировка',''         : [12,'\2p[|-]3666`666`666`666.88'], protect, browseSum;
+    tInv.NalDelta  'Налоги','корректировка',''           : [12,'\2p[|-]3666`666`666`666.88'], protect, browseSum;
+end;
+
+//#endregion Визуальная часть
+//******************************************************************************
+
+
+//******************************************************************************
+//#region Queries Saldo
+sql query qSaldo96Head =
+  insert tSaldo96 (TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+                   KauOs[1] , KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+                   KodSpO, SumS)
+  select
+    TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+    KauOs[1], KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+    KodSpO,
+    Round(Sum(SumS),2)
+  from
+    ( select
+        TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+        KauOs[1], KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+        case when Filial.Nrec is Null then :cKatPodrEM else KodSpO end as KodSpO,
+        SumS * case when ViOb = 1 then 1 else -1 end as SumS
+      from
+        SaldMoun
+      left join Filial
+        on Filial.cPodr = SaldMoun.KodSpO
+      where
+        SchetO = :psKod + '96' and subOsSch = '01' and
+        KauOs[2] in (:cRezervOtp,:cRezervNal ) and
+        DateSal = :dSald //and KodSpo = :cOwnFil
+;
+sql query qSaldo96Oborot =
+      union all
+
+      select                                                       //Дебетовые обороты по 96 счету
+        TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+        KauOs[1], KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+        case when Filial.Nrec is Null then :cKatPodrEM else KodSpO end,
+        SumOb
+      from
+        Oborot
+      left join Filial
+        on Filial.cPodr = Oborot.KodSpO
+      where
+        SchetO = :psKod + '96' and subOsSch = '01' and
+        KauOs[2] in (:cRezervOtp,:cRezervNal) and
+        DatOb between :dSald and :dOb //and KodSpo = :cOwnFil
+
+      union all
+
+      select                                                       //Кредитовые обороты по 96 счету с минусом
+        TblKs[1], TblKs[2], TblKs[3], TblKs[4], TblKs[5], TblKs[6],
+        KauKs[1], KauKs[2], KauKs[3], KauKs[4], KauKs[5], KauKs[6],
+        case when Filial.Nrec is Null then :cKatPodrEM else KodSpK end,
+        -SumOb
+      from
+        Oborot
+      left join Filial
+        on Filial.cPodr = Oborot.KodSpK
+      where
+        SchetK = :psKod + '96' and SUBSCHK = '01' and
+        KauKs[2] in (:cRezervOtp,:cRezervNal) and
+        DatOb between :dSald and :dOb //and KodSpk = :cOwnFil
+;
+sql query qSaldo96Tail =
+    ) t
+    group by
+      TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+      KauOs[1] , KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+      KodSpO
+;
+//#endregion Queries Saldo
+//******************************************************************************
+
+
+//******************************************************************************
+//#region Query Inv
+sql query qInv =
+  select
+    coalesce(Persons.StrTabN, '') as StrTabN,
+    coalesce(Persons.FIO, '')     as FIO,
+    coalesce(KatPodr.Kod, '')     as PodrCode,
+    coalesce(KatPodr.Name, '')    as PodrName,
+    t.cPerson,
+    t.cPodr,
+    case when t.SumBuh > 0 then t.SumBuh  else 0 end as SumBuhD,
+    case when t.SumBuh < 0 then -t.SumBuh else 0 end as SumBuhK,
+    case when t.NalBuh > 0 then t.NalBuh  else 0 end as NalBuhD,
+    case when t.NalBuh < 0 then -t.NalBuh else 0 end as NalBuhK,
+    t.SumStaff,
+    t.NalStaff,
+    (t.SumStaff + t.SumBuh) as SumDelta,
+    (t.NalStaff + t.NalBuh) as NalDelta
+  from
+    ( select
+        cPerson,
+        cPodr,
+        sum(SumBuh)   as SumBuh,
+        sum(NalBuh)   as NalBuh,
+        sum(SumStaff) as SumStaff,
+        sum(NalStaff) as NalStaff
+      from
+        ( select
+            KauOs[1] as cPerson,
+            KodSpO   as cPodr,
+            case when KauOs[2] = :cRezervOtp then SumS else 0 end as SumBuh,
+            case when KauOs[2] = :cRezervNal then SumS else 0 end as NalBuh,
+            0 as SumStaff,
+            0 as NalStaff
+          from
+            tSaldo96
+          where
+            SumS <> 0
+
+          union all
+
+          select                                                       //Оценочные обязательства (персонал)
+            tPerson,
+            case when Filial.Nrec is Null then :cKatPodrEM else Cex end as Cex,
+            0, 0,
+            SumUdAll,
+            SumUdPre + ChasF
+          from
+            ArxShtrf
+          left join Filial
+            on Filial.cPodr = ArxShtrf.Cex
+          where
+            RecType = 1 and
+            DataN = :dStaff //and ( ArxShtrf.Cex = 0 or ArxShtrf.Cex = :cOwnFil)
+        ) t
+      group by cPerson, cPodr
+    ) t
+  join Persons
+    on Persons.Nrec = t.cPerson
+  left join KatPodr
+    on KatPodr.Nrec = t.cPodr
+  where
+    t.SumBuh   <> 0 or
+    t.NalBuh   <> 0 or
+    t.SumStaff <> 0 or
+    t.NalStaff <> 0
+  order by Persons.StrTabN
+;
+
+//#endregion Queries
+//******************************************************************************
+
+
+//******************************************************************************
+//#region Query Raspr
+sql query qRasprByPerson =
+  select
+    0          as wType,
+    (KauKs[1])   as cRec,
+    KauKs[2]   as cRezerv,
+    SchetO, SubOsSch,
+    TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+    KauOs[1], KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+    KodSpO,
+    Sum(SumOb) as SumOb
+  from
+    Oborot
+  where
+    SchetO in (:psKod+'20', :psKod+'23', :psKod+'25', :psKod+'26', :psKod+'29', :psKod+'44') and
+    SchetK = :psKod+'96' and SubSchK = '01' and
+    DatOb between :dBeg and :dEnd and
+    KauKs[2] in (:cRezervOtp, :cRezervNal ) and
+    KauOs[3] not in (select cRec from PickRep where cUserDeskRep = :cUserDeskRep and wList = :wList ) //and KodSpK = :cOwnFil
+  group by
+    SchetO, SubOsSch,
+    TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+    KauOs[1], KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+    KodSpO,
+    (KauKs[1]), KauKs[2]
+;
+
+sql query qRasprByPodr =
+  select
+    1                                       as wType,
+    Coalesce(KatPodrTop.Nrec, KatPodr.Nrec) as cRec,
+    KauKs[2]                                as cRezerv,
+    SchetO, SubOsSch,
+    TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+    KauOs[1], KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+    KodSpO,
+    Sum(SumOb) as SumOb
+  from
+    Oborot
+  join KatPodr
+    on KatPodr.Nrec = Oborot.KodSPO
+  left join KatPodr KatPodrTop
+    on KatPodrTop.Kod = SubString(KatPodr.Kod, 1, 3)
+  where
+    SchetO in (:psKod+'20', :psKod+'23', :psKod+'25', :psKod+'26', :psKod+'29', :psKod+'44') and
+    SchetK = :psKod+'96' and SubSchK = '01' and
+    DatOb between :dBeg and :dEnd and
+    KauKs[2] in (:cRezervOtp, :cRezervNal ) and
+    KauOs[3] not in (select cRec from PickRep where cUserDeskRep = :cUserDeskRep and wList = :wList ) //and KodSpK = :cOwnFil
+  group by
+    SchetO, SubOsSch, KodSpO,
+    TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+    KauOs[1], KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+    Coalesce(KatPodrTop.Nrec, KatPodr.Nrec),
+    KauKs[2]
+
+  union all
+
+  select
+    1        as wType,
+    #comp(0) as cRec,
+    KauKs[2] as cRezerv,
+    SchetO, SubOsSch,
+    TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+    KauOs[1], KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+    KodSpO,
+    Sum(SumOb) as SumOb
+  from
+    Oborot
+  join KatPodr
+    on KatPodr.Nrec = Oborot.KodSPO
+  where
+    SchetO in (:psKod+'20', :psKod+'23', :psKod+'25', :psKod+'26', :psKod+'29', :psKod+'44') and
+    SchetK = :psKod+'96' and SubSchK = '01' and
+    DatOb between :dBeg and :dEnd and
+    KauKs[2] in (:cRezervOtp, :cRezervNal ) and
+    KauOs[3] not in (select cRec from PickRep where cUserDeskRep = :cUserDeskRep and wList = :wList ) //and KodSpK = :cOwnFil
+  group by
+    SchetO, SubOsSch, KodSpO,
+    TblOs[1], TblOs[2], TblOs[3], TblOs[4], TblOs[5], TblOs[6],
+    KauOs[1], KauOs[2], KauOs[3], KauOs[4], KauOs[5], KauOs[6],
+    KauKs[2]
+;
+
+//#endregion Query Raspr
+//******************************************************************************
+
+procedure SetOborotBufferBase;
+{
+  Oborot.TiDk       := PlPor.TiDk;
+  Oborot.TiDkGal    := PlPor.TiDkGal;
+  Oborot.cSoprDoc   := PlPor.Nrec;
+  Oborot.cSoprHoz   := SoprHoz.Nrec;
+  Oborot.cPlansSch  := PlansSch.Nrec;
+  Oborot.Descr      := PlPor.Descr;
+  Oborot.DesGr      := PlPor.DesGr;
+  Oborot.DatOb      := PlPor.DatVip;
+  Oborot.DataOt     := PlPor.DatVip;
+  Oborot.NoDok      := PlPor.NoDok;
+  Oborot.VhProp     := '+';
+}
+
+
+procedure Set_tRasp_cRec_ByLSKatPodr(cLSKatPodr: comp);
+{
+  _tRasp_cRec := cLSKatPodr;
+  if getfirst tRaspr != tsOk
+  {
+    _cLSKatPodr := cLSKatPodr;
+    if getfirst LSKatPodr = tsOk
+      Set_tRasp_cRec_ByLSKatPodr(LSKatPodr.cPodr);
+  }
+}
+
+
+procedure CreateOborotK96(cRezerv: comp; dSumOb: double; dSumSaldo: double);
+{
+  var i: byte = 0;
+  _cRezerv     := cRezerv;
+  _tRasp_cRec  := tInv.cPerson;
+  _tRasp_wType := 0;
+
+  //если отсутствует база распределения по сотруднику - ищем базу распределения по подразделению
+  if getfirst tRaspr != tsOk
+  {
+    if _mlfp.GetMainLschet(tInv.cPerson, _lschetNrec)
+    {
+      if getfirst LSchet = tsOk
+      {
+        _tRasp_wType := 1;
+        //устанавливаем в _tRasp_cRec ссылку на подразделение из л/с сотрудника
+        //или одно из вышестоящих подразделений, по которому есть база распределения
+        Set_tRasp_cRec_ByLSKatPodr(LSchet.Cex);
+      }
+    }
+    else
+      _protocol.LogLine(APE_WARNING, 'Не найден лицевой счет по сотруднику ' + tInv.StrTabN + ' ' + tInv.FIO);
+  }
+
+  var totalRaspr: double = 0;
+  _loop tRaspr
+    totalRaspr += tRaspr.SumOb;
+
+  if totalRaspr = 0
+    _protocol.LogLine(APE_WARNING, 'Не определена база распределения по сотруднику ' + tInv.StrTabN + ' ' +
+                                   tInv.FIO + ', подр. ' + if(_tRasp_wType = 0, tInv.PodrCode,
+                                   ShowKau(cgKau_KatPodr, LSchet.Cex)) +
+                                   ', вид резерва: ' + ShowKau(cgKau_Rezerv, _cRezerv));
+
+  var dSumPortion: double = 0;
+  if dSumSaldo != 0
+  {
+    _loop tSaldo96
+    {
+      dSumPortion := 0;
+      _loop tRaspr
+      {
+        ClearBuffer(tnOborot);
+        SetOborotBufferBase;
+        Oborot.SchetK     := PlansSch.Kod + '96';
+        Oborot.SubSchK    := '01';
+        Oborot.KrSchetK   := '96';
+        Oborot.KodSPK     := tSaldo96.KodSpo;
+        for(i := 1; i <= 6; i++)
+        {
+          Oborot.TblKs[i] := tSaldo96.TblOs[i];
+          Oborot.KauKs[i] := if(tSaldo96.TblOs[i] = cgKau_Persons ,tSaldo96.KauOs[i] ,tSaldo96.KauOs[i]) ;
+          Oborot.TblOs[i] := tRaspr.TblOs[i];
+          Oborot.KauOs[i] := if(tRaspr.TblOs[i]= cgKau_Persons ,tRaspr.KauOs[i] ,tRaspr.KauOs[i]) ;
+        }
+        Oborot.SchetO     := tRaspr.SchetO;
+        Oborot.SubOsSch   := tRaspr.SubOsSch;
+        Oborot.DbSchetO   := SubStr(tRaspr.SchetO, 2, 20);
+        Oborot.KodSpo     := tRaspr.KodSpo;
+        dSumPortion       += dSumOb * (tSaldo96.SumS / dSumSaldo) * (tRaspr.SumOb / totalRaspr);
+        Oborot.SumOb      := round(dSumPortion, 2);
+        dSumPortion       -= Oborot.SumOb;
+        insert current Oborot;
+      }
+    }
+  }
+  else
+  {
+    dSumPortion := 0;
+    _loop tRaspr
+    {
+      ClearBuffer(tnOborot);
+      SetOborotBufferBase;
+      Oborot.SchetK     := PlansSch.Kod + '96';
+      Oborot.SubSchK    := '01';
+      Oborot.KrSchetK   := '96';
+      Oborot.TblKs[2]   := BuhSchet96.KodTable[2];
+      Oborot.KauKs[2]   := _cRezerv;
+      Oborot.TblKs[1]   := BuhSchet96.KodTable[1];
+      Oborot.KauKs[1]   := tInv.cPerson ;
+      Oborot.KodSPK     := tInv.cPodr;
+      for(i := 1; i <= 6; i++)
+      {
+        Oborot.TblOs[i] := tRaspr.TblOs[i];
+        Oborot.KauOs[i] := if(tRaspr.TblOs[i] = cgKau_Persons ,tRaspr.KauOs[i] ,tRaspr.KauOs[i]) ;
+      }
+      Oborot.SchetO     := tRaspr.SchetO;
+      Oborot.SubOsSch   := tRaspr.SubOsSch;
+      Oborot.DbSchetO   := SubStr(tRaspr.SchetO, 2, 20);
+      Oborot.KodSpo     := tRaspr.KodSpo;
+      dSumPortion       += dSumOb * (tRaspr.SumOb / totalRaspr);
+      Oborot.SumOb      := round(dSumPortion, 2);
+      dSumPortion       -= Oborot.SumOb;
+      insert current Oborot;
+    }
+  }
+}
+
+
+//Формирует бухсправку, возвращает ее nrec
+function CreateBuhSpr: comp;
+{
+  result := 0;
+
+  if getfirst BuhSchet96 != tsOk
+  {
+    _protocol.LogLine(APE_ERROR, 'В плане счетов не найден счет 96. Проверьте настройку плана счетов.');
+    exit;
+  }
+
+  _plporNrec := _plporSimple.PlPor_InsertBSByParam(
+    _plporSimple.PlPor_GetNewNumber(PLPOR_TIDK, PLPOR_TIDKGAL, sGetTune('USER.DESCR'), _dInv),
+    comp(0),
+    PLPOR_TIDK,
+    _dInv,
+    'Инвентаризация резерва на отпуск ' + DateToStr(_dInv, 'Month YYYYг.'),
+    ''
+  );
+
+  if getfirst PlPor != tsOk
+  {
+    _protocol.LogLine(APE_ERROR, 'Ошибка формирования бухгалтерской справки');
+    exit;
+  }
+  else
+    _protocol.LogMessage(APE_INFO, 'Сформирована бухгалтерская справка №' + PlPor.NoDok + ' от ' + PlPor.DatVip);
+
+  if getfirst SoprHoz != tsOk
+  {
+    _protocol.LogLine(APE_ERROR, 'Ошибка формирования хозяйственной операции к бухгалтерской справке');
+    _protocol.LogCommit;
+    exit;
+  }
+
+  pushpos(tntInv);
+  _protocol.LogStartVisual('Формирование проводок', RecordsInTable(tntInv));
+  _loop tInv
+  {
+    if not _protocol.LogNextVisual('Формирование проводок') break;
+
+    if round(tInv.SumDelta,2) != 0
+      CreateOborotK96(_cRezervOtp, tInv.SumDelta, tInv.SumBuhD - tInv.SumBuhK);
+
+    if round(tInv.NalDelta,2) != 0
+      CreateOborotK96(_cRezervNal, tInv.NalDelta, tInv.NalBuhD - tInv.NalBuhK);
+  }
+  _protocol.LogStopVisual;
+  poppos(tntInv);
+
+  RunInterface(F_PlPor::PlPor, PlPor.TiDkGal, PlPor.TiDk, PlPor.Nrec);
+}
+
+
+//Заполняет временную таблицу tInv данными инвентаризации
+procedure RefreshInv;
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Выборка данных', 0);
+  //Определяем код плана счетов
+  var psKod: string[1] = if(GetFirst PlansSch = tsOk, PlansSch.Kod, '');
+  //Определяем дату начала ближайшего месяца, на которую рассчитано сальдо
+  var dSald: date = dGetTune('DAT_M_OT'); //Отчетный период бухгалтерского контура
+  if dSald > _dInv
+    dSald := date(1, Month(_dInv), Year(_dInv));
+  //Определяем дату до которой нужно учитывать проводки
+  var dOb: date = _dInv;
+  //Создаем временную sql таблицу сальдо по 96 счету
+  var s: longint = 0;
+  sqlAddStr(s, 'table tSaldo96 (');
+  sqlAddStr(s, '  TblOs: array[1..6] of word,');
+  sqlAddStr(s, '  KauOs: array[1..6] of comp,');
+  sqlAddStr(s, '  KodSpo: comp,');
+  sqlAddStr(s, '  SumS: double');
+  sqlAddStr(s, ') with index (');
+  sqlAddStr(s, '  i01 = KauOs[1] + KauOs[2]');
+  sqlAddStr(s, ');');
+  sqlCreateTmpTable(s, ctmNormal);
+  //Заполняем sql таблицу tSaldo96 рассчитанным сальдо на дату инвентаризации
+  sqlFreeStr(s);
+  sqlAddStr(s, qSaldo96Head);
+  if dSald <= dOb
+    sqlAddStr(s, qSaldo96Oborot);
+  sqlAddStr(s, qSaldo96Tail);
+  var rslt: integer = queryManager.createQuery(s)
+//                                  .setParam('coPersonsSdvig', coPersonsSdvig)
+                                  .setParam('dSald', dSald)
+                                  .setParam('dOb', dOb)
+                                  .setParam('cRezervOtp', _cRezervOtp)
+                                  .setParam('cRezervNal', _cRezervNal)
+                                  .setParam('psKod', psKod)
+                                  .setParam('cKatPodrEM', _cKatPodrEM)
+                                  //.setParam('cOwnFil', _cOwnFil)
+                                  .execute
+                                  .errorCode;
+  if rslt != tsOk
+    message('Ошибка расчета сальдо по 96 счету: ' + rslt, error);
+  //Заполняем tSaldo96
+  var q1: IQuery = queryManager.createQuery('select * from tSaldo96 where SumS <> 0');
+  mtClear(tntSaldo96, mfNormal);
+  sqlCopyInto(q1, tntSaldo96, true);
+
+  //Определяем дату, на которую должны быть посчитаны оценочные обязательства в персонале
+  //Это дата окончания месяца инвентаризации
+  var dStaff: date = _dInv;
+  dStaff := date(last_day(dStaff), Month(dStaff), Year(dStaff));
+  //Заполняем tInv данными инвентаризации
+  var q2: IQuery = queryManager.createQuery(qInv)
+                               .setParam('dStaff', dStaff)
+                               .setParam('cRezervOtp', _cRezervOtp)
+                               .setParam('cRezervNal', _cRezervNal)
+                               .setParam('cKatPodrEM', _cKatPodrEM);
+                               //.setParam('cOwnFil', _cOwnFil);
+  if q2.execute.errorCode = tsOk
+  {
+    mtClear(tntInv, mfNormal);
+    sqlCopyInto(q2, tntInv, true);
+  }
+  else
+    Message('Ошибка выборки данных: ' + q2.errorCode);
+
+  //Определяем период анализа проводок Д2** К96 для определения на какие разрезы распределять корректировки по 96 счету
+  var dBegRaspr: date = date(1, Month(_dInv), Year(_dInv));
+  var dEndRaspr: date = date(Last_Day(dBegRaspr), Month(dBegRaspr), Year(dBegRaspr));
+  //Заполняем tRaspr данными пропорции на которую распределять корректировку резерва по сотрудникам
+  var q3: IQuery = queryManager.createQuery(qRasprByPerson)
+//                               .setParam('coPersonsSdvig', coPersonsSdvig)
+                               .setParam('psKod', psKod)
+                               .setParam('dBeg', dBegRaspr)
+                               .setParam('dEnd', dEndRaspr)
+                               .setParam('cRezervOtp', _cRezervOtp)
+                               .setParam('cRezervNal', _cRezervNal)
+                               .setParam('wList', PICKREP_WLIST_MNPLAN)
+                               .setParam('cUserDeskRep', UserDeskRep.Nrec);
+                               //.setParam('cOwnFil', _cOwnFil);
+  if q3.execute.errorCode = tsOk
+  {
+    mtClear(tntRaspr, mfNormal);
+    sqlCopyInto(q3, tntRaspr, true);
+  }
+  else
+    Message('Ошибка выборки данных по распределению корректировки резерва по сотрудникам: ' + q3.errorCode);
+  //Заполняем tRaspr данными пропорции на которую распределять корректировку резерва по подразделениям
+  var q4: IQuery = queryManager.createQuery(qRasprByPodr)
+                               .setParam('psKod', psKod)
+                               .setParam('dBeg', dBegRaspr)
+                               .setParam('dEnd', dEndRaspr)
+                               .setParam('cRezervOtp', _cRezervOtp)
+                               .setParam('cRezervNal', _cRezervNal)
+                               .setParam('wList', PICKREP_WLIST_MNPLAN)
+                               .setParam('cUserDeskRep', UserDeskRep.Nrec);
+                               //setParam('cOwnFil', _cOwnFil);
+  if q4.execute.errorCode = tsOk
+    sqlCopyInto(q4, tntRaspr, true);
+  else
+    Message('Ошибка выборки данных по распределению корректировки резерва по подразделениям: ' + q4.errorCode);
+
+  StopVisual('', 0);
+  sqlDropTmpTable('tSaldo96');
+}
+
+
+handleevent
+
+  cmInit:
+  {
+    /*
+    //Определяем код КАУ "Резервы"
+    if getfirst KatKau where ((0         == KatKau.IsActive and
+                               1         == KatKau.SysNum and
+                               'Резервы' == KatKau.Name)) = tsOk
+      cgKau_Rezerv := KatKau.KodGroup;
+    if cgKau_Rezerv = 0
+    {
+      Message('Не найден КАУ "Резервы"', error);
+      Abort;
+      Exit;
+    }
+    //Читаем/инициализируем настройки
+    if getfirst UserDeskRep != tsOk
+    {
+      ClearBuffer(tnUserDeskRep);
+      UserDeskRep.ResDate[1]   := cur_date;
+      UserDeskRep.ResComp[1]   := coGetTune('KONSOLID.CPLANSSCH'); //"Настройки Галактики \ Бухгалтерский контур \ План счетов по умолчанию"
+      if getfirst SpKau where (( cgKau_Rezerv == SpKau.KodGrKau and 'Резерв (фактический) отпуск' == SpKau.Name )) = tsOk
+        UserDeskRep.ResComp[2] := SpKau.Nrec;
+      if getfirst SpKau where (( cgKau_Rezerv == SpKau.KodGrKau and 'Резерв (фактический) отпуск Налоги' == SpKau.Name )) = tsOk
+        UserDeskRep.ResComp[3] := SpKau.Nrec;
+      if getfirst KatPodr where (( '01' == KatPodr.Kod )) = tsOk
+        UserDeskRep.ResComp[4] := KatPodr.Nrec;
+      insert current UserDeskRep;
+    }
+
+*/
+    if getfirst KatKau where ((0         == KatKau.IsActive and
+                               1         == KatKau.SysNum and
+                               'Вид резерва' == KatKau.Name)) = tsOk
+      cgKau_Rezerv := KatKau.KodGroup;
+    if cgKau_Rezerv = 0
+    {
+      Message('Не найден КАУ "Вид резерва"', error);
+      Abort;
+      Exit;
+    }
+
+    //_cOwnFil := coGetTune('TPROV.CURFILIALASKATPODR');
+
+    //Читаем/инициализируем настройки
+    if getfirst UserDeskRep != tsOk
+    {
+      ClearBuffer(tnUserDeskRep);
+      UserDeskRep.ResDate[1]   := cur_date;
+      UserDeskRep.ResComp[1]   := coGetTune('KONSOLID.CPLANSSCH'); //"Настройки Галактики \ Бухгалтерский контур \ План счетов по умолчанию"
+      if getfirst SpKau where (( cgKau_Rezerv == SpKau.KodGrKau and 'ФОТ' == SpKau.Name )) = tsOk
+        UserDeskRep.ResComp[2] := SpKau.Nrec;
+      if getfirst SpKau where (( cgKau_Rezerv == SpKau.KodGrKau and 'Налоги на ФОТ' == SpKau.Name )) = tsOk
+        UserDeskRep.ResComp[3] := SpKau.Nrec;
+      if getfirst KatPodr where (( '01' == KatPodr.Kod )) = tsOk
+        UserDeskRep.ResComp[4] := KatPodr.Nrec;
+      insert current UserDeskRep;
+    }
+
+
+
+
+    set _dInv       := UserDeskRep.ResDate[1];
+    set _cPlansSch  := UserDeskRep.ResComp[1];
+    set _cRezervOtp := UserDeskRep.ResComp[2];
+    set _cRezervNal := UserDeskRep.ResComp[3];
+    set _cKatPodrEM := UserDeskRep.ResComp[4];
+    //Обновляем данные
+    RefreshInv;
+    RescanPanel(tntInv);
+  }
+
+  cmRefreshInv:
+  {
+    RefreshInv;
+    RereadRecord(tntInv);
+  }
+
+  cmParameters:
+  {
+    RunWindow(wParameters);
+  }
+
+  cmCreateBuhSpr:
+  {
+    _protocol.Visible := true;
+    _protocol.AutoFlush := true;
+    CreateBuhSpr;
+  }
+
+  cmDone:
+  {
+    //сохраняем настройки
+    UserDeskRep.ResDate[1] := _dInv       ;
+    UserDeskRep.ResComp[1] := _cPlansSch  ;
+    UserDeskRep.ResComp[2] := _cRezervOtp ;
+    UserDeskRep.ResComp[3] := _cRezervNal ;
+    UserDeskRep.ResComp[4] := _cKatPodrEM ;
+    update current UserDeskRep;
+  }
+
+end;
+
+end.

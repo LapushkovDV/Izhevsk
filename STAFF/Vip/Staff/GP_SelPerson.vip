@@ -1,0 +1,164 @@
+/*************************************************************************************************\
+* Наименование: Выбор карточки работника                                                          *
+* Контур/Модуль: Управление персоналом                                                            *
+* Пункт меню: Документы / Все приказы по персоналу                                                *
+* Примечание:                                                                                     *
+* В РПД 201 нужно выбирать одновременно из уволенных и из практикантов.                           *
+* Стандартного такого интервфейса, естественно, нет.                                              *
+* Пришлось сделать свой. К РПД 201 его не привязывал, может в будущем еще придётся расширить для  *
+* других вариантов выбора.                                                                        *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#339          |14/06/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include CatFunc.vih // интерфейс работы с каталогами
+#include MainLschetForPersons.vih // нахождение основного л\с
+
+interface GP_SelPerson 'Выбор сотрудника'  (, hcStaffSelectPsn, sci1EnEsc) escClose, doAccept, cyan;
+  show at (,, 121, 27);
+
+  const
+    // Константы для задания режима выбора (битовая маска)
+    SP_FIRED = 1; // уволенные сотрудники
+    SP_TRAINEE = 2; // практиканты
+  end;
+
+  var iCatFunc: CatalogsFunctions;   // для работы с каталогами
+  var MLFP: MainLschetForPersons;// Переменная типа интерфейс MainLschetForPersons
+
+  table struct SPersons
+  (
+    cPersons: tNRec,
+    FIO: String,
+    TabN: LongInt,
+    StrTabN: String,
+    cDept: tNRec,
+    AppDate: Date,
+    DisDate: Date,
+    IsEmployee: String[1]
+  )
+  with index
+  (
+    SPersons01 = cPersons,
+    SPersons02 = FIO + DisDate,
+    SPersons03 = TabN + StrTabN + FIO + DisDate
+  );
+
+  create view
+    var
+      pMode: Word;
+      pcPerson: tNRec; // выбранный сотрудник
+      pDate: Date; // дата приказа, чтобы корректно обрезать сотрудников из Персонс по дате увольнения
+    from
+      Persons,
+      SPersons (SPersons02)
+  ;
+
+  parameters pMode, pcPerson, pDate;
+
+  function GetSourceName(_IsEmployee: String[1]): String;
+  begin
+    result := '';
+    case _IsEmployee of
+      'Р': result := 'Практиканты';
+      'С': result := 'Картотека';
+      'У': result := 'Архив';
+      'П': result := 'Приказ';
+    end;
+  end;
+
+  browse brSPersons;
+    table SPersons;
+  fields
+    SPersons.TabN 'Таб. номер' ('Табельный номер'): [10], protect, noAutoSize;
+    SPersons.StrTabN 'Таб. номер' ('Табельный номер'): [10], protect, noAutoSize;
+    SPersons.FIO 'Фамилия, имя, отчество' ('Фамилия Имя Отчество'): [40], protect;
+    iCatFunc.GetCatalogsName(SPersons.cDept) 'Подразделение' ('Подразделение'): [20], protect;
+    SPersons.AppDate 'Дата', 'приема' ('Дата приема'): [10], protect, noAutoSize;
+    SPersons.DisDate 'Дата', 'увольнения' ('Дата увольнения'): [10], protect, noAutoSize;
+    GetSourceName(SPersons.IsEmployee) 'Источник': [15], protect, noAutoSize;
+  end;
+
+  function AddPerson: Boolean;
+  begin
+    result := true;
+    if getFirst SPersons where ((Persons.NRec == SPersons.cPersons)) = tsOk then
+      exit;
+    // ClearBuffer(#SPersons); // Вызывать нет нужды - все поля присваиваются
+    SPersons.cPersons := Persons.NRec;
+    SPersons.FIO := Persons.FIO;
+    SPersons.TabN := Persons.TabNmb;
+    SPersons.StrTabN := Persons.StrTabN;
+    SPersons.cDept := Persons.Department;
+    SPersons.AppDate := Persons.AppDate;
+    SPersons.DisDate := Persons.DisDate;
+    SPersons.IsEmployee := Persons.IsEmployee;
+    if insert current SPersons != tsOk then
+    begin
+      Message('Ошибка: не удалось вставить запись в таблицу SPersons');
+      result := false
+    end;
+  end;
+
+  function FillSPersons: Boolean;
+  var
+    IsAborted: Boolean;
+  begin
+    result := true;
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak, 'Инициализация', 1);
+    IsAborted := false;
+    _try
+      begin
+        // Добавляем уволенных
+        if (pMode and SP_FIRED) != 0 then
+          _loop Persons where ((
+            pDate >>= Persons.DisDate
+            and (Persons.DisDate != ZeroDate and (Persons.IsEmployee = 'С' or Persons.IsEmployee = 'У'))
+          ))
+          begin
+            if not AddPerson then
+            begin
+              IsAborted := true;
+              break;
+            end;
+            NextVisual;
+          end;
+        // Добавляем практикантов
+        if (pMode and SP_TRAINEE) != 0 then
+          _loop Persons where (('Р' == Persons.IsEmployee))
+          begin
+            if not AddPerson then
+            begin
+              IsAborted := true;
+              break;
+            end;
+            NextVisual;
+          end;
+      end
+    _except
+      on ExUserBreak:
+        begin
+          IsAborted := true;
+        end;
+    StopVisual('', 0);
+  end;
+
+  handleEvent
+    cmInit:
+      begin
+        if not FillSPersons then
+          abort;
+        // Выводим поле с табельным номером в зависимости от значения настройки
+        // "Общие настройки системы \ Табельные номера (правила работы) \ Формат табельных номеров"
+        if wGetTune('FormatClockNumber') = 0 then
+          ClearFieldState(#SPersons.StrTabn, sfVisible)
+        else
+          ClearFieldState(#SPersons.Tabn, sfVisible);
+      end;
+    cmDefault:
+      pcPerson := SPersons.cPersons;
+  end;
+
+end.

@@ -1,0 +1,265 @@
+/*************************************************************************************************\
+* Наименование: Импорт гиперссылок на документы к Договорам из Excel                              *
+* Контур/Модуль: Обмен бизнес-документами                                                         *
+* Примечание:  Импорт из Excel внешних документов         й                                       *
+*       запуск разовый, без добавления в GP_Common\vip.prj                                        *
+* Вид работы  |Номер         |Дата      |Исполнитель              |Проект                         *
+* ---------------------------------------------------------------------------------------------   *
+* Разработка  |#3260         |18/08/2018|Шунин А.Г.               |НПО Энергомаш                  *
+\*************************************************************************************************/
+#include GP_File_hRef.Vih
+Interface GP_ImpDogFile 'Договора. Импорт гиперссылок на документы' gray dialog;
+show (, , 150, 15);
+
+const
+ moChXl         =   1b;
+ moInsDOC       =  10b;
+ moInsAvansAttr = 100b;
+end;
+
+var
+ FRef: GP_File_hRef new;
+ lMode: longint;
+
+ Counter, MaxLine, MaxCol: longint;
+ srcXlFile: string;
+ liVisual: longint;
+
+ xlNrec: comp;
+
+ minNRec1 :comp = 100000000h;        // условно, Максимальный код из 1С
+ minNRecF:comp = 1000000000h;       // minNRec + 1 разряд для Финансового ПКП
+ minNRec2:comp = 0001000000000000h; // условно, Минимальный nRec в Галактике с офисом ()
+
+ lKodDOC, lFName, lUpDOC  : longint;
+ xlKodDOC, xlUpDOC: longint;
+ xlFName, sCommonPath: string;
+
+ f_WTable: word;
+ f_nRec : comp;
+
+
+create view vM
+  as
+select * from  
+ CALPLAN
+,DOGOVOR
+where
+((
+            xlNrec == CALPLAN.nrec and
+  CALPLAN.CDOGOVOR == DOGOVOR.nrec
+))
+;
+
+screen createdScreen;
+    fields
+      lMode  :NoProtect;
+ sCommonPath :NoProtect;
+      srcXlFile:NoProtect, PickButton;
+
+    buttons
+      cmDoMode;
+<<
+ `Режим:`
+ [.] Проверка данных Excel`
+ [.] Загрузить гиперссылки на документы`
+! [.] Изменять Атрибут Аванс. Отсрочка поставки, дни к плану платежей Финансовых ПКП`
+
+ Путь где хранятся файлы сейчас:
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ Файл с данными.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ <. Обработать.>
+
+>>
+end;
+
+
+function ReadColNumByNamesOK1: boolean;
+Var str: string;
+   lCol:longint;
+{
+str := '';
+
+lKodDOC := lFName := lUpDOC := longint(0);
+
+
+lCol:=0;
+    while lCol <= MaxCol // по Колонкам первой строки
+    do
+    {
+      lCol++;
+
+        xlgetcellvalue(1, lCol   ,str );
+        str  := UpCase(trim( str ));
+// КодДоговора	ВидОплаты	ПроцентОплаты	СрокОтсрочки
+
+            Case str of
+        'КОДДОГОВОРА': lKodDOC :=lCol;
+               'ФАЙЛ': lFName    :=lCol;
+    'КОДВЫШЕСТОЯЩЕГО', 'КОДГРУППАДОГОВОРОВ': lUpDOC   :=lCol;
+
+            end; // Case
+    }
+
+    if lKodDOC  = 0 or lFName  = 0 // or lUpDOC=0
+    {
+        message ( 'Ошибка формата файла. Не найдена колонка'
+                +''#13'КодДоговора='+  lKodDOC
+                +''#13'ФАЙЛ='+  lFName
+//                +''#13'КодГруппаДоговоров='+ lUpDOC
+                );
+
+
+       result := False;
+    }
+    else
+    result := true;
+}
+
+procedure xlOut1(pCol:longint;pStr: string);
+{
+  xlSetCellStringValue(pStr,Counter,MaxCol+pCol,Counter,MaxCol+pCol);
+}
+#define _DateS(_Str) date(substr(#_Str,1,2),substr(#_Str,4,2),substr(#_Str,7,4))
+
+
+HandleEvent
+
+cmInit:
+{
+
+  if not ReadMyDsk(lMode, 'ImpDogFilelMode', false) lMode := 1b;
+  if not ReadMyDsk(sCommonPath, 'ImpDogPath', false) sCommonPath := '';
+
+  if not ReadMyDsk(srcXlFile, 'ImpDogFilesrcXlFile',    false) srcXlFile := 'G:\Договоры 20180828.xls';
+
+}
+// --------------------------------------------------------------------------------
+
+cmDoMode:
+{
+
+  SaveMyDsk(srcXlFile, 'ImpDogFilesrcXlFile');
+  SaveMyDsk(lMode, 'ImpDogFilelMode');
+
+  if (not ExistFile(srcXlFile))
+  { message('Не найден шаблон файла "'+srcXlFile+'"');
+    exit;
+  }
+
+  if (not xlCreateExcelWithTemplate(srcXlFile,true))
+  { message('Ошибка создания нового файла в Excel"'+srcXlFile+'".');
+    exit;
+  }
+
+    if (xlIsExcelValid) xlSetActiveSheetByName('1');
+
+    xlGetUsedRange(0,0,MaxLine,MaxCol);
+
+StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Чтение Финансовых ПКП из Excel ...'#13 + srcXlFile, MaxLine div 5);
+
+Var mkErrList: longint = InitMarker('',4,100,10,false);
+
+// Читаем заголовок и находим номера колонок по названию полей
+// MaxLine := 100;
+
+Counter := 1;
+        xlOut1(1, 'Статус');
+        xlOut1(2, 'nRec');
+        xlOut1(3, 'Где');
+// xlOut1(20, STRING(_CurDateTime));
+Counter:=1;
+if ReadColNumByNamesOK1
+while counter < MaxLine
+do
+{
+  Counter++;
+
+//  if Counter> 200 break;
+
+  if Counter mod 5 = 0
+  if not nextvisual break;
+
+  xlgetcellvalue(Counter, lKodDOC , xlKodDOC );
+
+  f_wTable := 0;
+  f_nRec := 0;
+
+  xlNrec := comp(xlKodDOC); // У нижестоящего
+  if Getfirst CalPlan = tsOK
+  {
+    f_WTable := coCalPlan;
+      f_nRec :=   CalPlan.nRec;
+  }
+  else
+  {
+    xlNrec := comp(xlKodDOC) + comp(minNRec1); // У одиночного
+    if Getfirst CalPlan <> tsOK
+    {
+      xlOut1(1,'Ошибка. Нет CalPlan');
+      continue;
+    }
+    else
+    if Getfirst DOGOVOR = tsOK
+    {
+      f_WTable := coDOGOVOR;
+        f_nRec :=   DOGOVOR.nRec;
+    }
+  }
+
+  if f_wTable = 0
+  {
+    xlOut1(1,'Ошибка. Документ не найден');
+    continue;
+  }
+
+  xlOut1(2,string(f_nRec,0,0));
+  xlOut1(3,if(f_wTable = coCalplan,'Calplan','DOGOVOR') );
+
+     xlgetcellvalue(Counter, lFName , xlFName );
+     xlFName := trim(xlFName);
+     if xlFName = ''
+     {
+       xlOut1(1,'Пустое имя файла');
+       continue;
+     }
+     else
+     if not ExistFile(xlFName)
+     {
+       xlOut1(1,'Ошибка. Файл не найден');
+       continue;
+     }
+     else
+     if (lMode and 10b) = 0 xlOut1(1,'Проверено ОК')
+     else
+     {
+       // что- то c xlFName
+       if FRef.Add_File(f_WTable, f_nRec, xlFName)
+       xlOut1(1,'Обработан')
+       else
+       xlOut1(1,'Ошибка добавления файла');
+     }
+
+//  xlOut1(1,'Обработан');
+} // while counter < MaxLine
+
+xlkillExcel;
+StopVisual('',0);
+
+} // cmDoMode:
+
+cmPick:
+  { case CurField of
+    #srcXlFile:
+    { var ww_str:string=GetFileName('*.xl*;*.DBF','Выберите файл c данными по Табелям из КИС');
+      if ww_str<>''
+         set srcXlFile:=ww_str;
+    }
+    end;
+  }
+cmDone:
+{
+   SaveMyDsk(lMode, 'ImpDogFilelMode');
+}
+end;
+end.

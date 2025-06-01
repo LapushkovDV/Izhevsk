@@ -1,0 +1,205 @@
+#component "GP_ZP"
+#include GP_ReesBVipExportObj.vih
+#include LoadReesByGroup.vih
+#include ReesByGroup.Tbl
+
+interface GP_ReesBVipExport_RosBank;
+table struct SpPlBanTmp 
+(
+  FIO    : string
+, TabN   : string
+, NomLsh : string
+, NomCard: string
+, sOrder : string
+, PasSer : string
+, PasNum : string
+, SumUd  : double
+, SumOpl : double
+, Sbor   : double
+, SumAlim: double
+)
+(i1 = sOrder, i2 = NomLSh + FIO + NomCard);
+
+var oLoadGr: LoadReesByGroup;
+create view
+var cOrg: comp;
+as select * from
+  DocPodot
+, KatOrg
+, Passports
+, Persons
+, PlPor
+, SbBan
+, SpPlBanTmp
+, tp_rees
+;
+
+property GP_ReesBVipExportObj.Caption: string read 'РосБанк';
+function ChooseReesToApply(mRee: TPtr): TPtr;
+var m: TPtr;
+    i: longint;
+    cRec: comp;
+{
+  m := InitMarker('', 8, 1, 1);
+  for (i := 0; i < GetMarkerCount(mRee); i++)
+  {
+    GetMarker(mRee, i, cRec);
+    if getfirst SbBan where ((cRec == SbBan.NRec)) = tsOk
+      if SbBan.cPol = cOrg
+        InsertMarker(m, cRec);
+  }
+  Result := m;
+}
+function GetData(cSbBan: comp): boolean;
+var boIns: boolean;
+{
+  Result := false;
+  oLoadGr.pLoadRees(cSbBan);
+  mtClear(tnSpPlBanTmp, mfNormal);
+  _loop tp_Rees
+  {
+    boIns := false;
+    var _NomLsh : tNomLSch = tp_Rees.NomLsh;
+    if ( SbBan.Prefix <> 'R$D' )
+      _NomLsh := LTrim(_NomLsh, '0');
+    _NomLsh := ZeroFiller(_NomLsh, tp_Rees.FilialNo);
+    if GetFirst SpplbanTmp where (( _NomLsh           == SpplbanTmp.NomLsh and
+                                    Trim(tp_Rees.FIO) == SpplbanTmp.FIO and
+                                    tp_Rees.NomCard   == SpplbanTmp.NomCard)) <> tsOk
+    {
+      boIns := true;
+      ClearBuffer( #SpplbanTmp );
+      SpplbanTmp.TabN    := tp_Rees.StrTabn;
+      SpplbanTmp.FIO     := UpCase(trim(tp_Rees.FIO));
+      SpplbanTmp.NomLsh  := _NomLsh;
+      SpplbanTmp.NomCard := tp_Rees.NomCard;
+      SpplbanTmp.sOrder  := tp_Rees.FIO;
+      if getfirst Persons where ((tp_Rees.tPerson == Persons.NRec)) = tsOk
+      {
+        if getfirst Passports where ((Persons.PasspRus == Passports.nrec))= tsOk
+        {
+          SpplbanTmp.PasSer := Passports.Ser;
+          SpplbanTmp.PasNum := Passports.Nmb;
+        }
+      } //  if getfirst Persons = tsOk
+    } // if
+    SpplbanTmp.SumUd  += tp_Rees.SumUd;
+    SpplbanTmp.SumOpl += tp_Rees.SumOpl;
+    SpplbanTmp.Sbor   += tp_Rees.Sbor;
+    SpplbanTmp.SumAlim += tp_Rees.SumAlim;
+    if ( boIns )
+      insert current SpplbanTmp;
+    else
+      update current SpplbanTmp;
+  } //  _loop tp_Rees
+  Result := true;
+}
+
+function SumToString(doSum: double): string;
+{
+  Result := DoubleToStr(Round(doSum, 2),'''' + '[|-]6666666666.88');
+}
+
+function GetNumRee(sPath, mask: string): byte;
+var str: string;
+    p: byte;
+{
+  Result := 0;
+  str := GetFirstFile(sPath, mask);
+  while str <> strDataIsEmpty do
+  {
+    p := byte(substr(str, length(str) - 6, 2));
+    if Result < p
+      Result := p;
+
+    str := GetNextFile;
+  }
+  Result++;
+}
+
+function Export(cRec: comp; sPath: string; var fileName: string): boolean;
+var sTemplate: string;
+    i, j, kolR, kolC: longint;
+    doSum: double;
+{
+  Result := false;
+  if getfirst SbBan where ((cRec == SbBan.NRec)) <> tsOk
+    exit;
+  GetData(cRec);
+  if sPath[length(sPath)] <> '\' sPath += '\';
+  sTemplate := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' + 'GP_ReestrToRosBank.xls' ;
+  if (not ExistFile(sTemplate))
+  { 
+    message('Не найден шаблон файла "'+sTemplate+'"',error);
+    exit;
+  }
+
+  if (not xlCreateExcelWithTemplate(sTemplate, false))
+  { 
+    message('Ошибка создания нового файла в Excel"' + sTemplate + '".', error);
+    exit;
+  }
+  xlSetCellStringValue('' ,2 , 2, 2, 3); // Очистить ячейки с вспомогательной информацией про путь для сохранения
+  kolC := 10;
+  kolR := 0;
+  _loop SpplbanTmp
+    kolR++;
+
+  if KolR > 1 
+    xlInsertRange(xlShiftDown, 21, 1, 20 + KolR - 1, KolC);
+  xlCreateMatrix(kolR, kolC);
+  i := 0; 
+  doSum := 0; 
+  xlSetCellDateValue(SbBan.dForm , 12, 4, 12, 4); // Дата платежного реестра / Payroll list date
+  _loop DocPodot where ((cgLink_ReesPlDoc == DocPodot.TipDoc and SbBan.NRec == DocPodot.cVtDoc))
+    _loop PlPor where ((DocPodot.cPrDoc == PlPor.NRec))
+      if IsValid(#PLPOR) and (cgSrc_Sbor > PLPOR.WRESERV)
+      {
+        xlSetCellStringValue('''' + PLPOR.NODOK, 14, 4, 14, 4); // К платёжному поручению № /  To the payment order #
+        xlSetCellDateValue(PLPOR.DATVIP, 15, 4, 15, 4); // От/ As of
+        break;
+      }
+
+  _loop SpplbanTmp ordered by SpplbanTmp.sOrder
+  {
+    i++;
+    j := 0;
+    xlStWriteToMatrix(i, ++j, SpplbanTmp.FIO                                  ); // Фамилия, имя ,отчество
+    xlStWriteToMatrix(i, ++j, SpplbanTmp.TabN                                 ); // Табельный номер
+    ++j;
+    xlStWriteToMatrix(i, ++j, '''' + SpplbanTmp.NomLsh                        ); // Счёт сотрудника
+    xlStWriteToMatrix(i, ++j, 'RUB'                                           ); // Валюта
+    xlStWriteToMatrix(i, ++j, SumToString(SpplbanTmp.SumOpl - SpplbanTmp.Sbor)); // Сумма
+    doSum += SpplbanTmp.SumOpl - SpplbanTmp.Sbor;
+    j := 9;
+    if SpplbanTmp.SumAlim <> 0
+      xlStWriteToMatrix(i, ++j, SumToString(SpplbanTmp.SumAlim));                 // Сумма
+  }
+  xlWriteMatrixToExcel(20, 1);
+  xlSetCellStringValue(doSum, 20 + kolR, 6, 20 + kolR, 6);
+ 
+  xlGetActiveWorkBookName(sTemplate); // Узнать текущее имя Excel-файла
+
+  fileName := DateToStr(Cur_Date,'РБDDMMYYYY');
+  var ii: byte = GetNumRee(sPath, '*' + fileName + '_??.xlsx');
+  var gozAbbr: string = sGetAttr(covPlan, coGetAttr(coSbBan, cRec, 'Группа заказов'), 'Аббревиатура');
+  if gozAbbr <> ''
+    fileName := gozAbbr + '_' + fileName;
+  fileName := fileName + '_' + LPadCh(ii, '0', 2) + '.xlsx';
+  xlSetCellStringValue(ii, 13, 4, 13, 4); // Номер платежного реестра / Payroll list number
+  xlSaveAsWorkBookByName(sTemplate, sPath + fileName);
+  xlGetActiveWorkBookName(sTemplate);
+  xlCloseWorkBookByName(sTemplate);
+  xlKillExcel;
+  sSetAttr(coSbBan,cRec,'Имя файла',fileName);
+  Result := true;
+}
+
+handleEvent
+  cmOnVipLoad:
+  {
+    if getfirst KatOrg where (('Росбанк филиал Акционерного общества "ТБанк"' == KatOrg.Name)) = tsOk
+      cOrg := KatOrg.NRec;
+  }
+end;
+end.

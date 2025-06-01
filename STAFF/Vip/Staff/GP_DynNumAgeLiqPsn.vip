@@ -1,0 +1,1042 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                "Динамика численности, возраста и текучести работников АО НПО Энергомаш"         *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#259          |12/10/17|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include UserReport.vih
+#include CatFunc.vih
+#include RunStaj.vih
+#include APPFUNCS.VIH
+#include TotalOrganizationAttributes.vih
+#include ExtAttr.Vih
+
+#include GP_3GD.vih
+#include GP_XlOutExt.vih
+
+#define GPInt GP_DynNumAgeLiqPsn // #(GPInt)
+#define GPNam Динамика численности, возраста и текучести работников АО НПО Энергомаш. // #(GPNam)
+
+Interface #(GPInt) '#(GPNam) (ЭМ)' EscClose, Gray;
+  show (,,45,4);
+
+const
+#include Excel.inc;
+end;
+#include TotalOrganizationAttributes.var
+#include ExtAttr.var
+
+#include GP_DynNumAgeLiqPsn.tbl
+
+var
+  wYearRep      : word;
+  iCatFunc      : CatalogsFunctions;
+  iRunStaj      : Runstaj;
+  ExtAttr       : iExtAttr;
+  i3GD          : GP_3GD;
+  iOut          : GP_XlOutExt;
+  sFullName     : string;
+  lRB, lHS,
+  lCB, lCE,
+  lSB, lSE,
+  lBB, lBE,
+  lDB, lDE      : longint;
+  l5Row,lAgeRow : longint;
+  iRowB, iRowE,
+  iTypB, iTypE,
+  iNPP          : integer;
+  cVidPro       : comp;
+  cMainLinkDept : comp;
+
+Create view
+Var
+  dBeg, dEnd : date;
+from
+  ttRepPeriod
+, ttTypePodr
+, ttPodr
+, ttZGD
+, ttEmplKat
+, ttRepData
+, ttLog
+, ttRash
+, Persons      AllPers
+, Appointments AllApp
+, ContDoc      DisDoc
+, StaffStruct  AllStaff
+, KlKatego     AllEmpl
+, Catalogs     AllPodr
+, Catalogs     ZGDDept
+where
+((
+    dEnd>>= AllStaff.dInput
+and ((dBeg <= AllStaff.dClose or  AllStaff.dClose = 0) and AllStaff.Department <> 0 and AllStaff.Post<>0)
+and AllStaff.nRec == AllApp.StaffStr
+and (dEnd >= AllApp.AppointDate and (dBeg <= AllApp.DismissDate or AllApp.DismissDate = 0))
+and AllApp.Person == AllPers.nRec
+and AllPers.nRec == DisDoc.Person
+and integer(8) == DisDoc.TypeOper and (DisDoc.cStr = AllApp.nRec)
+and AllStaff.EmpCategory == AllEmpl.nRec
+and AllStaff.Department == AllPodr.nRec
+and integer(0) == ZGDDept.LPr
+and cMainLinkDept == ZGDDept.MainLink
+))
+;
+
+procedure InsLog(sModeT, sReasonT, sAddInfT : string; cRecDepT : comp);
+{
+  if getfirst ttLog where
+  ((  sModeT   == ttLog.sMode
+  and sAddInfT == ttLog.sAddInf
+  )) <> tsOk
+  {
+    ClearBuffer(#ttLog);
+    ttLog.sMode  :=sModeT;
+    ttLog.sReason:=sReasonT;
+    ttLog.sAddInf:=sAddInfT;
+    ttLog.cRecDep:=cRecDepT;
+    insert current ttLog;
+  }
+}
+
+procedure FillZGD;
+{
+  set cMainLinkDept := iCatFunc.GetCatalogsNRec(-11);
+  iNextVisual('Заполняю описатель иерархии ЗГД');
+  i3GD.Init3GD;
+  if isvalid(#ZGDDept)
+  _loop ZGDDept
+  {
+    if (not NextVisual) break;
+    if i3GD.bFindCurZGDPodr(ZGDDept.nRec)
+    {
+      if getfirst ttZGD where ((ZGDDept.nRec == ttZGD.cRecDept)) <> tsOk
+      {
+        ClearBuffer(#ttZGD);
+        ttZGD.cRecDept := ZGDDept.nRec;
+        ttZGD.sCodeZGD := i3GD.sCodeCurZGDPodr;
+        ttZGD.sNameZGD := i3GD.sNameCurZGDPodr;
+        insert current ttZGD;
+      }
+    }
+    else
+      InsLog('1', 'Отсутствует вышестоящее подразделение', 'Код подр. '+ZGDDept.Code,ZGDDept.nRec);
+  }
+}
+function LocateZGD(cRecAny : comp) : boolean;
+{
+  if getfirst ttZGD where ((cRecAny == ttZGD.cRecDept)) = tsOk
+    result := true
+  else
+    result := false;
+}
+
+procedure InitRepPeriod(wYear : word);
+{
+  var wMonth: word;
+  var wKvart: word; 
+  
+  delete all from ttRepPeriod;
+  ClearBuffer(#ttRepPeriod);
+  ttRepPeriod.sNamePeriod := (wYear-1);
+  ttRepPeriod.sSortPeriod := (wYear-1)+'.1';
+  ttRepPeriod.dBegPeriod  := Date( 1, 1,(wYear-1));
+  ttRepPeriod.dEndPeriod  := Date(31,12,(wYear-1));
+  insert current ttRepPeriod;
+  for(wMonth := 1; wMonth <= 10; wMonth := wMonth + 3)
+  {
+    if date(1,wMonth,wYear) < Date(31,12,wYear)
+    {
+      ClearBuffer(#ttRepPeriod);
+      wKvart := 1+round(wMonth/3);
+      ttRepPeriod.sNamePeriod := wKvart + ' квартал ' + wYear;
+      ttRepPeriod.sSortPeriod := wYear+'.'+wKvart;
+      ttRepPeriod.dBegPeriod  := Date( 1, wMonth,wYear);
+      ttRepPeriod.dEndPeriod  := Sub_Day(Add_Months(Date(1, wMonth,wYear),3), 1);
+      insert current ttRepPeriod;
+    }
+  }
+}
+
+function wWhatAgePeriod(dBorn, dPeriod : date) : word;
+{
+  var wAgePsn : word=0;
+  var wRez    : word=0;
+
+  if dBorn <> 0 
+  {
+    wAgePsn := Year(Sub_Date(dPeriod,dBorn));
+    if wAgePsn < 29
+      wRez := 4
+    else
+    if wAgePsn < 39
+      wRez := 5
+    else
+    if wAgePsn < 49
+      wRez := 6
+    else
+    if wAgePsn < 59
+      wRez := 7
+    else
+      wRez := 8;
+  }
+  else
+  {
+    wRez := 0;
+  }
+  wWhatAgePeriod := wRez;
+}
+
+function iSortEmpl(iKodEmpl : integer) : integer;
+{
+  var iRez : integer = 0;
+  case iKodEmpl of
+  1: {iRez := 4}
+  2: {iRez := 5}
+  3: {iRez := 6}
+  4: {iRez := 7}
+  5: {iRez := 1}
+  6: {iRez := 2}
+  7: {iRez := 3}
+  end;
+  iSortEmpl := iRez;
+}
+function sNameEmpl(iKodEmpl : integer; sEmpl : string) : string;
+{
+  var sRez : string = '';
+  case iKodEmpl of
+  1: {sRez := 'ОР ОП'}
+  2: {sRez := 'ВР ОП'}
+  3: {sRez := 'ОР ВП'}
+  4: {sRez := 'ВР ВП'}
+  5: {sRez := sEmpl}
+  6: {sRez := sEmpl}
+  7: {sRez := sEmpl}
+  end;
+  sNameEmpl := sRez;
+}
+
+procedure MadeData;
+var
+  sTypePodrT : string;
+  sNamePodrT : string;
+  sPodrCodeT : string;
+  sEmplT     : string;
+  bIsDismiss : boolean; 
+{
+  FillZGD;
+
+  if isvalid(#ttRepPeriod)
+  _loop ttRepPeriod// ordered index ttRepPeriodRepSort
+  {
+    dEnd := ttRepPeriod.dEndPeriod;
+    dBeg := ttRepPeriod.dBegPeriod;
+    iNextVisual('Выборка данных для отчета на '+dEnd);
+    if isvalid(#AllStaff)
+    _loop AllStaff// where ttRepPeriod.dEndPeriod >= AllStaff.dInput
+    {
+      if isvalid(#AllPodr)
+      {
+        // find zgd
+        sTypePodrT := sEmplT := '';
+        if not LocateZGD(AllStaff.Department) continue;
+        sPodrCodeT := trim(AllPodr.Code);
+        sTypePodrT := ttZGD.sCodeZGD;
+        sNamePodrT := ttZGD.sNameZGD;
+
+        if getfirst ttTypePodr where ((sTypePodrT == ttTypePodr.sSortTypePodr)) <> tsOk
+        {
+          ClearBuffer(#ttTypePodr);
+          ttTypePodr.sNameTypePodr := sNamePodrT;
+          ttTypePodr.sSortTypePodr := sTypePodrT;
+          insert current ttTypePodr;
+        }
+
+        if getfirst ttRash where ((sTypePodrT == ttRash.sCodZGD and sPodrCodeT == ttRash.sCodPodr)) <> tsOk
+        {
+          clearbuffer(#ttRash);
+          ttRash.sCodPodr  := sPodrCodeT;
+          ttRash.sNamePodr := trim(AllPodr.Name);
+          ttRash.sCodZGD   := sTypePodrT;
+          ttRash.sNameZGD  := if(sTypePodrT<>'',ttTypePodr.sNameTypePodr,'');
+          if ExtAttr.ValueExistsId(coCatalogs,AllStaff.Department,cVidPro) = true
+            ttRash.sVidPro := ExtAttr.sGetAttrId(coCatalogs,AllStaff.Department,cVidPro);
+          insert current ttRash;
+        }
+        //make podr
+        if getfirst ttPodr where((AllStaff.Department == ttPodr.cnRecPodr)) <> tsOk
+        {
+          ClearBuffer(#ttPodr);
+          ttPodr.cTypePodr := ttTypePodr.nRec;
+          ttPodr.cnRecPodr := AllStaff.Department;
+          ttPodr.sTypePodr := sTypePodrT;
+          ttPodr.sNamePodr := ttRash.sNamePodr;//iCatFunc.GetCatalogsName(AllStaff.Department);
+          ttPodr.sSortPodr := ttRash.sCodPodr; //iCatFunc.GetCatalogsCode(AllStaff.Department);
+          insert current ttPodr;
+        }
+        //make empl
+        if isvalid(#AllEmpl)
+        {
+          if ttTypePodr.sSortTypePodr = '1'
+          {
+            if getfirst ttEmplKat where((  ttTypePodr.nRec == ttEmplKat.cTypePodr
+                                       and     ttPodr.nRec == ttEmplKat.cPodr
+            /*-if getfirst ttEmplKat-*/and    AllEmpl.nRec == ttEmplKat.cnRecEmpl)) <> tsOk
+            {
+              ClearBuffer(#ttEmplKat);
+              ttEmplKat.cTypePodr:= ttTypePodr.nRec;
+              ttEmplKat.cPodr    := ttPodr.nRec;
+              ttEmplKat.cnRecEmpl:= AllEmpl.nRec;
+              ttEmplKat.sNameKat := sNameEmpl(AllEmpl.Kod,AllEmpl.NaiKat);
+              ttEmplKat.iSortKat := iSortEmpl(AllEmpl.Kod);
+              insert current ttEmplKat;
+            }
+          }
+          else
+          {
+            if getfirst ttEmplKat where((  ttTypePodr.nRec == ttEmplKat.cTypePodr
+                                       and         comp(0) == ttEmplKat.cPodr
+            /*-if getfirst ttEmplKat-*/and    AllEmpl.nRec == ttEmplKat.cnRecEmpl)) <> tsOk
+            {
+              ClearBuffer(#ttEmplKat);
+              ttEmplKat.cTypePodr:= ttTypePodr.nRec;
+              ttEmplKat.cPodr    := comp(0);
+              ttEmplKat.cnRecEmpl:= AllEmpl.nRec;
+              ttEmplKat.sNameKat := sNameEmpl(AllEmpl.Kod,AllEmpl.NaiKat);;
+              ttEmplKat.iSortKat := iSortEmpl(AllEmpl.Kod);
+              insert current ttEmplKat;
+            }
+          }
+          sEmplT := ttEmplKat.sNameKat;
+        }
+        else
+        {
+          InsLog('2', 'Не задана категория ставки', 'Код подр. '+iCatFunc.GetCatalogsCode(AllStaff.Department)+ ' номер ставки ' +AllStaff.SEQNMB,AllStaff.Department);
+        }
+        //make plan
+        //make fact
+        if sEmplT <> ''
+        {
+          if (not NextVisual) break;
+          // вставляем плановые значения
+//#include GP_259_MadePlan.vpp
+          // вставляем плановое количество ставок в разрезе категорий
+          if sTypePodrT = '1'
+          {
+            if getfirst ttRepData where ((   ttTypePodr.nRec == ttRepData.cTypePodr 
+                                        and      ttPodr.nRec == ttRepData.cPodr     
+                                        and   ttEmplKat.nRec == ttRepData.cEmplKat  
+                                        and ttRepPeriod.nRec == ttRepData.cRepPeriod
+            /*-if getfirst ttRepData--*/and                0 == ttRepData.wTypeData )) <> tsOk
+            {
+              ClearBuffer(#ttRepData);
+              ttRepData.cTypePodr  := ttTypePodr.nRec;
+              ttRepData.cPodr      := ttPodr.nRec;
+              ttRepData.cEmplKat   := ttEmplKat.nRec;
+              ttRepData.cRepPeriod := ttRepPeriod.nRec;
+              ttRepData.wTypeData  := 0;
+              ttRepData.lStavPlan  := AllStaff.Workstations;
+              insert current ttRepData;
+            }
+            else
+            {
+              ttRepData.lStavPlan  := ttRepData.lStavPlan + AllStaff.Workstations;
+              update current ttRepData;
+            }
+          }
+          else
+          {
+            if getfirst ttRepData where ((   ttTypePodr.nRec == ttRepData.cTypePodr 
+                                        and          comp(0) == ttRepData.cPodr     
+                                        and   ttEmplKat.nRec == ttRepData.cEmplKat  
+                                        and ttRepPeriod.nRec == ttRepData.cRepPeriod
+            /*-if getfirst ttRepData--*/and                0 == ttRepData.wTypeData )) <> tsOk
+            {
+              ClearBuffer(#ttRepData);
+              ttRepData.cTypePodr  := ttTypePodr.nRec;
+              ttRepData.cPodr      := comp(0);
+              ttRepData.cEmplKat   := ttEmplKat.nRec;
+              ttRepData.cRepPeriod := ttRepPeriod.nRec;
+              ttRepData.wTypeData  := 0;
+              ttRepData.lStavPlan  := AllStaff.Workstations;
+              insert current ttRepData;
+            }
+            else
+            {
+              ttRepData.lStavPlan  := ttRepData.lStavPlan + AllStaff.Workstations;
+              update current ttRepData;
+            }
+          }
+          // вставляем плановое количество ставок в разрезе типов подразделений cTypePodr  + cRepPeriod + wTypeData
+          if getfirst ttRepData where ((   ttTypePodr.nRec == ttRepData.cTypePodr 
+                                      and ttRepPeriod.nRec == ttRepData.cRepPeriod
+          /*-if getfirst ttRepData--*/and                1 == ttRepData.wTypeData )) <> tsOk
+          {
+            ClearBuffer(#ttRepData);
+            ttRepData.cTypePodr  := ttTypePodr.nRec;
+            ttRepData.cRepPeriod := ttRepPeriod.nRec;
+            ttRepData.wTypeData  := 1;
+            ttRepData.lStavPlan  := AllStaff.Workstations;
+            insert current ttRepData;
+          }
+          else
+          {
+            ttRepData.lStavPlan  := ttRepData.lStavPlan + AllStaff.Workstations;
+            update current ttRepData;
+          }
+          // вставляем плановое количество ставок в разрезе подразделений cPodr + cRepPeriod + wTypeData,
+          if substr(sTypePodrT,1,1) = '1'
+          {
+            if getfirst ttRepData where ((       ttPodr.nRec == ttRepData.cPodr     
+                                        and ttRepPeriod.nRec == ttRepData.cRepPeriod
+            /*-if getfirst ttRepData--*/and                2 == ttRepData.wTypeData )) <> tsOk
+            {
+              ClearBuffer(#ttRepData);
+              ttRepData.cPodr      := ttPodr.nRec;
+              ttRepData.cRepPeriod := ttRepPeriod.nRec;
+              ttRepData.wTypeData  := 2;
+              ttRepData.lStavPlan  := AllStaff.Workstations;
+              insert current ttRepData;
+            }
+            else
+            {
+              ttRepData.lStavPlan  := ttRepData.lStavPlan + AllStaff.Workstations;
+              update current ttRepData;
+            }
+          }
+          // вставляем плановое количество ставок в разрезе предприятия
+          if getfirst ttRepData where ((  ttRepPeriod.nRec == ttRepData.cRepPeriod
+          /*-if getfirst ttRepData--*/and                3 == ttRepData.wTypeData )) <> tsOk
+          {
+            ClearBuffer(#ttRepData);
+            ttRepData.cRepPeriod := ttRepPeriod.nRec;
+            ttRepData.wTypeData  := 3;
+            ttRepData.lStavPlan  := AllStaff.Workstations;
+            insert current ttRepData;
+          }
+          else
+          {
+            ttRepData.lStavPlan  := ttRepData.lStavPlan + AllStaff.Workstations;
+            update current ttRepData;
+          }
+          // далее вставляем фактические данные
+//-------------------------
+          if isvalid(#AllApp)
+          _loop AllApp
+          {
+            if (not NextVisual) break;
+            if isvalid(#AllPers)
+            {
+//#include GP_259_MadeFact.vpp
+#declare UpdFact
+              ttRepData.lStavFact := ttRepData.lStavFact + 1;
+              ttRepData.lStavAge  := ttRepData.lStavAge  + Year(Sub_Date(ttRepPeriod.dEndPeriod,AllPers.BornDate));
+              ttRepData.lStavDiss := ttRepData.lStavDiss + if(bIsDismiss,1,0);
+              update current ttRepData;
+#end        
+              bIsDismiss := false;
+              if AllApp.DismissDate >= ttRepPeriod.dBegPeriod and AllApp.DismissDate <= ttRepPeriod.dEndPeriod
+              if isvalid(#DisDoc)
+                bIsDismiss := true;
+              // вставляем факт в разрезе категорий
+              if substr(sTypePodrT,1,1) = '1'
+              {
+                if getfirst ttRepData where ((   ttTypePodr.nRec == ttRepData.cTypePodr 
+                                            and      ttPodr.nRec == ttRepData.cPodr     
+                                            and   ttEmplKat.nRec == ttRepData.cEmplKat  
+                                            and ttRepPeriod.nRec == ttRepData.cRepPeriod
+                /*-if getfirst ttRepData--*/and                0 == ttRepData.wTypeData )) = tsOk
+                {
+                  #UpdFact
+                }
+              }
+              else
+              {
+                if getfirst ttRepData where ((   ttTypePodr.nRec == ttRepData.cTypePodr 
+                                            and          comp(0) == ttRepData.cPodr     
+                                            and   ttEmplKat.nRec == ttRepData.cEmplKat  
+                                            and ttRepPeriod.nRec == ttRepData.cRepPeriod
+                /*-if getfirst ttRepData--*/and                0 == ttRepData.wTypeData )) = tsOk
+                {
+                  #UpdFact
+                }
+              }
+              // вставляем факт в разрезе типов подразделений cTypePodr  + cRepPeriod + wTypeData
+              if getfirst ttRepData where ((   ttTypePodr.nRec == ttRepData.cTypePodr 
+                                          and ttRepPeriod.nRec == ttRepData.cRepPeriod
+              /*-if getfirst ttRepData--*/and                1 == ttRepData.wTypeData )) = tsOk
+              {
+                #UpdFact
+              }
+                // вставляем факт в разрезе подразделений cPodr + cRepPeriod + wTypeData,
+              if substr(sTypePodrT,1,1) = '1'
+              {
+                if getfirst ttRepData where ((       ttPodr.nRec == ttRepData.cPodr     
+                                            and ttRepPeriod.nRec == ttRepData.cRepPeriod
+                /*-if getfirst ttRepData--*/and                2 == ttRepData.wTypeData )) = tsOk
+                {
+                  #UpdFact
+                }
+              }
+              // вставляем факт в разрезе предприятия
+              if getfirst ttRepData where ((  ttRepPeriod.nRec == ttRepData.cRepPeriod
+              /*-if getfirst ttRepData--*/and                3 == ttRepData.wTypeData )) = tsOk
+              {
+                #UpdFact
+              }
+              var wAge : word;
+              wAge := wWhatAgePeriod(AllPers.BornDate,ttRepPeriod.dEndPeriod);
+              if wAge <> 0
+              {
+                if getfirst ttRepData where ((  ttRepPeriod.nRec == ttRepData.cRepPeriod
+                /*-if getfirst ttRepData--*/and wAge == ttRepData.wTypeData )) = tsOk
+                {
+                  #UpdFact
+                }
+                else
+                {
+                  ClearBuffer(#ttRepData);
+                  ttRepData.cRepPeriod:= ttRepPeriod.nRec;
+                  ttRepData.wTypeData := wAge;
+                  ttRepData.lStavFact := 1;
+                  ttRepData.lStavAge  := Year(Sub_Date(ttRepPeriod.dEndPeriod,AllPers.BornDate));
+                  ttRepData.lStavDiss := if(bIsDismiss,1,0);
+                  insert current ttRepData;
+                }
+              }
+            }
+          }
+//-------------------------
+        }
+      }
+      else
+      {
+//        InsLog('0', 'Ссылка на несуществующее подразделение в ставке', 'nRec '+AllStaff.nRec);
+      }
+    }
+  }  
+  ClearBuffer(#ttTypePodr);
+  ttTypePodr.sNameTypePodr := 'АУП';
+  ttTypePodr.sSortTypePodr := '5';
+  insert current ttTypePodr;
+}
+
+#define repT       2,    3,    2,    3
+#define FrmHd    lRB,  lCE,  lRB,  lCE
+#define FrmHu    lRB+1,lCE,  lRB+1,lCE
+#define FrmHb    lRB+2,lCE,  lRB+2,lCE
+#define FrmCl    lDE,  lSE,  lDE,  lSE
+#define FrmBl    lRB,  lSE,  lDE,  lSE
+#define FrmDat   lRB,    3,  lDE,  lCE
+#define AllTab   lRB,  lCB,  lDE,  lCE
+#define LBR      '+chr(10)+' 
+
+procedure PrintBlockData;
+{
+  if ttRepPeriod.sNamePeriod = (wYearRep-1)
+  {
+    iOut.StringValC(ttRepData.lStavPlan,#FrmCl); lSE++;
+    iOut.StringValC(ttRepData.lStavFact,#FrmCl); lSE++;
+    iOut.StringValC(if(ttRepData.lStavFact<>0,round(ttRepData.lStavAge/ttRepData.lStavFact,0),'0'),#FrmCl); lSE++;
+    iOut.StringValC(if(ttRepData.lStavFact<>0 and ttRepData.lStavDiss <> 0,(ttRepData.lStavDiss/ttRepData.lStavFact*100)+'%','0,00%'),#FrmCl); lSE++;
+  }
+  else
+  {
+    iOut.StringValC(ttRepData.lStavPlan,#FrmCl); lSE++;
+    iOut.StringValC(ttRepData.lStavFact,#FrmCl); lSE++;
+    lSE++;lSE++;
+    iOut.StringValC(if(ttRepData.lStavFact<>0,round(ttRepData.lStavAge/ttRepData.lStavFact,0),'0'),#FrmCl); lSE++;
+    iOut.StringValC(if(ttRepData.lStavFact<>0 and ttRepData.lStavDiss <> 0,(ttRepData.lStavDiss/ttRepData.lStavFact*100)+'%','0,00%'),#FrmCl); lSE++;
+  }
+}
+procedure PrintAgeData;
+{
+  if ttRepPeriod.sNamePeriod = (wYearRep-1)
+  {
+    lSE++;
+    iOut.StringValC(ttRepData.lStavFact,#FrmCl); lSE++;
+    iOut.StringValC(if(ttRepData.lStavFact<>0,round(ttRepData.lStavAge/ttRepData.lStavFact,0),'0'),#FrmCl); lSE++;
+    iOut.StringValC(if(ttRepData.lStavFact<>0 and ttRepData.lStavDiss <> 0,(ttRepData.lStavDiss/ttRepData.lStavFact*100)+'%','0,00%'),#FrmCl); lSE++;
+  }
+  else
+  {
+    lSE++;
+    iOut.StringValC(ttRepData.lStavFact,#FrmCl); lSE++;
+    lSE++;lSE++;
+    iOut.StringValC(if(ttRepData.lStavFact<>0,round(ttRepData.lStavAge/ttRepData.lStavFact,0),'0'),#FrmCl); lSE++;
+    iOut.StringValC(if(ttRepData.lStavFact<>0 and ttRepData.lStavDiss <> 0,(ttRepData.lStavDiss/ttRepData.lStavFact*100)+'%','0,00%'),#FrmCl); lSE++;
+  }
+}
+procedure PrintBlockBlank;
+{
+  if ttRepPeriod.sNamePeriod = (wYearRep-1)
+    lSE := lSE + 4;
+  else
+    lSE := lSE + 6;
+}
+
+procedure PrintData;
+{
+  var iPodrCount, iComma : integer;
+  iNextVisual('Выгружаю отчет.');
+  lRB  := 4;
+  lHS  := 3;
+  lDB  := lDE := lRB + lHS;
+  lCB  := lCE := 1;
+  iNPP := 0;
+
+  iOut.xlSummaryRowAbove;
+  TOA.Bind(0);
+  iOut.StringValL('Динамика численности, возраста и текучести работников '+Trim(TOA1.GetNaming.GetFullName())+' за '+wYearRep+' г.',#repT);
+  xlSetFontSize(14,#repT); xlSetFontStyle(xlBold,#repT);
+
+  iOut.Header3Row('Категории',                  #FrmHd); lCE++;
+  iOut.Header3Row('Номера подразделений',       #FrmHd); lCE++;
+  _loop ttRepPeriod
+  {
+    if (not NextVisual) break;
+    if ttRepPeriod.sNamePeriod = (wYearRep-1)
+    {
+      iOut.HeaderIns(ttRepPeriod.sNamePeriod+' год',#FrmHd, 4);
+      iOut.Header2Row('Кол-во шт.ед. план',      #FrmHu); lCE++;
+      iOut.Header2Row('Численность факт',        #FrmHu); lCE++;
+      iOut.Header2Row('Средний возраст',         #FrmHu); lCE++;
+      iOut.Header2Row('% текучести',             #FrmHu); lCE++;
+    }
+    else
+    {
+      iOut.HeaderIns(ttRepPeriod.sNamePeriod+' года',#FrmHd, 6);
+      iOut.Header2Row('Кол-во шт.ед. план',      #FrmHu); lCE++;
+      iOut.Header2Row('Численность факт',        #FrmHu); lCE++;
+      iOut.HeaderIns('Изменение численности',    #FrmHu, 2);
+      iOut.Header1Row('%',                       #FrmHb); lCE++;
+      iOut.Header1Row('Чел.',                    #FrmHb); lCE++;
+      iOut.Header2Row('Средний возраст',         #FrmHu); lCE++;
+      iOut.Header2Row('% текучести',             #FrmHu); lCE++;
+    }
+  }
+  lCE--;
+  xlSetFontStyle(xlBold,lRB, lCB, lDB-1, lCE);
+  lSB := 1;
+  if isvalid(#ttTypePodr)
+  _loop ttTypePodr ordered index ttTypePodrRepSort
+  {
+//    if ttTypePodr.sSortTypePodr = '' continue;
+    lSE := 1; 
+    xlSetFontStyle(xlBold,lDE, lCB, lDE, lCE);
+    iOut.StringValL(ttTypePodr.sSortTypePodr+'. '+ttTypePodr.sNameTypePodr,#FrmCl); lSE++;
+    if ttTypePodr.sNameTypePodr = 'АУП' { l5Row := lDE;}
+    iPodrCount:=iComma:=0;
+    _loop ttPodr where ((ttTypePodr.nRec == ttPodr.cTypePodr))
+      iPodrCount++;
+    _loop ttPodr where ((ttTypePodr.nRec == ttPodr.cTypePodr))
+    {
+      iComma++;
+      xlAddCellStringValue(ttPodr.sSortPodr+if(iComma<iPodrCount,', ',''),lDE, lSE);
+    }
+    lSE++;
+    _loop ttRepPeriod //PrintBlockData;
+    {
+      if (not NextVisual) break;
+      if getfirst ttRepData where
+      ((  ttTypePodr.nRec == ttRepData.cTypePodr
+      and ttRepPeriod.nRec== ttRepData.cRepPeriod
+      and               1 == ttRepData.wTypeData
+      )) = tsOk
+      {PrintBlockData} else {PrintBlockBlank}
+    } 
+    lDE++;
+    lSE := 1; 
+    if ttTypePodr.sSortTypePodr = '1'
+    {
+      _loop ttPodr where ((ttTypePodr.nRec == ttPodr.cTypePodr))
+      {
+        lSE := 1; 
+        iOut.StringValC(ttPodr.sSortPodr+' '+ttPodr.sNamePodr,#FrmCl); lSE++; lSE++;
+        _loop ttRepPeriod //PrintBlockData;
+        {
+          if (not NextVisual) break;
+          if getfirst ttRepData where
+          ((      ttPodr.nRec == ttRepData.cPodr
+          and ttRepPeriod.nRec== ttRepData.cRepPeriod
+          and               2 == ttRepData.wTypeData
+          )) = tsOk
+          {PrintBlockData} else {PrintBlockBlank}
+        } 
+        lDE++;
+        lSE := 1;
+        iRowB := lDE;
+        _loop ttEmplKat where
+        ((  ttTypePodr.nRec == ttEmplKat.cTypePodr
+        and ttPodr.nRec == ttEmplKat.cPodr
+        )) ordered index ttEmplKatRepSort1
+        {
+          lSE := 1;
+          iOut.StringValR(ttEmplKat.sNameKat,#FrmCl); lSE++;lSE++;
+          _loop ttRepPeriod
+          {
+            if (not NextVisual) break;
+            if getfirst ttRepData where
+            ((ttTypePodr.nRec==ttRepData.cTypePodr and 
+                  ttPodr.nRec==ttRepData.cPodr and 
+               ttEmplKat.nRec==ttRepData.cEmplKat and 
+             ttRepPeriod.nRec==ttRepData.cRepPeriod and 
+                            0==ttRepData.wTypeData 
+            )) = tsOk
+            {PrintBlockData} else {PrintBlockBlank}
+          }
+          lDE++;
+        }
+        iRowE := lDE-1;
+        if iRowE >= iRowB
+          iOut.xlSetSummaryRow(iRowB, iRowE, iNPP++);
+      }
+    }
+    else
+    {
+      iRowB := lDE;
+      _loop ttEmplKat where
+      ((  ttTypePodr.nRec == ttEmplKat.cTypePodr
+      and         comp(0) == ttEmplKat.cPodr
+      )) ordered index ttEmplKatRepSort1
+      {
+        lSE := 1;
+        iOut.StringValR(ttEmplKat.sNameKat,#FrmCl); lSE++;lSE++;
+        _loop ttRepPeriod
+        {
+          if (not NextVisual) break;
+          if getfirst ttRepData where
+          ((ttTypePodr.nRec==ttRepData.cTypePodr and 
+                    comp(0)==ttRepData.cPodr and 
+             ttEmplKat.nRec==ttRepData.cEmplKat and 
+           ttRepPeriod.nRec==ttRepData.cRepPeriod and 
+                          0==ttRepData.wTypeData 
+          )) = tsOk
+          {PrintBlockData} else {PrintBlockBlank}
+        }
+        lDE++;
+      }
+      iRowE := lDE-1;
+      if iRowE >= iRowB
+        iOut.xlSetSummaryRow(iRowB, iRowE, iNPP++);
+    }
+  }
+  lSE := 1; 
+  xlSetFontStyle(xlBold,lDE, lCB, lDE, lCE);
+  iOut.StringValR('Итого:',#FrmCl); lSE++; lSE++;
+  _loop ttRepPeriod //PrintBlockData;
+  {
+    if (not NextVisual) break;
+    if getfirst ttRepData where
+    ((  ttRepPeriod.nRec== ttRepData.cRepPeriod
+    and               3 == ttRepData.wTypeData
+    )) = tsOk
+    {PrintBlockData} else {PrintBlockBlank}
+  } 
+  lDE++;
+  lSE := 1; 
+  xlSetFontStyle(xlBold,lDE, lCB, lDE, lCE);
+  iOut.StringValL('Возрастные группы (классификация Роскосмос)',#FrmCl);
+  lAgeRow := lDE;
+  lDE++;
+  lSE := 1; 
+  iOut.StringValR('работники в возрасте до 29 лет вкл.',#FrmCl); lSE++; lSE++;
+  _loop ttRepPeriod //PrintBlockData;
+  {
+    if (not NextVisual) break;
+    if getfirst ttRepData where
+    ((  ttRepPeriod.nRec== ttRepData.cRepPeriod
+    and               4 == ttRepData.wTypeData
+    )) = tsOk
+    {PrintAgeData} else {PrintBlockBlank}
+  } 
+  lDE++;
+  lSE := 1; 
+  iOut.StringValR('работники в возрасте от 30 до 39 вкл.',#FrmCl); lSE++; lSE++;
+  _loop ttRepPeriod //PrintBlockData;
+  {
+    if (not NextVisual) break;
+    if getfirst ttRepData where
+    ((  ttRepPeriod.nRec== ttRepData.cRepPeriod
+    and               5 == ttRepData.wTypeData
+    )) = tsOk
+    {PrintAgeData} else {PrintBlockBlank}
+  } 
+  lDE++;
+  lSE := 1; 
+  iOut.StringValR('работники в возрасте от 40 до 49 вкл.',#FrmCl); lSE++; lSE++;
+  _loop ttRepPeriod //PrintBlockData;
+  {
+    if (not NextVisual) break;
+    if getfirst ttRepData where
+    ((  ttRepPeriod.nRec== ttRepData.cRepPeriod
+    and               6 == ttRepData.wTypeData
+    )) = tsOk
+    {PrintAgeData} else {PrintBlockBlank}
+  } 
+  lDE++;
+  lSE := 1; 
+  iOut.StringValR('работники в возрасте от 50 до 59 вкл.',#FrmCl); lSE++; lSE++;
+  _loop ttRepPeriod //PrintBlockData;
+  {
+    if (not NextVisual) break;
+    if getfirst ttRepData where
+    ((  ttRepPeriod.nRec== ttRepData.cRepPeriod
+    and               7 == ttRepData.wTypeData
+    )) = tsOk
+    {PrintAgeData} else {PrintBlockBlank}
+  } 
+  lDE++;
+  lSE := 1; 
+  iOut.StringValR('работники в возрасте 60 лет и старше',#FrmCl); lSE++; lSE++;
+  _loop ttRepPeriod //PrintBlockData;
+  {
+    if (not NextVisual) break;
+    if getfirst ttRepData where
+    ((  ttRepPeriod.nRec== ttRepData.cRepPeriod
+    and               8 == ttRepData.wTypeData
+    )) = tsOk
+    {PrintAgeData} else {PrintBlockBlank}
+  } 
+  lDE++;
+  lSE := 1; 
+  xlSetFontStyle(xlBold,lDE, lCB, lDE, lCE);
+  iOut.StringValL('Итого по предприятию в целом',#FrmCl); lSE++; lSE++;
+  _loop ttRepPeriod //PrintBlockData;
+  {
+    if (not NextVisual) break;
+    if getfirst ttRepData where
+    ((  ttRepPeriod.nRec== ttRepData.cRepPeriod
+    and               3 == ttRepData.wTypeData
+    )) = tsOk
+    {PrintBlockData} else {PrintBlockBlank}
+  } 
+  //FormulaIntegerVal
+  var lRow : longint;
+  for(lRow := lDB; lRow <= lDE; lRow++)
+  {
+    if (not NextVisual) break;
+    if lRow <> l5Row and lRow <> lAgeRow
+    {
+      iOut.FormulaIntegerValC('=H'+lRow+'-D'+lRow,lRow,10,lRow,10);
+      iOut.FormulaIntegerValC('=N'+lRow+'-H'+lRow,lRow,16,lRow,16);
+      iOut.FormulaIntegerValC('=T'+lRow+'-N'+lRow,lRow,22,lRow,22);
+      iOut.FormulaIntegerValC('=Z'+lRow+'-T'+lRow,lRow,28,lRow,28);
+      iOut.FormulaPctVal('=ЕСЛИ(D'+lRow+'<>0;((H'+lRow+'/D'+lRow+'))-1;0)',lRow,9,lRow,9);
+      iOut.FormulaPctVal('=ЕСЛИ(H'+lRow+'<>0;((N'+lRow+'/H'+lRow+'))-1;0)',lRow,15,lRow,15);
+      iOut.FormulaPctVal('=ЕСЛИ(N'+lRow+'<>0;((T'+lRow+'/N'+lRow+'))-1;0)',lRow,21,lRow,21);
+      iOut.FormulaPctVal('=ЕСЛИ(T'+lRow+'<>0;((Z'+lRow+'/T'+lRow+'))-1;0)',lRow,27,lRow,27);
+    }
+  }
+
+  lSE := 1;
+  xlSetColumnWidth(40,#FrmBl); lSE++;
+  xlSetColumnWidth(13,#FrmBl); lSE++;
+  xlSetColumnWidth(11, #FrmDat);
+  xlSetFontSize(10,#AllTab);
+  xlSetFontSize( 7,lDB,2,lDE,2);
+  xlWrapText(#AllTab);
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0, #AllTab);
+  xlFreeze(lDB,3);
+
+
+  
+}
+
+procedure printlog;
+{
+  iNextVisual('Выгружаю замечания.');
+  lRB  := 1;
+  lHS  := 1;
+  lDB  := lDE := lRB + lHS;
+  lCB  := lCE := 1;
+    lSE := 1;
+    iOut.StringValC('Причина'      ,#FrmCl); lSE++;
+    iOut.StringValC('Пояснение' ,#FrmCl); lSE++;
+    lDE++;
+  _loop ttLog ordered index ttLogSort
+  {
+    if (not NextVisual) break;
+    lSE := 1;
+    iOut.StringValL(ttLog.sReason ,#FrmCl); lSE++;
+    iOut.StringValL(ttLog.sAddInf ,#FrmCl); lSE++;
+    lDE++;
+  }
+  lSE := 1;
+  xlSetColumnWidth(50,#FrmBl); lSE++;
+  xlSetColumnWidth(50,#FrmBl);
+}
+
+procedure printrash;
+{
+  iNextVisual('Выгружаю расшифровку.');
+  lRB  := 1;
+  lHS  := 1;
+  lDB  := lDE := lRB + lHS;
+  lCB  := lCE := 1;
+  lSE := 1;
+  iOut.StringValC('Код ЗГД'      ,#FrmCl); lSE++;
+  iOut.StringValC('Название ЗГД' ,#FrmCl); lSE++;
+  iOut.StringValC('Код подразделения',#FrmCl); lSE++;
+  iOut.StringValC('Название подразделения' ,#FrmCl); lSE++;
+  iOut.StringValC('Вид производства'      ,#FrmCl); lSE++;
+  lDE++;
+  _loop ttRash ordered index ttRash01
+  {
+    if (not NextVisual) break;
+    lSE := 1;
+    iOut.CodeVal   (ttRash.sCodZGD  ,#FrmCl); lSE++;
+    iOut.StringValL(ttRash.sNameZGD ,#FrmCl); lSE++;
+    iOut.CodeVal   (ttRash.sCodPodr  ,#FrmCl); lSE++;
+    iOut.StringValL(ttRash.sNamePodr ,#FrmCl); lSE++;
+    iOut.StringValL(ttRash.sVidPro ,#FrmCl); lSE++;
+    lDE++;
+  }
+  xlAutoFit(1,1,lDE,lSE);
+//  lSE := 1;
+//  xlSetColumnWidth(50,#FrmBl); lSE++;
+//  xlSetColumnWidth(50,#FrmBl);
+}
+
+function sFPF : string; {sFPF := DateToStr(Cur_Date(),'_YYMMDD')+TimeToStr(Cur_Time(),'_HHMMSS');}
+
+procedure Run;
+{
+/*
+var tRep1
+   ,tRep2
+   ,tRep3
+   ,tRep4  : time;
+*/
+//  tRep1 := Cur_Time;
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+
+  InitRepPeriod(wYearRep);
+
+  MadeData;
+  sFullName := GetDefaultUserPath + '#(GPNam)'+sFPF+'.xls';
+
+//  tRep2 := Cur_Time;
+  xlCreateExcel(sFullName, TRUE);
+  xlAddSheet;
+  xlAddSheet;
+  xlSetActiveSheet(1);
+  xlSetSheetName(1,'Отчет');
+  PrintData;
+//  tRep3 := Cur_Time;
+  if isvalid(#ttLog)
+  {
+    xlSetActiveSheet(2);
+    printlog;
+    xlSetSheetName(2,'Замечания');
+    xlSetActiveSheet(1);
+  }
+  if isvalid(#ttRash)
+  {
+    xlSetActiveSheet(3);
+    printrash;
+    xlSetSheetName(3,'Подчинения');
+    xlSetActiveSheet(1);
+  }
+  xlKillExcel;
+  StopVisual;
+//  tRep4 := Cur_Time;
+/*
+  message(   'Время данные:'+     TimeToStr(Sub_Time(tRep2,tRep1),'HH:MM:SS')+
+          ' / Время выгрузка:'+   TimeToStr(Sub_Time(tRep3,tRep2),'HH:MM:SS')+
+          ' / Время расшифровка:'+TimeToStr(Sub_Time(tRep4,tRep3),'HH:MM:SS')+
+          ' / Время всего:'+      TimeToStr(Sub_Time(tRep4,tRep1),'HH:MM:SS'));
+*/
+}
+
+Screen s1(,,sci1Esc);
+  show at (,,44,3);
+  fields
+    wYearRep ('Отчетный период',,): {Font = {BackColor = if(wYearRep = 0, ColorNeed, 0)}}, noprotect;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+  << 'Параметры отчета'
+    Отчетный период .@@@@@@@@@@ год
+  
+     <. ~С~формировать .>  <. ~З~акрыть .>
+  >>
+end;
+
+#declare CloseGpInterface
+//++++++++++++++++++++++++++++++++++++++++++++++++
+  SaveMyDsk(wYearRep, '#(GPInt)_wYearRep');
+  closeinterface(cmDefault);
+//++++++++++++++++++++++++++++++++++++++++++++++++
+#end
+
+handleevent
+  cmInit:
+  {
+    delete all from ttRepPeriod;
+    delete all from ttTypePodr ;
+    delete all from ttPodr     ;
+    delete all from ttEmplKat  ;
+    delete all from ttRepData  ;
+    delete all from ttLog      ;
+    if (not (ReadMyDsk(wYearRep, '#(GPInt)_wYearRep', false)))
+      wYearRep := year(Cur_Date);
+    cVidPro := ExtAttr.AttrId(coCatalogs,'Вид производства');
+    if cVidPro = 0
+      if message('Атрибут Вид производства не существует.'+chr(13)+'Создать?',yesNo) = cmYes
+        cVidPro := ExtAttr.CreateAttr(coCatalogs,'Вид производства', cgAttrType_Str);
+  }
+  cmOk:
+  {
+    if (wYearRep = 0)
+    {
+      message('Задан некорректный период!');
+    }
+    else
+    {
+      Run;
+      #CloseGpInterface
+    }
+  }
+  cmCancel:
+  {
+    #CloseGpInterface
+  }
+end;
+end.
+
+
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+Procedure Run;
+Begin
+  runinterface(#(GPInt));
+End;
+Function GetReportName: String;
+Begin
+  GetReportName := '#(GPNam) (ЭМ)';
+End;
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Ведение картотеки сотрудников';
+  End;
+End;
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+end;
+End.

@@ -1,0 +1,258 @@
+/*************************************************************************************************\
+* Наименование: Операции-Изменение тарифов/окладов-Обновление тарифов/окладов в штатном расписании*
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:       *
+*             номер и дата приказа, который был удален                                            *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#3633         |16/11/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#component "Z_STAFF"
+#doc
+УП - Операции - Изменение тарифов/окладов - Обновление тарифов/окладов в штатном расписании.
+<p>#3633 В поле <Пересчет производить> добавить режим <на основе оклада из ШР>
+При выборе режима <на основе оклада из ШР>, применять правила пересчета ко всем ставкам ШР, действующим на момент пересчета (поле Дата обновления тарифа), независимо от других условий (оклад не соответствует тарифной сетке; нет ссылки на тарифную сетку; новый оклад не укладывается в вилку окладов).
+Добавить параметр: Менять ссылку на тарифную сетку: Да/Нет
+При установленном параметре <ДА>, менять ссылку на тарифную сетку (Дата обновления тарифа), по номеру тарифной сетки и номеру разряда.
+В результате работы функции, все действующие ставки ШР должны быть пересчитаны, в соответствии с заданными правилами пересчета:
+Действующий Тариф/оклад * коэффициент, округленный по заданным правилам.
+#end
+
+//***********************************************
+Alter Interface ST_TARIFFUNC
+//***********************************************
+OverLoad
+  procedure CheckAndRecalcHistoryRec(cHistRec : comp);
+end;
+
+//***********************************************
+var
+ GP_TarStav_Ch:word;//#3633
+
+//******************************************************************************
+// контроль/пересчет данных записи истории
+// #3633 берем целиком для wTypeCalc=2;
+procedure CheckAndRecalcHistoryRec(cHistRec : comp);
+var
+  doKorKoef : double;     // КК для расчета
+  CalcKoef  : double;     // коэффициент пересчета
+  CodTar    : Word;       // код тарифа
+  Razr      : Word;       // разряд тарифа
+{
+#IFDEF _GP_
+// Дата расчета  из параметров
+// if not ReadMyDsk(DateChan , 'St_ChangeData', false)    DateChan := Cur_Date;
+  if wTypeCalc=2
+  { bCheckMinMax:=false;
+  }
+  if wTypeCalc<>2
+  { Inherited::CheckAndRecalcHistoryRec(cHistRec);
+    exit;
+  }
+#ENDIF
+  CodTar := 0;
+  Razr   := 0;
+
+  if GetFirst HistoryStr where (( cHistRec == HistoryStr.NRec )) <> tsOk
+    exit;
+
+  // заполняем данные из обрабатываемой записи истории
+  recTariff.dHist        := if(HistoryStr.dHist > dOperDate, HistoryStr.dHist, dOperDate);
+  recTariff.cTariff      := HistoryStr.cTariff;
+  recTariff.wCategory    := HistoryStr.wCategory;
+  recTariff.doTaxRate    := HistoryStr.HTaxRate;
+  recTariff.sKorKoef     := HistoryStr.LastUser;
+  recTariff.sNameTariff  := '';
+
+  // берем значение тарифа из действующей тарифной сетки,если тариф привязан
+  if ( getfirst TarStav where (( recTariff.cTariff == TarStav.NRec )) = tsOK )
+  {
+    CodTar := TarStav.CodTar;
+    Razr   := TarStav.Razr;
+
+    recTariff.sNameTariff  := TarStav.NaiTar;
+
+    // обновим мин/макс из тарифных ставок, на случай если установлен соотв. параметр
+    recTariff.doMinTaxRate := TarStav.TarMin;
+    recTariff.doMaxTaxRate := TarStav.TarMax;
+  }
+  else // если не привязан обнулим, на случай если привязан кривой
+    recTariff.cTariff := 0;
+
+  // пересчитаем корректирующий коэффициент,если запущен пересчет и установлены настройки использования и замены КК
+  if ( Number = 1 ) and ( bUseKoeff ) and
+     (boGetTune('UP.STAFF.USECOEFFICIENT')) and
+     ( wGetTune('UP.STAFF.COEFFICIENT') = 0 )
+  {
+    if ( double(recTariff.sKorKoef) <> 0 )
+      doKorKoef := double(recTariff.sKorKoef);
+    else
+      doKorKoef := 1;
+
+    recTariff.sKorKoef := DoubleToStr(ChangeKoeff(doKorKoef), '[|-]36666666666667.888999999999999999999');
+  }
+
+  // если пересчет/контроль запущены на основе тарифов, берем актуальные тарифы
+  if ( wTypeCalc = 0 )
+  {
+    if GetLast TarStav where (( HistoryStr.wPayModel ==  TarStav.SisOpl and
+                                CodTar               ==  TarStav.CodTar and
+                                Razr                 ==  TarStav.Razr   and
+                                recTariff.dHist      >>= TarStav.DatIzm )) = tsOK
+    {
+      recTariff.cTariff      := TarStav.NRec;
+      recTariff.wCategory    := TarStav.Razr;
+      recTariff.sNameTariff  := TarStav.NaiTar;
+
+      // обновим мин/макс из тарифных ставок, на случай если установлен соотв. параметр
+      recTariff.doMinTaxRate := TarStav.TarMin;
+      recTariff.doMaxTaxRate := TarStav.TarMax;
+    }
+    else // если актуальный не нашли, пропускаем
+      exit;
+  }
+#IFDEF _GP_
+  if ( wTypeCalc = 2 )
+  { if IsBitCtW(GP_TarStav_Ch,1)
+    { if GetLast TarStav where (( HistoryStr.wPayModel ==  TarStav.SisOpl and
+                                  CodTar               ==  TarStav.CodTar and
+                                  Razr                 ==  TarStav.Razr   and
+                                  DateChan             ==  TarStav.DatIzm )) = tsOK
+      { recTariff.cTariff      := TarStav.NRec;
+        recTariff.wCategory    := TarStav.Razr;
+        recTariff.sNameTariff  := TarStav.NaiTar;
+        // обновим мин/макс из тарифных ставок, на случай если установлен соотв. параметр
+        if WMINMAX=5 //обновить из тарифных ставок
+        { recTariff.doMinTaxRate := TarStav.TarMin;
+          recTariff.doMaxTaxRate := TarStav.TarMax;
+        }
+      }
+    }//
+    else
+    {  Log('Для должности ' + sNamePostPodr +
+            ' не нашли тарифную сетку с кодом тарифа ' + CodTar+', разряд '+string(Razr), mfInformation);
+    }
+  } //if ( wTypeCalc = 2 )
+#ENDIF
+
+#IFDEF _GP_
+  if ( wTypeCalc <> 2 ) //для 2 оклад берем только из штатки!
+#ENDIF
+  // если есть привязка к тарифу, пересчитаем оклад
+  if ( recTariff.cTariff <> 0 )
+    recTariff.doTaxRate := vTSFuncs.GetTariffRoundAllPositionsHist(HistoryStr.NRec, recTariff.cTariff);
+
+  // если запущен пересчет,проверим коэффициент и умножим на него оклад
+  if ( Number = 1 )
+  {
+    CalcKoef := if(HistoryStr.wPayModel = 30, kofO, kofT);
+
+    if ( CalcKoef = 0 )
+      exit;
+
+    recTariff.doTaxRate := recTariff.doTaxRate * CalcKoef;
+  }
+
+  // если параметр не "обновить из тарифных ставок" - посчитаем мин/макс
+  // для значения 5 - уже обновили мин/макс выше,при актуализации тарифа
+  if wMinMax <> 5
+  {
+    // нахождение Мин
+    recTariff.doMinTaxRate := ChangeMinMax(HistoryStr.HMinTaxRate); // изменяем в зависимости от установленного параметра "что делать с MinMax"
+    // нахождение Мах
+    recTariff.doMaxTaxRate := ChangeMinMax(HistoryStr.HMaxTaxRate); // изменяем в зависимости от установленного параметра "что делать с MinMax"
+  }
+
+  // округление
+  Round(recTariff.doTaxRate,    4);
+  Round(recTariff.doMinTaxRate, 4);
+  Round(recTariff.doMaxTaxRate, 4);
+
+  dRndOT := if(HistoryStr.wPayModel = 30, rO, rT); //Округление окладов или тарифов
+#if(#__TOOLVERSION__ >= 5005.034)
+  case bRndUp of
+    0: // округление по обычным правилам
+    {
+      recTariff.doTaxRate    := OcrugNaRuk(recTariff.doTaxRate,    dRndOT);
+      recTariff.doMinTaxRate := OcrugNaRuk(recTariff.doMinTaxRate, dRndOT);
+      recTariff.doMaxTaxRate := OcrugNaRuk(recTariff.doMaxTaxRate, dRndOT);
+    }
+    1: // округление в большую сторону
+    {
+      recTariff.doTaxRate    := vTSFuncs.GetRoundUp(recTariff.doTaxRate,    dRndOT);
+      recTariff.doMinTaxRate := vTSFuncs.GetRoundUp(recTariff.doMinTaxRate, dRndOT);
+      recTariff.doMaxTaxRate := vTSFuncs.GetRoundUp(recTariff.doMaxTaxRate, dRndOT);
+    }
+    2: // не округлять
+    {
+      recTariff.doTaxRate    := OcrugVms(recTariff.doTaxRate,    dRndOT);
+      recTariff.doMinTaxRate := OcrugVms(recTariff.doMinTaxRate, dRndOT);
+      recTariff.doMaxTaxRate := OcrugVms(recTariff.doMaxTaxRate, dRndOT);
+    }
+  end;
+#else
+  if bRndUp // округление в большую сторону
+  {
+    recTariff.doTaxRate    := vTSFuncs.GetRoundUp(recTariff.doTaxRate,    dRndOT);
+    recTariff.doMinTaxRate := vTSFuncs.GetRoundUp(recTariff.doMinTaxRate, dRndOT);
+    recTariff.doMaxTaxRate := vTSFuncs.GetRoundUp(recTariff.doMaxTaxRate, dRndOT);
+  }
+  else  // округление по обычным правилам
+  {
+    recTariff.doTaxRate    := OcrugNaRuk(recTariff.doTaxRate,    dRndOT);
+    recTariff.doMinTaxRate := OcrugNaRuk(recTariff.doMinTaxRate, dRndOT);
+    recTariff.doMaxTaxRate := OcrugNaRuk(recTariff.doMaxTaxRate, dRndOT);
+  }
+#end
+
+  if ( bCheckMinMax ) //если надо проверять вилку
+  {
+    /* Надо рассмотреть случай, когда измененный оклад уже не попадает в новую вилку
+       Тогда, если он меньше минимума, то приравняем его к минимальному, если
+       больше максимального, то к верхней границе. Однако только в том случае, если до
+       пересчета он попадал, иначе сюда просто не придем */
+    if ( recTariff.doTaxRate > recTariff.doMaxTaxRate) and (recTariff.doMaxTaxRate > 0.00001)
+    {
+      if ( cHistRec = cLastRec )
+        Log('Для должности ' + sNamePostPodr +
+            ' оклад ' + trim(string(recTariff.doTaxRate, 15, 3)) + ' вышел за верхнюю границу ' +
+            trim(string(recTariff.doMaxTaxRate, 15, 3)) + ', поэтому будет к ней приведен.', mfInformation);
+      recTariff.doTaxRate := recTariff.doMaxTaxRate;
+    }
+    else
+      if ( recTariff.doTaxRate < recTariff.doMinTaxRate and abs(recTariff.doMinTaxRate) > 0.00001 )
+      {
+        if ( cHistRec = cLastRec )
+          Log('Для должности ' + sNamePostPodr +
+              ' оклад ' + trim(string(recTariff.doTaxRate, 15, 3)) + ' вышел за нижнюю границу ' +
+              trim(string(recTariff.doMinTaxRate, 15, 3)) + ', поэтому будет к ней приведен.', mfInformation);
+        recTariff.doTaxRate := recTariff.doMinTaxRate;
+      }
+  }
+
+  // вставка записи истории
+  RecordHistory;
+
+  // для последней записи истории производим синхронизацию данных в истории и ставке, а также запись в протокол
+  if ( cHistRec = cLastRec )
+    ActualizeStaffStruct;
+}
+
+//********************************************
+// события интерфейса
+//********************************************
+Handleevent
+//----------------------
+cmInit:
+{ timelog_init;
+  if not ReadMyDsk(GP_TarStav_Ch,     'st_GP_TarStav_Ch',false) GP_TarStav_Ch:=0;
+  case Inherited::HandleEvent(cmInit) of
+  heAbort :  Abort;
+  heStop  :  Exit;
+  end;
+
+}
+end;//Handleevent
+end.

@@ -1,0 +1,669 @@
+/*************************************************************************************************\
+* Наименование:  Разработка функционала выгрузки данных для открытия карт-счетов                  *
+*                "Выгрузка данных для Сбербанка (ЭМ)"                                             *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#765          |04/12/17|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include UserReport.vih
+#include ComFiltr.vih
+#include CatFunc.vih
+#include AdrFunc.vih
+#include StrFunc.vih
+#include AppFuncs.vih
+#include MainLschetForPersons.vih
+#include GP_XlOutExt.vih
+
+
+#define GPInt GP_ExpOpenCardSbb // #(GPInt)
+#define GPNam Выгрузка данных для Сбербанка // #(GPNam)
+
+Interface #(GPInt) '#(GPNam) (ЭМ)' EscClose, Gray;
+  show (,,86,12);
+
+const
+#include Excel.inc;
+end;
+
+table struct ttPerFlt // для фильтра по персоналу
+(
+  cRecPers : comp
+)
+with index
+(
+  ttPerFlt01  = cRecPers
+);
+
+table struct ttResStr // статический набор данных
+(
+  nRec      : comp
+, cRecPers  : comp
+, sFIO      : string
+, sF        : string
+, sI        : string
+, sO        : string
+, dBorn     : date
+, sBorn     : string
+, sGrazhd   : string
+//fakt
+, sLIdx      : string
+, sLRegion   : string
+, sLRegionS  : string
+, sLRajon    : string
+, sLRajonS   : string
+, sLGorod    : string
+, sLGorodS   : string
+, sLNasPunkt : string
+, sLNasPunktS: string
+, sLUlitsa   : string
+, sLUlitsaS  : string
+, sLDom      : string
+, sLKorpus   : string
+, sLKvartira : string
+//Propis
+, sBIdx      : string
+, sBRegion   : string
+, sBRegionS  : string
+, sBRajon    : string
+, sBRajonS   : string
+, sBGorod    : string
+, sBGorodS   : string
+, sBNasPunkt : string
+, sBNasPunktS: string
+, sBUlitsa   : string
+, sBUlitsaS  : string
+, sBDom      : string
+, sBKorpus   : string
+, sBKvartira : string
+//pass
+, sRezi     : string
+, sTypPass  : string
+, sSerPass  : string
+, sNomPass  : string
+, sKtoPass  : string
+, dKtoPass  : date
+, sTelDom   : string
+, sTelRab   : string
+, sTelMob   : string
+, sEMail    : string
+, sPost     : string
+, sINN      : string
+)
+with index
+(
+  ttResStr00 = nRec(Surrogate)
+, ttResStr01 = cRecPers
+, ttResStr02 = sFIO
+);
+
+var
+  VCommonFiltr  : CommonFiltr; // Для встраивания фильтра по подразделениям / сотрудникам
+  MadeReport    : boolean;
+  mPsn          : TPtr;
+  iCatFunc      : CatalogsFunctions;
+  iAdrFunc      : AddressFunc;
+  iStrFunc      : StringFunctions;
+  iAppFunc      : AppointmentsFunctions;
+  MLFP          : MainLschetForPersons;
+  iOut          : GP_XlOutExt;
+  sFullName     : string;
+  lRB, lRE,
+  lCB, lCE,
+  lDB, lDE,
+  iNPP          : integer = 0;
+  sShKl         : array [1..67] of string;
+  isDiffAddr    : boolean;
+
+create view
+var
+  cLSch : comp;
+from
+  Persons
+, Passports
+, Passports PassINN
+, Communications
+, LSchet
+, ttPerFlt
+, ttResStr
+where
+((
+    ttPerFlt.cRecPers == Persons.nRec
+and Persons.PasspRus  == Passports.nRec
+and Persons.nRec      == Communications.Person
+and Persons.nRec      == PassINN.Person
+and integer(505)      == PassINN.SysCode
+and cLSch             == LSchet.nRec
+))
+;
+
+function sFPF : string; {sFPF := DateToStr(Cur_Date(),'_YYMMDD')+TimeToStr(Cur_Time(),'_HHMMSS');}
+
+function sRetPhoneList(sAny : string) : string;
+{
+  result:='';
+  if isvalid(#Communications)
+  _loop Communications
+    if Pos(sAny,LoCase(iCatFunc.GetCatalogsName(Communications.ComType)))<>0
+      result+=if(Trim(result)<>'','; ','')+Communications.Addr;
+}
+function sRetEMailList(sAny : string) : string;
+{
+  result:='';
+  if isvalid(#Communications)
+  _loop Communications
+    if Pos(sAny,LoCase(iCatFunc.GetCatalogsName(Communications.ComType)))<>0
+      result+=if(Trim(result)<>'','; ','')+Communications.EMail;
+}
+
+function isDiffAddrCheck : boolean;
+{
+  result := false;
+  if ttResStr.sLIdx       <> ttResStr.sBIdx      
+  or ttResStr.sLRegion    <> ttResStr.sBRegion   
+  or ttResStr.sLRajon     <> ttResStr.sBRajon    
+  or ttResStr.sLGorod     <> ttResStr.sBGorod    
+  or ttResStr.sLNasPunkt  <> ttResStr.sBNasPunkt 
+  or ttResStr.sLUlitsa    <> ttResStr.sBUlitsa   
+  or ttResStr.sLDom       <> ttResStr.sBDom      
+  or ttResStr.sLKorpus    <> ttResStr.sBKorpus   
+  or ttResStr.sLKvartira  <> ttResStr.sBKvartira 
+    result := true;
+}
+
+procedure InitShortKLAdr;
+{
+  sShKl[1] :='аал';
+  sShKl[2] :='автодорога';
+  sShKl[3] :='Аобл';
+  sShKl[4] :='АО';
+  sShKl[5] :='арбан';
+  sShKl[6] :='аул';
+  sShKl[7] :='волость';
+  sShKl[8] :='высел';
+  sShKl[9] :='г.о.';
+  sShKl[10]:='гп';
+  sShKl[11]:='городок';
+  sShKl[12]:='г';
+  sShKl[13]:='дп';
+  sShKl[14]:='д';
+  sShKl[15]:='ж/д_будка';
+  sShKl[16]:='ж/д_казарм';
+  sShKl[17]:='ж/д_оп';
+  sShKl[18]:='ж/д_платф';
+  sShKl[19]:='ж/д_пост';
+  sShKl[20]:='ж/д_рзд';
+  sShKl[21]:='ж/д_ст';
+  sShKl[22]:='жилзона';
+  sShKl[23]:='жилрайон';
+  sShKl[24]:='заимка';
+  sShKl[25]:='казарма';
+  sShKl[26]:='кв-л';
+  sShKl[27]:='км';
+  sShKl[28]:='кордон';
+  sShKl[29]:='кп';
+  sShKl[30]:='край';
+  sShKl[31]:='лпх';
+  sShKl[32]:='мкр';
+  sShKl[33]:='массив';
+  sShKl[34]:='м';
+  sShKl[35]:='нп';
+  sShKl[36]:='обл';
+  sShKl[37]:='округ';
+  sShKl[38]:='остров';
+  sShKl[39]:='промзона';
+  sShKl[40]:='п/о';
+  sShKl[41]:='п/р';
+  sShKl[42]:='п/ст';
+  sShKl[43]:='пгт';
+  sShKl[44]:='погост';
+  sShKl[45]:='починок';
+  sShKl[46]:='п';
+  sShKl[47]:='Респ';
+  sShKl[48]:='Респ';
+  sShKl[49]:='рзд';
+  sShKl[50]:='р-н';
+  sShKl[51]:='рп';
+  sShKl[52]:='ст-ца';
+  sShKl[53]:='с/а';
+  sShKl[54]:='с/мо';
+  sShKl[55]:='с/о';
+  sShKl[56]:='с/п';
+  sShKl[57]:='с/с';
+  sShKl[58]:='сл';
+  sShKl[59]:='снт';
+  sShKl[60]:='ст';
+  sShKl[61]:='с';
+  sShKl[62]:='тер';
+  sShKl[63]:='ул';
+  sShKl[64]:='у';
+  sShKl[65]:='х';
+  sShKl[66]:='Чувашия';
+  sShKl[67]:='ш';
+}
+
+procedure RetSTerr(sAny : string; var sLObj : string; var sSObj : string);
+Var
+  wI   : word;
+  wPos : word;
+  wLen : word;
+{
+  if sAny <> ''
+    for(wI:=1; wI<=67; wI++)
+    {
+      wLen := Length(sShKl[wI]);
+      //сначала проверяем в конце
+      wPos := Pos(' '+sShKl[wI],sAny);
+      if wPos <> 0
+      {
+        sLObj := SubStr(sAny,1,wPos-1);
+        sSObj := sShKl[wI];//SubStr(sAny,wPos+1,wLen);
+        exit;
+      }
+      //На всякий случай проверяем в начале
+      wPos := Pos(sShKl[wI]+' ',sAny);
+      if wPos = 1
+      {
+        sLObj := SubStr(sAny,wLen+2,Length(sAny)-(wLen+1));
+        sSObj := sShKl[wI];//SubStr(sAny,1,wLen);
+        exit;
+      }
+    }
+}
+
+procedure Run;
+var kol, i    : integer = 0;
+    cPersNRec : comp;
+    cAddrNeed : comp;
+    sAny      : string;
+    iRow      : integer = 0;
+{
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Процесс...', 0);
+
+  InitShortKLAdr;
+
+  if (VCommonFiltr.GetPsnCount = 0)
+    VCommonFiltr.SelectAllPsn;
+
+  mPsn := InitMarker('#(GPInt)_PSN_'+UserName(),8,200,100);
+  mPsn := VCommonFiltr.GetPersonsMarker;
+  kol  := GetMarkerCount(mPsn);
+  RestartVisual('Формирование таблицы фильтров.',1);
+  while i < kol
+  {
+    GetMarker(mPsn, i++, cPersNRec);
+    insert ttPerFlt set ttPerFlt.cRecPers := cPersNRec;
+    If (not NextVisual) break;
+  }
+  
+  RestartVisual('Формирование данных для выгрузки.',1);
+  if IsValid(#ttPerFlt)
+  _loop ttPerFlt
+  {
+    if (not NextVisual) break;  
+    if IsValid(#Persons)
+    {
+      ClearBuffer(#ttResStr);
+      ttResStr.cRecPers := Persons.nRec;
+      ttResStr.sFIO     := Persons.FIO ;
+      ttResStr.sF       := UpCase(iStrFunc.Get_LastName (Persons.FIO));
+      ttResStr.sI       := UpCase(iStrFunc.Get_FirstName(Persons.FIO));
+      ttResStr.sO       := UpCase(iStrFunc.GetPatronymic(Persons.FIO));
+      ttResStr.dBorn    := Persons.BornDate;
+      ttResStr.sBorn    := iAdrFunc.GetFullAddressInd(Persons.BornAddr);
+      sAny := iCatFunc.GetCatalogsCode(Persons.Gr);
+      ttResStr.sGrazhd  := if(sAny='1' or sAny='2','РОССИЯ',iCatFunc.GetCatalogsName(Persons.Gr));
+      //fact
+      cAddrNeed          := Persons.LiveAddr;
+      ttResStr.sLIdx     := iAdrFunc.GetAddressInd(cAddrNeed);
+      ttResStr.sLDom     := iAdrFunc.GetHouse     (cAddrNeed);
+      ttResStr.sLKorpus  := iAdrFunc.GetCorpus    (cAddrNeed);
+      ttResStr.sLKvartira:= iAdrFunc.GetFlat      (cAddrNeed);
+      RetSTerr(iAdrFunc.GetStreetName(cAddrNeed)   ,ttResStr.sLUlitsa  ,ttResStr.sLUlitsaS  );
+      cAddrNeed          := iAdrFunc.GetATDNRec   (cAddrNeed);
+      RetSTerr(iAdrFunc.GetNameATD   (cAddrNeed,20),ttResStr.sLRegion  ,ttResStr.sLRegionS  );
+      RetSTerr(iAdrFunc.GetNameATD   (cAddrNeed, 3),ttResStr.sLRajon   ,ttResStr.sLRajonS   );
+      RetSTerr(iAdrFunc.GetNameATD   (cAddrNeed, 4),ttResStr.sLGorod   ,ttResStr.sLGorodS   );
+      RetSTerr(iAdrFunc.GetNameATD   (cAddrNeed, 5),ttResStr.sLNasPunkt,ttResStr.sLNasPunktS);
+      //propis
+      cAddrNeed          := Persons.PasspAddr;
+      ttResStr.sBIdx     := iAdrFunc.GetAddressInd(cAddrNeed);
+      ttResStr.sBDom     := iAdrFunc.GetHouse     (cAddrNeed); //message(ttResStr.sDom);
+      ttResStr.sBKorpus  := iAdrFunc.GetCorpus    (cAddrNeed);
+      ttResStr.sBKvartira:= iAdrFunc.GetFlat      (cAddrNeed);
+      RetSTerr(iAdrFunc.GetStreetName(cAddrNeed)   ,ttResStr.sBUlitsa  ,ttResStr.sBUlitsaS  );
+      cAddrNeed         := iAdrFunc.GetATDNRec   (cAddrNeed);
+      RetSTerr(iAdrFunc.GetNameATD   (cAddrNeed,20),ttResStr.sBRegion  ,ttResStr.sBRegionS  );
+      RetSTerr(iAdrFunc.GetNameATD   (cAddrNeed, 3),ttResStr.sBRajon   ,ttResStr.sBRajonS   );
+      RetSTerr(iAdrFunc.GetNameATD   (cAddrNeed, 4),ttResStr.sBGorod   ,ttResStr.sBGorodS   );
+      RetSTerr(iAdrFunc.GetNameATD   (cAddrNeed, 5),ttResStr.sBNasPunkt,ttResStr.sBNasPunktS);
+
+      ttResStr.sTelDom  := sRetPhoneList('дом');//'НЕ ИМЕЮ'
+      ttResStr.sTelRab  := sRetPhoneList('раб');
+      ttResStr.sTelMob  := sRetPhoneList('Личный сотовый номер');
+      sAny := sRetPhoneList('тел.сот.');
+      if sAny <> ''
+        ttResStr.sTelMob+= if(Length(ttResStr.sTelMob)<>0,'; ','')+sAny;
+      if ttResStr.sTelDom='' ttResStr.sTelDom := 'НЕ ИМЕЮ';
+      if ttResStr.sTelRab='' ttResStr.sTelRab := 'НЕ ИМЕЮ';
+      if ttResStr.sTelMob='' ttResStr.sTelMob := 'НЕ ИМЕЮ';
+      ttResStr.sEMail   := sRetEMailList('e-mail');
+      ttResStr.sPost    := iAppFunc.GetAppPost(iAppFunc.GetAppNrec_OnDate(Persons.nRec,Cur_Date));
+      if IsValid(#Passports)
+      {
+        ttResStr.sTypPass := iCatFunc.GetCatalogsName(Passports.DocName);
+        ttResStr.sSerPass := Replace(Passports.Ser, ' ', '');
+        ttResStr.sNomPass := Passports.Nmb;
+        ttResStr.sKtoPass := Passports.GivenBy+' '+Passports.GivenPodr;// Passports.GivenPodr;
+        ttResStr.dKtoPass := Passports.GivenDate;
+      }
+      if IsValid(#PassINN)
+        ttResStr.sINN     := PassINN.NMB;
+      if MLFP.GetMainLschet(Persons.nRec, cLSch)
+      {
+        set cLSch := cLSch; //прикол MS-SQL, так надо иначе не работает
+        if IsValid(#LSchet)
+          ttResStr.sRezi  := if(LSchet.Summa10=0,'РЕЗИДЕНТ','НЕ РЕЗИДЕНТ');
+      }
+      insert current ttResStr;
+    }
+  }
+  if isvalid(#ttResStr)
+  {
+    if not xlCreateExcelWithTemplate(sFullName, true)
+    {
+      message('Невозможно открыть заданный XLS-файл!',Error);
+      StopVisual;
+      exit;
+    }
+    
+    if not xlSetActiveSheetByName('Общий')
+    {
+      message('Задан XLS-файл с неправильной структурой!',Error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    lRB  := 4;
+    lDB  := lRB + 1;
+    lCB  := 1;
+    lCE  := 6;
+    iNPP := 1;
+    RestartVisual('Выгрузка данных.',1);
+
+    _loop ttResStr iRow++; 
+
+    #define FrmCl lDE,lCE++
+  
+    if (not xlCreateMatrix(iRow,4))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    iNPP:=1;
+    lDE :=1;
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+      lCE := 1;
+      xlStWriteToMatrix(#FrmCl,       iNPP++               );
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sF         ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sI         ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sO         ));
+      lDE++;
+    }
+    xlSetNumberFormat('@', 5, 6,iRow+5,10);
+    if (not xlWriteMatrixToExcel(5,6))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+    xlFreeMatrix;
+
+    if (not xlCreateMatrix(iRow,37))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    lDE :=1;
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+      lCE := 1;
+      xlDtWriteToMatrix(#FrmCl,       ttResStr.dBorn       );
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sBorn      ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sGrazhd    ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLIdx      ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLRegion   ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLRegionS  ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLRajon    ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLRajonS   ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLGorod    ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLGorodS   ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLNasPunkt ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLNasPunktS));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLUlitsa   ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLUlitsaS  ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLDom      ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLKorpus   ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sLKvartira ));
+      isDiffAddr:=isDiffAddrCheck;
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBIdx       ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBRegion    ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBRegionS   ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBRajon     ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBRajonS    ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBGorod     ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBGorodS    ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBNasPunkt  ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBNasPunktS ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBUlitsa    ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBUlitsaS   ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBDom       ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBKorpus    ),''));
+      xlStWriteToMatrix(#FrmCl,if(isDiffAddr,upcase(ttResStr.sBKvartira  ),''));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sRezi      ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sTypPass   ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sSerPass   ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sNomPass   ));
+      xlDtWriteToMatrix(#FrmCl,       ttResStr.dKtoPass    );
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sKtoPass   ));
+      lDE++;
+    }
+    xlSetNumberFormat('@',5,14,iRow+5,47);
+    xlSetNumberFormat('@',5,49,iRow+5,49);
+    if (not xlWriteMatrixToExcel(5,13))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+    xlFreeMatrix;
+  
+    if (not xlCreateMatrix(iRow,3))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    lDE :=1;
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+      lCE := 1;
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sTelDom   ));
+//       xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sTelRab   )); //'8-495-2869206'
+      xlStWriteToMatrix(#FrmCl,'8-495-2869206'); //'8-495-2869206'
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sTelMob   ));
+      lDE++;
+    }
+    xlSetNumberFormat('@',5,51,iRow+5,53);
+    if (not xlWriteMatrixToExcel(5,51))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+    xlFreeMatrix;
+
+    if (not xlCreateMatrix(iRow,2))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    lDE :=1;
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+      lCE := 1;
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sEMail    ));
+      xlStWriteToMatrix(#FrmCl,upcase(ttResStr.sPost     ));
+      lDE++;
+    }
+    xlSetNumberFormat('@',5,56,iRow+5,57);
+    if (not xlWriteMatrixToExcel(5,56))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+    xlFreeMatrix;
+
+    if (not xlCreateMatrix(iRow,1))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    lDE :=1;
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+      lCE := 1;
+      xlStWriteToMatrix(#FrmCl, 'ZK0SS110000'              );
+      lDE++;
+    }
+    xlSetNumberFormat('@',5,60,iRow+5,60);
+    if (not xlWriteMatrixToExcel(5,60)) 
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+    xlFreeMatrix;
+
+    if (not xlCreateMatrix(iRow,1))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    lDE :=1;
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+      lCE := 1;
+      xlStWriteToMatrix(#FrmCl, upcase(ttResStr.sINN      ));
+      lDE++;
+    }
+    xlSetNumberFormat('@',5,65,iRow+5,65);
+    if (not xlWriteMatrixToExcel(5,65))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+    xlFreeMatrix;
+
+// B 180321
+    if (not xlCreateMatrix(iRow,2))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    lDE :=1;
+    _loop ttResStr ordered index ttResStr02
+    {
+      if (not NextVisual) break;
+      lCE := 1;
+      xlStWriteToMatrix(#FrmCl,'9040');
+      xlStWriteToMatrix(#FrmCl,'7771');
+      lDE++;
+    }
+    xlSetNumberFormat('@',5,65,iRow+5,79);
+    xlSetNumberFormat('@',5,65,iRow+5,80);
+    if (not xlWriteMatrixToExcel(5,79))
+      message('Ошибка функции xlWriteMatrixToExcel.',error);
+    xlFreeMatrix;
+// E 180321
+    xlAutoFit(4,6,lDE+4,65);
+    xlKillExcel;
+  }
+  else
+  {
+    message('Нет данных для формирования отчета!');
+  }
+  StopVisual;
+}
+
+embedded ComFiltrEmbedded 'Фильтры' interface VCommonFiltr;
+  show (,,85,6);
+end
+Screen s2(,,sci1Esc);
+  show (,7,85,11);
+  fields
+    sFullName ('Файл выгрузки',,sci13Esc): {Font = {BackColor = if(sFullName    = '', ColorNeed, 0)}},Protect, PickButton ;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+  <<
+
+   `Файл выгрузки` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+     <. ~С~формировать .>                         <. ~З~акрыть .>
+  >>
+end;
+
+handleevent
+  cmInit:
+  {
+    delete all from ttPerFlt;
+    delete all from ttResStr;
+    MadeReport:= false;
+    if (not (ReadMyDsk(sFullName,'#(GPInt)_sFullName', false)))
+      set sFullName := '';
+  }
+  cmPick:
+  {
+    case CurField of
+      #sFullName: set sFullName := GetFileName('*.xls;*.xlsx','Выбор файла...');
+    end;
+  }
+  cmDelOnprotect:
+  {
+    case CurField of
+      #sFullName: set sFullName := '';
+    end;
+  }
+  cmOk:
+  {
+    if trim(sFullName)='' {message('Не задан файл приемник!',Error); exit;}
+    Run;
+    MadeReport:= true;
+    VCommonFiltr.IntClose(MadeReport);
+    VCommonFiltr.StoreAllParams;
+    Notify(cmEvaluateAndModify, 0);
+    DoneMarker(mPsn,      '#(GPInt)_PSN_');
+    SaveMyDsk (sFullName, '#(GPInt)_sFullName');
+    closeinterface(cmDefault);
+  }
+  cmCancel:
+  {
+    VCommonFiltr.IntClose(MadeReport);
+    DoneMarker(mPsn,      '#(GPInt)_PSN_'     );
+    SaveMyDsk (sFullName, '#(GPInt)_sFullName');
+  }
+end;
+end.
+
+
+
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+Procedure Run;                                  {runinterface(#(GPInt));}
+Function  GetReportName               : String; {GetReportName := '#(GPNam) (ЭМ)';}
+Function  GetGroupName (Level : Word) : String; {Level:=Level;GetGroupName := '';}
+function  GetPriority                 : Integer;{GetPriority := 3;}
+function  VisibleInModule(Ind : Byte) : String; {Ind:=Ind; VisibleInModule := 'STAFFMAINMENU';} // для Пушковой Перенесено из MENUZARP';}
+End.

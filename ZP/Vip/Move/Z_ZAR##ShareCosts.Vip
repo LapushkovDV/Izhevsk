@@ -1,0 +1,646 @@
+/*************************************************************************************************\
+* Наименование:  Ведение заказов/проектов - Распределение ФОТ работников по заказам               *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Распределение начисленных и неначисляемых сумм по затратным счетам               *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#798          |10/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#767          |10/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include PAXRefs.vih
+#include GP_ZP_RaspZakazVO.vih
+#component "z_zar"
+#doc
+ Распределение начисленных и неначисляемых сумм по затратным счетам
+#end
+
+alter interface ShareCosts
+  ( '')
+;
+  overload
+      function GetDivisor: double;
+  end;
+//----------------------------------
+var iGP_ZP_RaspZakazVO  :GP_ZP_RaspZakazVO;
+var pZakaz:comp;
+var boDiv  :boolean;
+var boDiv_D:boolean;
+
+table struct DIVISORS_D
+(
+  PERIODBeg: date,
+  PeriodEnd :date,
+  DIVISOR: double
+
+)
+with index
+(
+   DIVISORS01 = PeriodBeg+PeriodEnd(unique)
+);
+
+
+Create view
+var
+ DTB,DTE:date;
+as select PRVIDOPL_D.Nrec
+From PRVIDOPL PRVIDOPL_D, DIVISORS_D
+where ((
+      pcCostSharing   == PRVIDOPL_D.CHOICE
+  and PersonalAccount == PRVIDOPL_D.CLSCH
+  and PeriodBeginning == PRVIDOPL_D.DATAN (noindex)
+  and DTB<<=PRVidopl_D.DataF(noindex)
+  and DTE>>=PRVidopl_D.DataF(noindex)
+  and DTB<<=DIVISORS_D.PeriodBeg
+  and DTE>>=DIVISORS_D.PeriodBeg
+
+))
+bounds Cost_DT= DTB<<=PRVidopl.DataF(noindex)
+           and DTE>>=PRVidopl.DataF (noindex)
+;
+//----------------------------------
+create view vFndSpr
+var
+   myPlansNo:comp=0;
+   sSchet   :string[22];
+   sSubSch  :string[22];
+as select
+  BuhSchet.Nrec
+From
+  BuhSchet
+where
+((   myPlansNo== PlansSch.Nrec
+and  PlansSch.Kod+sSchet == BuhSchet.Schet
+and  sSubSch             == BuhSchet.SubSch
+))
+;
+
+function GetDivisor: double;    ;
+{
+  if (GetFirst DIVISORS <> tsOk)
+  {
+    var D: double = 0;
+    _loop PRVIDOPL novisual
+    {  D := D + PRVIDOPL.CHASF;
+       boDiv:=true
+    }
+    ClearBuffer(#DIVISORS);
+    DIVISORS.DIVISOR := D;
+    //GP
+    DIVISORS.Period:=PeriodBeginning;
+    insert current DIVISORS;
+  }
+
+  result := DIVISORS.DIVISOR;
+}
+
+
+function GetDivisor_D(_DTB:date;_DTE:date): double;
+{
+  DTB:=_DTB; DTE:=_DTE;
+  if (GetFirst DIVISORS_D <> tsOk)
+  {
+    var D: double = 0;
+    _loop PRVIDOPL_d novisual
+    {  D := D + PRVIDOPL_D.CHASF;
+       boDiv_D:=true
+    }
+    if D=0   D:=GetDivisor;
+
+    ClearBuffer(#DIVISORS_D);
+    DIVISORS_D.DIVISOR := D;
+    DIVISORS_D.PeriodBeg:=_DTB;
+    DIVISORS_D.PeriodEND:=_DTB;
+    insert current DIVISORS_D;
+  }
+
+  result := DIVISORS_D.DIVISOR;
+}
+
+//-------------------------------------------------------
+// Найти счет
+//-------------------------------------------------------
+Function FindSchet(ww_sch:string[22];ww_sub:string[22]) : boolean; cacheable;
+{ Result:=false;
+  if vFndSpr.myPlansNo=0
+  { vFndSpr.myPlansNo:=coGetTune('KONSOLID.CPLANSSCH'); // "Настройки Галактики \ Бухгалтерский контур \ План счетов по умолчанию"
+    if vFndSpr.myPlansNo=0
+      vFndSpr.myPlansNo:=coGetTune('FIN.USER.CPLANSSCH'); // "Настройки Галактики \ Бухгалтерский контур \ Текущий план счетов"
+    if vFndSpr.GetFirst fastfirstrow PlansSch=tsok {}
+  }
+  vFndSpr.sSchet :=ww_sch;
+  vFndSpr.sSubSch:=ww_sub;
+  if vFndSpr.GetFirst BuhSchet<>tsok
+  { displ('Ошибка поиска счета '+vFndSpr.sSchet+'/'+vFndSpr.sSubSch+' в плане счетов "'+vFndSpr.PlansSch.Name+'"');
+    exit;
+
+  } //if vFndSpr.GetFirst BuhSchet<>tsok
+  Result:=true;
+} //Function FindSchet(ww_sch:string[20];ww_sub:string) : boolean; cacheable;
+
+#UNDEF ShareCosts_SetZakaz
+// установка фиксированного заказа
+#DECLARE ShareCosts_SetZakaz (wTable)
+   var iZ:word=0;
+   if FindSchet( #(wTable).cSchetD, #(wTable).cSubSchD)
+   { For(iZ:=1;iZ<=6;iZ++)
+     { if vFndSpr.BuhSchet.KodTable[iZ]=cgKau_Zakaz
+       { #(wTable).TblD[iZ]:=cgKau_Zakaz;
+         #(wTable).cKauD[iZ]:=pZakaz;
+         pZakaz:=0;
+       } //if vFndSpr.BuhSchet.KodTable[iZ]=cgKau_Zakaz
+     } //For(iZ:=1;iZ<=6;iZ++)
+     //--------------------------
+     if pZakaz>0
+     { For(iZ:=1;iZ<=6;iZ++)
+       { if #(wTable).TBLEXTR[iZ]=0 or #(wTable).TBLEXTR[iZ]=cgKau_Zakaz
+         { #(wTable).TBLEXTR[iZ]:=cgKau_Zakaz;
+           #(wTable).KAUEXTR[iZ]:=pZakaz;
+         }
+       } //For(iZ:=1;iZ<=6;iZ++)
+     } //if pZakaz
+     update current #(wTable);
+   } //if FindSchet( #(wTable).cSchet, #(wTable).cSubSch)
+#END //ShareCosts_SetZakaz
+HandleEvent
+cmInit:
+{ displ('Корректировка аналитики в начислениях');
+  RunInterface('GP_ZP_AFTERRAS',0,0,0);
+  displ('Корректировка аналитики в начислениях завершена');
+  //Забираем целиком. Пункт VI. Доработка функции распределения затрат лицевого счета сотрудника
+  //Доработки системы для учета по заказам.pptx
+   //if Inherited::HandleEvent(cmInit)=heAbort Abort;
+  //closeinterface(cmDone)
+   if (SharingFlags = 0)
+  {
+    abort;
+    exit;
+  }
+
+  if not GetUserDate(YearRas, MonthRas, DayRas, FirstDayRas, DatRas)
+  {
+    abort;
+    exit;
+  }
+
+  if (not IntInit)
+  {
+    abort;
+    exit;
+  }
+
+  var M, M2: TPtr;
+  M := InitMarker('', 8, 100, 200, false);
+  M2 := InitMarker('', 8, 100, 200, true);
+
+  _try
+  {
+    // получить список лицевых счетов в соответствии с настройками расчета з/п
+    StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Подсчет количества итераций', 1);
+    case PersonalAccountFilter of
+      // по основному месту работы
+      1:
+        _loop FORMARKS where ((_cLSCHET == FORMARKS.CHOICE and 0 == FORMARKS.FIELD4))
+          InsertMarker(M, FORMARKS.CPODR);
+
+      // по совместительству
+      2:
+        _loop FORMARKS where ((_cLSCHET == FORMARKS.CHOICE and 1 <<= FORMARKS.FIELD4 and 3 >>= FORMARKS.FIELD4))
+          InsertMarker(M, FORMARKS.CPODR);
+
+      // без учета видов работ;
+      // по основному месту работы с учетом совместительства;
+      0, 3:
+      {
+        var APAI: IAdjacentPersonalAccountsIterator;
+        LoadVipRef(APAI, 'AdditionalPersonalAccountsIterator');
+        _loop FORMARKS where ((_cLSCHET == FORMARKS.CHOICE))
+        {
+          InsertMarker(M, FORMARKS.CPODR);
+          if (PersonalAccountFilter = 3)
+          {
+            if (GetFirst LSCHET where ((FORMARKS.CPODR == LSCHET.NREC)) <> tsOk)
+              continue;
+
+            // выгрузить ссылки на дополнительные лицевые счета
+            if APAI.First(LSCHET.NREC)
+              do
+                InsertMarker(M, APAI.GetAdjacent);
+              while APAI.Next;
+          }
+        }
+      }
+    end; //case
+
+    StopVisual;
+
+    StartNewVisual(vtIndicatorVisual, vfTimer + vfbreak + vfConfirm, '', GetMarkerCount(M) * 2);
+
+    var Iterator: longint;
+    for (Iterator := 0; Iterator < GetMarkerCount(M); Iterator++)
+    {
+      if (not GetMarker(M, Iterator, PersonalAccount))
+      {
+        NNextVisual(2);
+        continue;
+      }
+
+      if (LogIfError(BeginConcurrentTransaction(0), '') <> tsOk)
+      {
+        NNextVisual(2);
+        continue;
+      }
+
+      if (GetFirst LSCHET where ((PersonalAccount == LSCHET.NREC)) = tsOk)
+        SetVisualHeader('Распределение затрат (таб.н. ' + GetStrTabn(LSCHET.TABN, LSCHET.StrTABN) + ')');
+      else
+        SetVisualHeader('Распределение затрат');
+
+      // прибить делители
+      ResetBounds(#DIVISORS);
+      delete all DIVISORS;
+      SetBounds(#DIVISORS);
+      ResetBounds(#DIVISORS_D);
+      delete all DIVISORS_D;
+      SetBounds(#DIVISORS_D);
+
+//------------------------------------------------------------------------------
+// начисления
+//------------------------------------------------------------------------------
+      if ((SharingFlags and 1) = 1) and (GetFirst NACHISL = tsOk)
+      {
+        var N: TPtr;
+        N := InitMarker('', 8, 5, 5);
+        // выгрузить nrec-и начислений в маркер
+        _loop NACHISL novisual
+          InsertMarker(N, NACHISL.NREC);
+
+        // для каждого вида начисления - свой делитель (своя разбивка)
+        while GetMarkerCount(N) > 0
+        {
+          var Payment: comp;
+          GetMarker(N, 0, Payment);
+          AtDeleteMarker(N, 0);
+
+          // спозиционироваться на очередное начисление
+          if GetFirst NACHISL where ((Payment == NACHISL.NREC)) <> tsOk
+            continue;
+
+         //-----------------------------------------------------------
+         //GP_CHAMGE
+         //Пункт VI. Доработка функции распределения затрат лицевого счета сотрудника
+         //Доработки системы для учета по заказам.pptx
+         var ii:word;
+         var need_rasp:boolean=true;
+         for(ii:=1;ii<=6;ii++)
+         { if NACHISL.TblD[ii]=cgKau_Zakaz
+           { if NACHISL.cKaud[ii]>0
+             { need_rasp:=false;
+               break;
+             }
+           }
+           if NACHISL.TBLEXTR[ii]=cgKau_Zakaz
+           { if NACHISL.KAUEXTR[ii]>0
+             { need_rasp:=false;
+               break;
+             }
+           }
+         } //for(ii:=1;ii<=6;ii++)
+         if not need_rasp then continue;
+
+         //установим заказ по распределению видов оплат
+         pZakaz:=0;
+         pZakaz:=iGP_ZP_RaspZakazVO.FindZakazByPeriod(
+            Nachisl.VIDOPLS // вид оплаты/удержаний
+          , 0// _wTP :word //0 оплата, 1 удержание
+          , Nachisl.Cexoz //_cPodr:comp //ссылка на подразделение
+          , Nachisl.cSchetD //_Schet:string=''// счет бухгалтерского учета
+          , Nachisl.cSubSchD //_SubSch:string=''//субсчет бухгалтерского учета
+          , Nachisl.DataN// дата начала периода
+          , Nachisl.DatOk// дата окончания периода
+
+          );
+          if pZakaz>0
+          {
+            displ('Таб.№ '+GetStrTabn(Nachisl.TABN, Nachisl.StrTABN)
+             + ' Установили заказ из распределения видов оплат по заказам в начислении  '+String(Nachisl.VidOpl) );
+            #ShareCosts_SetZakaz(Nachisl)
+            continue;
+          }
+         //GP_CHAMGE
+         //-----------------------------------------------------------
+          var Info: longint = 0;
+          var Info1: longint;
+
+          // надо ли разбивать оплату
+          if (not PE.HasEnteringEx(NACHISL.VIDOPLS, PE.GetEntering(egCalculations, peShareCosts), Info, Info1))
+            continue;
+
+          // в контексте данной входимости Info означает кол-во м-цев, которое
+          // нужно отступить от расчетного при выборке разноски
+          PeriodBeginning := Sub_Months(FirstDayRas, Info);
+
+          var Rounding: longint;
+          Rounding := GetRounding(NACHISL.VIDOPLS);
+          if  BoundActive (tbCost_DT) SubBounds(tbCost_DT);
+          // получить делитель
+          var D: double;
+          D := GetDivisor;
+          if (D <= 0)
+            continue;
+         //-----------------------------------------------------------
+         //GP_CHAMGE
+          boDiv:=false;
+          boDiv_D:=false;
+          var DD:double;
+          DD:=GetDivisor_D(Nachisl.DataN,Nachisl.Datok);
+          if DD<>D
+          { //{ if not BoundActive (tbCost_DT)
+            AddBounds(tbCost_DT);
+            D:=DD;
+          }
+          if D=0
+          { if (not boDiv) and (not boDiv_D) continue;
+            D:=1000;
+          }
+
+         //GP_CHAMGE
+         //-----------------------------------------------------------
+
+          var SumTotal: double;
+          var DaysTotal: double;
+          var HoursTotal: double;
+          SumTotal := 0;
+          DaysTotal := 0;
+          HoursTotal := 0;
+
+          // пройти по списку затратных счетов
+          _loop PRVIDOPL novisual
+          {
+            if (PRVIDOPL.CHASF = 0)
+            //GP_CHAMGE
+            if D=1000
+            { PRVIDOPL.CHASF:=D
+
+            }
+            else
+            //GP_CHAMGE
+             continue;
+
+            NACHISL2.BUFFER := NACHISL.BUFFER;
+
+            if ((Info1 and 1) = 0)
+            {
+              NACHISL2.CSCHETD := PRVIDOPL.CSCHETD;
+              NACHISL2.cSUBSCHD := PRVIDOPL.CSUBSCHD;
+              var I: integer;
+              for (I := cFirstKAU; I <= cLastKAU; I++)
+              {
+                NACHISL2.CKAUD[I] := PRVIDOPL.CKAUD[I];
+                NACHISL2.TBLD[I] := PRVIDOPL.TBLD[I];
+              }
+            }
+
+            if ((Info1 and 4) = 0)
+            {
+              if PRVIDOPL.CHOZOPER <> 0
+                NACHISL2.CHOZOPER := PRVIDOPL.CHOZOPER;
+
+              if Trim(PRVIDOPL.PARAM) <> ''
+                NACHISL2.PARAM := PRVIDOPL.PARAM;
+            }
+
+            if ((Info1 and 2) = 0)
+              NACHISL2.CEXOZ := PRVIDOPL.CEXOZ;
+
+            // пересчитать сумму
+            NACHISL2.SUMMA := OcrugNaRuk(NACHISL.SUMMA * PRVIDOPL.CHASF / D, Rounding);
+            NACHISL2.KOLDN := Round(NACHISL2.KOLDN * PRVIDOPL.CHASF / D, 1);
+            NACHISL2.CHASF := Round(NACHISL2.CHASF * PRVIDOPL.CHASF / D, 2);
+
+            // кол-во дней? часов?
+            NACHISL2.NREC := 0;
+            if (LogIfError((insert current NACHISL2), 'NACHISL') = tsOk)
+            {
+              SumTotal := SumTotal + NACHISL2.SUMMA;
+              DaysTotal := DaysTotal + NACHISL2.KOLDN;
+              HoursTotal := HoursTotal + NACHISL2.CHASF;
+            }
+          }
+
+          // дописать остатки суммы, дней и часов в последнюю запись
+          NACHISL2.SUMMA := NACHISL2.SUMMA + NACHISL.SUMMA - SumTotal;
+          NACHISL2.KOLDN := NACHISL2.KOLDN + NACHISL.KOLDN - DaysTotal;
+          NACHISL2.CHASF := NACHISL2.CHASF + NACHISL.CHASF - HoursTotal;
+          LogIfError((update current NACHISL2), 'NACHISL');
+
+          // пометить запись-источник
+          //LogIfError((update NACHISL2 where ((NACHISL.NREC == NACHISL2.NREC)) set NACHISL2.FILIALNO := 1), 'NACHISL');
+          InsertMarker(M2, NACHISL.NREC);
+        }
+
+        var cnt: integer;
+        var RecordId: comp;
+        for (cnt := 0; cnt < GetMarkerCount(M2); cnt++)
+        {
+          // прибить записи-источники
+          if (GetMarker(M2, cnt, RecordId))
+            LogIfError((delete NACHISL where ((RecordId == NACHISL.NREC))), 'NACHISL');
+        }
+        ClearMarker(M2);
+        DoneMarker(N, '');
+
+        //LogIfError((delete NACHISL where ((PersonalAccount == NACHISL.CLSCH and 1 == NACHISL.FILIALNO(noindex)))), 'NACHISL');
+      }
+
+      NextVisual;
+
+      if ((SharingFlags and 1) = 1) and (GetFirst NENACH = tsOk)
+      {
+        var N: TPtr;
+        N := InitMarker('', 8, 5, 5);
+        // выгрузить nrec-и начислений в маркер
+        _loop NENACH novisual
+          InsertMarker(N, NENACH.NREC);
+
+        // для каждого вида начисления - свой делитель (своя разбивка)
+        while GetMarkerCount(N) > 0
+        {
+          var Payment: comp;
+          GetMarker(N, 0, Payment);
+          AtDeleteMarker(N, 0);
+
+          // спозиционироваться на очередное начисление
+          if GetFirst NENACH where ((Payment == NENACH.NREC)) <> tsOk
+            continue;
+         //-----------------------------------------------------------
+         //GP_CHAMGE
+         //Пункт VI. Доработка функции распределения затрат лицевого счета сотрудника
+         //Доработки системы для учета по заказам.pptx
+         var ii:word;
+         var need_rasp:boolean=true;
+         for(ii:=1;ii<=6;ii++)
+         { if NENACH.TblD[ii]=cgKau_Zakaz
+           { if NENACH.cKaud[ii]>0
+             { need_rasp:=false;
+               break;
+             }
+           }
+           if NENACH.TBLEXTR[ii]=cgKau_Zakaz
+           { if NENACH.KAUEXTR[ii]>0
+             { need_rasp:=false;
+               break;
+             }
+           }
+         } //for(ii:=1;ii<=6;ii++)
+         if not need_rasp then continue;
+
+         //установим заказ по распределению видов оплат
+         pZakaz:=0;
+         pZakaz:=iGP_ZP_RaspZakazVO.FindZakazByPeriod(
+            NeNach.VIDOPLS // вид оплаты/удержаний
+          , 0// _wTP :word //0 оплата, 1 удержание
+          , NeNach.Cexoz //_cPodr:comp //ссылка на подразделение
+          , NeNach.cSchetD //_Schet:string=''// счет бухгалтерского учета
+          , NeNach.cSubSchD //_SubSch:string=''//субсчет бухгалтерского учета
+          , NeNach.DataN// дата начала периода
+          , NeNach.DatOk// дата окончания периода
+
+          );
+          if pZakaz>0
+          { displ('Таб.№ '+GetStrTabn(NeNach.TABN, NeNach.StrTABN)
+             +    ' Установили заказ из распределения видов оплат в ненач.сумме '+String(NeNach.VidOpl) );
+            #ShareCosts_SetZakaz(NeNach)
+            continue;
+          }
+         //GP_CHAMGE
+         //-----------------------------------------------------------
+
+          var Info: longint = 0;
+          var Info1: longint;
+
+          // надо ли разбивать оплату
+          if (not PE.HasEnteringEx(NENACH.VIDOPLS, PE.GetEntering(egCalculations, peShareCosts), Info, Info1))
+            continue;
+
+          // в контексте данной входимости Info означает кол-во м-цев, которое
+          // нужно отступить от расчетного при выборке разноски
+          PeriodBeginning := Sub_Months(FirstDayRas, Info);
+
+          var Rounding: longint;
+          Rounding := GetRounding(NENACH.VIDOPLS);
+
+          // получить делитель
+          var D: double;
+          D := GetDivisor;
+          if (D <= 0)
+            continue;
+
+          var SumTotal: double;
+          var DaysTotal: double;
+          var HoursTotal: double;
+          SumTotal := 0;
+          DaysTotal := 0;
+          HoursTotal := 0;
+
+          // пройти по списку затратных счетов
+          _loop PRVIDOPL novisual
+          {
+            if (PRVIDOPL.CHASF = 0)
+              continue;
+
+            NENACH2.BUFFER := NENACH.BUFFER;
+
+            if ((Info1 and 1) = 0)
+            {
+              // затратные счета - в дебетовую часть начисления
+              NENACH2.CSCHETD := PRVIDOPL.CSCHETD;
+              NENACH2.CSUBSCHD := PRVIDOPL.CSUBSCHD;
+              var I: integer;
+              for (I := cFirstKAU; I <= cLastKAU; I++)
+              {
+                NENACH2.CKAUD[I] := PRVIDOPL.CKAUD[I];
+                NENACH2.TBLD[I] := PRVIDOPL.TBLD[I];
+              }
+            }
+
+            if ((Info1 and 4) = 0)
+            {
+              if PRVIDOPL.CHOZOPER <> 0
+                NENACH2.CHOZOPER := PRVIDOPL.CHOZOPER;
+
+              if Trim(PRVIDOPL.PARAM) <> ''
+                NENACH2.PARAM := PRVIDOPL.PARAM;
+            }
+
+            if ((Info1 and 2) = 0)
+              NENACH2.CEXOZ := PRVIDOPL.CEXOZ;
+
+            // пересчитать сумму
+            NENACH2.SUMMA := OcrugNaRuk(NENACH.SUMMA * PRVIDOPL.CHASF / D, Rounding);
+            NENACH2.KOLDN := Round(NENACH2.KOLDN * PRVIDOPL.CHASF / D, 1);
+            NENACH2.CHASF := Round(NENACH2.CHASF * PRVIDOPL.CHASF / D, 2);
+
+            // кол-во дней? часов?
+            NENACH2.NREC := 0;
+            if (LogIfError((insert current NENACH2), 'NENACH') = tsOk)
+            {
+              SumTotal := SumTotal + NENACH2.SUMMA;
+              DaysTotal := DaysTotal + NENACH2.KOLDN;
+              HoursTotal := HoursTotal + NENACH2.CHASF;
+            }
+          }
+
+          // дописать остатки суммы, дней и часов в последнюю запись
+          NENACH2.SUMMA := NENACH2.SUMMA + NENACH.SUMMA - SumTotal;
+          NENACH2.KOLDN := NENACH2.KOLDN + NENACH.KOLDN - DaysTotal;
+          NENACH2.CHASF := NENACH2.CHASF + NENACH.CHASF - HoursTotal;
+          LogIfError((update current NENACH2), 'NENACH');
+
+          // пометить запись-источник
+          InsertMarker(M2, NENACH.NREC);
+          // LogIfError((update NENACH2 where ((NENACH.NREC == NENACH2.NREC)) set NENACH2.FILIALNO := 1), 'NENACH');
+        }
+        var cnt: integer;
+        var RecordId: comp;
+        for (cnt := 0; cnt < GetMarkerCount(M2); cnt++)
+        {
+          // прибить записи-источники
+          if (GetMarker(M2, cnt, RecordId))
+            LogIfError((delete NENACH where ((RecordId == NENACH.NREC))), 'NENACH');
+        }
+        ClearMarker(M2);
+        DoneMarker(N, '');
+
+          // прибить записи-источники
+          // LogIfError((delete NENACH where ((PersonalAccount == NENACH.CLSCH and 1 == NENACH.FILIALNO(noindex)))), 'NENACH');
+      }
+
+      if (TransactionIsActive)
+        LogIfError(EndTransaction, '');
+
+      NextVisual;
+    }
+  }
+  _except
+    on ExDatabase:
+    {
+      Displ('[x] ' + ExploreException);
+      AbortTransaction;
+    }
+
+    on ExUserBreak:
+    {
+      if (TransactionIsActive)
+        LogIfError(AbortTransaction, '');
+    }
+
+  StopVisual('', 0);
+  ExitProc;
+  DoneMarker(M, '');
+  DoneMarker(M2, '');
+  abort;
+
+
+} //cmInit
+end;
+end.

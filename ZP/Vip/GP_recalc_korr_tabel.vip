@@ -1,0 +1,1574 @@
+/*************************************************************************************************\
+* Наименование: Обработка корректировочных табелей                                                *
+* Контур/Модуль: ЗП                                                                               *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2480         |29/05/18|Плинда Н.А.              |НПО Энергомаш                    *
+* Разработка  |#2480         |15/05/19|Евдокимов М.А.           |НПО Энергомаш                    *
+* Разработка  |#86889        |09/12/24|Семичев П.В.             |НПО Энергомаш                    *
+* Разработка  |#87938        |16/01/25|Семичев П.В.             |НПО Энергомаш                    *
+* Разработка  |#89918        |27/01/25|Семичев П.В.             |НПО Энергомаш                    *
+* Разработка  |#93702        |21/03/25|Семичев П.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+/* SD_89918
+  1. Добавлен пересчет 102 вида (Компенсация за молоко), рассчитывается как
+     "количество дней" * 0,5 * "цена литра молока" (скопирован функционал из зарплатного алгоритма Milk_PriceYfhj;l)
+  2. Изменен расчет 38 вида (Ежемесячная премия ОПР) - теперь, если сотрудник 1 категории и код
+     подразделения не начинается с "750" дополнительно учитываем в расчетах 70-й вид оплаты
+     (Опл. труда в выходн. и празднич. дни (повышен. размер))
+
+Update_28.01.2025 В результате тестирования, оказалось, что может быть несколько копий Табеля на один месяц
+                  если у сотрудника были переходы в межпериод. В ресурсе это никак не обрабатывалось
+Update_29.01.2025 Исправил недочет, из за которого при расчете в январе месяц расчета ставился = 0
+
+SD_87938
+  Изменение принципа отображение признака корректировки в табеле. Раньше признак отображался, если была
+сохраненная копия, теперь такая копия есть всегда. Признак появляется если в сохраненной копии и рабочем табеле
+есть расхождение в отработанных часах или если буквенное обозначение графика изменилось с "НН" на "Б"
+
+Upd_18.02.2025 Теперь признак "Корр" ставится не только при изменении с "НН" на "Б" а и просто если было "НН",
+а стало что-то другое. Пока так, но чувствую будут еще изменения...
+
+ SD_93702
+  1. Изменен расчет вида оплат 68, раньше было "сумма начисленная/часы по плану*часы доначисления"
+     стало "сумма начисленная/часы, за которые начислено * часы доначисления"
+  2. Изменения в сборе данных по произведенным оплатам - теперь, если на одну и ту же дату есть несколько
+     произведенных оплат, то сумма по ним суммируется, а часы берутся из первой попавшейся
+  3. Добавление к проставлению признака корректировки - если было что-то, а стало "Б" - тоже ставим "корр"
+*/
+#include ZarAlg.vih
+
+#include IDepartmentValidator.obj
+
+Interface GP_recalc_korr_tabel 'Обработка корректировочных табелей' EscClose, Gray;
+
+var DepMarker: TPtr;
+  DepartmentValidator: IDepartmentValidator;
+  ChasfDay
+, ChasfDayKorr
+, tarifMesn
+, NormaVr
+, Proc21
+, Proc22
+, Proc23
+, ProcV
+, SummK
+, Sverh1
+, Sverh2
+, SummRasp : double;
+  bbLoadZar : boolean;
+
+ ExcelPath1:string;
+
+//*****************************************************************************
+table struct tmpProc
+(
+  cLSChet        : comp
+, cPodr          : comp
+, Code           : string[10]
+, dSum           : double
+)
+with index
+(
+  tmpProc01 = Code + cLSChet + cPodr
+);
+
+//*****************************************************************************
+table struct tlschet
+(
+  nrec    : comp
+, tabn    : longint
+, strtabn : string[20]
+, TPERSON : comp
+, CEX     : comp
+, CPODR   : comp
+, FIO     : string[60]
+, sisopl  : longint
+, prizn   : string[5]
+, DCrCorr : date
+)
+with index
+(
+  in1 = nrec
+, in2 = cex + tabn + strtabn
+, in3 = tabn
+, in4 = fio + CEX
+);
+
+//*****************************************************************************
+table struct KorrSumm
+( 
+  clsch    : comp
+, cex      : comp
+, tperson  : comp
+, prizn    : integer
+, vidopl   : longint
+, vidoplp  : longint
+, datan    : date
+, datok    : date
+, koldn    : double
+, chasf    : double
+, summa    : double
+, summaB   : double
+, proc     : double
+, strtabn  : string
+, kateg    : integer
+, cappoint : comp
+, cprvidopl: comp
+, POSLRAS  : word // Последовательность расчета сумм
+, bISN_750 : boolean
+, SisOpl   : word
+, chasfB   : double
+)
+with index
+(
+  in01 = clsch + vidoplp + datan
+, in02 = clsch + POSLRAS
+, in03 = clsch + vidopl + SisOpl
+, in04 = clsch + vidopl + datan + prizn
+, in05 = clsch + prizn + vidoplp
+)
+;
+//*****************************************************************************
+table struct mSumvidop   = Sumvidop;
+
+table struct tErr_Sys_mbf
+(
+  nRec  : comp
+, sName : string
+)
+with index
+(
+  i1 = nrec
+, i2 = sName
+)
+;
+
+table struct tErr_prvidopl
+(
+  nRec    : comp
+, sFIO    : string
+, cLschet : comp
+, mNrec   : comp
+, doSumm  : double
+, dDateB   : date
+, dDateE   : date
+)
+with index
+(
+  i1 = nrec
+, i2 = mNrec + sFIO + dDateB
+, i3 = sFIO + dDateB
+)
+;
+
+
+table struct mSumvidop_gr
+(
+   clsch   : comp
+ , vidoplp : longint
+ , summa   : double
+ , chasf   : double
+ , koldn   : double
+)
+with index (m01=clsch+vidoplp);
+
+
+var
+  pmes      : word    ;
+  pyearn    : integer ;
+
+//*****************************************************************************
+create view
+var
+  FiltrPodr : string  ;
+   stmt
+ , stmt_str
+ , curcount
+ , cntmrk
+ , i
+ , lsMarker : longint;
+   nrecn    : comp;
+
+ from
+  tlschet(in4)
+, persons
+, katpodr
+, mSumvidop
+, mSumvidop_gr
+, KorrSumm, KorrSumm KorrSumm1, KorrSumm KorrSumm2
+, klvidopl, klvidopl klvidopl2
+, sys_mbf
+, prvidopl
+, prvidopl prvidopl1
+, prvidopl prvidopl2
+, tmpProc
+, lstab
+, Gp_Timetable
+, Klrejim
+, Gp_TimeNorms
+, Gp_klrejim
+, tErr_Sys_mbf
+, tErr_prvidopl
+, ValZar
+where
+((
+    tlschet.tperson  == persons.nrec
+AND tlschet.cex      == katpodr.nrec
+
+AND tlschet.nrec     == mSumvidop.clsch
+AND tlschet.nrec     == mSumvidop_gr.clsch
+AND tlschet.nrec     == KorrSumm.clsch
+AND mSumvidop.vidopl == klvidopl.vidopl
+AND tlschet.nrec     == prvidopl2.CLSCH
+AND      0           == prvidopl2.CHOICE
+
+AND string(mSumvidop.vidopl) == tmpProc.Code
+AND tlschet.nrec     == tmpProc.cLSChet
+and KorrSumm.cprvidopl == prvidopl1.nrec
+//AND tlschet.cex      == tmpProc.cPodr
+))
+
+ Condition Conls  = FoundMarker(lsMarker,tlschet.nrec)=true
+;
+
+create view vFix
+var
+  _cLSch : comp;
+  _dBeg  : date;
+as select
+  mSumvidop.Nrec
+from mSumvidop
+   , mSumvidop mNextSumvidop
+where ((
+  vFix._cLSch == mSumVidOp.cLSch  and
+  pyearn      == mSumVidOp.YearN  and
+  pmes        == mSumVidOp.MesN   and
+  7           == mSumVidOp.VidOpl and
+  (vFix.mSumVidOp.DataN >= vFix._dBeg) and
+
+  vFix._cLSch == mNextSumvidop.cLSch  and
+  pyearn      == mNextSumvidop.YearN  and
+  pmes        == mNextSumvidop.MesN   and
+  7           == mNextSumvidop.VidOpl and
+  (vFix.mNextSumvidop.DataN >= vFix.mSumVidOp.DatOk)
+))
+order by mSumVidOp.DataN, mNextSumvidop.DataN
+;
+//Выстраивает даты начала и окончания начислений по окладу в неразрывные интервалы с начала до конца месяца
+//Пример: есть начисления оклад1 с 03.04 по 10.04, оклад2 с 15.04 по 20.04
+//        результат: оклад1 с 01.04 по 14.04, оклад2 с 15.04 по 30.04
+procedure FixSalaryDates(__cLSch: comp);
+{
+  vFix._cLSch := __cLSch;
+  vFix._dBeg  := Date(1, pmes, pyearn);
+  var dEndMonth : date = Date(Last_Day(vFix._dBeg), pmes, pyearn);
+  while vFix.getfirst mSumVidOp = tsOk
+  {
+    var isDirty : boolean = false;
+
+    if vFix.mSumVidOp.DataN > vFix._dBeg
+    {
+      vFix.mSumVidOp.DataN := vFix._dBeg;
+      isDirty := true;
+    }
+
+    if vFix.getfirst mNextSumVidOp = tsOk
+    {
+      if vFix.mNextSumVidOp.DataN > Add_Day(vFix.mSumVidOp.DatOk, 1)
+      {
+        vFix.mSumVidOp.DatOk := Sub_Day(vFix.mNextSumVidOp.DataN, 1);
+        isDirty := true;
+      }
+    }
+    else if vFix.mSumVidOp.DatOk < dEndMonth
+    {
+      vFix.mSumVidOp.DatOk := dEndMonth;
+      isDirty := true;
+    }
+
+    if isDirty
+      vFix.update current mSumVidOp;
+
+    vFix._dBeg := Add_Day(vFix.mSumVidOp.DatOk, 1);
+  }
+}
+
+Screen ParamForm '' ;
+ show at (,,,7) fixed_y;
+ notablenavigation;
+  fields
+    pmes : noprotect;
+    pyearn : noprotect;
+    FiltrPodr : protect,pickbutton;
+  buttons
+    CmValue1,,,;
+    CmValue2,,,;
+    CmValue3,,,;
+  << 'Параметры формирования'
+
+   `За` .@@@ `месяц` .@@@@ `года`
+
+   `Фильтр по подразделению` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+      <. Рассчитать .>  <. Создать ведомость .>  <. Алгоритм 3  .>
+  >>
+ end;
+
+Browse BrwLsch (,,/*sci14Esc*//*sciADV149Esc*//*sci13EscIns*/sci14InsPMEnEsc);
+ show at (,8,,12);
+ table tlschet;
+     Fields
+  {Font = {Color = if ( FoundMarker(lsMarker,tlschet.nrec) , ColorError, 0)}};
+
+  tlschet.prizn                             'Признак'                                 : [5],protect;
+  tlschet.DCrCorr                           'Дата создания корректировочного табеля'  : [5],protect;
+  tlschet.strtabn                           'Таб№'                                    : [10],protect;
+  if(tlschet.sisopl=20,'Сдельная','Оклад')  'СистОпл'                                 : [10],protect;
+!  if(isvalid(#tlschet),SumTotal,0)        'Всего начислений' : [11,'\5p[|-]36 666 666 666 666.88'],protect;
+  tlschet.fio/*persons.fio*/                'ФИО'                                     : [50],protect;
+  prvidopl2.ATL_LASTDATE                    'Дата создания ведомости'                 : [10],protect;
+  katpodr.kod                               'КодПодр'                                 : [10],protect;
+  katpodr.name                              'Подразделение'                           : [45],protect;
+end;
+
+Browse BrwNach (,,);
+ show at (,13,40,);
+ table mSumvidop_gr;
+     Fields
+  mSumvidop_gr.vidoplp    'Вид оплаты'  : [7],protect;
+  mSumvidop_gr.koldn      'Дни'         : [5.2],protect;
+  mSumvidop_gr.chasf      'Часы'        : [5.2],protect;
+  mSumvidop_gr.summa      'Сумма'       : [11,'\2p[|-]36 666 666 666 666.88'],protect;
+end;
+
+Browse BrwNachFot (,,);
+ show at (41,13,,);
+ table KorrSumm;
+     Fields
+{Font = {color = if (KorrSumm.prizn = word(0), ColorSysRed, 0)}};
+  KorrSumm.vidoplp    'Вид оплаты'    : [7],protect;
+  KorrSumm.koldn      'Дни'           : [5.2],protect;
+  KorrSumm.chasf      'Часы'          : [5.2],protect;
+  KorrSumm.datan      'Дата с'        : [10], protect;
+  KorrSumm.datok      'Дата по'       : [10], protect;
+  KorrSumm.proc       'Процент'       : [5.2],protect;
+  KorrSumm.summa      'Сумма'         : [11,'\2p[|-]36 666 666 666 666.88'],protect;
+  prvidopl1.nrec      'Ведомость'     : [20],protect;
+
+end;
+
+//*****************************************************************************
+  SQL QUERY SqltmpProc =
+    SELECT 
+        SP.cLschet  as cLSChet,
+        D.cKatPodr  as cPodr,
+        R.Code      as Code, 
+        CASE F.Npp
+             WHEN 01 THEN CASE WHEN SP.FARRVALUE[01] = '' THEN '0.00' ELSE SP.FARRVALUE[01] END
+             WHEN 02 THEN CASE WHEN SP.FARRVALUE[02] = '' THEN '0.00' ELSE SP.FARRVALUE[02] END
+             WHEN 03 THEN CASE WHEN SP.FARRVALUE[03] = '' THEN '0.00' ELSE SP.FARRVALUE[03] END
+             WHEN 04 THEN CASE WHEN SP.FARRVALUE[04] = '' THEN '0.00' ELSE SP.FARRVALUE[04] END
+             WHEN 05 THEN CASE WHEN SP.FARRVALUE[05] = '' THEN '0.00' ELSE SP.FARRVALUE[05] END
+             WHEN 06 THEN CASE WHEN SP.FARRVALUE[06] = '' THEN '0.00' ELSE SP.FARRVALUE[06] END
+             WHEN 07 THEN CASE WHEN SP.FARRVALUE[07] = '' THEN '0.00' ELSE SP.FARRVALUE[07] END
+             WHEN 08 THEN CASE WHEN SP.FARRVALUE[08] = '' THEN '0.00' ELSE SP.FARRVALUE[08] END
+             WHEN 09 THEN CASE WHEN SP.FARRVALUE[09] = '' THEN '0.00' ELSE SP.FARRVALUE[09] END
+             WHEN 10 THEN CASE WHEN SP.FARRVALUE[10] = '' THEN '0.00' ELSE SP.FARRVALUE[10] END
+             WHEN 11 THEN CASE WHEN SP.FARRVALUE[11] = '' THEN '0.00' ELSE SP.FARRVALUE[11] END
+             WHEN 12 THEN CASE WHEN SP.FARRVALUE[12] = '' THEN '0.00' ELSE SP.FARRVALUE[12] END
+             WHEN 13 THEN CASE WHEN SP.FARRVALUE[13] = '' THEN '0.00' ELSE SP.FARRVALUE[13] END
+             WHEN 14 THEN CASE WHEN SP.FARRVALUE[14] = '' THEN '0.00' ELSE SP.FARRVALUE[14] END
+             WHEN 15 THEN CASE WHEN SP.FARRVALUE[15] = '' THEN '0.00' ELSE SP.FARRVALUE[15] END
+             WHEN 16 THEN CASE WHEN SP.FARRVALUE[16] = '' THEN '0.00' ELSE SP.FARRVALUE[16] END
+             WHEN 17 THEN CASE WHEN SP.FARRVALUE[17] = '' THEN '0.00' ELSE SP.FARRVALUE[17] END
+             WHEN 18 THEN CASE WHEN SP.FARRVALUE[18] = '' THEN '0.00' ELSE SP.FARRVALUE[18] END
+             WHEN 19 THEN CASE WHEN SP.FARRVALUE[19] = '' THEN '0.00' ELSE SP.FARRVALUE[19] END
+             WHEN 20 THEN CASE WHEN SP.FARRVALUE[20] = '' THEN '0.00' ELSE SP.FARRVALUE[20] END
+        END as dSum
+    FROM
+        GP_KPI_ALG ALG
+      , GP_KPI_Raise R
+      , GP_KPI_FIELDS F  
+      , GP_KPI_DOC_SP SP
+      , GP_KPI_DOC D
+    WHERE (    case when r.code='22' then 'Нормативный процент для расчета премии' 
+                    when r.code='38' then 'Общий процент с 01/03/2019'
+		    else 'Фактический процент' end           =  ALG.Name
+      AND  ALG.NRec         =  F.cGP_KPI_ALG
+      AND  R.NRec           =  F.cDoc
+      AND  R.NRec           =  SP.cGP_KPI_Raise 
+      //AND  :pLSChet         =  SP.cLschet 
+      AND  SP.cGP_KPI_DOC   =  D.NRec    
+      AND  :pYear           =  D.wYear   
+      AND  :pMonth          =  D.wMonth  
+    //  AND  :pPodr           =  D.cKatPodr 
+          )  
+    ;
+
+//*****************************************************************************
+Procedure ClearQuery(Var liHandle: Longint);
+{
+  if (liHandle != 0)
+  {
+    sqlFreeStr(liHandle);
+    liHandle := 0;
+  }
+}
+//*****************************************************************************
+procedure InitKorrTabel;
+{
+	_loop tLschet
+	{
+	  if getfirst lstab where ((tLschet.nrec==lstab.clschet and pyearn==lstab.yearn and pMes==lstab.mesn))=tsok
+	  {
+
+		  _loop gp_TimeTable where ((tLschet.nrec == GP_TIMETABLE.clschet
+                                   and pyearn == GP_TIMETABLE.yearn
+                                   and   pMes == GP_TIMETABLE.monthn))
+		  {
+				i := Day(gp_TimeTable.DBeg);
+				do
+				{
+
+					if (lstab.DAYCHF[i]>100)
+            ChasfDay:=0;
+          else
+            ChasfDay:=lstab.daychf[i];
+
+					if (ChasfDay<>gp_timeTable.DHOURS[i])  or
+             (LoCase(trim(lstab.DAYS[i])) <> LoCase(trim(gp_timeTable.dMark[i])) and
+             (LoCase(trim(gp_timeTable.dMark[i])) = 'нн' or LoCase(trim(lstab.DAYS[i])) = 'б'))
+			    {
+			      tlschet.prizn := 'Корр';
+            tlschet.DCrCorr := gp_timeTable.DFORM;
+					  update current tLschet;
+					  i := 35;
+					}
+				  i++;
+				}
+				while (i<day(gp_TimeTable.DEnd)+1)
+
+        if (tlschet.prizn = 'Корр')
+          break;
+			}
+		}
+
+	}
+}
+
+procedure FullTable;
+{ 
+  var stmt             : Longint;
+  var ExecuteErrorCode : longint;
+  _try
+    {
+      delete all tmpProc;
+      ClearQuery(stmt);
+      stmt             := sqlAllocStmt;
+      ExecuteErrorCode := sqlPrepare(stmt, SqltmpProc);
+
+      if (ExecuteErrorCode = 0)
+        {
+          sqlBindParamByName(stmt,'pName'     , 'Фактический процент');
+          sqlBindParamByName(stmt,'pYear'     , pyearn);
+          sqlBindParamByName(stmt,'pMonth'    , pmes);
+
+          ExecuteErrorCode := SqlExecute(stmt);
+
+          if (ExecuteErrorCode = 0)
+            { 
+              ExecuteErrorCode := SqlFetchIntoByName(stmt, #tmpProc);
+              ReReadRecord(#tmpProc);
+              if (ExecuteErrorCode <> 0)
+                Message('Ошибка : ' + string(ExecuteErrorCode)); 
+            }
+          else 
+            Message('Ошибка : ' + string(ExecuteErrorCode)); 
+        }
+      else
+        Message('Ошибка : ' + string(ExecuteErrorCode));
+    }
+  _finally
+    {
+    }
+}
+//*****************************************************************************
+Procedure ReloadLs;
+{
+  if filtrPodr<>'По всем'                       	
+   {
+     sqlDropTmpTable('selpodr');
+     sqlAddStr(stmt_str, 'TABLE selpodr ( nrecpodr   : Comp ) WITH INDEX (selpodr1 = nrecpodr);');
+     sqlCreateTmpTable(stmt_str,ctmDynamicIndex);
+     sqlFreeStr(stmt_str);
+     stmt_str:=0;
+  
+     for(
+         i:=0;
+         i<GetMarkerCount(DepMarker);
+         inc(i)
+        )
+       {
+         GetMarker(DepMarker,i,nrecn);
+         ClearQuery(stmt);
+         sqlAddStr(stmt, 'INSERT INTO selpodr');
+         sqlAddStr(stmt, '(');
+         sqlAddStr(stmt, '  nrecpodr');
+         sqlAddStr(stmt, ')');
+         sqlAddStr(stmt, 'VALUES');
+         sqlAddStr(stmt, '(');
+         sqlAddStr(stmt, '  #comp(' + nrecn + ')');
+         sqlAddStr(stmt, ')');
+         sqlExecDirect(stmt);
+       }  
+   }
+
+   MtClear(#tlschet,mfNormal);
+
+   stmt := sqlAllocStmt;
+
+   sqlAddStr(stmt_str,'select ');
+   sqlAddStr(stmt_str,'      l.nrec  ');
+   sqlAddStr(stmt_str,'     ,l.tabn  ');
+   sqlAddStr(stmt_str,'     ,l.strtabn  ');
+   sqlAddStr(stmt_str,'     ,l.tperson  ');
+   sqlAddStr(stmt_str,'     ,l.cex  ');
+   sqlAddStr(stmt_str,'     ,l.cpodr  ');
+   sqlAddStr(stmt_str,'     ,p.fio  ');
+   sqlAddStr(stmt_str,'     ,l.sisopl  ');
+   sqlAddStr(stmt_str,'  from     ');
+   sqlAddStr(stmt_str,'    (   ');
+   sqlAddStr(stmt_str,'      select ');
+   sqlAddStr(stmt_str,'        distinct ');
+   sqlAddStr(stmt_str,'         clsch');
+   sqlAddStr(stmt_str,'       from sumvidop s');
+   sqlAddStr(stmt_str, '               inner join katpodr podr on s.cex=podr.nrec');
+
+   if filtrpodr<>'По всем'
+     sqlAddStr(stmt_str, '             inner join selpodr on s.cex=selpodr.nrecpodr');
+   sqlAddStr(stmt_str,'                inner join gp_timetable on s.clsch=gp_timetable.clschet and gp_timetable.yearn=? and gp_timetable.monthn=?');
+
+   sqlAddStr(stmt_str,'         where s.mesn=? and s.yearn=?');
+
+   sqlAddStr(stmt_str,'     )t1 inner join lschet l on t1.clsch=l.nrec');
+   sqlAddStr(stmt_str,'         inner join persons p on l.tperson=p.nrec');
+
+   sqlbindparam(stmt,1,pyearn);
+   sqlbindparam(stmt,2,pmes);
+   sqlbindparam(stmt,3,pmes);
+   sqlbindparam(stmt,4,pyearn);
+   sqlPrepare(stmt,stmt_str);
+
+   sqlExecute(stmt);
+
+   if (sqlFetchInto(stmt,#tlschet) != tsOk)
+     Message('not tsOk select (');
+
+   sqlFreeStmt(stmt);
+   sqlFreeStr(stmt);
+
+}
+//*****************************************************************************
+Procedure ReloadAllNach;
+{
+  StartNewVisual(vtRotateVisual, vfTimer+vfBreak,''#3'Загружаю данные...'#13#3,1);
+
+   mtclear(#mSumvidop,fmNormal);
+   mtclear(#mSumvidop_gr,fmNormal);
+   mtclear(#KorrSumm,fmNormal);
+
+   sql
+    select *
+     from sumvidop n
+    where n.yearn=:(pyearn) and n.mesn=:(pmes) 
+    into mSumvidop byName;
+
+   sql
+    select n.clsch,n.vidoplp,sum(n.summa) as summa,sum(n.chasf) as chasf,sum(n.koldn) as koldn
+     from sumvidop n
+    where n.yearn=:(pyearn) and n.mesn=:(pmes) 
+    group by n.vidoplp, n.clsch
+    into mSumvidop_gr byName;
+
+
+
+  StopVisual('',0);
+}
+//*****************************************************************************
+
+//-------------------------------------------------
+// инициализировать зарплату
+//-------------------------------------------------
+function GetMilkPice : double;
+var dBeg, dEnd : date;
+{
+  Result := 0;
+  dBeg := date(1, pmes, pyearn);
+  dEnd := date(Last_Day(dBeg), pmes, pyearn);
+  _loop VALZAR where ((coGetTune('NPOEM_OWN.ZP.MILK') == valzar.kodvalut and dBeg <<= valzar.datval and dEnd >>= valzar.datval))
+    if Result < valzar.sumrubl
+      Result := valzar.sumrubl;
+}
+
+HandleEvent
+cmInit :
+{
+  InitWorkingTable;
+  FiltrPodr:='По всем';
+  pyearn:=year(cur_date);
+  pmes:=month(cur_date)-1;
+  bbLoadZar := false;
+  if pmes = 0
+  {
+    pmes := 12;
+    pyearn -= 1;
+  }
+
+!  pyearn:=2001;
+!  pmes:=1;
+  DepMarker := InitMarker('', 8, 1, 1);
+  lsMarker  := InitMarker('', 8, 100, 10, FALSE);
+  ReloadLs;
+  ReloadAllNach;
+  InitKorrTabel;
+
+  if getfirst tlschet=tsok
+   {
+    ReReadRecord(#mSumvidop);
+    ReReadRecord(#KorrSumm);
+   }
+}
+CmEdit:
+{
+  RunInterface('LSchet1',comp(0),tlschet.nrec,0,0);
+}
+
+CmMarkUnMark :
+{
+   if (not FoundMarker(lsMarker,tlschet.nrec))
+     {
+      InsertMarker(lsMarker,tlschet.nrec);
+     }
+    else
+     {
+      DeleteMarker(lsMarker,tlschet.nrec);
+     }
+ ReDrawCurrentAndGo(GetCurrentFormat, True);
+}
+cmSelectAll :
+{
+  PushPos(#tlschet);
+   _loop tlschet
+   {
+    if (not FoundMarker(lsMarker,tlschet.nrec))
+    {
+     InsertMarker(lsMarker,tlschet.nrec);
+    }
+   }
+  PopPos(#tlschet);
+  ReScanPanel(#tlschet);
+}
+cmUnSelectAll :
+{
+ ClearMarker(lsMarker);
+ ReScanPanel(#tlschet);
+}
+cmPick:
+{
+ Case curfield of
+   #filtrPodr :
+     {
+       if RunInterface('SelectSalaryDepartments', 12, comp(DepMarker),
+                           DepartmentValidator, ZeroDate, 0) = cmDefault
+       {
+        cntmrk:=GetMarkerCount(DepMarker);
+         if cntmrk>0 filtrPodr  :='выбрано '+DoubleToStr(cntmrk,'666 666 667')+' подразд.'
+            else filtrPodr  :='По всем';
+
+        ReloadLs;
+        ReloadAllNach;
+       }
+     }
+  end;
+ ReReadRecord(tntlschet);
+ ReReadRecord(#mSumvidop);
+ ReReadRecord(#KorrSumm);
+}
+cmDelOnProtect:
+{
+
+ Case curfield of
+  #filtrPodr :
+    {
+     ClearMarker(DepMarker);
+     filtrPodr  :='По всем';
+     ReloadLs;
+     ReloadAllNach;
+    }
+ end;
+  ReReadRecord(#tlschet);
+  ReReadRecord(#mSumvidop);
+  ReReadRecord(#KorrSumm);
+}
+cmCheckField:
+{
+ Case curfield of
+  #pmes,#pyearn:
+   {
+    ReloadLs;
+    ReloadAllNach;
+    InitKorrTabel;
+    ReReadRecord(tntlschet);
+    ReReadRecord(#mSumvidop);
+    ReReadRecord(#KorrSumm);
+    }
+  end;
+}
+CmValue1:
+{
+  FullTable();
+	if GetMarkerCount(lsMarker)=0
+	{
+    Message('Ничего не выбрано',error) ;
+    stop; abort; exit;
+	}
+
+  PushConditionForLeave(tcConls,tntlschet);
+  var doMilkPrice : double = GetMilkPice;
+
+  _loop tLschet
+  {
+    if getfirst lstab where ((tLschet.nrec==lstab.clschet and pyearn==lstab.yearn and pMes==lstab.mesn))=tsok
+  	{
+      tarifMesn := lstab.tarif;
+     	if lstab.sisopl=20
+     	{
+        message('сдельщик');
+     		exit;
+     	}
+
+      if LoadWorkingTable(LStab.clschet, pMes, pYearn) <> 0 then continue;
+
+     	if getfirst prvidopl1=tsok
+     	{
+        message('Сформирована ведомость. Перерасчет запрещен');
+        exit;
+     	}
+
+     	delete from KorrSumm1 where ((tlschet.nrec == KorrSumm1.clsch));
+  //		message (tarifMesn);
+
+      if getfirst klrejim where ((lstab.rejim == klrejim.rejim))=tsok
+     	{
+     	  if getfirst GP_KLREJIM where ((klrejim.nrec == GP_KLREJIM.CKLREJIM))=tsok
+     		{
+     		  if getfirst GP_TIMENORMS where ((GP_KLREJIM.CGP_PRCAL == GP_TIMENORMS.CGP_PRCAL
+                                                     and pYearn == GP_TIMENORMS.YEAR))=tsok
+     			{
+            NormaVr := GP_TIMENORMS.HOURS;
+     			}
+     		}
+     	}
+
+     	_loop gp_TimeTable where ((tLschet.nrec == GP_TIMETABLE.clschet
+                                   and pyearn == GP_TIMETABLE.yearn
+                                   and   pMes == GP_TIMETABLE.monthn))
+     	{
+        i := Day(gp_TimeTable.DBeg);
+        //Есть случаи, когда дата окончания начисления mSumVidOpl.DatOk меньше даты окончания месяца,
+        //а корректировка табеля выполняется по дням после mSumVidOpl.DatOk. Расширяем период
+        //действия начисления до конца месяца.
+        FixSalaryDates(tLschet.nrec);
+     		do
+     		{
+          if lstab.DAYCHF[i]>100
+            ChasfDay:=0;
+          else
+            ChasfDay:=lstab.daychf[i];
+
+     			if ChasfDay<>gp_timeTable.DHOURS[i]
+     			{
+            var dDatAn : date = to_date(i,pmes,pyearn);
+
+            _loop mSumvidop
+     				{
+              if mSumVidOp.vidoplp = 63
+                continue;//Соберем отдельно, так как по нему доплата рассчитывается за весь период, а не за один день
+
+
+              SummK:=0;
+              if mSumvidop.datok<dDatAn or mSumvidop.datan>dDatAn continue;
+
+     					if mSumvidop.datok=dDatAn and mSumvidop.datan=dDatAn
+     					{
+                ChasfDayKorr:=mSumvidop.chasf;
+                SummK:=mSumvidop.summa;
+     					}
+     					else
+     					{
+                ChasfDayKorr:=(gp_timeTable.DHOURS[i]);//-DHOURSADD[i]);
+     					}
+
+     					if klvidopl.VHVOE[31]='+'
+     					{
+                if getfirst KorrSumm where ((lstab.clschet == KorrSumm.clsch and mSumvidop.vidopl == KorrSumm.vidopl
+                                         and dDatAn == KorrSumm.datan and 0 == KorrSumm.prizn ))!=tsOK
+                {
+                  clearbuffer(#KorrSumm);
+                  KorrSumm.prizn   := 0;
+                  KorrSumm.clsch   := lstab.clschet;
+                  KorrSumm.strtabn := lstab.strtabn;
+                  KorrSumm.kateg   := lstab.kateg;
+                  KorrSumm.cex     := lstab.cex;
+                  KorrSumm.tperson := lstab.tperson;
+                  KorrSumm.vidoplp := mSumvidop.vidoplp;
+                  KorrSumm.vidopl  := mSumvidop.vidopl;
+                  KorrSumm.proc    := mSumvidop.proc;
+                  KorrSumm.SisOpl  := lstab.SisOpl;
+                  KorrSumm.SummaB  := mSumvidop.summa;
+                  KorrSumm.chasfB  := mSumvidop.chasf;
+                  KorrSumm.datan   := dDatAn;
+                  KorrSumm.datok   := dDatAn;
+
+                  KorrSumm.proc    := mSumvidop.proc;
+                  if (KorrSumm.proc = 0)
+                  {
+                    if (GetFirst tmpProc = tsOk)
+                    {
+                      KorrSumm.proc := double(tmpProc.dSum);
+
+  //                    if KorrSUmm.vidoplp = 38
+  //                    then KorrSumm.proc := KorrSumm.proc*100;
+                    }
+                  }
+
+                  if (KorrSumm.proc = 0)
+                    KorrSumm.proc := KlVidOpl.KFOPL;
+
+                  if (KorrSumm.proc = 0)
+                    KorrSumm.proc:=100;
+
+  //  						  if WT_GHBD(hkWorking, 0, 0, stActual, date(i,pmes,pyearn), date(i,pmes,pyearn))<>0
+  //  						  {
+                    if KorrSumm.vidoplp <> 3
+                    {
+                      KorrSumm.chasf := -(ChasfDayKorr);
+                      KorrSumm.koldn := -1;
+                    }
+                    else
+                    {
+                      KorrSumm.chasf := -(gp_timeTable.DHOURS[i]-gp_timeTable.DHOURSADD[i]-(if(gp_timeTable.dMark[i]='РВ' or gp_timeTable.dMark[i]='РО',gp_timeTable.DHOURS[i],0)));
+                      KorrSumm.koldn := -1;
+                    }
+  //  						  }
+                  if SummK<>0
+                    KorrSumm.Summa  := -SummK;
+
+                  if KorrSumm.chasf<>0 then insert current KorrSumm;
+                }
+                else
+                {
+                  if SummK<>0
+                    KorrSumm.Summa  += -SummK;
+
+                  KorrSumm.SummaB  += mSumvidop.summa;
+                  KorrSumm.chasfB  += mSumvidop.chasf;
+
+                  update current KorrSumm;
+                }
+
+
+                if getfirst KorrSumm where ((lstab.clschet == KorrSumm.clsch and mSumvidop.vidopl == KorrSumm.vidopl
+                                         and dDatAn == KorrSumm.datan and 1 == KorrSumm.prizn ))!=tsOK
+                {
+                  clearbuffer(#KorrSumm);
+                  KorrSumm.prizn   := 1;
+                  KorrSumm.clsch   := lstab.clschet;
+                  KorrSumm.strtabn := lstab.strtabn;
+                  KorrSumm.kateg   := lstab.kateg;
+                  KorrSumm.cex     := lstab.cex;
+                  KorrSumm.tperson := lstab.tperson;
+                  KorrSumm.vidoplp := mSumvidop.vidoplp;
+                  KorrSumm.vidopl  := mSumvidop.vidopl;
+                  KorrSumm.datan   := dDatAn;
+                  KorrSumm.datok   := dDatAn;
+                  KorrSumm.proc    := mSumvidop.proc;
+                  KorrSumm.SisOpl  := lstab.SisOpl;
+                  KorrSumm.SummaB  := mSumvidop.summa;
+                  KorrSumm.chasfB  := mSumvidop.chasf;
+
+                  if msumvidop.proc=0
+                  {
+                    if (GetFirst tmpProc = tsOk)
+                    {
+                      KorrSumm.proc := double(tmpProc.dSum);
+  //                    if KorrSUmm.vidoplp=38
+  //                    then KorrSumm.proc := KorrSumm.proc*100;
+                    }
+                  }
+
+                  if msumvidop.proc=0
+                    KorrSumm.proc := KlVidOpl.KFOPL;
+
+                  if KorrSumm.proc=0
+                  then KorrSumm.proc:=100;
+
+                  //if LoadWorkingTable(LStab.clschet, pMes, pYearn) <> 0 then continue;
+
+                  if WT_GHBD(hkWorking, 0, 0, stActual, dDatAn, dDatAn)<>0//проверка на выходной
+                  {
+                    case KorrSumm.vidoplp of
+                      3, 102 :
+                      {
+                        KorrSumm.chasf := ChasfDay - WT_GetAbsencesHours(stActual, 'С', dDatAn, dDatAn);
+                        KorrSumm.koldn := 1;
+                      };
+                      else
+                      {
+                        KorrSumm.chasf := ChasfDay;
+                        KorrSumm.koldn := 1;
+                      }
+                    end;
+                  }
+                  else
+                  {
+                    case KorrSumm.vidoplp of
+                      3, 51, 52, 53, 102 : {};
+                      else
+                      {
+                        KorrSumm.chasf := ChasfDay;
+                        KorrSumm.koldn := 1;
+                      }
+                    end;
+                  }
+
+                  if KorrSumm.chasf<>0 insert current KorrSumm;
+                }
+              }
+            }
+
+            if (wGetTune('UP.FakelGAL.Fakel') = 1)
+            {
+              if WT_GetAbsencesHours(stActual, 'РВ', dDatAn, dDatAn)<>0// and (mSumvidop.vidoplp=9 or mSumvidop.vidoplp=70)
+              {
+                if getfirst KorrSumm where ((lstab.clschet == KorrSumm.clsch
+                                                    and 71 == KorrSumm.vidoplp
+                                                and dDatAn == KorrSumm.datan))<>tsok
+                {
+                  clearbuffer(#KorrSumm);
+                  KorrSumm.prizn   := 1;
+                  KorrSumm.clsch   := lstab.clschet;
+                  KorrSumm.cex     := lstab.cex;
+                  KorrSumm.strtabn := lstab.strtabn;
+                  KorrSumm.kateg   := lstab.kateg;
+                  KorrSumm.tperson := lstab.tperson;
+                  KorrSumm.datan   := dDatAn;
+                  KorrSumm.datok   := dDatAn;
+                  KorrSumm.chasf   := chasfDay;//lstab.DAYCHF[i];
+                  KorrSumm.koldn   := 1;
+                  KorrSumm.vidoplp := 71;
+                  KorrSumm.vidopl  := 71;
+                  KorrSumm.proc    := 200;
+                  insert current KorrSumm;
+                }
+              }
+
+              if WT_GetAbsencesHours(stActual, 'РО', dDatAn, dDatAn) <> 0// and (mSumvidop.vidoplp=9)
+              {
+                if getfirst KorrSumm where ((lstab.clschet == KorrSumm.clsch
+                                                    and 94 == KorrSumm.vidoplp
+                                                and dDatAn == KorrSumm.datan))<>tsok
+                {
+                  clearbuffer(#KorrSumm);
+                  KorrSumm.prizn   := 1;
+                  KorrSumm.clsch   := lstab.clschet;
+                  KorrSumm.cex     := lstab.cex;
+                  KorrSumm.strtabn := lstab.strtabn;
+                  KorrSumm.kateg   := lstab.kateg;
+                  KorrSumm.tperson := lstab.tperson;
+                  KorrSumm.datan   := dDatAn;
+                  KorrSumm.datok   := dDatAn;
+                  KorrSumm.chasf   := chasfDay;//lstab.DAYCHF[i];
+                  KorrSumm.proc    := 100;
+                  KorrSumm.koldn   := 1;
+                  KorrSumm.vidoplp := 94;
+                  KorrSumm.vidopl  := 94;
+                  insert current KorrSumm;
+                }
+              }
+            }
+            else
+            {
+              if WT_GetAbsencesHours(stActual, 'РВ', dDatAn, dDatAn)<>0// and (mSumvidop.vidoplp=9 or mSumvidop.vidoplp=70)
+              {
+                if getfirst KorrSumm where ((lstab.clschet == KorrSumm.clsch
+                                                     and 9 == KorrSumm.vidoplp
+                                                and dDatAn == KorrSumm.datan))<>tsok
+                {
+                  clearbuffer(#KorrSumm);
+                  KorrSumm.prizn   := 1;
+                  KorrSumm.clsch   := lstab.clschet;
+                  KorrSumm.cex     := lstab.cex;
+                  KorrSumm.strtabn := lstab.strtabn;
+                  KorrSumm.kateg   := lstab.kateg;
+                  KorrSumm.tperson := lstab.tperson;
+                  KorrSumm.datan   := dDatAn;
+                  KorrSumm.datok   := dDatAn;
+                  KorrSumm.chasf   := chasfDay;//lstab.DAYCHF[i];
+                  KorrSumm.koldn   := 1;
+                  KorrSumm.vidoplp := 9;
+                  KorrSumm.vidopl  := 9;
+                  KorrSumm.proc    := 100;
+                  insert current KorrSumm;
+                  KorrSumm.vidoplp := 70;
+                  KorrSumm.vidopl  := 70;
+                  insert current KorrSumm;
+                }
+              }
+
+              if WT_GetAbsencesHours(stActual, 'РО', dDatAn, dDatAn) <> 0// and (mSumvidop.vidoplp=9)
+              {
+                if getfirst KorrSumm where ((lstab.clschet == KorrSumm.clsch
+                                                     and 9 == KorrSumm.vidoplp
+                                                and dDatAn == KorrSumm.datan))<>tsok
+                {
+                  clearbuffer(#KorrSumm);
+                  KorrSumm.prizn   := 1;
+                  KorrSumm.clsch   := lstab.clschet;
+                  KorrSumm.cex     := lstab.cex;
+                  KorrSumm.strtabn := lstab.strtabn;
+                  KorrSumm.kateg   := lstab.kateg;
+                  KorrSumm.tperson := lstab.tperson;
+                  KorrSumm.datan   := dDatAn;
+                  KorrSumm.datok   := dDatAn;
+                  KorrSumm.chasf   := chasfDay;//lstab.DAYCHF[i];
+                  KorrSumm.proc    := 100;
+                  KorrSumm.koldn   := 1;
+                  KorrSumm.vidoplp := 9;
+                  KorrSumm.vidopl  := 9;
+                  insert current KorrSumm;
+                }
+              }
+            }
+
+            if WT_GetAbsencesHours(stActual, 'С', dDatAn, dDatAn)<>0// and (mSumvidop.vidoplp=9 or mSumvidop.vidoplp=70)
+            {
+              if getfirst KorrSumm where ((lstab.clschet == KorrSumm.clsch
+                                                  and 10 == KorrSumm.vidoplp
+                                              and dDatAn == KorrSumm.datan))<>tsok
+              {
+                clearbuffer(#KorrSumm);
+                KorrSumm.prizn   := 1;
+                KorrSumm.clsch   := lstab.clschet;
+                KorrSumm.cex     := lstab.cex;
+                KorrSumm.strtabn := lstab.strtabn;
+                KorrSumm.kateg   := lstab.kateg;
+                KorrSumm.tperson := lstab.tperson;
+                KorrSumm.datan   := dDatAn;
+                KorrSumm.datok   := dDatAn;
+
+                if (WT_GetAbsencesHours(stActual, 'С', dDatAn, dDatAn)>2)
+                {
+                  Sverh1 := 2;
+                  Sverh2 := WT_GetAbsencesHours(stActual, 'С', dDatAn, dDatAn)-2;
+                }
+                else
+                {
+                  Sverh2 := 0;
+                  Sverh1 := WT_GetAbsencesHours(stActual, 'С', dDatAn, dDatAn);
+                }
+
+                KorrSumm.chasf   := Sverh1+Sverh2;
+                KorrSumm.koldn   := 1;
+                KorrSumm.vidoplp := 10;
+                KorrSumm.vidopl  := 11;
+                KorrSumm.proc    := 100;
+                insert current KorrSumm;
+
+                KorrSumm.chasf   := Sverh1/2+Sverh2;
+                KorrSumm.vidoplp := 72;
+                KorrSumm.vidopl  := 72;
+                insert current KorrSumm;
+              }
+            }
+
+            if WT_GetAbsencesHours(stActual, 'К', dDatAn, dDatAn)<>0// and (mSumvidop.vidoplp=9)
+            {
+              if getfirst KorrSumm where ((lstab.clschet == KorrSumm.clsch
+                                                   and 5 == KorrSumm.vidoplp
+                                              and dDatAn == KorrSumm.datan))<>tsok
+              {
+                clearbuffer(#KorrSumm);
+                KorrSumm.prizn:=1;
+                KorrSumm.clsch:=lstab.clschet;
+                KorrSumm.strtabn:=lstab.strtabn;
+                KorrSumm.kateg:=lstab.kateg;
+                KorrSumm.cex:=lstab.cex;
+                KorrSumm.tperson:=lstab.tperson;
+                KorrSumm.datan:=dDatAn;
+                KorrSumm.datok:=dDatAn;
+                KorrSumm.chasf:=chasfDay;//lstab.DAYCHF[i];
+                KorrSumm.koldn:=1;
+                KorrSumm.vidoplp:=5;
+                KorrSumm.vidopl:=5;
+                insert current KorrSumm;
+              }
+            }
+          }
+          i++;
+        }
+        while i<day(gp_TimeTable.DEnd)+1
+
+      }
+
+      //Сбор данных по 63-ему виду доплаты
+      //Очередное извращение, собираем все доплаты за период в разрезе тарифа (на случай если работник переводился в течении месяца)
+      // и потом уже на эти часы высчитываем изменение
+      clearbuffer(#KorrSumm);
+      KorrSumm.clsch   := lstab.clschet;
+      KorrSumm.strtabn := lstab.strtabn;
+      KorrSumm.kateg   := lstab.kateg;
+      KorrSumm.cex     := lstab.cex;
+      KorrSumm.tperson := lstab.tperson;
+      KorrSumm.vidoplp := 63;
+      KorrSumm.vidopl  := 63;
+      KorrSumm.datan   := date(1,pmes,pyearn);
+      KorrSumm.datok   := date(last_day(KorrSumm.datan),pmes,pyearn);
+      KorrSumm.proc    := 0;
+      KorrSumm.SisOpl  := lstab.SisOpl;
+
+      _loop mSumvidop
+     	{
+        if mSumVidOp.vidoplp != 63
+          continue;//Соберем отдельно, так как по нему доплата рассчитывается за весь период, а не за один день
+
+        if mSumvidop.datok<KorrSumm.datan or mSumvidop.datan>KorrSumm.datok
+          continue;
+        //message(mSumvidop.chasf);
+        if msumvidop.proc=0
+          KorrSumm.proc := mSumvidop.proc;
+
+        if msumvidop.proc=0
+          if (GetFirst tmpProc = tsOk)
+            KorrSumm.proc := double(tmpProc.dSum);
+
+        if msumvidop.proc=0
+          KorrSumm.proc := KlVidOpl.KFOPL;
+
+        if KorrSumm.proc=0
+          KorrSumm.proc:=100;
+
+        KorrSumm.chasf += -mSumvidop.chasf;
+      }
+
+      KorrSumm.chasf += WT_GHBD(hkNight  , 0, 0, stActual, KorrSumm.datan, KorrSumm.datok);
+      KorrSumm.prizn := if(KorrSumm.chasf > 0, 1, 0);
+      if (KorrSumm.chasf <> 0)
+        insert current KorrSumm;
+    }
+
+    //Удалим из расчета, если есть (их быть и не должно, но вдруг уберут фильтр по ним), все записи по 11-224 виду оплаты где система оплаты сдельная
+    delete all KorrSumm where ((tLschet.nrec == KorrSumm.clsch and 224 == KorrSumm.vidopl and 20 == KorrSumm.SisOpl));
+
+    _loop KorrSumm where ((tLschet.nrec == KorrSumm.clsch and KorrSumm.vidopl /== KlVidOpl2.VidOpl))
+    {
+      KorrSumm.POSLRAS := KlVidOpl2.POSLRAS;
+
+      if (KorrSumm.vidopl = 224//ИСН
+       or KorrSumm.vidopl = 38)//Ежемесячная премия ОПР
+       and KorrSumm.KATEG = 1
+        if getfirst fastfirstrow KatPodr where ((KorrSumm.cex == katPodr.nRec))=tsOK
+          if (SubStr(KatPodr.Kod, 1, 3) <> '750')
+            KorrSumm.bISN_750 := true;
+
+      update current KorrSumm;
+    }
+
+    _loop KorrSumm where ((tLschet.nrec == KorrSumm.clsch)) ordered by KorrSumm.POSLRAS
+    {
+      if KorrSumm.summa <> 0 continue;
+      if  KorrSumm.vidoplp = 3  or KorrSumm.vidoplp = 53 //or KorrSumm.vidoplp = 32 убрали не пользуемся
+         //or KorrSumm.vidoplp = 51 or KorrSumm.vidoplp = 52 or KorrSumm.vidoplp = 54 - пересчитывается ниже, на основании других видов оплат
+       or KorrSumm.vidoplp = 55 or KorrSumm.vidoplp = 57// or KorrSumm.vidoplp = 62 - пересчитывается ниже, на основании других видов оплат
+       or KorrSumm.vidoplp = 75
+      {
+        KorrSumm.summa := KorrSumm.chasf/wt_ghbd(1 or 64,0,24,-1,to_date(01, pMes, pYearn),to_date(last_day(to_date(1,pmes,pyearn)), pMes, pYearn))*tarifMesn*KorrSumm.proc/100;
+      }
+
+      if  KorrSumm.vidoplp = 68//Доплата при совмещ.профес.,расшир.зон обслуж.,увел.об.
+      {
+        //(Сумма начисления/Часы, за которые начислено) * Часы доначисления
+        KorrSumm.summa := (KorrSumm.summaB/KorrSumm.chasfB) * KorrSumm.chasf;
+      }
+
+      if KorrSumm.vidoplp = 10
+      then KorrSumm.proc := 100;// else KorrSumm.proc:=100;
+
+      if KorrSumm.vidoplp = 9 or KorrSumm.vidoplp = 10
+      or KorrSumm.vidoplp = 70 or KorrSumm.vidoplp = 72
+      or KorrSumm.vidoplp = 63
+      {
+        KorrSumm.summa := KorrSumm.chasf/NormaVr*tarifMesn*KorrSumm.proc/100;
+        if KorrSumm.vidoplp = 72
+        then KorrSumm.chasf:=0;
+      }
+
+      if  KorrSumm.vidoplp = 21 or KorrSumm.vidoplp = 22 or KorrSumm.vidoplp = 23 or KorrSumm.vidoplp=34
+      {
+        SummRasp:=0;
+        _loop KorrSumm1 where (KorrSumm1.vidoplp = 9 or KorrSumm1.vidoplp = 10 or KorrSumm1.vidoplp = 3)
+                           and KorrSumm1.datan = KorrSumm.datan and KorrSumm1.prizn = KorrSumm.prizn and KorrSumm.clsch = KorrSumm1.clsch
+        {
+          SummRasp += KorrSumm1.summa;
+        }
+        KorrSumm.summa := SummRasp*KorrSumm.proc/100;
+      }
+
+      if  KorrSumm.vidoplp = 40 //Ежемесячная премия за результаты выполнения показателей прем
+      {
+        SummRasp:=0;
+        _loop KorrSumm1 where (KorrSumm1.vidoplp = 9 or KorrSumm1.vidoplp = 10 or KorrSumm1.vidoplp = 3 or KorrSumm1.vidoplp = 72)
+                               and KorrSumm1.datan = KorrSumm.datan and KorrSumm1.prizn = KorrSumm.prizn and KorrSumm.clsch = KorrSumm1.clsch
+        {
+          SummRasp += KorrSumm1.summa;
+        }
+        KorrSumm.summa := SummRasp*KorrSumm.proc/100;
+      }
+
+      if  KorrSumm.vidoplp = 38 //Ежемесячная премия ОПР
+      {
+        SummRasp:=0;
+        _loop KorrSumm1 where (KorrSumm1.vidoplp = 9 or KorrSumm1.vidoplp = 10 or KorrSumm1.vidoplp = 3 or KorrSumm1.vidoplp = 72 or (KorrSumm1.vidoplp = 70 and KorrSumm.bISN_750))
+                               and KorrSumm1.datan = KorrSumm.datan and KorrSumm1.prizn = KorrSumm.prizn and KorrSumm.clsch = KorrSumm1.clsch
+        {
+          SummRasp += KorrSumm1.summa;
+        }
+        KorrSumm.summa := SummRasp*KorrSumm.proc/100;
+      }
+
+      if KorrSumm.vidoplp = 6// and KorrSumm.Summa=>0
+      {
+          SummRasp:=0;
+          _loop KorrSumm1 where (KorrSumm1.vidoplp = 1 or KorrSumm1.vidoplp = 9 or KorrSumm1.vidoplp = 10 or KorrSumm1.vidoplp = 3)
+                               and KorrSumm1.datan = KorrSumm.datan and KorrSumm1.prizn = KorrSumm.prizn and KorrSumm.clsch = KorrSumm1.clsch
+          {
+            SummRasp += KorrSumm1.summa;
+          }
+          KorrSumm.summa := SummRasp*KorrSumm.proc/100;
+      }
+
+      if KorrSumm.vidoplp = 62 // ВРЕДНОСТЬ
+      {
+        SummRasp:=0;
+        _loop KorrSumm1 where (KorrSumm1.vidoplp = 1 or KorrSumm1.vidoplp = 9 or KorrSumm1.vidoplp = 10 or KorrSumm1.vidoplp = 3 or KorrSumm1.vidoplp = 72)
+                           and KorrSumm1.datan = KorrSumm.datan and KorrSumm1.prizn = KorrSumm.prizn and KorrSumm.clsch = KorrSumm1.clsch
+        {
+          SummRasp += KorrSumm1.summa;
+        }
+        KorrSumm.summa := SummRasp*KorrSumm.proc/100;
+      }
+
+        //Секретность и шифры
+      if  KorrSumm.vidoplp = 51
+       or KorrSumm.vidoplp = 52
+       or KorrSumm.vidoplp = 54
+      {
+        SummRasp:=0;
+        _loop KorrSumm1 where (KorrSumm1.vidoplp = 3 or KorrSumm1.vidoplp = 10 or KorrSumm1.vidoplp = 72)
+                           and KorrSumm1.datan = KorrSumm.datan and KorrSumm1.prizn = KorrSumm.prizn and KorrSumm.clsch = KorrSumm1.clsch
+        {
+          SummRasp += KorrSumm1.summa;
+        }
+        KorrSumm.summa := SummRasp*KorrSumm.proc/100;
+      }
+
+      if KorrSumm.vidoplp = 11//ИСН
+      {
+        SummRasp:=0;
+        if KorrSumm.vidopl = 224//ИСН
+        {
+          _loop KorrSumm1 where (KorrSumm1.vidopl = 7 or KorrSumm1.vidopl = 9
+                              or KorrSumm1.vidopl = 11 or KorrSumm1.vidopl = 70
+                              or KorrSumm1.vidopl = 72)
+                             and KorrSumm1.datan = KorrSumm.datan and KorrSumm1.prizn = KorrSumm.prizn and KorrSumm.clsch = KorrSumm1.clsch
+          {
+            if not (KorrSumm.bISN_750)
+              if (KorrSumm1.vidopl = 9  or KorrSumm1.vidopl = 70)
+                continue;
+            SummRasp += KorrSumm1.summa;
+
+          }
+            KorrSumm.summa := SummRasp*KorrSumm.proc/100;
+        }
+        else if KorrSumm.vidopl = 229//ИСН (Breton)
+        {
+          var SummRasp7 : double = 0;
+          var SummRasp1 : double = 0;
+          _loop KorrSumm1 where (KorrSumm1.vidopl = 1 or KorrSumm1.vidoplp = 7
+                              or KorrSumm1.vidopl = 9 or KorrSumm1.vidopl = 11
+                              or KorrSumm1.vidopl = 70 or KorrSumm1.vidopl = 72)
+                             and KorrSumm1.datan = KorrSumm.datan and KorrSumm1.prizn = KorrSumm.prizn and KorrSumm.clsch = KorrSumm1.clsch
+          {
+            if KorrSumm1.vidopl = 1
+              SummRasp1 += KorrSumm1.summa;
+            else if KorrSumm1.vidopl = 7
+              SummRasp7 += KorrSumm1.summa;
+            else
+              SummRasp += KorrSumm1.summa;
+          }
+          KorrSumm.summa := (SummRasp + if(SummRasp7 = 0, SummRasp1, SummRasp7))*KorrSumm.proc/100;
+        }
+      }
+
+      if KorrSumm.vidopl = 102//Молоко
+      {
+        KorrSumm.summa := KorrSumm.koldn * 0.5 * doMilkPrice;
+      }
+
+      KorrSumm.summa := round(KorrSumm.summa,2);
+      update current KorrSumm;
+    }
+  }
+
+  if ConditionActiveinLeave(tcConls,tntlschet)=True
+    PopConditionForLeave(tcConls,tntlschet);
+
+!ExcelPath1:='\\dep968-terminal\User_disk\Galaktika\WorkFolder\ERPDB\Nikolai.Plinda\';
+!	puttabletodbf(#KorrSumm,ExcelPath1+'KorrSumm2.xls',ptfFullTable);
+  ReReadRecord(#KorrSumm);
+}
+
+CmValue2:
+{
+  if GetMarkerCount(lsMarker)=0
+	{
+    Message('Ничего не выбрано',error);
+    stop; abort; exit;
+	}
+
+  PushConditionForLeave(tcConls,tntlschet);
+
+//Проверим, что по имеющимся данным не сформирована другая ведомость
+  MtClear(#tErr_Sys_mbf,mfNormal);
+  MtClear(#tErr_prvidopl,mfNormal);
+  var mrLSchet : longint = InitMarker('', 8, 100, 10, FALSE);
+  //Сгруппируем все записи
+  _loop KorrSumm1 where (KorrSumm1.prizn < 2 and KorrSumm1.summa<>0)
+  {
+    var dDate1 : date = date(1, Month(KorrSumm1.datan), Year(KorrSumm1.datan));
+    if getfirst KorrSumm2 where ((KorrSumm1.clsch  == KorrSumm2.clsch
+                              and KorrSumm1.vidopl == KorrSumm2.vidopl
+                              and dDate1           == KorrSumm2.datan
+                              and 2                == KorrSumm2.prizn))!=tsOK
+    {
+      ClearBuffer(#KorrSumm2);
+      KorrSumm2.Buffer  := KorrSumm1.Buffer;
+
+      KorrSumm2.prizn   := 2;
+      KorrSumm2.datan   := dDate1;
+      KorrSumm2.datok   := Date(Last_Day(KorrSumm1.datan), Month(KorrSumm1.datan), Year(KorrSumm1.datan));
+
+      insert current KorrSumm2;
+    }
+    else
+    {
+      KorrSumm2.CHASF   += KorrSumm1.chasf;
+      KorrSumm2.koldn   += KorrSumm1.koldn;
+      KorrSumm2.summa   += KorrSumm1.summa;
+
+      update current KorrSumm2;
+    }
+
+
+  }
+
+  _loop tlschet
+  {
+    _loop KorrSumm where (KorrSumm.prizn = 2 and KorrSumm.summa<>0)
+    {
+      _loop prvidopl where  ((KorrSumm.clsch  == prvidopl.clsch
+                          and               0 == prvidopl.choice
+                          and (prvidopl.DATAN >= KorrSumm.datan
+                           and prvidopl.datok <= KorrSumm.datok
+                           and prvidopl.vidopl = KorrSumm.vidopl)
+                          and PrVidOpl.MNREC  == sys_mbf.nrec))
+      {
+        if getfirst tErr_Sys_mbf where ((sys_mbf.nrec == tErr_Sys_mbf.nRec)) != tsOK
+        {
+          ClearBuffer(#tErr_Sys_mbf);
+          tErr_Sys_mbf.nRec := sys_mbf.nrec;
+          tErr_sys_mbf.sName := SYS_MBF.NMNEM;
+          insert current tErr_sys_mbf;
+        }
+
+        if getfirst tErr_prvidopl where ((prvidopl.nRec == tErr_prvidopl.nRec)) != tsOK
+        {
+          ClearBuffer(#tErr_prvidopl);
+          tErr_prvidopl.nRec    := prvidopl.nRec;
+          tErr_prvidopl.sFIO    := Persons.Fio;
+          tErr_prvidopl.cLschet := KorrSumm.clsch;
+          tErr_prvidopl.mNrec   := sys_mbf.nrec;
+          tErr_prvidopl.doSumm  := prvidopl.summa;
+          tErr_prvidopl.dDateB  := KorrSumm.datan;
+          tErr_prvidopl.dDateE  := KorrSumm.datok;
+          insert current tErr_prvidopl;
+        }
+
+        InsertMarker(mrLSchet, KorrSumm.clsch);
+      }
+    }
+  }
+
+  var iii : longint = 0;
+  _loop tlschet
+  {
+    if FoundMarker(mrLSchet, tlschet.nrec)
+      continue;
+
+    _loop KorrSumm1 where ((tlschet.nrec == KorrSumm1.clsch and 2 == KorrSumm1.prizn)) ordered by KorrSumm1.vidoplp
+    {
+      if (KorrSumm1.summa = 0)
+        continue;
+
+      if getfirst prvidopl where ((KorrSumm1.cprvidopl==prvidopl.nrec))=tsok
+        break;
+
+      iii++;
+      if (iii = 1)
+      {
+        clearbuffer(#SYS_MBF);
+        SYS_MBF.NMNEM  := 'Корректировка за '+cur_date;
+        SYS_MBF.NMPODR := 'все подразделения';
+        SYS_MBF.CEX    := 0;
+        SYS_MBF.DATAN  := to_date(1,pmes,pYearn);
+        SYS_MBF.DATOK  := to_date(28,pmes,pYearn);
+        SYS_MBF.KASSIR := 65535;
+        SYS_MBF.mnrec  := 1001;
+        insert current SYS_MBF;
+      }
+
+      if getfirst prvidopl where ((KorrSumm1.datan  == prvidopl.datan(noindex)
+                               and KorrSumm1.vidopl == prvidopl.vidopl(noindex)
+                               and KorrSumm1.clsch  == prvidopl.clsch
+                               and                0 == prvidopl.choice))<>tsok
+      {
+        clearbuffer(#prvidopl);
+        prvidopl.CEX      := KorrSumm1.cex;
+        prvidopl.cexoz    := KorrSumm1.cex;
+        prvidopl.MNREC    := sys_mbf.nrec;
+        prvidopl.POMETKA  := '+';
+        prvidopl.VIDOPL   := korrSumm1.vidopl;
+        prvidopl.MES      := month(KorrSumm1.datan);
+        prvidopl.DATAN    := KorrSumm1.datan;
+        prvidopl.DATok    := KorrSumm1.datok;
+        prvidopl.CLSCH    := KorrSumm1.clsch;
+        prvidopl.Tperson  := KorrSumm1.tperson;
+        prvidopl.CHASF    := KorrSumm1.chasf;
+        prvidopl.koldn    := KorrSumm1.koldn;
+        prvidopl.summa    := KorrSumm1.summa;
+        prvidopl.summaR   := KorrSumm1.summa;
+        prvidopl.proc     := KorrSumm1.proc;
+        prvidopl.STRTABN  := korrSumm1.strtabn;
+        prvidopl.KATEG    := KorrSumm1.Kateg;
+        prvidopl.CAPPOINT := KorrSumm1.Cappoint;
+        insert current prvidopl;
+
+        KorrSumm1.cprvidopl := prvidopl.nrec;
+        update current KorrSumm1;
+      }
+      else
+      {
+        prvidopl.CHASF   += KorrSumm1.chasf;
+        prvidopl.koldn   += KorrSumm1.koldn;
+        prvidopl.summa   += KorrSumm1.summa;
+        prvidopl.summaR  += KorrSumm1.summa;
+
+        KorrSumm1.cprvidopl :=prvidopl.nrec;
+        update current KorrSumm1;
+
+
+        if prvidopl.summa=0
+          delete current prvidopl;
+        else
+          update current prvidopl;
+      }
+    }
+  }
+
+  donemarker(mrLSchet, '');
+
+  if ConditionActiveinLeave(tcConls,tntlschet)=True
+    PopConditionForLeave(tcConls,tntlschet);
+
+
+  if getfirst tErr_Sys_mbf = tsOK
+  {
+    //Есть дубли, создадим протокол
+    var sFileName : string = CreateTmpFileName;
+    if ExistFile(sFileName)
+      DeleteFile(sFileName);
+
+    LogStrToFile(sFileName, '**********По некоторым сотрудникам формирование ведомости невозможно!********');
+    LogStrToFile(sFileName, '-----------------------------------------------------------------------------');
+    LogStrToFile(sFileName, 'Найдены следующие, ранее созданные документы:');
+    _loop tErr_Sys_mbf ordered by index i2
+    {
+      LogStrToFile(sFileName, '   ' + tErr_Sys_mbf.sName);
+
+      _loop tErr_prvidopl where ((tErr_Sys_mbf.nRec == tErr_prvidopl.mNrec)) ordered by index i3
+        LogStrToFile(sFileName, '      ' + tErr_prvidopl.sFIO + ', ' + DateToStr(tErr_prvidopl.dDateB, 'DD.MM.YYYY') + '-' + DateToStr(tErr_prvidopl.dDateE, 'DD.MM.YYYY')+', ' + DoubleToStr(tErr_prvidopl.doSumm, '\2p[|-]36`666`666`666`666`667.88'));
+    }
+
+    ProcessText(sFileName, vfNewTitle Or vfMacroSize,  'Протокол проверки');
+  }
+
+  message('Ведомость '+if(iii = 0, 'не', '')+' создана');
+}
+end;
+end.
+
+
+
+
+#include UserReport.vih
+
+VipInterface UserReport_gp_recalc_korr_tabel Implements IUserReport;
+Interface UserReport_gp_recalc_korr_tabel;
+
+Procedure Run;
+Begin
+  runinterface(GP_recalc_korr_tabel);
+End;
+
+Function GetReportName: String;
+Begin
+  GetReportName := 'Обработка корректировочных табелей';
+End;
+
+
+Function GetGroupName (Level : Word) : String;
+Begin
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Обработка корректировочных табелей';
+  End;
+End;
+
+function GetPriority : Integer;
+begin
+  GetPriority := 3;
+end;
+
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'menuzarp';
+  end;
+end;
+
+End.

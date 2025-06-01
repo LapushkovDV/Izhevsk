@@ -1,0 +1,815 @@
+/*************************************************************************************************\
+* Наименование: Реализация интерфейса заполнения РПД-111 по данным excel-файла                    *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1329         |29/11/17|Евдокимов М.А.           |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include AtlProtocol.vih
+#include CatFunc.vih
+#include AppFuncs.vih
+#include PsnFuncs.vih
+#include Query.vih
+
+Interface GP_RPD111_Import_v2 'Импорт полисов ДМС' (,,sci178Ins) Cyan,DoAccept;
+show at (,,60,10);
+
+const
+  ALG_ID_REMOVE: byte = 1;
+  ALG_ID_ADD   : byte = 0;
+  ALG_ID_MODIFY: byte = 2;
+  CONF_FLAG_CHECK_STARTDATE: word := 1;
+  CONF_FLAG_CHECK_ENDDATE: word := 2;
+end;
+
+table struct tConf (
+  Nrec              : comp,
+  SheetName         : string,
+  AlgId             : byte,
+  DataStartRow      : longint,
+  ErrorsCol         : longint,
+  FirstNameCol      : longint,
+  FirstNameRow      : longint,
+  SecondNameCol     : longint,
+  SecondNameRow     : longint,
+  PatronymicCol     : longint,
+  PatronymicRow     : longint,
+  BirthDateCol      : longint,
+  BirthDateRow      : longint,
+  PolicyNumberCol   : longint,
+  PolicyNumberRow   : longint,
+  InsuranceOptionCol: longint,
+  InsuranceOptionRow: longint,
+  StartDateCol      : longint,
+  StartDateRow      : longint,
+  EndDateCol        : longint,
+  EndDateRow        : longint,
+  CostCol           : longint,
+  CostRow           : longint,
+  Flags             : word
+) with index (
+  byNrec = Nrec (Unique)
+);
+
+table struct tData (
+  AlgId              : byte,
+  PersonsNrec        : comp,
+  PolicyNumber       : string,
+  InsuranceOptionNrec: comp,
+  StartDate          : date,
+  EndDate            : date,
+  Cost               : double
+);
+
+var
+  _log                  : IAtlProtocol(AtlProtocol) new;
+  _LogRowStart          :boolean;
+  _appointmentsFunctions: AppointmentsFunctions;
+  _catalogsFunctions    : CatalogsFunctions;
+  _personsFunctions     : PersonsFunctions;
+  _queryRaiseForDeletion: IQuery;
+
+  _importFilePath : string;
+  _partDocNrec    : comp;
+  _appNrec        : comp;
+  _raiseTypeNrec  : comp;
+  _raiseNrecForDel: comp;
+
+Create view
+as select tConf.Nrec
+from tConf,
+     tData,
+     PartDoc,
+     TitleDoc,
+     ContDoc,
+     ContDoc ContDocLastWRec (ContDoc05),
+     Appointments,
+     Raise,
+     RaiseHist,
+     GP_RaiseHistExt111,
+     Raise RaiseForDel,
+     DelRaise
+where ((
+  _partDocNrec      == PartDoc.Nrec and
+
+  PartDoc.cDoc      == TitleDoc.Nrec and
+
+  tData.PersonsNrec == ContDoc.Person and
+  _partDocNrec      == ContDoc.cPart  and
+
+  _partDocNrec      == ContDocLastWRec.cPart  and
+  1                 == ContDocLastWRec.SeqNmb and
+
+  _appNrec          == Appointments.Nrec and
+
+  ContDoc.Nrec      == Raise.cRDop     and
+  ContDoc.Person    == Raise.Person    and
+  ( Raise.RaiseType  = _raiseTypeNrec  and
+    Raise.FromDate   = tData.StartDate and
+    Raise.ToDate     = tData.EndDate ) and
+
+  Raise.Nrec       == RaiseHist.cRaise   and
+  ContDoc.Nrec     == RaiseHist.cContDoc and
+
+  RaiseHist.Nrec   == GP_RaiseHistExt111.cRaiseH and
+  _raiseNrecForDel == RaiseForDel.Nrec and
+
+  cgDelRaiseRPD10       == DelRaise.wTypeInfo  and
+  RaiseForDel.nRec      == DelRaise.cSource    and
+  // могут встретиться зависшие записи
+  ContDoc.nRec          == DelRaise.cOrderCont1(noindex) and
+  RaiseForDel.RaiseType == DelRaise.cRaiseType
+));
+
+create view vDefinePerson
+var
+  _isEmployee: string;
+  _fio       : string;
+  _birthDate : date;
+as select Persons.Nrec
+from Persons
+where ((
+  _isEmployee  == Persons.IsEmployee and
+  (trim(locase(Persons.FIO)) like (trim(locase(_fio)) + '%') and Persons.BornDate = _birthDate)
+));
+
+create view vInsuranceOption
+var
+  _name: string;
+as select catParent.Nrec
+from catalogs catParent,
+     catalogs catInsuranceOption
+where ((
+  4006 == catParent.SysCode and
+  catParent.Nrec == catInsuranceOption.cParent and
+  (locase(trim(catInsuranceOption.Name)) = locase(trim(_name)))
+));
+
+Parameters _partDocNrec, _importFilePath;
+
+sql query queryRaiseForDeletion =
+select Raise.Nrec, GP_RaiseHistExt111.PolisDms, Raise.appoint
+from GP_RaiseHistExt111
+join RaiseHist on RaiseHist.Nrec = GP_RaiseHistExt111.cRaiseH and RaiseHist.cPsn = :PersonsNrec
+join Raise on Raise.Nrec = RaiseHist.cRaise
+join ContDoc on ContDoc.Nrec = RaiseHist.cContDoc
+join PartDoc on PartDoc.Nrec = ContDoc.cPart
+join TitleDoc on TitleDoc.Nrec = PartDoc.cDoc and TitleDoc.wStatus = 1
+left outer join DelRaise on//будем искать не отмененные доплаты по всем приказам
+                    // DelRaise.cOrderCont1 = :(ContDoc.Nrec)
+                    DelRaise.cOrderCont1> RaiseHist.cContDoc
+                and DelRaise.wTypeInfo =1 //cgDelRaiseRPD10
+                and DelRaise.cSource = RaiseHist.cRaise
+where GP_RaiseHistExt111.PolisDms  = :PolicyNumber and
+      GP_RaiseHistExt111.DateBeg  <= :OnDate and
+      (GP_RaiseHistExt111.DateEnd >= :OnDate or GP_RaiseHistExt111.DateEnd = 0) and
+      ((DelRaise.Nrec is Null))
+
+;
+
+//Возвращает нрек надбавки, соответствующей полису ДМС с номером sPolicyNumber, действующему на
+//дату dOnDate и принадлежащему сотруднику cPersonsNrec. Если надбавка не найдена - результат 0.
+function GetRaiseNrecForDeletion(sPolicyNumber: string; cPersonsNrec: comp; dOnDate: date): comp;
+{
+  result := 0;
+
+  if _queryRaiseForDeletion = nullref
+    _queryRaiseForDeletion := queryManager.createQuery(queryRaiseForDeletion);
+
+  _queryRaiseForDeletion.setParam('PolicyNumber', sPolicyNumber)
+                        .setParam('PersonsNrec', cPersonsNrec)
+                        .setParam('OnDate', dOnDate)
+                        .Execute;
+
+  if _queryRaiseForDeletion.errorCode = tsOk
+    if _queryRaiseForDeletion.fetch.errorCode = tsOk
+      result := _queryRaiseForDeletion.row.ValAt(1);
+}
+
+//Инициализация настроек импорта
+procedure InitConf;
+{
+  ClearBuffer(#tConf);
+  tConf.Nrec               := comp(1);
+  tConf.SheetName          := '1.Исключение';
+  tConf.AlgId              := ALG_ID_REMOVE;
+  tConf.DataStartRow       := 3;
+  tConf.ErrorsCol          := 11;
+  tConf.FirstNameCol       := 4;
+  tConf.SecondNameCol      := 3;
+  tConf.PatronymicCol      := 5;
+  tConf.BirthDateCol       := 6;
+  tConf.PolicyNumberCol    := 2;
+  tConf.InsuranceOptionCol := 7;
+  //Вариант 1
+  //tConf.StartDateCol       := 8;
+  //Вариант 2
+  tConf.StartDateRow       := 1;
+  tConf.StartDateCol       := 5;
+
+  insert current tConf;
+
+  ClearBuffer(#tConf);
+  tConf.Nrec               := comp(2);
+  tConf.SheetName          := '2.Включить';
+  tConf.AlgId              := ALG_ID_ADD;
+  tConf.DataStartRow       := 3;
+  tConf.ErrorsCol          := 18;
+  tConf.FirstNameCol       := 4;
+  tConf.SecondNameCol      := 3;
+  tConf.PatronymicCol      := 5;
+  tConf.BirthDateCol       := 6;
+  tConf.InsuranceOptionCol := 8;
+  tConf.PolicyNumberCol    := 2;
+  /*
+  Вариант 01
+  tConf.StartDateCol       := 13;
+  tConf.EndDateCol         := 14;
+  */
+  //Вариант 02
+  tConf.StartDateRow       := 1;
+  tConf.StartDateCol       := 7;
+  tConf.EndDateRow         := 1;
+  tConf.EndDateCol         := 10;
+
+  tConf.CostCol            := 9;
+  tConf.Flags              := CONF_FLAG_CHECK_STARTDATE + CONF_FLAG_CHECK_ENDDATE;
+  insert current tConf;
+
+  ClearBuffer(#tConf);
+  tConf.Nrec               := comp(3);
+  tConf.SheetName          := '3.Изменение варианта';
+  tConf.AlgId              := ALG_ID_MODIFY;
+  tConf.DataStartRow       := 3;
+  tConf.ErrorsCol          := 11;
+  tConf.FirstNameCol       := 4;
+  tConf.SecondNameCol      := 3;
+  tConf.PatronymicCol      := 5;
+  tConf.BirthDateCol       := 6;
+  tConf.InsuranceOptionCol := 9;
+  tConf.PolicyNumberCol    := 2;
+  //Вариант 1
+  //tConf.StartDateCol       := 11;
+  //tConf.EndDateCol         := 12;
+  //Вариант 2
+  tConf.StartDateRow       := 1;
+  tConf.EndDateRow         := 1;
+  tConf.StartDateCol       := 6;
+  tConf.EndDateCol         := 9;
+  //----------------------
+  tConf.CostCol            := 10;
+  insert current tConf;
+}
+
+//Добавляет сообщение об ошибке в протокол и excel в ячейку [row, col]
+procedure AddErrorToLogAndExcel(row: longint; col: longint; errMsg: string);
+{ // не красиво получается
+  if not _LogRowStart
+  { //_log.LogMessage(APE_MESSAGE, 'Строка ' + row);
+    _LogRowStart:=true;
+  }
+  var s: string = '';
+  xlGetCellValue(row, col, s);
+  if trim(s) = ''
+  {
+    xlSetColumnWidth(50, row, col, row, col);
+    xlAlignCells(xlLeft, row, col, row, col);
+    xlWrapText(row, col, row, col);
+    xlSetFontColor(16711680, row, col, row, col);
+    xlSetFontSize(8, row, col, row, col);
+  }
+  else
+    xlAddCellStringValue(chr(10), row, col);
+  xlAddCellStringValue('- ' + errMsg, row, col);
+  _log.LogLine(APE_ERROR, errMsg);
+}
+
+//Читает в s значение строковой ячейки [confRow, confCol]. Если confRow = 0, то номер строки определяется по
+//текущей строке считываемой таблицы - curRow. Если confCol = 0, то ячейка не считывается.
+//Возвращает истину, если чтение выполнено без ошибок. Ошибки выводятся в excel файл и в протокол.
+function xlGetStringCellValue(var s: string; confRow: longint; confCol: longint;
+                              curRow: longint; errCol: longint = 0): boolean;
+{
+  if confCol = 0
+  {
+    s := '';
+    result := true;
+  }
+  else
+  {
+    if confRow = 0 confRow := curRow;
+    result := xlGetCellValue(confRow, confCol, s);
+    if not result
+    {
+      if errCol = 0 errCol := tConf.ErrorsCol;
+      AddErrorToLogAndExcel(confRow, confCol, 'Ошибка чтения ячейки [' + confRow +
+                            ', ' + confCol + ']. Код ошибки: ' + xlGetLastError);
+    }
+  }
+}
+
+//Читает в d преобразованное в дату значение ячейки [confRow, confCol].
+//Работает аналогично xlGetStringCellValue
+function xlGetDateCellValue(var d: date;var ds:string; confRow: longint; confCol: longint;
+                              curRow: longint; errCol: longint = 0; dateFormat: string = 'DD.MM.YYYY'): boolean;
+{
+  ds:='';
+  result := xlGetStringCellValue(ds, confRow, confCol, curRow, errCol);
+  ds:=Replace(ds,'  ',' ');
+  d := StrToDate(ds, dateFormat);
+  if d=ZeroDate d:=StrToDate(ds,'DD.MM.YYYY');
+  if d=ZeroDate d:=StrToDate(ds,'DD/MM/YYYY');
+  if d=ZeroDate d:=StrToDate(ds,'DD mon YYYY');
+  timelog(' xlGetDateCellValue:tConf.SheetName='+tConf.SheetName+',confRow='+string(confRow)+',confCol='+string(confCol)+',ds='+DS+', d='+DateTostr(d,''));
+}//function xlGetDateCellValue(var d: date;var ds:string; confRow: longint; confCol: longint;
+
+//Читает в d преобразованное в double значение ячейки [confRow, confCol].
+//Работает аналогично xlGetStringCellValue
+function xlGetDoubleCellValue(var d: double; confRow: longint; confCol: longint;
+                              curRow: longint; errCol: longint = 0): boolean;
+{
+  var s: string = '';
+  result := xlGetStringCellValue(s, confRow, confCol, curRow, errCol);
+  d := double(replace(replace(s, ' ', ''), ',', '.'));
+}
+
+//Читает данные excel файла _importFilePath во временную таблицу tData в соответствии с настройками в tConf
+//Заполняет в каждом листе excel файла колонку №tConf.ErrorCol текстом ошибок, возникших при загрузке строк
+//Возвращает истину если данные загружены в tData без ошибок
+function LoadData: boolean;
+{
+  result := false;
+
+  _log.LogStartVisual('Чтение и проверка данных', RecordsInTable(#tConf));
+
+  if not xlOpenNewExcel(true)
+  {
+    _log.LogLine(APE_ERROR, 'Ошибка инициализации Excel. Код ошибки: ' + xlGetLastError);
+    _log.LogStopVisual;
+    exit;
+  }
+
+  if not xlOpenWorkBook(_importFilePath)
+  {
+    _log.LogLine(APE_ERROR, 'Ошибка открытия книги Excel. Код ошибки: ' + xlGetLastError);
+    xlSetAppVisibleMode(false);
+    xlKillExcel;
+    _log.LogStopVisual;
+    exit
+  }
+
+  var errorExists: boolean = false;
+  var s: string = '';
+  var d: date = 0;
+  var ds: string = '';
+  var row: longint;
+
+  //Проходим в цикле по настройкам чтения листов
+  _loop tConf
+  {
+    _log.LogMessage(APE_MESSAGE, 'Лист "' + tConf.SheetName + '"');
+
+    //Активизируем лист с наименованием из текущей настройки
+    if not xlSetActiveSheetByName(tConf.SheetName)
+    {
+      _log.LogLine(APE_ERROR, 'Ошибка активации листа "' + tConf.SheetName + '". Код ошибки: ' + xlGetLastError);
+      _log.LogCommit;
+      errorExists := true;
+      continue;
+    }
+
+    //Если необходимо проверяем заполненность дат
+    if (tConf.Flags and CONF_FLAG_CHECK_STARTDATE) = CONF_FLAG_CHECK_STARTDATE and tConf.StartDateRow != 0
+    {
+      errorExists := errorExists or not xlGetDateCellValue(d,ds, tConf.StartDateRow, tConf.StartDateCol, tConf.StartDateRow, tConf.ErrorsCol);
+      errorExists := errorExists or (d = 0);
+      if d = 0 AddErrorToLogAndExcel(tConf.StartDateRow, tConf.ErrorsCol, 'Не заполнена дата начала действия полиса '+ds);
+    }
+
+    if (tConf.Flags and CONF_FLAG_CHECK_ENDDATE) = CONF_FLAG_CHECK_ENDDATE and tConf.EndDateRow != 0
+    {
+      errorExists := errorExists or not xlGetDateCellValue(d,ds, tConf.EndDateRow, tConf.EndDateCol, tConf.EndDateRow, tConf.ErrorsCol);
+      errorExists := errorExists or (d = 0);
+      if d = 0 AddErrorToLogAndExcel(tConf.EndDateRow, tConf.ErrorsCol, 'Не заполнена дата окончания действия полиса '+ds);
+    }
+
+    //Читаем строки на листе
+    for(row := tConf.DataStartRow; row < 65535; row++)
+    { _LogRowStart:=false;
+      ClearBuffer(#tData);
+      _log.LogMessage(APE_MESSAGE, 'Строка ' + row);
+
+      //Получаем ФИО, дату рождения сотрудника, определяем сотрудника в Галактике
+      //Фамилия
+      errorExists := errorExists or not xlGetStringCellValue(s, tConf.SecondNameRow, tConf.SecondNameCol, row, tConf.ErrorsCol);
+      vDefinePerson._fio := trim(s);
+      //Имя
+      errorExists := errorExists or not xlGetStringCellValue(s, tConf.FirstNameRow, tConf.FirstNameCol, row, tConf.ErrorsCol);
+      vDefinePerson._fio += ' ' + trim(s);
+      //Отчество
+      errorExists := errorExists or not xlGetStringCellValue(s, tConf.PatronymicRow, tConf.PatronymicCol, row, tConf.ErrorsCol);
+      vDefinePerson._fio += ' ' + trim(s);
+
+      //Если получившееся ФИО пустое - считаем, что это конец данных на листе, завершаем цикл по строкам
+      if trim(vDefinePerson._fio) = ''
+      {
+        _log.LogLine(APE_MESSAGE, 'ФИО не заполнено. Конец данных на листе.');
+        _log.LogCommit;
+        break;
+      }
+
+      //Дата рождения
+      errorExists := errorExists or not xlGetDateCellValue(vDefinePerson._birthDate,ds,
+        tConf.BirthDateRow, tConf.BirthDateCol, row, tConf.ErrorsCol);
+
+      //Определяем nrec сотрудника по фио и дате рождения
+      vDefinePerson._isEmployee := 'С'; //ищем среди работающих
+      if vDefinePerson.getfirst Persons = tsOk
+        tData.PersonsNrec := vDefinePerson.Persons.Nrec;
+      else
+      {
+        vDefinePerson._isEmployee := 'У'; //ищем среди уволенных
+        if vDefinePerson.getfirst Persons = tsOk
+          tData.PersonsNrec := vDefinePerson.Persons.Nrec;
+        else
+        {
+          AddErrorToLogAndExcel(row, tConf.ErrorsCol, 'Сотрудник ' + vDefinePerson._fio +
+                                ' с датой рождения ' + vDefinePerson._birthDate + ' не найден');
+          errorExists := true;
+        }
+      }
+
+      //номер полиса
+      errorExists := errorExists or not xlGetStringCellValue(tData.PolicyNumber,
+        tConf.PolicyNumberRow, tConf.PolicyNumberCol, row, tConf.ErrorsCol);
+      //дата начала действия
+      errorExists := errorExists or not xlGetDateCellValue(tData.StartDate,ds,
+        tConf.StartDateRow, tConf.StartDateCol, row, tConf.ErrorsCol);
+      if tData.StartDate = 0
+        errorExists := errorExists or not xlGetDateCellValue(tData.StartDate,ds,
+          tConf.StartDateRow, tConf.StartDateCol, row, tConf.ErrorsCol, 'DD Mon YYYY');
+      if tData.StartDate = 0
+      { timelog('DS='+vDefinePerson.Persons.Fio+', не смогли распознать дату' );
+        if (tConf.Flags and CONF_FLAG_CHECK_STARTDATE) = CONF_FLAG_CHECK_STARTDATE and tConf.StartDateRow = 0
+        {
+          errorExists := true;
+          AddErrorToLogAndExcel(tConf.StartDateRow, tConf.ErrorsCol, 'Не заполнена дата начала действия полиса '+ds);
+        }
+        tData.StartDate := TitleDoc.DocDate;
+      }
+      //дата окончания действия
+      errorExists := errorExists or not xlGetDateCellValue(tData.EndDate,ds,
+        tConf.EndDateRow, tConf.EndDateCol, row, tConf.ErrorsCol);
+      if tData.EndDate = 0
+        errorExists := errorExists or not xlGetDateCellValue(tData.EndDate,ds,
+          tConf.EndDateRow, tConf.EndDateCol, row, tConf.ErrorsCol, 'DD Mon YYYY');
+      if tData.EndDate = 0
+      {
+        if (tConf.Flags and CONF_FLAG_CHECK_ENDDATE) = CONF_FLAG_CHECK_ENDDATE and tConf.EndDateRow = 0
+        {
+          errorExists := true;
+          AddErrorToLogAndExcel(tConf.EndDateRow, tConf.ErrorsCol, 'Не заполнена дата окончания действия полиса '+ds);
+        }
+        tData.EndDate := TitleDoc.DocDate;
+      }
+      //наименование вида страхования
+      errorExists := errorExists or not xlGetStringCellValue(vInsuranceOption._name,
+        tConf.InsuranceOptionRow, tConf.InsuranceOptionCol, row, tConf.ErrorsCol);
+      //определяем нрек вида страхования по его наименованию
+      if vInsuranceOption.getfirst catInsuranceOption = tsOk
+        tData.InsuranceOptionNrec := vInsuranceOption.catInsuranceOption.Nrec;
+      else
+      {
+        AddErrorToLogAndExcel(row, tConf.ErrorsCol, 'Вид страхования "' +
+                              vInsuranceOption._name + '" не найден');
+        errorExists := true;
+      }
+      //алгоритм обработки записи данных
+      tData.AlgId := tConf.AlgId;
+      //сумма
+      errorExists := errorExists or not xlGetDoubleCellValue(tData.Cost,
+        tConf.CostRow, tConf.CostCol, row, tConf.ErrorsCol);
+      //проверка наличия полиса для отмены или изменения
+      if tData.AlgId = ALG_ID_REMOVE or tData.AlgId = ALG_ID_MODIFY
+      {
+        _raiseNrecForDel := GetRaiseNrecForDeletion(tData.PolicyNumber, tData.PersonsNrec, tData.StartDate);
+
+        if getfirst RaiseForDel != tsOk
+        {
+          AddErrorToLogAndExcel(row, tConf.ErrorsCol, 'Не найдена надбавка, соответствующая полису ДМС №' +
+                                tData.PolicyNumber + ', действующему на ' + tData.StartDate);
+          errorExists := true;
+        }
+      }
+      if tData.AlgId=ALG_ID_ADD
+      { _raiseNrecForDel := GetRaiseNrecForDeletion(tData.PolicyNumber, tData.PersonsNrec, tData.StartDate);
+        if getfirst RaiseForDel = tsOk
+        {
+          AddErrorToLogAndExcel(row, tConf.ErrorsCol, 'Уже есть надбавка, соответствующая полису ДМС №' +
+                                tData.PolicyNumber + ', действующему на ' + tData.StartDate);
+          errorExists := true;
+        }
+      }//if tData.AlgId=ALG_ID_ADD
+      _log.LogCommit; //Чтение данных в строке
+      insert current tData;
+    } //for
+
+    _log.LogCommit; //Чтение данных на листе
+
+    if not _log.LogNextVisual('') break;
+
+  } //_loop tConf
+
+  _log.LogStopVisual;
+
+  xlCloseWorkBook(1);
+  xlKillExcel;
+
+  result := not errorExists;
+}
+
+//Находит или создает ContDoc для текущей записи tData
+//На выходе актуальные данные - в таблице ContDoc
+//Возвращает истину, если найден существующий или успешно создан новый ContDoc
+function ImportCurrentData_FindOrCreateContDoc: boolean;
+{
+  if getfirst ContDoc != tsOk
+  {
+    ClearBuffer(tnContDoc);
+    ContDoc.cPart    := PartDoc.Nrec;
+
+    if getlast ContDocLastWRec = tsOk
+      ContDoc.wRec   := ContDocLastWRec.wRec + 1;
+    else
+      ContDoc.wRec   := 1;
+
+    ContDoc.NumPart  := 1;
+    ContDoc.TypeOper := PartDoc.TypeOper;
+    ContDoc.Person   := tData.PersonsNrec;
+    ContDoc.ObjType  := 1;
+    ContDoc.ObjNrec  := 0;
+    ContDoc.SeqNmb   := 1;
+
+    _appNrec := _appointmentsFunctions.GetAppNrec_OnDate(ContDoc.Person, TitleDoc.DocDate);
+    if getfirst Appointments = tsOk
+    {
+      ContDoc.cStr     := Appointments.Nrec;
+      ContDoc.cDopRef  := Appointments.Department;
+    }
+
+    insert current ContDoc;
+    _log.LogLine(APE_MESSAGE, 'Сотрудник добавлен в приказ');
+  }
+
+  if not IsValidAll(tnContDoc)
+  {
+    _log.LogLine(APE_ERROR, 'Ошибка при определении сотрудника в приказе');
+    result := false;
+  }
+  else
+    result := true;
+}
+
+//Обрабатывает текущую запись tData: регистрирует в приказе новый полис
+procedure ImportCurrentData_Add;
+{
+  if not ImportCurrentData_FindOrCreateContDoc exit;
+
+  //Определяем надбавку
+  if getfirst Raise != tsOk
+  {
+    ClearBuffer(tnRaise);
+    Raise.cRDop     := ContDoc.Nrec;
+    Raise.Person    := ContDoc.Person;
+    Raise.RaiseType := _raiseTypeNrec;
+    Raise.FromDate  := tData.StartDate;
+    Raise.ToDate    := tData.EndDate;
+    Raise.Sum       := tData.Cost;
+    insert current Raise;
+    _log.LogLine(APE_MESSAGE, 'Добавлена надбавка "' + _catalogsFunctions.GetCatalogsName(Raise.RaiseType) +
+                 '" с ' + Raise.FromDate + ' по ' + Raise.ToDate + ' на сумму ' + Raise.Sum);
+  }
+  else
+  {
+    _log.LogLine(APE_MESSAGE, 'Найдена надбавка ' + _catalogsFunctions.GetCatalogsName(Raise.RaiseType) +
+                 ' с ' + Raise.FromDate + ' по ' + Raise.ToDate + '. Установлена сумма ' + Raise.Sum);
+    Raise.Sum       := tData.Cost;
+    update current Raise;
+  }
+
+  //Определяем запись в истории надбавок
+  if getfirst RaiseHist != tsOk
+  {
+    ClearBuffer(tnRaiseHist);
+    RaiseHist.cRaise     := Raise.Nrec;
+    RaiseHist.cContDoc   := Raise.cRDop;
+    RaiseHist.cPsn       := Raise.Person;
+    RaiseHist.wTypeOper  := 9;
+    RaiseHist.dRec       := Raise.FromDate;
+    RaiseHist.dDat2      := Raise.ToDate;
+    RaiseHist.DocNmb     := TitleDoc.DocNmb;
+    RaiseHist.DocDate    := TitleDoc.DocDate;
+    RaiseHist.RhSum      := Raise.Sum;
+    RaiseHist.cRaiseType := Raise.RaiseType;
+    insert current RaiseHist;
+    _log.LogLine(APE_MESSAGE, 'Добавлена запись в историю надбавок');
+  }
+  else
+  {
+    RaiseHist.cRaiseType := Raise.RaiseType;
+    RaiseHist.dRec       := Raise.FromDate;
+    RaiseHist.dDat2      := Raise.ToDate;
+    RaiseHist.DocNmb     := TitleDoc.DocNmb;
+    RaiseHist.DocDate    := TitleDoc.DocDate;
+    RaiseHist.RhSum      := Raise.Sum;
+    update current RaiseHist;
+    _log.LogLine(APE_MESSAGE, 'Изменена запись истории надбавок');
+  }
+
+  //Определяем GP_RaiseHistExt111
+  if getfirst GP_RaiseHistExt111 != tsOk
+  {
+    ClearBuffer(tnGP_RaiseHistExt111);
+    GP_RaiseHistExt111.cRaiseH   := RaiseHist.nrec;
+    GP_RaiseHistExt111.cPerson   := ContDoc.Person;
+    GP_RaiseHistExt111.PolisDMS  := tData.PolicyNumber;
+    GP_RaiseHistExt111.DateBeg   := Raise.FromDate;
+    GP_RaiseHistExt111.DateEnd   := Raise.ToDate;
+    GP_RaiseHistExt111.cVarStrah := tData.InsuranceOptionNrec;
+    //GP_RaiseHistExt111.SummaVoz  := tData.Cost;   // Лист "2. Включить": Не заполнять поле "Сумма возмещения" данными из колонки "Стоимость полиса". (Чемарова Маргарита 20.12.2017 20:17)
+    insert current GP_RaiseHistExt111;
+    _log.LogLine(APE_MESSAGE, 'Добавлена запись о полисе ДМС');
+  }
+  else
+  {
+    GP_RaiseHistExt111.PolisDMS  := tData.PolicyNumber;
+    GP_RaiseHistExt111.DateBeg   := Raise.FromDate;
+    GP_RaiseHistExt111.DateEnd   := Raise.ToDate;
+    GP_RaiseHistExt111.cVarStrah := tData.InsuranceOptionNrec;
+    GP_RaiseHistExt111.SummaVoz  := tData.Cost;
+    update current GP_RaiseHistExt111;
+    _log.LogLine(APE_MESSAGE, 'Изменена запись о полисе ДМС');
+  }
+}
+
+//Обрабатывает текущую запись tData: регистрирует в приказе прекращение действия полиса
+procedure ImportCurrentData_Remove;
+{
+  if not ImportCurrentData_FindOrCreateContDoc exit;
+
+  _raiseNrecForDel := GetRaiseNrecForDeletion(tData.PolicyNumber, tData.PersonsNrec, tData.StartDate);
+
+  if getfirst RaiseForDel != tsOk
+  {
+    _log.LogLine(APE_ERROR, 'Не найдена надбавка, соответствующая полису ДМС №' + tData.PolicyNumber +
+                            ', действующему на ' + tData.StartDate);
+    exit;
+  }
+
+  if GetFirst DelRaise != tsOk
+  {
+    ClearBuffer(#DelRaise);
+    DelRaise.iRaseAttr     := RaiseForDel.RaiseAttr;
+    DelRaise.cRaiseType    := RaiseForDel.RaiseType;
+    DelRaise.cCurrency     := RaiseForDel.RaiseCurr;
+    DelRaise.cAppointments := RaiseForDel.Appoint;
+    DelRaise.cRaiseSTS     := RaiseForDel.cStRaise;
+    DelRaise.dSum1         := RaiseForDel.Sum;
+    DelRaise.dFromDate     := RaiseForDel.FromDate;
+    DelRaise.dToDate       := RaiseForDel.ToDate;
+    DelRaise.wPrizn2       := RaiseForDel.wPriz2;
+    DelRaise.dRaiseAbort   := tData.StartDate;
+    DelRaise.dDopDate      := RaiseForDel.dDop1;
+    DelRaise.sOrderNmb2    := RaiseForDel.OrderNmb2;
+    DelRaise.dOrderDate2   := RaiseForDel.OrderDate2;
+    DelRaise.wPrizn        := RaiseForDel.wPrizn;
+    DelRaise.cCat1         := RaiseForDel.cCat1;
+    DelRaise.cOrderCont2   := RaiseForDel.cRDop;
+    DelRaise.cSource       := RaiseForDel.nRec;
+    DelRaise.wTypeInfo     := cgDelRaiseRPD10;
+    DelRaise.cOrderCont1   := ContDoc.nRec;
+    DelRaise.cRef1         := ContDoc.Person;
+    DelRaise.cRef2         := TitleDoc.nRec;
+    insert current DelRaise;
+    _log.LogLine(APE_MESSAGE, 'Добавлена запись в доплаты для снятия');
+  }
+  else
+  {
+    DelRaise.dRaiseAbort   := tData.StartDate;
+    //DelRaise.cOrderCont1   := ContDoc.nRec;
+    //DelRaise.cRef2         := TitleDoc.nRec;
+    update current DelRaise;
+    _log.LogLine(APE_MESSAGE, 'Изменена доплата для снятия');
+  }
+
+}
+
+//Создает/модифицирует записи в приказе по данным в таблице tData
+procedure ImportLoadedData;
+{
+  _log.LogStartVisual('Импорт загруженных данных', RecordsInTable(#tData));
+
+  _loop tData
+  {
+
+    case tData.AlgId of
+      ALG_ID_ADD    :
+      {
+        _log.LogMessage(APE_MESSAGE, 'Сотрудник: ' + _personsFunctions.GetFIO(tData.PersonsNrec) + '; ' +
+                                     'Операция: Добавление; ' +
+                                     'Полис №' + tData.PolicyNumber + ' с ' + tData.StartDate + ' по ' + tData.EndDate + ';' +
+                                     'Вариант:' + _catalogsFunctions.GetCatalogsName(tData.InsuranceOptionNrec) + ';' +
+                                     'Сумма: ' + tData.Cost);
+        ImportCurrentData_Add;
+        _log.LogCommit;
+      }
+      ALG_ID_REMOVE :
+      {
+        _log.LogMessage(APE_MESSAGE, 'Сотрудник: ' + _personsFunctions.GetFIO(tData.PersonsNrec) + '; ' +
+                                     'Операция: Отмена; Полис №' + tData.PolicyNumber + '; Дата: ' + tData.StartDate);
+        ImportCurrentData_Remove;
+        _log.LogCommit;
+      }
+      ALG_ID_MODIFY :
+      {
+        _log.LogMessage(APE_MESSAGE, 'Сотрудник: ' + _personsFunctions.GetFIO(tData.PersonsNrec) + '; ' +
+                                     'Операция: Изменение; ' +
+                                     'Полис №' + tData.PolicyNumber + ' с ' + tData.StartDate + ' по ' + tData.EndDate + ';' +
+                                     'Вариант:' + _catalogsFunctions.GetCatalogsName(tData.InsuranceOptionNrec) + ';' +
+                                     'Сумма: ' + tData.Cost);
+
+        _log.LogMessage(APE_MESSAGE, 'Добавление');
+        ImportCurrentData_Add;
+        _log.LogCommit;
+
+        _log.LogMessage(APE_MESSAGE, 'Отмена');
+        update current tData set tData.StartDate := Sub_Day(tData.StartDate, 1); //дата окончания старой надбавки на день раньше даты начала действия новой
+        ImportCurrentData_Remove;
+        _log.LogCommit;
+
+        _log.LogCommit;
+      }
+    end; //case
+
+    if not _log.LogNextVisual('') break;
+
+  } //_loop tData
+
+  _log.LogStopVisual;
+}
+
+handleevent
+  cmInit:
+  { timelog_init;
+    if vInsuranceOption.getfirst catParent != tsOk
+    {
+      message('Не найден каталог "Варианты страхования" с системным кодом 4006', error);
+      Abort;
+      Exit;
+    }
+
+    _raiseTypeNrec := coGetTune('UP.STAFF.PRIKAZ_PERS.DOPLATY.RPD111');
+    if _raiseTypeNrec = 0
+    {
+      message('Не определен вид надбавки для полиса ДМС', error);
+      Abort;
+      Exit;
+    }
+
+    if getfirst PartDoc != tsOk
+    {
+      _log.LogLine(APE_ERROR, 'Не найдено распорядительное действие. Nrec = ' + string(_partDocNrec, 0, 0));
+      exit;
+    }
+
+    if getfirst TitleDoc != tsOk
+    {
+      _log.LogLine(APE_ERROR, 'Не найден приказ');
+      exit;
+    }
+
+    //Запросим имя файла Excel для импорта
+    if _importFilePath = ''
+      _importFilePath := GetFileName('*.xls;*.xlsx','Выберите файл Excel для импорта полисов ДМС');
+
+    //Инициализируем настройки
+    InitConf;
+
+    _log.AutoFlush := true;
+    _log.Visible := true;
+
+    //Прочитаем и проверим данные
+    if LoadData
+      //Если загрузили без ошибок - импортируем загруженные данные
+      ImportLoadedData;
+    else
+      message('При проверке файла обнаружены ошибки');
+
+    _log.Refresh;
+
+  }
+end; //HandleEvent
+
+end.

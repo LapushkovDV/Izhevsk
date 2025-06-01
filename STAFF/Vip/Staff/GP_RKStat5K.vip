@@ -1,0 +1,1158 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                лист 5-К "Сведения о количестве работников, получивших                           *
+*                социальные гарантии и компенсации, а также о награждении работников"             *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:    Отчеты пользователя                                                              *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#365          |27/06/18|Потапов А.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_RKStat.vih
+#include CatFunc.vih
+#include APPFUNCS.VIH
+#include TotalOrganizationAttributes.vih
+#include GP_ChRPD.vih
+#include StrFunc.vih
+#include GP_UDR_RKStat.vih
+
+#define GPInt GP_RKStat_List5K // #(GPInt)
+#define GPNam 05-К "Сведения о количестве работников, получивших социальные гарантии и компенсации, а также о награждении работников" ЭМ // #(GPNam)
+
+VipInterface #(GPInt) Implements IGP_RKStat;
+Interface #(GPInt);
+
+const
+#include Excel.inc;
+//--------------
+wAgeUpTo1 = 29;
+wAgeUpTo2 = 49;
+// iRPDBase = 9;
+// iRPD_3_8 = 9;
+//--------------
+end;
+#include TotalOrganizationAttributes.var
+
+table struct ttStat5K
+(
+  wRow  : word
+, dbVal  : array [1..2] of double
+)
+with index
+(
+  ttStat5K01 = wRow
+);
+table struct ttPsn5K
+(
+  cPsn    : comp
+, sTBN    : string[20] 
+, sFIO    : string[60] 
+, sPodr   : string
+, wRow    : word
+, dApp    : date
+, dDiss   : date
+, wAge    : word
+, wYear   : word
+, iKodRPD : integer
+, sNameRPD: string
+, dDateRPD: date
+, sNmbRPD : string[20] 
+, dBeg    : date
+, dEnd    : date
+, dStop   : date
+)
+with index
+(
+  ttPsn5K01 = cPsn + wRow + wYear
+, ttPsn5K02 = sFIO + dDateRPD
+, ttPsn5K03 = wYear
+);
+
+var
+  dRep          : date;
+  iCatFunc      : CatalogsFunctions;
+  iAppFuncs     : AppointmentsFunctions;
+  iStrFunc      : StringFunctions;
+  iChRPD        : GP_ChRPD;
+  iUDR          : GP_UDR_RKStat;
+//  sFullName     : string;
+  sPodr1        : string;
+  mPodr1        : TPtr;
+  wPrintRash    : word;
+  wToExistFile  : word;
+  sToExistFile  : string;
+  wFromExistFile  : word;
+  sFromExistFile  : string;
+  wPensM   : word = 0;
+  wPensF   : word = 0;
+  __cAppoint    : comp;
+  cVeteran      : comp;
+  isStayAloneAll: boolean = false;
+
+create view
+var
+  dBeg
+, dEnd: date;
+from
+  ttStat5K
+, ttPsn5K
+, ttPsn5K mtPsn5K2Del
+, raisehist
+, Raise
+, ContDoc ContDocR
+, Appointments AppointmentsR
+, Persons PersonsR
+, Fortune
+, ContDoc ContDocF
+, Appointments AppointmentsF
+, Persons PersonsF
+, NPF
+, Persons PersonsN
+, Appointments AppointmentsN
+, Persons PsnRS
+, TypePr RPDRS
+, Catalogs CatR
+, Catalogs CatV
+, GP_RaiseHistExt111
+where
+((
+//---All Block by RaiseHist
+//Почему (noindex)?...
+//Условия описанные в ТЗ и структура БД не позволяют организовать индексированную подцепку в выборке
+//В соответствующих таблицах либо нет требуемого поля вообще, либо поле есть, но нет подходящего индекса
+//    dBeg                <<= raisehist.DocDate (noindex) and (dEnd >= raisehist.DocDate and raisehist.wTypeOper = 9)
+    dBeg                <<= raisehist.DRec (noindex) and (dEnd >= raisehist.DRec and raisehist.wTypeOper = 9)
+and raisehist.cContDoc   == ContDocR.nRec
+and raisehist.cRaise     == raise.nrec
+//and ContDocR.cStr        == AppointmentsR.nRec
+and __cAppoint           == AppointmentsR.nRec
+and AppointmentsR.Person == PersonsR.nRec
+and raisehist.cRaiseType == CatR.nRec
+and RaiseHist.nrec       == GP_RaiseHistExt111.cRaiseH
+//---All Block by Fortune
+and dBeg                <<= Fortune.Dat1 and (dEnd >= Fortune.Dat1)
+and Fortune.cFCont       == ContDocF.nRec
+and ContDocF.cStr        == AppointmentsF.nRec
+and AppointmentsF.Person == PersonsF.nRec
+//---All Block by NPF
+//Why (noindex)?... Because of Условия описанные в ТЗ и структура БД...
+and dRep        >>= NPF.DateOfPayment (noindex)
+and NPF.cPersons == PersonsN.nRec
+))
+;
+
+function sSetPodrName(mSetPdr: TPtr): string;
+{
+  if (getMarkerCount(mSetPdr) = 0)
+  {
+    result := 'Все подразделения';
+    exit;
+  }
+  else
+    if (getMarkerCount(mSetPdr) = 1)
+    {
+      var cTmp: comp;
+      GetMarker(mSetPdr, 0, cTmp);
+        result := iCatFunc.GetCatalogsName(cTmp);
+    }
+    else
+      result := 'Несколько подразделений (' + string(getMarkerCount(mSetPdr)) + ')';
+}
+
+function wWhatAgeRow(dBorn, dOnDate : date) : word;
+{
+  var wAgeUpTo : word;
+  wAgeUpTo := Year(Sub_Date(dOnDate,dBorn))-1;
+  if wAgeUpTo <= wAgeUpTo1
+    result := 5
+  else
+    if wAgeUpTo <= wAgeUpTo2
+      result := 7
+    else
+      result := 0;
+}
+
+procedure LocateSetRow(wRowT : word; isCur : boolean);
+{
+  if wRowT = 0 exit;
+  ClearBuffer(#ttStat5K);
+  if ( getfirst ttStat5K where ((wRowT==ttStat5K.wRow)) <> tsOk )
+  {
+    ttStat5K.wRow := wRowT;
+    insert current ttStat5K;
+  }
+  if isCur
+    ttStat5K.dbVal[1] += 1
+  else
+    ttStat5K.dbVal[2] += 1;
+  update current ttStat5K;
+}
+
+procedure LocateSetRowPrev(wRowT : word; dbAny : double);
+{
+  if wRowT = 0 exit;
+  ClearBuffer(#ttStat5K);
+  if ( getfirst ttStat5K where ((wRowT==ttStat5K.wRow)) <> tsOk )
+  {
+    ttStat5K.wRow := wRowT;
+    insert current ttStat5K;
+  }
+  ttStat5K.dbVal[2] += dbAny;
+  update current ttStat5K;
+}
+
+function LocateReturnRow(wRowT : word; var dbValT1,dbValT2 : double) : boolean;
+{
+  result := false;
+  if wRowT = 0 exit;
+  if ( getfirst ttStat5K where ((wRowT==ttStat5K.wRow)) = tsOk )
+  {
+    result :=  true;
+    dbValT1:= ttStat5K.dbVal[1];
+    dbValT2:= ttStat5K.dbVal[2];
+  }
+}
+
+function isPsnCurSet(dAny : date) : boolean;
+{
+  if dAny >= date( 1, 1,Year(dRep)) and dAny <= dRep
+    result := true
+  else
+    result := false;
+}
+
+function isPsnFirstInRow(cPsnT : comp; wRowT : word; iRPD : integer; dOnDate : date; wMode : word; _dUse: date = 0; _wYear: word = 0) : boolean;
+{
+  result := false;
+  if ( wRowT = 0 ) exit;
+  if ( _wYear = 0 )
+  {
+    if ( _dUse <> 0 )
+      _wYear := Year(_dUse)
+    else
+      _wYear := Year(dOnDate);
+  }
+  if ( getfirst ttPsn5K where((cPsnT == ttPsn5K.cPsn and wRowT == ttPsn5K.wRow and _wYear == ttPsn5K.wYear)) <> tsOk )
+    result := true;
+  if ( getfirst PsnRS where((cPsnT==PsnRS.nrec)) = tsOk )
+  {
+    clearbuffer(#ttPsn5K);
+    ttPsn5K.cPsn := cPsnT;
+    ttPsn5K.sTBN := PsnRS.STRTABN;
+    ttPsn5K.sFIO := PsnRS.FIO;
+    ttPsn5K.wRow := wRowT;
+    ttPsn5K.dApp := PsnRS.APPDATE;
+    ttPsn5K.dDiss:= PsnRS.DISDATE;
+    ttPsn5K.wAge := Year(Sub_Date(if(_dUse<>0, _dUse, dOnDate),PsnRS.BornDate))-1;
+    ttPsn5K.wYear:= _wYear;//Year(dOnDate);
+    if getfirst RPDRS where((iRPD == RPDRS.CodOper)) = tsOk
+    {
+      ttPsn5K.iKodRPD  := RPDRS.CodOper;
+      ttPsn5K.sNameRPD := RPDRS.NOper;
+    }
+    //iCatFunc.GetCatalogsCode(Appointments.Department);
+    case wMode of
+    1:{
+        ttPsn5K.dDateRPD:= RaiseHist.DocDate;
+        ttPsn5K.sNmbRPD := RaiseHist.DocNmb;
+        ttPsn5K.sPodr   := iCatFunc.GetCatalogsCode(AppointmentsR.Department);
+        if ( trim(ttPsn5K.sPodr) = '' )
+          ttPsn5K.sPodr   := iCatFunc.GetCatalogsName(AppointmentsR.Department);
+        ttPsn5K.dBeg    := RaiseHist.DRec;
+        ttPsn5K.dEnd    := RaiseHist.DDat2;
+        ttPsn5K.dStop   := raise.DRABORT;
+      }
+    2:{
+        ttPsn5K.dDateRPD:= PsnRS.PensionDate;
+        ttPsn5K.sNmbRPD := RaiseHist.DocNmb;
+        ttPsn5K.sPodr   := iCatFunc.GetCatalogsCode(AppointmentsR.Department);
+        if ( trim(ttPsn5K.sPodr) = '' )
+          ttPsn5K.sPodr   := iCatFunc.GetCatalogsName(AppointmentsR.Department);
+        ttPsn5K.dBeg    := RaiseHist.DRec;
+        ttPsn5K.dEnd    := RaiseHist.DDat2;
+        ttPsn5K.dStop   := raise.DRABORT;
+      }
+    3:{
+        ttPsn5K.dDateRPD:= Fortune.DocDate;
+        ttPsn5K.sNmbRPD := Fortune.DocNmb;
+        ttPsn5K.sPodr   := iCatFunc.GetCatalogsCode(AppointmentsF.Department);
+        if ( trim(ttPsn5K.sPodr) = '' )
+          ttPsn5K.sPodr   := iCatFunc.GetCatalogsName(AppointmentsF.Department);
+      }
+    4:{
+        ttPsn5K.dDateRPD:= PsnRS.PensionDate;
+        ttPsn5K.sNmbRPD := '**'+Fortune.DocNmb;
+        ttPsn5K.sPodr   := iCatFunc.GetCatalogsCode(AppointmentsF.Department);
+        if ( trim(ttPsn5K.sPodr) = '' )
+          ttPsn5K.sPodr   := iCatFunc.GetCatalogsName(AppointmentsF.Department);
+      }
+    5:{
+        ttPsn5K.dDateRPD:= NPF.DateOfPayment;
+        ttPsn5K.sPodr   := iCatFunc.GetCatalogsCode(AppointmentsN.Department);
+        if ( trim(ttPsn5K.sPodr) = '' )
+          ttPsn5K.sPodr   := iCatFunc.GetCatalogsName(AppointmentsN.Department);
+      }
+    end;
+    insert current ttPsn5K;
+  }
+}
+
+function isWorkerOnDate(cPsnT : comp; dOnDate : date) : boolean;
+{
+  result := false;
+  if getfirst PsnRS where((cPsnT==PsnRS.nrec)) = tsOk
+    if PsnRS.DisDate = 0 or PsnRS.DisDate >= dOnDate
+      result := true;
+}
+
+function isPensAge(dBorn, dRep: date; sSex : string[1]): boolean;
+{
+  var wAgePsn : word = Year(Sub_Date(dRep,dBorn))-1;
+  result := false;
+  if ( ( sSex = 'М' and wAgePsn >= wPensM ) or ( sSex = 'Ж' and wAgePsn >= wPensF ) )
+    result := true;
+}
+
+function isPensioneerOnDate(cPsnT : comp; dOnDate : date) : boolean;
+{
+  result := false;
+  if getfirst PsnRS where((cPsnT==PsnRS.nrec)) = tsOk
+    if ( ( PsnRS.PensionDate <> 0 and PsnRS.PensionDate <= dOnDate ) and PsnRS.DisDate <= dOnDate )
+      result := true;
+
+  if not result
+    if ( isPensAge(PsnRS.BornDate, dOnDate, PsnRS.Sex) and ( PsnRS.DisDate <= dOnDate ) )
+      result := true;
+}
+
+
+function wWhatRow(iType : integer) : word;
+{
+  case iType of
+//  iRPD_3_8: result := 3;
+       111: result := 15;
+       113: result := 19;
+       108: result := 21;
+        30: result := 23;
+       115: result :=  3;
+  else      result :=  0;
+  end;
+/*
+  if isValid(#CatR)
+    if ( trim(CatR.CatData) = '79' or trim(CatR.CatData) = '97' )
+      result := 3;
+*/
+}
+
+function OpenFromRKS : boolean;
+{
+  result := false;
+  xlOpenExcel(true);
+  xlDisplayAlerts(false);
+  if xlOpenWorkBook(sFromExistFile)
+    result := true;
+}
+function CloseFromRKS : boolean;
+{
+  result := false;
+  if xlCloseWorkBookByName(sFromExistFile)
+//  if xlKillExcel
+    result := true;
+    // только ради того, чтобы прибить Книгу1, которая непонятно чем открывается и висит 2 файла
+    if xlGetActiveWorkBookName('Книга1')
+      xlCloseWorkBookByName('Книга1');
+  xlDisplayAlerts(true);
+  if isStayAloneAll
+    xlKillExcel;
+}
+
+function isPsnInPeriod(dBeg, dEnd, dStop, dBRep, dERep: date): boolean;
+{
+  result := false;
+  if ( dStop <> 0 )
+    dEnd := dStop;
+  result := iStrFunc.isCrossPeriod(dBeg, dEnd, dBRep, dERep);
+}
+function isNotVeteran(cPodr: comp): boolean; cacheable;
+{
+  result := true;
+  if ( cVeteran <> 0 )
+    if ( cVeteran = cPodr )
+      result := false;
+}
+
+procedure Make5K;
+{
+  var isFilterPodr : boolean = false;
+  var wKatEmpl : word = 0;
+  var cAppDept : comp = comp(0);
+  var isPsnCur : boolean;
+  var isPsnC, isPsnP: boolean;
+  var wRowT    : word;
+  var isFirstInRow: boolean;
+  
+
+//  message(wPensM+' '+wPensF);
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Формируются данные для Листа 5-к.', 0);
+  if (GetMarkerCount(mPodr1) > 0) isFilterPodr:=true;
+/*
+  if ( wFromExistFile = 0 )
+    set dBeg := date(1,1,Year(dRep)-1)
+  else
+    set dBeg := date(1,1,Year(dRep));
+*/
+  set dBeg := date(1,1,Year(dRep)-1);
+  set dEnd := dRep;
+
+  if isvalid(#raisehist)
+  _loop raisehist
+  {
+    if (not NextVisual) break;
+    if isvalid(#ContDocR)
+    if iChRPD.isConfirmed(ContDocR.nRec)
+    {
+/*
+      if ( ContDocR.cStr = comp(0) )
+      {
+        set __cAppoint := iAppFuncs.GetOldAppNrec_OnDate(ContDocR.Person, raisehist.DREC);
+      }
+      else
+      {
+        set __cAppoint := ContDocR.cStr;
+      }
+*/
+//      set __cAppoint := iAppFuncs.GetAppNrec_OnDate(ContDocR.Person, raisehist.DREC);//iAppFuncs.GetOldAppNrec_OnDate
+      set __cAppoint := iAppFuncs.GetOldAppNrec_OnDate(ContDocR.Person, raisehist.DREC);//iAppFuncs.GetOldAppNrec_OnDate
+      if not isvalid(#AppointmentsR)
+      {
+        set __cAppoint := ContDocR.cStr;
+        if isvalid(#AppointmentsR) {}
+      }
+//      if isvalid(#AppointmentsR)
+      if isvalid(#PersonsR)
+      {
+        if isFilterPodr
+          if ( not FoundMarker(mPodr1, AppointmentsR.Department) ) continue;
+        if ( isWorkerOnDate(PersonsR.nRec, raisehist.DREC/*RaiseHist.DOCDATE*/) and isNotVeteran(AppointmentsR.Department) )
+        {
+          isFirstInRow := false;
+          wRowT := wWhatRow(ContDocR.TypeOper);
+          isPsnCur := isPsnCurSet(RaiseHist.DRec/*RaiseHist.DOCDATE*/);
+          if ( wFromExistFile = 1 )
+            if ( ( not isPsnCur ) and ( wRowT <> 15 ) )
+              continue;
+          if ( wRowT = 15 )
+          {
+            if isValid(#GP_RaiseHistExt111)
+            {
+              isPsnC := isPsnInPeriod(GP_RaiseHistExt111.DateBeg, GP_RaiseHistExt111.DateEnd, raise.DRABORT, date( 1, 1,Year(dRep)), dRep);
+              if ( wFromExistFile = 0 )
+                isPsnP := isPsnInPeriod(GP_RaiseHistExt111.DateBeg, GP_RaiseHistExt111.DateEnd, raise.DRABORT, dBeg, sub_day(date( 1, 1, Year(dRep)), 1))
+              else
+                isPsnP := false;
+              if ( wFromExistFile = 1 )
+                if not isPsnC
+                  continue;
+              isFirstInRow := isPsnFirstInRow(PersonsR.nRec, wRowT, ContDocR.TypeOper, GP_RaiseHistExt111.DateBeg, 1, 0, if(isPsnC, year(dRep), 0));
+            }
+          }
+          else
+            isFirstInRow := isPsnFirstInRow(PersonsR.nRec, wRowT, ContDocR.TypeOper, RaiseHist.DRec/*RaiseHist.DOCDATE*/, 1);
+          if isFirstInRow
+          {
+  //          isPsnCur := isPsnCurSet(RaiseHist.DRec/*RaiseHist.DOCDATE*/);
+            
+            if wRowT <> 15
+              LocateSetRow(wRowT, isPsnCur);
+            if wRowT = 3
+              LocateSetRow(wWhatAgeRow(PersonsR.BornDate,RaiseHist.DRec/*RaiseHist.DOCDATE*/), isPsnCur);
+            if wRowT = 15
+              if isValid(#GP_RaiseHistExt111)
+              {
+                if isPsnC
+                {
+                  LocateSetRow(wRowT, true);
+                  LocateSetRow( 17, true);
+                }
+                if isPsnP
+                {
+                  LocateSetRow(wRowT, false);
+                  LocateSetRow( 17, false);
+                }
+              }
+  /*
+                if (  (      isPsnCur
+                      and ( GP_RaiseHistExt111.DateBeg >= date( 1, 1,Year(dRep)) and GP_RaiseHistExt111.DateBeg <= dRep )
+                      )
+                   or (( not isPsnCur ) 
+                      and ( GP_RaiseHistExt111.DateBeg >= dBeg and GP_RaiseHistExt111.DateBeg <  date( 1, 1,Year(dRep)) )
+                      )
+                   )
+                  LocateSetRow(17, isPsnCur);
+  */
+          }
+        }
+        else
+          if ( isPensioneerOnDate(PersonsR.nRec,RaiseHist.DRec/*RaiseHist.DOCDATE*/) or ( not isNotVeteran(AppointmentsR.Department) ) )
+  //          if ContDocR.TypeOper >= 101 and ContDocR.TypeOper <= 113
+            if ( ContDocR.TypeOper = 104 or ContDocR.TypeOper = 108 )
+            {
+              isPsnCur := isPsnCurSet(RaiseHist.DRec/*RaiseHist.DOCDATE*/);
+              if ( ( wFromExistFile = 1 ) and ( not isPsnCur ) )
+                continue;
+//isPsnFirstInRow(cPsnT : comp; wRowT : word; iRPD : integer; dOnDate : date; wMode : word; _dUse: date = 0; _wYear: word = 0)
+              if isPsnFirstInRow(PersonsR.nRec, 9, ContDocR.TypeOper, RaiseHist.DRec/*RaiseHist.DOCDATE*/, 1)
+                LocateSetRow( 9, isPsnCur);
+            }
+      }//if isvalid(#PersonsR)
+    }
+  }//_loop raisehist
+
+  if isvalid(#Fortune)
+  _loop Fortune
+  {
+    if (not NextVisual) break;
+    if isvalid(#ContDocF)
+    if iChRPD.isConfirmed(ContDocF.nRec)
+    if isvalid(#AppointmentsF)
+    if isvalid(#PersonsF)
+    {
+      if isFilterPodr
+      if (not FoundMarker(mPodr1,AppointmentsF.Department)) continue;
+      if isWorkerOnDate(PersonsF.nRec, Fortune.DocDate)
+      {
+        wRowT := wWhatRow(ContDocF.TypeOper);
+        if isPsnFirstInRow(PersonsF.nRec, wRowT, ContDocF.TypeOper, Fortune.DocDate, 3)
+          LocateSetRow(wRowT,isPsnCurSet(Fortune.DocDate));
+      }
+      else
+        if isPensioneerOnDate(PersonsF.nRec,Fortune.DOCDATE)
+          if ContDocF.TypeOper >= 101 and ContDocF.TypeOper <= 115
+            if isPsnFirstInRow(PersonsF.nRec, 9, ContDocF.TypeOper, Fortune.DOCDATE, 4)
+              LocateSetRow(9,isPsnCurSet(Fortune.DOCDATE));
+    }//if isvalid(#PersonsF)
+  }//_loop Fortune
+
+  var dRepP : date;
+  if isvalid(#NPF)
+  _loop NPF
+  {
+    if (not NextVisual) break;
+    if isvalid(#PersonsN)
+    {
+      if GetFirst AppointmentsN where ((iAppFuncs.GetAppNrec_OnDate(PersonsN.NRec, dRep) == AppointmentsN.NRec)) = tsOk
+      {
+        if isFilterPodr
+        if (not FoundMarker(mPodr1,AppointmentsN.Department)) exit;
+        if isWorkerOnDate(PersonsN.nRec, dRep)
+        {
+          if isPsnFirstInRow(PersonsN.nRec, 11, 0, dRep, 5)
+            LocateSetRow(11,true);
+        }
+        else
+        {
+          if isPsnFirstInRow(PersonsN.nRec, 13, 0, dRep, 5)
+            LocateSetRow(13,true);
+        }
+      }
+
+      if ( wFromExistFile = 0 )
+      {
+        dRepP := date(31,12,Year(dRep)-1);
+        if NPF.DateOfPayment <= dRepP
+        if GetFirst AppointmentsN where ((iAppFuncs.GetAppNrec_OnDate(PersonsN.NRec, dRepP) == AppointmentsN.NRec)) = tsOk
+        {
+          if isFilterPodr
+          if (not FoundMarker(mPodr1,AppointmentsN.Department)) exit;
+          if isWorkerOnDate(PersonsN.nRec, dRepP)
+          {
+            if isPsnFirstInRow(PersonsN.nRec, 11, 0, dRepP, 5)
+              LocateSetRow(11,false);
+          }
+          else
+          {
+            if isPsnFirstInRow(PersonsN.nRec, 13, 0, dRepP, 5)
+              LocateSetRow(13,false);
+          }
+        }
+      }
+    }//if isvalid(#PersonsN)
+  }//_loop NPF
+  if ( wFromExistFile = 1 )
+    if OpenFromRKS
+    {
+      if xlSetActiveSheetByName('5-к')
+      { //xlGetCellValue
+        var dbFrom: double = 0;
+        if xlGetCellValue( 6, 4, dbFrom)
+          LocateSetRowPrev( 3, dbFrom);
+//        message(' 6, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue( 8, 4, dbFrom)
+          LocateSetRowPrev( 5, dbFrom);
+//        message(' 8, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue(10, 4, dbFrom)
+          LocateSetRowPrev( 7, dbFrom);
+//        message('10, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue(12, 4, dbFrom)
+          LocateSetRowPrev( 9, dbFrom);
+//        message('12, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue(14, 4, dbFrom)
+          LocateSetRowPrev(11, dbFrom);
+//        message('14, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue(16, 4, dbFrom)
+          LocateSetRowPrev(13, dbFrom);
+//        message('16, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue(18, 4, dbFrom)
+          LocateSetRowPrev(15, dbFrom);
+//        message('18, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue(20, 4, dbFrom)
+          LocateSetRowPrev(17, dbFrom);
+//        message('20, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue(22, 4, dbFrom)
+          LocateSetRowPrev(19, dbFrom);
+//        message('22, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue(24, 4, dbFrom)
+          LocateSetRowPrev(21, dbFrom);
+//        message('24, 4='+dbFrom);
+        dbFrom := 0;
+        if xlGetCellValue(26, 4, dbFrom)
+          LocateSetRowPrev(23, dbFrom);
+//        message('26, 4='+dbFrom);
+        dbFrom := 0;
+      }
+      if CloseFromRKS {}
+    }
+  StopVisual;
+}
+
+function isData5K : boolean;
+{
+  if isvalid(#ttStat5K)
+    result := true
+  else
+    result := false;
+}
+
+
+procedure Print5K;
+{
+  var dbValT  : array [1..2] of double;
+  var i : integer;
+  
+  if isData5K
+  if xlSetActiveSheetByName('5-к')
+  {
+    StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Выгружаю данные для Листа 5-к в Excel.', 0);
+    TOA.Bind(0);
+    xlSetCellStringValue(DateToStr(dRep,'DD.MM.YYYY'),2,4,2,4);
+    xlSetCellStringValue(Trim(TOA1.GetNaming.GetFullName()),5,4,5,4);
+    for(i:=3;i<=23;i+=2)
+    {
+      if (not NextVisual) break;
+      if LocateReturnRow(i, dbValT[1], dbValT[2])
+      {
+        xlSetCellNumberValue(round(dbValT[1],0),3+i,4,3+i,4); 
+        xlSetCellNumberValue(round(if(dbValT[2]<>0,dbValT[1]/dbValT[2],0),4),4+i,4,4+i,4); 
+      }
+    }
+    StopVisual;
+  }
+}
+
+procedure Save5K;
+{
+  iUDR.SaveMarker('RKS5_mPodr1', mPodr1);
+  DoneMarker(mPodr1, '');
+  iUDR.SaveDate  ('RKS5_dRep'          , dRep        );
+  iUDR.SaveWord  ('RKS5_wToExistFile'  , wToExistFile);
+  iUDR.SaveString('RKS5_sToExistFile'  , sToExistFile);
+  iUDR.SaveWord  ('RKS5_wPrintRash'    , wPrintRash  );
+  iUDR.SaveWord  ('RKS5_wFromExistFile', wFromExistFile);
+  iUDR.SaveString('RKS5_sFromExistFile', sFromExistFile);
+}
+procedure Clear5K;
+{
+  delete all from ttStat5K;
+}
+procedure init5K;
+{
+  set dRep := iUDR.ReadDate('RKS5_dRep');
+  if dRep = 0
+    set dRep := To_Date(31,12,Year(Cur_Date));
+  
+  set wPrintRash   := iUDR.ReadWord  ('RKS5_wPrintRash'  );
+  set sToExistFile := iUDR.ReadString('RKS5_sToExistFile');
+  set wToExistFile := iUDR.ReadWord  ('RKS5_wToExistFile');
+  set sFromExistFile := iUDR.ReadString('RKS5_sFromExistFile');
+  set wFromExistFile := iUDR.ReadWord  ('RKS5_wFromExistFile');
+  
+  if wToExistFile = 1 
+    ToggleFieldVisible(#sToExistFile,true )
+  else
+    ToggleFieldVisible(#sToExistFile,false);
+  
+  if wFromExistFile = 1 
+    ToggleFieldVisible(#sFromExistFile,true )
+  else
+    ToggleFieldVisible(#sFromExistFile,false);
+
+  mPodr1     := iUDR.ReadMarker('RKS5_mPodr1');
+  set sPodr1 := sSetPodrName(mPodr1);
+
+  if ExistTune('UP.PENSFOND.AGEMALENEW')
+    wPensM := word(doGetTune('UP.PENSFOND.AGEMALENEW'))
+  else
+    wPensM := word(doGetTune('  '));
+  if ExistTune('UP.PENSFOND.AGEFEMALENEW')
+    wPensF := word(doGetTune('UP.PENSFOND.AGEFEMALENEW'))
+  else
+    wPensF := word(doGetTune('UP.PENSFOND.AGEFEMALE'));
+  
+  cVeteran := iCatFunc.GetCatalogsNRec(-11);
+  if ( getfirst CatV where((0 == CatV.LPr and cVeteran == CatV.MainLink and 'Ветераны' == CatV.Name)) = tsOk )
+    cVeteran := CatV.nRec;
+}
+
+function isCheckRepParam(isStayAlone : boolean) : boolean;
+{
+  result := false;
+  if dRep = 0
+  {if isStayAlone message('Не задана дата!'); exit;}
+  if ( day(dRep) = 31 and month(dRep) = 12 ) {}
+  else
+  {
+    if isStayAlone
+      if ( message('Дата формирования отчета отличается от регламентной!'#3+chr(13)+'Продолжить?'#3, Information+yesNo) <> cmYes )
+        exit;
+  }
+  if wToExistFile = 1
+  if not ExistFile(sToExistFile)
+  {if isStayAlone message('Ошибка открытия файла результата!'); exit;}
+  if wFromExistFile = 1
+  if not ExistFile(sFromExistFile)
+  {if isStayAlone message('Ошибка открытия входного файла!'); exit;}
+  result := true;
+}
+//++++++++++++++++++++++++++++++++++++++++++++++++
+window Win5KParamEx 'Параметры формирования. Лист 5-К.' Gray;
+//  show at (,,95,32);
+  show at (,,95,14);
+Screen sEx(,,sci1Esc);
+  fields
+    dRep   ('Дата формирования'): {Font = {BackColor = if(dRep = 0, ColorNeed, 0)}}, noprotect;
+    sPodr1 ('Выбранные подразделения',hcStaffAppDepartment,sci13Esc): {Font = {BackColor = if(sPodr1 = 'Не выбраны подразделения', ColorNeed, 0)}},Protect, PickButton ;
+    wFromExistFile('Считать данные за прошлый период из файла'), noprotect;
+    sFromExistFile('Считать данные за прошлый период из файла',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sToExistFile = '', ColorNeed, 0)}},protect;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+<< 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ Регламентная дата формирования 31 декабря
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  [.] Считать данные за прошлый период из файла`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   <. ~С~охранить .>                                                        <. ~З~акрыть .>
+>>
+end;
+HandleEvent
+  cmOK:
+  {
+    Save5K;
+    init5K;
+    if not isCheckRepParam(true)
+      exit;
+    CloseWindowEx(CurWindow,cmDefault);
+  }
+  cmCancel:
+  {
+    Save5K;
+    CloseWindowEx(CurWindow,cmCancel);
+  }
+end;
+end;//Win4KParamEx
+//++++++++++++++++++++++++++++++++++++++++++++++++
+//++++++++++++++++++++++++++++++++++++++++++++++++
+window Win5KParam 'Параметры формирования. Лист 5-К.' Gray;
+//  show at (,,95,34);
+  show at (,,95,14);
+Screen s1(,,sci1Esc);
+  fields
+    dRep   ('Дата формирования'): {Font = {BackColor = if(dRep = 0, ColorNeed, 0)}}, noprotect;
+    sPodr1 ('Выбранные подразделения',hcStaffAppDepartment,sci13Esc): {Font = {BackColor = if(sPodr1 = 'Не выбраны подразделения', ColorNeed, 0)}},Protect, PickButton ;
+    wPrintRash  ('Печать расшифровки'), noprotect;
+    wToExistFile('Добавить в существующий файл'), noprotect;
+    sToExistFile('Добавить в существующий файл',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sToExistFile = '', ColorNeed, 0)}},protect;
+    wFromExistFile('Считать данные за прошлый период из файла'), noprotect;
+    sFromExistFile('Считать данные за прошлый период из файла',, scStaffKatPodrRefsPick): {Font = {BackColor = if(sToExistFile = '', ColorNeed, 0)}},protect;
+  buttons
+    cmOk,,,'Запуск',,;
+    cmCancel,,,'Выход',,;
+<< 'Параметры отчета'
+
+ `Дата формирования       `.@@@@@@@@@@@
+ Регламентная дата формирования 31 декабря
+ `Подразделения для отчета`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   [.] Печать расшифровки`
+
+   [.] Добавить в существующий файл             `.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   [.] Считать данные за прошлый период из файла`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+   <. ~С~формировать .>                                                     <. ~З~акрыть .>
+>>
+end;
+
+HandleEvent
+  cmOK:
+  {
+    if not isCheckRepParam(true)
+      exit;
+    CloseWindowEx(CurWindow,cmDefault);
+  }
+end;
+end;//Win1KParam
+//++++++++++++++++++++++++++++++++++++++++++++++++
+
+function OpenNewRKS : boolean;
+{
+  result := false;
+  sToExistFile := TranslatePath('%ClientStartPath%') +'XLS_ЭМ\Staff\RKStat.xltm';
+  if xlCreateExcelWithTemplate(sToExistFile, true)
+    result := true;
+}
+function OpenExistRKS : boolean;
+{
+  result := false;
+  if xlOpenExcel(true)
+  {
+    // только ради того, чтобы прибить Книгу1, которая непонятно чем открывается и висит 2 файла
+    if xlGetActiveWorkBookName('Книга1')
+      xlCloseWorkBookByName('Книга1');
+    // только ради того, чтобы прибить Книгу1, которая непонятно чем открывается и висит 2 файла
+    if xlOpenWorkBook(sToExistFile)
+      result := true;
+  }
+}
+
+function SetParam5k : boolean;
+{
+  result := false;
+  if RunWindowModal(Win5KParam)=cmDefault
+    result := true;
+}
+procedure PrintRash;
+{
+  var lLine : longint;
+  var lRB, lRE, lCB, lCE : longint = 1;
+  var sAgeT: string;
+  var dAge : date;
+  var wDays, wMonths, wYears : word;
+
+
+  StartNewVisual(vtNumericVisual, vfTimer+vfBreak+vfConfirm,'Печать расшифровки.', 0);
+  lRB := lRE := 2;
+  lCB := 1;
+  lLine:=0;
+  xlMergeCells(1,1,1,4);
+  xlSetCellStringValue('Расшифровка листа 5. Данные на '+datetostr(dRep,'DD.MM.YYYY')+'.',1,1,1,1);
+//  message(Year(dRep));
+  delete all from mtPsn5K2Del where ((word(Year(dRep)-1) == mtPsn5K2Del.wYear));//mtPsn5K2Del.wYear <> Year(dRep);
+  if isvalid(#ttPsn5K)
+  {
+    lCE := 0;
+    //'+chr(10)+'
+    //, sTBN    : string[20] 
+   //, sFIO    : string[60] 
+   //, sPodr   : string
+
+    //
+    lCE++; xlSetCellStringValue('Номер'+chr(10)+'сторки'+chr(10)+'отчета',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Табельный'+chr(10)+'номер',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('ФИО',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Подразделение',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'приема'+chr(10)+'на работу',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'увольнения',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Возраст',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Год',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Номер и наименование РПД',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'приказа по персоналу'+chr(10)+'оформления пенсии'+chr(10)+'начала выплат в НПФ',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Номер приказа'+chr(10)+'по персоналу',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'начала',lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'конца', lRE,lCE,lRE,lCE);
+    lCE++; xlSetCellStringValue('Дата'+chr(10)+'отмены',lRE,lCE,lRE,lCE);
+    lRE++;
+
+    var lRecCount: longint = recordsintable(#ttPsn5K);
+    xlSetNumberFormat('@', lRE, 2, lRE+lRecCount, 2);
+    xlSetNumberFormat('@', lRE, 4, lRE+lRecCount, 4);
+    var wMatrixSizeRow: word = 100;
+    if (not xlCreateMatrix(wMatrixSizeRow, lCE))
+    {
+      message('Ошибка функции xlCreateMatrix.',error);
+      xlKillExcel;
+      StopVisual;
+      exit;
+    }
+    var lRowMatrix: longint = 1;
+    var lRowCurMx : longint = lRE;
+
+    #define FrmCl lRowMatrix, lCE
+    _loop ttPsn5K ordered index ttPsn5K02
+    {
+//      if ( wFromExistFile = 1 )
+//        if ( ttPsn5K.wYear < Year(dRep) )
+//          continue;
+      if (not NextVisual) break;
+      lCE := 0;
+      lCE++; xlStWriteToMatrix(#FrmCl, ttPsn5K.wRow);
+      lCE++; xlStWriteToMatrix(#FrmCl, ttPsn5K.sTBN);
+      lCE++; xlStWriteToMatrix(#FrmCl, ttPsn5K.sFIO);
+      lCE++; xlStWriteToMatrix(#FrmCl, ttPsn5K.sPodr);
+      lCE++; if ( ttPsn5K.dApp <> 0 ) xlDtWriteToMatrix(#FrmCl, ttPsn5K.dApp);
+      lCE++; if ( ttPsn5K.dDiss <> 0 ) xlDtWriteToMatrix(#FrmCl, ttPsn5K.dDiss);
+      lCE++; xlStWriteToMatrix(#FrmCl, ttPsn5K.wAge);
+      lCE++; xlStWriteToMatrix(#FrmCl, ttPsn5K.wYear);
+      lCE++; xlStWriteToMatrix(#FrmCl, ttPsn5K.iKodRPD+' '+ttPsn5K.sNameRPD);
+      lCE++; if ( ttPsn5K.dDateRPD <> 0 ) xlDtWriteToMatrix(#FrmCl, ttPsn5K.dDateRPD);
+      lCE++; xlStWriteToMatrix(#FrmCl, ttPsn5K.sNmbRPD);
+      lCE++; if ( ttPsn5K.dBeg <> 0 ) xlDtWriteToMatrix(#FrmCl, ttPsn5K.dBeg);
+      lCE++; if ( ttPsn5K.dEnd <> 0 ) xlDtWriteToMatrix(#FrmCl, ttPsn5K.dEnd);
+      lCE++; if ( ttPsn5K.dStop <> 0 ) xlDtWriteToMatrix(#FrmCl, ttPsn5K.dStop);
+/*
+      lCE++; xlSetCellStringValue(ttPsn5K.wRow                                                       ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetNumberFormat('@',lRE,lCE,lRE,lCE); xlSetCellStringValue(ttPsn5K.sTBN               ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttPsn5K.sFIO                                                       ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetNumberFormat('@',lRE,lCE,lRE,lCE); xlSetCellStringValue(ttPsn5K.sPodr              ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(if(ttPsn5K.dApp    <>0,datetostr(ttPsn5K.dApp    ,'DD.MM.YYYY'),''),lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(if(ttPsn5K.dDiss   <>0,datetostr(ttPsn5K.dDiss   ,'DD.MM.YYYY'),''),lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttPsn5K.wAge                                                       ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttPsn5K.wYear                                                      ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttPsn5K.iKodRPD+' '+ttPsn5K.sNameRPD                               ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(if(ttPsn5K.dDateRPD<>0,datetostr(ttPsn5K.dDateRPD,'DD.MM.YYYY'),''),lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellStringValue(ttPsn5K.sNmbRPD                                                    ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellDateValue(ttPsn5K.dBeg                                                       ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellDateValue(ttPsn5K.dEnd                                                       ,lRE,lCE,lRE,lCE);
+      lCE++; xlSetCellDateValue(ttPsn5K.dStop                                                      ,lRE,lCE,lRE,lCE);
+*/
+
+      lRE++;
+      lRowMatrix++;
+      
+      if ( lRowMatrix > wMatrixSizeRow )
+      {
+        if (not xlWriteMatrixToExcel(lRowCurMx, 1))
+          message('Ошибка функции xlWriteMatrixToExcel.', error);
+        xlFreeMatrix;
+        lRowCurMx += wMatrixSizeRow;
+        lRowMatrix := 1;
+        if (not xlCreateMatrix(wMatrixSizeRow, lCE))
+        {
+          message('Ошибка функции xlCreateMatrix.', error);
+          xlKillExcel;
+          StopVisual;
+          exit;
+        }
+      }
+    }
+    if (not xlWriteMatrixToExcel(lRowCurMx, 1))
+      message('Ошибка функции xlWriteMatrixToExcel.', error);
+    xlFreeMatrix;
+  }
+  lRE--;
+//  xlWrapText(lRB,lCB,lRB,lCE);
+  xlAutoFit(lRB/*+1*/,lCB,lRE,lCE);
+  xlAlignCellsEx(xlCenter,xlCenter,lRB,lCB,lRB,lCE);
+  xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB or xlInsideV or xlInsideH, xlThin,0,0, lRB,lCB,lRE,lCE);
+  xlSetCellStringValue('Версия отчета 20181003_1200', lRE+3, 1, lRE+3, 1);
+  xlSetFontSize( 5, lRE+3, 1, lRE+3, 1);
+  StopVisual;
+}
+
+procedure PrintRepPage(isStayAlone : boolean);
+{
+  var isOkFile : boolean = false;
+  var isDoRep  : boolean = false; 
+  
+  init5K;
+
+  if isStayAlone
+    if SetParam5k
+      isDoRep := true;
+  if not isStayAlone
+    isDoRep := isCheckRepParam(true);
+
+  if isDoRep
+  {
+    Make5K;
+//    PostProcess5K;
+    if isData5K
+    {
+      if isStayAlone
+      {
+        if wToExistFile = 0 {isOkFile := OpenNewRKS  ;}
+        if wToExistFile = 1 {isOkFile := OpenExistRKS;}
+      }
+      else
+      {
+        isOkFile := true;
+      }
+      if isOkFile
+      {
+        Print5K;
+
+        if (wPrintRash = 1) and isStayAlone
+        {
+          var i, j : integer = 0;
+          var s    : string = '';
+          xlGetSheetsCount(j);
+          while i<=j
+          {
+            xlSetActiveSheet(++i);
+            xlGetSheetName(i,s);
+            if s='5-к' break;
+          }
+          xlSetActiveSheet(++i);
+          xlAddSheet;
+          xlSetSheetName(i,'Расшифровка 5-К'); 
+          xlSetActiveSheet(i);
+          PrintRash;
+        }
+
+        xlSetActiveSheetByName('5-к');
+        if wToExistFile = 0 {sToExistFile:='';}
+        if isStayAlone
+          xlKillExcel;
+      }
+      else if isStayAlone message('Проверте наличие файла шаблона по пути EXE\XLS_ЭМ\Staff');
+    }
+    else if isStayAlone message('Нет данных для отчета.');
+  }
+  Save5K;
+  Clear5K;
+  closeinterface(cmDefault);
+}
+//++++++++++++++++++++++++++++++++++++++++++++++++
+//--------------------------------------------------------
+function bSetRepParam : boolean;  
+{
+  result := false;
+  if RunWindowModal(Win5KParamEx)=cmDefault
+    result := true;
+}//function bSetRepParam
+Function GetReportName: String;
+{
+  GetReportName := '#(GPNam) (ЭМ)';
+}
+function GetPriority : Integer;
+{
+  GetPriority := 5;
+}
+procedure initRKStatRepParam;
+{
+  init5K;
+}
+function dRepOnDateParam : date;
+{
+  dRepOnDateParam := dRep;
+}
+//--------------------------------------------------------
+handleevent
+  cmInit:
+  {
+    isStayAloneAll := true;
+    PrintRepPage(true);
+  }
+  cmPick:
+  {
+    case CurField of
+      #sPodr1:
+        if (RunInterface('PICKCATALOGEX', -11, 0, Comp(100), mPodr1) = cmDefault)
+          set sPodr1 := sSetPodrName(mPodr1);
+      #sToExistFile:
+      {
+        set sToExistFile := GetFileName('*.xls;*.xlsx;*.xlsm','Выбор файла...');
+      }
+      #sFromExistFile:
+      {
+        set sFromExistFile := GetFileName('*.xls;*.xlsx;*.xlsm','Выбор файла...');
+      }
+    end;
+  }
+  cmDelOnprotect:
+  {
+    case CurField of
+      #sPodr1:        {ClearMarker(mPodr1);      set sPodr1 := sSetPodrName(mPodr1);}
+      #sToExistFile:  {set sToExistFile:='';}
+      #sFromExistFile:{set sFromExistFile:='';}
+    end;
+  }
+  cmCheckField:
+  {
+    case CurField of
+      #wToExistFile:
+      {
+        if wToExistFile = 1 
+          ToggleFieldVisible(#sToExistFile,true )
+        else
+          ToggleFieldVisible(#sToExistFile,false);
+      }
+      #wFromExistFile:
+      {
+        if wFromExistFile = 1 
+          ToggleFieldVisible(#sFromExistFile,true )
+        else
+          ToggleFieldVisible(#sFromExistFile,false);
+      }
+    end;
+  }
+end;
+
+
+End.
+//---------------------------------------------------------------------------------
+#include UserReport.vih
+VipInterface UserReport_#(GPInt)R Implements IUserReport;
+Interface UserReport_#(GPInt)R;
+Procedure Run;
+{
+  runinterface(#(GPInt));
+}
+Function GetReportName: String;
+{
+  GetReportName := '#(GPNam) (ЭМ)';
+}
+Function GetGroupName (Level : Word) : String;
+{
+  GetGroupName := '';
+  Case Level of
+    1 : GetGroupName := 'Формы "Роскосмоса"';
+  End;
+}
+function GetPriority : Integer;
+{
+  GetPriority := 3;
+}
+function VisibleInModule(Ind : Byte) : String;
+{
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := 'STAFFMAINMENU';
+  end;
+}
+End.

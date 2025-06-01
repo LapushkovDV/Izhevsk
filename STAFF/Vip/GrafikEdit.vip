@@ -1,0 +1,283 @@
+/*************************************************************************************************\
+* Наименование: Интерфейс просмотра и редактирования графиков                                     *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#1127         |29/09/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include LinkedDaysAPI.inc // функционал работы с цепочками дней
+
+#include GP_CopyTemplateSpGraf.vih
+
+#component "Z_Calendar"
+alter interface GrafikEdit;
+OverloadFormats TemplateBrowse;
+
+Create view GrafikEditView
+as select
+  if (SpGraf.DayChas > 0 or SpGraf.DayMin>0, Time2StrDef(SpGraf.DayChas + SpGraf.DayMin / 60.0), 'выходной')
+  (fieldname = GP_WorkingHoursStr),
+
+  if (SpGraf.DayChas > 0 or SpGraf.DayMin>0, Time2StrDef(SpGraf.EvnChas + SpGraf.EvnMin / 60.0), 'выходной')
+  (fieldname = GP_EveningHoursStr),
+
+  if (SpGraf.DayChas > 0 or SpGraf.DayMin>0, Time2StrDef(SpGraf.NightChas + SpGraf.NightMin / 60.0), 'выходной')
+  (fieldname = GP_NightHoursStr)
+from
+  GP_WorkPatternExt,
+  WorkPattern PreHolidayPattern
+where((
+  TemplateWorkPattern.NRec==GP_WorkPatternExt.cWorkPattern and
+  GP_WorkPatternExt.cPreHolidayPattern==PreHolidayPattern.NRec
+));
+
+browse TemplateBrowse (,hcCha,sci178Esc);
+Table SpGraf;
+fields
+  {font = {color = if(SpGraf.DayChas = 0 and SpGraf.DayMin=0, ColorNotOk, 0)}};
+  Year(SpGraf.dDate) '№', 'п/п': [2], protect, noautosize;
+  GP_WorkingHoursStr
+    'Рабочих', 'часов'('Количество рабочих часов'): [8], noautosize, noprotect;
+  GP_EveningHoursStr
+    'Вечерних', 'часов' ('Количество часов работы в вечернее время'): [8], noautosize, noprotect;
+  GP_NightHoursStr
+    'Ночных', 'часов' ('Количество часов работы в ночное время'): [8], noautosize, noprotect;
+  ShiftDayKindStr
+    'День', 'смены' ('Для рабочих смен, переходящих на следующие сутки: 1 - начало смены, 2 - окончание смены, 2-1 - окончание одной смены и начало следующей'): [5],
+    noautosize, noprotect;
+  TemplateWorkPattern.NameP
+    'Шаблон рабочего дня' ('Наименование шаблона рабочего дня',, sci1378Esc): [40], protect, pickbutton;
+  PreHolidayPattern.NameP 'Шаблон предпраздничного дня' ('Шаблон предпраздничного дня'):
+    [40],Protect,NoDel;
+end;
+
+TableEvent table Grafik;
+cmCheckRecord:{
+  case inherited :: handleEvent (cmCheckRecord) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  if (IsTemplate and Grafik.LastDate=ZeroDate) {
+    message('Не указана дата отсчета.',error);
+    SelectFormat(TemplateEditsc);
+    SelectField(#Grafik.LastDate);
+    abort;
+  }
+}
+end;
+
+TableEvent table SpGraf;
+cmCheckField:{
+  case inherited :: handleEvent (cmCheckField) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  case CurField of
+    #GP_WorkingHoursStr,
+    #GP_EveningHoursStr,
+    #GP_NightHoursStr:
+    {
+      if (ErrorInExprField)
+      {
+        ErrorInExprField := false;
+        abort;
+      }
+
+      SetModified(true);
+    }
+  end;
+}
+end;
+
+HandleEvent
+cmInit:{
+  case inherited :: handleEvent (cmInit) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  if (IsTemplate) {
+    cfsSetProp('i_TEMPLATEEDITSC_GRAFIK.CODE',cfpSize_X,304);
+    cfsSetProp('i_TEMPLATEEDITSC_GRAFIK.NAME',cfpSize_X,500);
+    cfsSetExtProp('i_TEMPLATEEDITSC_GRAFIK.LASTDATE',cfpFontBackColor,if(Grafik.LastDate=ZeroDate,ColorNeed,0));
+    cfsSetProp('i_TEMPLATEEDITSC_PARENTSCHEDULENAMEFORTEMPL',cfpNoStatic,true);
+    ToggleFieldSelectable(fnParentScheduleName,false);
+  }
+}
+cmDone:{
+  case inherited :: handleEvent (cmDone) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  if (IsValidAll(tnGrafik))
+    SaveMyDsk(Grafik.NRec,'GrafikEdit_GrafikNRec')
+  else
+    ClearMyDsk('GrafikEdit_GrafikNRec');
+}
+
+cmPick:{
+    case curfield of
+    #TemplateWorkpattern.NameP:
+      {
+        parrec := cPrazdTemplate;
+        if (RunInterface('GP_WorkPattern', SPGRAF.CWORKPATTERN) <> cmCancel)
+        {
+          GatherWorkData(byte(0));
+
+          if (InterfaceType = 1) or  (InterfaceType= 2) // шаблоны графиков
+          {
+            // Сообщить цепочке дней, если день изменил свою робочесть
+            if ((SpGraf.DayChas > 0) <> LDS_IsDayLinkable(hLDS, Year(SpGraf.dDate)))
+            {
+              // сохранить изменения часов
+              SetModified(true);
+              UpdateTable;
+              // сказать цепочке дней
+              LDS_SetDayLinkable(hLDS, Year(SpGraf.dDate), SpGraf.DayChas > 0);
+              LDS_Refresh(hLDS); // контроль целостности данных
+              // сохранить данные, если что поменялось
+              StoreShiftsData;
+              RereadRecord(#SpGraf);
+            }
+          }
+        }
+      }
+       else
+     { case inherited :: handleEvent (cmPick) of
+       heAbort:{abort;exit;}
+       heStop:{stop;exit;}
+       end;
+     }
+     end;
+}
+
+cmExprFieldChanged:{
+  case inherited :: handleEvent (cmExprFieldChanged) of
+    heAbort:{abort;exit;}
+    heStop:{stop;exit;}
+  end;
+
+  case CurField of
+    #GP_WorkingHoursStr,
+    #GP_EveningHoursStr,
+    #GP_NightHoursStr:
+    {
+      SetModified(true);
+      var Value: double;
+      _try
+      {
+        Value := Str2Time(ExprFieldValue);
+
+        if (Value >= 0)
+        {
+
+          if (Value < 0) or (Value > 24)
+          {
+            Message('Введено недопустимое количество часов', Error + OkButton);
+            ErrorInExprField := true;
+            exit;
+          }
+
+          // Для контроля вводимых значений мы переведем имеющиеся часы-минуты
+          // в часы в формате double:
+          var dDayChas, dNightChas, dEvnChas: double;
+          dDayChas := SpGraf.DayChas + SpGraf.DayMin / 60.0;
+          dNightChas := SpGraf.NightChas + SpGraf.NightMin / 60.0;
+          dEvnChas := SpGraf.EvnChas + SpGraf.EvnMin / 60.0;
+
+          // И ещё. При ручном редактировании мы очищаем минуты,
+          // и всё записываем в дробные часы, чтобы было меньше погрешностей.
+          // (минуты записываются при указании шаблона раб.дня, см. вэ-пэ-пэшку)
+
+          case CurField of
+            #GP_WorkingHoursStr:
+            {
+              if (dEvnChas + dNightChas > Value)
+              {
+                // Подгоняем под сумму. Т.к. это логичнее и эргономичнее.
+                set SpGraf.DayChas := dEvnChas + dNightChas;
+                set SpGraf.DayMin := 0.0;
+              }
+              else
+              {
+                set SpGraf.DayChas := Value;
+                set SpGraf.DayMin := 0.0;
+              }
+
+              // Сообщить цепочке дней, если день изменил свою робочесть
+              if ((SpGraf.DayChas > 0) <> LDS_IsDayLinkable(hLDS, Year(SpGraf.dDate)))
+              {
+                UpdateTable; // сохранить другие изменения
+                LDS_SetDayLinkable(hLDS, Year(SpGraf.dDate), SpGraf.DayChas > 0);
+                LDS_Refresh(hLDS); // оправиться от такого расколбаса
+                // Сохранить данные о сменах
+                StoreShiftsData;
+                RereadRecord(#SpGraf);
+              }
+            }
+
+            #GP_EveningHoursStr:
+            {
+              if (dDayChas < Value + dNightChas)
+              {
+                ErrorInExprField := true;
+                exit;
+              }
+              else
+              {
+                set SpGraf.EvnChas := Value;
+                set SpGraf.EvnMin := 0.0;
+              }
+            }
+            #GP_NightHoursStr:
+            {
+              if (dDayChas < Value + dEvnChas)
+              {
+                ErrorInExprField := true;
+                exit;
+              }
+              else
+              {
+                set SpGraf.NightChas := Value;
+                set SpGraf.NightMin := 0.0;
+              }
+            }
+          end; //case
+         }
+      }
+      _except
+        on ExNumberConvert:
+        {
+          Message('Введена недопустимая величина', Error + OkButton);
+          ErrorInExprField := true;
+        }
+    }
+  end;
+}
+cmHotKeys:{
+  if (FocusedFormat=TemplateBrowse and IsTemplate)
+    PutContextMenuCommand('GP_GrafikEdit_HotKeys');
+}
+cmValue10:{//Копирование шаблона рабочего дня
+  if (not IsValidAll(tnSpGraf)) exit;
+
+  var CopyTemplate:GP_CopyTemplateSpGraf;
+  if (CopyTemplate.Run(SpGraf.buffer)) {
+    if (getlast SpGraf = tsok) {};
+    ReReadRecord(tnSpGraf);
+  }
+}
+end;
+
+end.
+
+GP_GrafikEdit_HotKeys menu
+{
+ - 'Копирование шаблона рабочего дня ...', cmValue10, 'Копирование шаблона рабочего дня', hcNoContext, , , sci1Esc,,,, bmpCopyDoc16;
+}

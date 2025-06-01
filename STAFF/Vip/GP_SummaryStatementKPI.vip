@@ -1,0 +1,450 @@
+/*************************************************************************************************\
+* Наименование: Сводная ведомость показателей премирования                                        *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#197          |14/09/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include ExtClass.vih
+
+#include GP_UserAccessService.vih
+#include GP_Status.vih
+#include GP_QueryBuilder.vih
+#include GP_UserFilterStoreDSK.vih
+#include GP_UserFilterCatalogs.vih
+#include GP_UserFilterList.vih
+#include GP_xlMatrixUtil.vih
+#include Gp_KPI_ALG.Vih
+
+
+//-----------------------------
+interface GP_SummaryStatementKPI 'Сводная справка о выполнении показателей премирования по структурным подразделениям', Cyan;
+//-----------------------------
+show(10,5,190,35);
+
+#include ExtClass.var
+//-----------------------------
+Function CalCoefPodr(_pNrec:comp)    :double; forward;
+Function GetHeadPostName(_pDep:comp) :string;forward;
+//-----------------------------
+
+var UserAccessService:GP_UserAccessService NoAuto;
+    Status:GP_Status NoAuto;
+    iQBuilder:GP_QueryBuilder new;
+    ClassCodeHead:word;
+    FilterSwitch:longint;
+    FilterDat1,FilterDat2:date;
+    IsFilterSet   :boolean;
+    UserFilterList:GP_ObjUserFilterList;
+    FilterStore:GP_IUserFilterStore;
+    xlMatrixUtil:GP_xlMatrixUtil new;
+    iGp_KPI_ALG : Gp_KPI_ALG_Calc New;
+
+table struct Statements(
+   NRec:comp
+  ,DocNumber:string[40]
+  ,DocDate:date
+  ,cDep:comp
+  ,cPost:comp
+  ,DepName:string
+  ,DepCode:string
+  ,KPICode:string
+  ,KPIName:string
+  ,UdVes:double
+  ,LowLimit:double
+  ,HighLimit:double
+  ,Plan:double
+  ,Fact:double
+  ,ImplProc:double
+  ,ChiefPostName:string
+  ,ChiefDepCode  :string
+  ,cKatPodr       :comp
+)
+with index(i=DocDate,i2=NRec);
+
+create view
+as select
+   GetHeadPostName(Statements.cDep)  (fieldname=HeadPostName)
+  ,if(Statements.ImplProc<100,Statements.ImplProc/100,1)*Statements.UdVes (fieldname=ItKoef)
+  ,CalCoefPodr(Statements.Nrec) (FieldName=ItPodr,FieldTitle='Ит.коэф по подразд.')
+
+from
+  Statements
+  ,Catalogs Dolj
+  where
+   ((
+      Statements.cPost == Dolj.nrec
+   ))
+/*  ,extcatlinks
+where ((
+     11                            == extcatlinks.objtype
+and  1                             == extcatlinks.modtype
+and  Statements.cDep    == extcatlinks.staffcat
+))*/
+  ;
+
+Create view vPodr
+var pPodr :comp;
+as select Catalogs.code, Catalogs.name
+From Catalogs, Catalogs CatMain
+where (( pPodr == Catalogs.nrec
+and -11 == CatMain.syscode
+));
+
+//-------------------------------------------
+// Рассчитать итоговый коэф по подразделению
+//-------------------------------------------
+Function CalCoefPodr(_pNrec:comp) :double; cacheable;
+{ #__UNUSED__(_pNrec)
+  Result:=0;
+  //if getfirst extcatlinks<>0 exit;
+  Result:=iGp_KPI_ALG.EM_TOTALWEIGHTKOEF_Koef(
+     Statements.cKatPodr //extcatlinks.extcat //_cPodr:comp;
+   , 0 // категория всегда 0
+//   , 0 //Statements.cPost //_cPost:comp;
+   , Statements.cPost //_cPost:comp;
+   , Year(Statements.DocDate) //_wYear:word;
+   , month(Statements.DocDate) //_wMonth:word;
+   ,  ''//_Param:string)
+   ,False //_OnlyConfirm:boolean=true
+    )
+
+
+} //Function CalCoefPodr(_pNrec:comp) :double; cacheble;
+
+//-------------------------------------------
+// #197 от 28.11.2017
+// 2.	Заполнить колонку D <Наименование должности руководителя функционального
+// направления деятельности, в чьем подчинении находится структурное подразделение>.
+// Выводить туда наименование вышестоящего подразделения уровня ЗГД,
+// либо <Генеральный директор> для подразделений, у которых нет вложенных подразделений,
+// и которые подчинены Генеральному директору, например для подразделений 940:
+// #193.21
+// внесен ВА "Верхний уровень иерархии", привязанный к СЕ ШР (catalogs),
+// который однозначно определяет СЕ ШР, которые являются верхним уровнем иерархии (ГД или ЗГД).
+// В колонку "Наименование должности руководителя функционального направления деятельности,
+// в чьем подчинении находится структурное подразделение" выводить наименование ближайшего по иерархии СЕ ШР,
+// у которого заполнен ВА "Верхний уровень иерархии".
+//-------------------------------------------
+Function FindZGD(_pDep:comp; Flag_ZGD:boolean=false) :string;cacheable;
+var _pnrec:comp;
+{ Result:='';
+  vPodr.pPodr:=_pDep;
+  if vPodr.getfirst Catalogs=tsok
+  { _pnrec:=coGetAttr(coCatalogs,_pDep,'Верхний уровень иерархии');
+    //-------------------------------
+    //-- #193.21
+    if _pnrec>0
+    { Result:=vPodr.Catalogs.Name;
+    }
+    else
+    { Result:=FindZGD(vPodr.Catalogs.cParent,pos('-',vPodr.Catalogs.Code)=0 or Flag_ZGD);
+    }
+    Exit;
+    //-- #193.21
+    //-------------------------------
+
+    if Flag_ZGD
+    { //#783.17 от 14.03.2018 16:06 , проверим - а вдруг, это еще не тот
+      if pos('-',vPodr.Catalogs.Code)=0
+      { Result:=vPodr.Catalogs.Name;
+        Exit;
+      }
+    }
+    if vPodr.Catalogs.cParent=vPodr.Catalogs.MainLink exit;
+    // а вдруг Mainlink кривой
+    if vPodr.Catalogs.cParent=vPodr.CatMain.Nrec exit;
+    Result:=FindZGD(vPodr.Catalogs.cParent,pos('-',vPodr.Catalogs.Code)=0 or Flag_ZGD);
+  }
+} //Function FindZGD(_pDep:comp) :string;cacheable;
+
+Function GetHeadPostName(_pDep:comp) :string;cacheable;
+{ Result:=''; //oExtClass.GetSegName(ClassCodeHead,Statements.cDep);
+  if Result=''
+  { Result:=FindZGD(_pDep);
+  }
+}//Function GetHeadPostName(_pDep:comp) :string;cacheable;
+
+
+//*******************************************************
+// визуальная часть
+//*******************************************************
+browse brStatements (,,sci1Esc);
+table Statements;
+fields
+  Statements.DocDate 'Дата' ('Дата ведомости',,):[10,'MM.YYYY'],Protect,NoAutoSize;
+  Statements.DocNumber 'Номер' ('Номер ведомости') :[7],Protect,NoAutoSize;
+  Statements.DepName 'Наименование', 'структурного', 'подразделения' ('Оцениваемое подразделение',,):[25],Protect;
+  HeadPostName 'Должность руководителя', 'функционального направления,','в чьем подчинении находится','структурное подразделение'
+    ('Наименование должности руководителя функционального направления деятельности, в чьем подчинении находится структурное подразделение',,):
+    [30],Protect;
+  Statements.DepCode '№ структурного','подразделения' ('Код оцениваемого подразделения',,):[16],Protect,NoAutoSize;
+  Dolj.name          'Оцениваемая ','должность' ('Оцениваемая должность',,):[16],Protect,NoAutoSize;
+  Statements.KPIName 'Наименование', 'показателя премирования' ('Наименование показателя премирования',,):[25],Protect;
+  Statements.UdVes 'Удельный','вес' ('Удельный вес показателя премирования',,):[10.2],Protect,NoAutoSize;
+  Statements.LowLimit 'Нижняя','граница' ('Нижняя граница премирования',,):[10.2],Protect,NoAutoSize;
+  Statements.HighLimit 'Верхняя','граница' ('Верхняя граница премирования',,):[10.2],Protect,NoAutoSize;
+  Statements.Plan 'Плановое','значение' ('Плановое значение показателя премирования',,):[12.2],Protect,NoAutoSize;
+  Statements.Fact 'Фактическое','значение' ('Фактическое значение показателя премирования',,):[12.2], Protect, NoAutoSize;
+  Statements.ImplProc 'Процент','выполнения','показателя','премир-я' ('Процент выполнения показателя премирования',,):[12.2], Protect, NoAutoSize;
+  Statements.ChiefPostName 'Должность', 'ответственного'
+    ('Наименование должности руководителя, отвечающего за учет и оценку достижений установленных показателей',,):[25],Protect;
+  ItKoef 'Итоговый', 'коэффициент', 'по показателю', 'с учетом веса' ('Итоговый коэффициент по показателю с учетом веса (Кп)',,):[14.2], Protect, NoAutoSize;
+  ItPodr 'Итоговый', 'коэффициент', 'по подраз-', 'делению' ('Итоговый коэффициент по всем показателям в разрезе подразделение/должность',,):[14.2], Protect, NoAutoSize;
+
+  Statements.ChiefDepCode 'Подразделение','ответственного'
+    ('Код подразделения руководителя, отвечающего за учет и оценку достижений установленных показателей',,):[15],Protect,NoAutoSize;
+  Statements.KPICode 'Код показателя','премирования' ('Код показателя премирования',,):[16],Protect, NoAutoSize;
+end;
+
+window WinFilter 'Фильтр' DoAccept, EscClose, Gray;
+show(50, 5, 110, 11);
+
+screen scFilter ('', , sci13Esc);
+Fields
+  FilterSwitch(,,sci1Esc):noprotect;
+  FilterDat1 ('Начало периода',,):['MM.YYYY'],NoProtect;
+  FilterDat2 ('Окончание периода',,):['MM.YYYY'],NoProtect;
+  [FilterDep] UserFilterList.FilterStr(1):Protect,PickButton;
+buttons
+  cmOK,,,'Установить',,sci1Esc;
+  cmCancel,,,'Выход',,sci1Esc;
+<<
+
+    [.] по периоду`               .@@@@@@@@@    .@@@@@@@@@
+    [.] Оцениваемое подразделение`.@@@@@@@@@@@@@@@@@@@@@@@
+
+ <. ~У~становить .>                           <. ~О~тмена  .>
+>>
+end;
+
+HandleEvent
+cmInit:{
+  FilterDat1:=FilterStore.LoadDate('FilterDat1');
+  FilterDat2:=FilterStore.LoadDate('FilterDat2');
+  UserFilterList.Load;
+  if vPodr.getfirst CatMain=tsok {}
+}
+cmDone:{
+  FilterStore.SaveDate(FilterDat1,'FilterDat1');
+  FilterStore.SaveDate(FilterDat2,'FilterDat2');
+  UserFilterList.Save;
+}
+cmOK:{
+  PutCommand(cmDefault);
+}
+end;
+end;//WinFilter
+
+procedure FillStatements;
+var m:tptr;
+    cRec:comp;
+    Dat:date;
+{
+  StartNewVisual(vtRotateVisual, vfTimer, 'Формирование сводной ведомости показателей премирования...', 0);
+  cRec:=0;
+  cRec:=Statements.NRec;
+
+  delete all Statements;
+//  iQBuilder.AddToSelect('Spec.NRec,Statements.DocNumber,Statements.DocDate,Spec.cPodr,#comp(0)/*Spec.cPost*/,CatDep.Name,CatDep.Code,GP_KPI.Kod,GP_KPI.Name');
+  iQBuilder.AddToSelect('Spec.NRec,Statements.DocNumber,Statements.DocDate,Spec.cPodr,Spec.cPost,CatDep.Name,CatDep.Code,GP_KPI.Kod,GP_KPI.Name');
+  iQBuilder.AddToSelect('Spec.UdVes,Spec.LowLimit,Spec.HighLimit,Spec.Plan,Spec.Fact,Spec.ImplProc');
+  iQBuilder.AddToSelect('PostChief.Name,DepChief.Code');
+  iQBuilder.AddToSelect('COALESCE(extcatlinks.extcat,#Comp(0)) as cKAtPodr');
+  iQBuilder.AddToFrom('GP_KPI_Statements Statements');
+  iQBuilder.AddToFrom('inner join GP_KPI_StatementSpec Spec on (Statements.NRec = Spec.cStatement)');
+  iQBuilder.AddToFrom('left join Catalogs CatDep on (Spec.cPodr = CatDep.NRec)');
+  iQBuilder.AddToFrom('left join GP_KPI on (Spec.cKPI = GP_KPI.NRec)');
+  iQBuilder.AddToFrom('left join StaffStruct on (Statements.cChiefStaffStr = StaffStruct.NRec)');
+  iQBuilder.AddToFrom('left join Catalogs DepChief on (StaffStruct.Department = DepChief.NRec)');
+  iQBuilder.AddToFrom('left join Catalogs PostChief on (StaffStruct.Post = PostChief.NRec)');
+  iQBuilder.AddToFrom('left join extcatlinks on 11 = extcatlinks.objtype and 1= extcatlinks.modtype and extcatlinks.staffcat=Spec.cPodr');
+  iQBuilder.AddToWhereMarker('Statements.cStatus',UserAccessService.PermittedStatusMarker);
+  iQBuilder.AddToWhere('(  Statements.cStatus=#comp('+string(Status.GetByName('утверждено'))+') ');//
+  iQBuilder.AddToWhere('or Statements.cStatus=#comp('+string(Status.GetByName('На утверждении'))+')');
+  iQBuilder.AddToWhere('or Statements.cStatus=#comp('+string(Status.GetByName('Утвержден'))+'))');
+
+  if (IsFilterSet) {
+    if ((FilterSwitch and 1b)<>0) {//Период
+      Dat:=FilterStore.LoadDate('FilterDat1');
+      Dat:=date(1,Month(Dat),Year(Dat));
+      if (Dat<>ZeroDate)
+        iQBuilder.AddToWhere('Statements.DocDate>=',Dat);
+
+      Dat:=FilterStore.LoadDate('FilterDat2');
+      Dat:=date(Last_Day(Dat),Month(Dat),Year(Dat));
+      if (Dat<>ZeroDate)
+        iQBuilder.AddToWhere('Statements.DocDate<=',Dat);
+    }
+
+    if ((FilterSwitch and 10b)<>0) {//Оцениваемое подразделение
+      m:=FilterStore.LoadMarker('mFilterDep');
+      iQBuilder.AddToWhereMarker('Spec.cPodr',m);
+      DoneMarker(m,'');
+    }
+  }
+
+  if (sqlSelectInto(iQBuilder.Make(0,false),tnStatements)<>tsok)
+    message('Ошибка выполнения DSQL запроса при формировании ведомости.',error)
+  else {
+    if (cRec<>0)
+      if (getfirst Statements where((cRec==Statements.NRec))=tsok) {};
+  }
+  ClearFuncCache; // очистим кэш функций
+  StopVisual;
+}
+
+procedure DropFilter;
+{
+  if (IsFilterSet) {
+    IsFilterSet:=false;
+
+    FillStatements;
+    ReReadRecord(tnStatements);
+  }
+}
+
+procedure SetFilter;
+{
+  IsFilterSet:=true;
+
+  FillStatements;
+
+  if (RecordsInTable(tnStatements)>0)
+    ReReadRecord(tnStatements);
+  else {
+    message('Не найдены записи удовлетворяющие фильтру.',Warning);
+    DropFilter;
+  }
+}
+
+HandleEvent
+cmInit:{
+  UserAccessService:=New(GP_UserAccessService,InitForRoleGroup('Мотивация персонала'));
+  if (UserAccessService=NullRef) {
+    abort;
+    exit;
+  }
+
+  Status:=New(GP_Status,InitForTypeDoc('Оценка по показателям премирования'));
+  if (Status=NullRef) {
+    abort;
+    exit;
+  }
+
+  var PermittedStatusMarker:tptr;
+  PermittedStatusMarker:=UserAccessService.PermittedStatusMarker;
+  if (not FoundMarker(PermittedStatusMarker,Status.GetByName('Утвержден')) and
+      not FoundMarker(PermittedStatusMarker,Status.GetByName('утверждено')) and
+      not FoundMarker(PermittedStatusMarker,Status.GetByName('На утверждении'))) {
+    message('Вам запрещен доступ к сводной ведомости показателей премирования.');
+    abort;
+    exit;
+  }
+
+  ClassCodeHead:=oExtClass.GetClassCode(coCatalogs,'Вышестоящий руководитель');
+
+  FilterStore:=GP_IUserFilterStore(new(GP_UserFilterStoreDSK,InitDSK('GP_SummaryStatementKPI_')));
+  UserFilterList:=GP_ObjUserFilterList(new(GP_UserFilterList,UserFilterList(FilterStore)));
+  UserFilterList.Add(GP_IUserFilter(new(GP_UserFilterCatalogs,UserFilterCatalogs(fnFilterDep,'mFilterDep',-11))));
+
+  FillStatements;
+}
+cmPick:{
+  if (UserFilterList.Pick(CurField))
+    RedrawPanel(CurTable);
+}
+cmDelOnProtect:{
+  if (UserFilterList.Del(CurField))
+    RedrawPanel(CurTable);
+}
+cmHotKeys:{
+  if (IsFilterSet)
+    EnableCommand(cmIEHist)
+  else
+    DisableCommand(cmIEHist);
+
+  PutContextMenuCommand('GP_SummaryStatementKPI_HotKeys');
+}
+cmFilterSave:{//Установка фильтра
+  if (RunWindowModal(WinFilter)=cmDefault) {
+    if (FilterSwitch=0)
+      DropFilter
+    else
+      SetFilter;
+  }
+}
+cmRefresh:
+{ SetFilter;
+}
+cmIEHist:{//Снятие фильтра
+  DropFilter;
+}
+cmPrintDoc:{//Печать
+  var sXLTFileName:string;
+  sXLTFileName := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' +
+                  'Сводная справка о выполнении показателей премирования (GP_SummaryStatementKPI).xlt';
+
+  if (not ExistFile(sXLTFileName)) {
+    message('Не найден шаблон отчета "'+sXLTFileName+'"',error);
+    exit;
+  }
+
+  if (not xlCreateNewExcelWithTemplate(sXLTFileName,true)) {
+    message('Ошибка при открытии шаблона отчета "'+sXLTFileName+'".',error);
+    exit;
+  }
+  xlDisplayAlerts(false);
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm,
+                'Печать сводной ведомости показателей премирования...', RecordsInTable(tnStatements));
+
+  xlMatrixUtil.ExcelFirstRow:=2;
+  xlMatrixUtil.ExcelFirstCol:=1;
+  xlMatrixUtil.MatrixColCount:=17;
+
+  PushPos(tnStatements);
+  _loop Statements {
+    if (not NextVisual) break;
+
+    if (not xlMatrixUtil.AddRow) break;
+    xlMatrixUtil.StWrite(1,DateToStr(Statements.DocDate,'MM'));
+    xlMatrixUtil.StWrite(2,DateToStr(Statements.DocDate,'YYYY'));
+    xlMatrixUtil.StWrite(3,Statements.DepName);
+    xlMatrixUtil.StWrite(4,HeadPostName);
+    xlMatrixUtil.StWrite(5,Statements.DepCode);
+    xlMatrixUtil.StWrite(6,Statements.KPIName);
+    xlMatrixUtil.WriteSum(7,Statements.UdVes);
+    xlMatrixUtil.WriteSum(8,Statements.LowLimit);
+    xlMatrixUtil.WriteSum(9,Statements.HighLimit);
+    xlMatrixUtil.WriteSum(10,Statements.Plan);
+    xlMatrixUtil.WriteSum(11,Statements.Fact);
+    xlMatrixUtil.WriteSum(12,Statements.ImplProc);
+    xlMatrixUtil.StWrite(13,Statements.ChiefPostName);
+    xlMatrixUtil.WriteSum(14,ItKoef);
+    xlMatrixUtil.WriteSum(15,ItPodr);// Итоговый коэффициент по подразделению'
+    xlMatrixUtil.StWrite(16,Statements.ChiefDepCode);
+    xlMatrixUtil.StWrite(17,Statements.KPICode);
+  }//_loop Statements
+  PopPos(tnStatements);
+
+  xlMatrixUtil.WriteMatrix;
+  xlKillExcel;
+
+  StopVisual;
+}
+end;
+end.
+
+GP_SummaryStatementKPI_HotKeys menu
+{
+ - '~У~становка фильтра ...', cmFilterSave, 'Установить фильтр на данные', hcNoContext, 'Alt+B', kbAltB, sci1Esc,,,, bmpFilterSO;
+ - '~С~нятие фильтра',cmIEHist,'Снять фильтр на данные',hcNoContext,'Alt+H',kbAltH,sci1Esc;
+-------;
+ - '~О~бновить ...', cmRefresh, 'обновить данные', hcNoContext, 'Ctrl+R', kbCtrlR, sci1Esc;
+-------;
+ - '~П~ечать',cmPrintDoc,'Печать перечня показателей премирования',hcNoContext,'Ctrl+P',kbCtrlP,sci1Esc,,,, bmpPrint;
+}

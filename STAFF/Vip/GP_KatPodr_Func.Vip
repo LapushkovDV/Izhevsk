@@ -1,0 +1,689 @@
+/* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#195          |28/10/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#2242         |11/04/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+
+#include Query.vih
+#include GP_KatPodr_Func.Vih
+#DEFINE  NO_GP_KatPodr_Func_Debug
+//-------------------------------------
+
+//---------------------------------
+Interface GP_KatPodr_Func 'Функции по работе с каталогом подразделений' , DoAccept;
+
+var
+  wTunePickPodrVisiblityMode: word; //Значение настройки ''
+  dTunePickPodrVisibleOnDate: date; //Значение настройки ''
+  VA_StaffStruct_ZGD:comp;// внешний атрибут функционального руководителя
+  // настройки
+  PODR_FILTER_BY_DATE_MODE:word;
+//---------------------------------
+Table Struct  tmp_podr_post
+(  Fio         :string[100]
+  ,cPost       :comp
+  ,cPersons    :comp
+  ,AppointDate :date
+  ,cDepartment :comp //PA = 1,2 - Catalogs.Nrec, 3 - KatPodr.Nrec
+  ,PA          :word //1 - по Catalog,3 - KatPodr, 2 - функц.руководитель
+  ,Dt          :date
+)
+with index
+(  tmp_podr_post01 =PA+cDepartment+ DT + AppointDate
+);
+//---------------------------------
+create view
+var
+ pPodr:comp;
+as select KatPodr.Nrec,tmp_podr_post.*
+From KatPodr,extcatlinks,Catalogs,Katpodr ChildPodr
+, tmp_podr_post
+where
+((  11                    == extcatlinks.objtype
+and 1                     == extcatlinks.modtype
+and pPodr                 == extcatlinks.extcat
+and extcatlinks.staffcat  == Catalogs.Nrec
+and pPodr                 == ChildPodr.cPodr
+));
+
+//-------------------------------------------
+create view vCat
+var
+ pCatalogs:comp;
+as select Catalogs.Nrec
+From KatPodr,extcatlinks,Catalogs
+where
+((  11                    == extcatlinks.objtype
+and 1                     == extcatlinks.modtype
+and pCatalogs             == extcatlinks.staffcat
+AND pCatalogs             == catalogs.NREC
+and extcatlinks.extcat    == KatPodr.nrec
+)); //vCat
+
+//--------------------------------
+create view vPers
+var
+ pPersons :comp;
+ DDate:date;
+as select Appointments.Nrec
+from Appointments
+where (( pPersons == Appointments.person
+and 0 == Appointments.lPrizn
+and DDate>>=Appointments.AppointDate
+)); //create view vPers
+
+
+//--------------------------------
+Constructor Init;
+{ Result:=True;
+  VA_StaffStruct_ZGD:=ExtAttr_ID(coStaffStruct,'Должность функционального руководителя');
+  if VA_StaffStruct_ZGD=0
+    VA_StaffStruct_ZGD:=ExtAttr_CreateComp  (coStaffStruct,'Должность функционального руководителя',
+                                         cgAttrType_Comp,cgKatKau_System,coStaffStruct);
+  PODR_FILTER_BY_DATE_MODE:=wGetTune('PICK.PODR.FILTER_BY_DATE_MODE');
+} //Constructor Init;
+
+//--------------------------------
+#doc
+ получить KatPodr.Nrec по  Catalogs.Nrec
+#end
+Function MyGetKatPodrNrec(_pCatalogs:comp):comp;Cacheable;
+{ vCat.pCatalogs:=_pCatalogs;
+  Result:=comp(0);
+  if vCat.Getfirst extcatlinks=tsok
+  { Result:=vCat.extcatlinks.extcat
+  }
+
+}
+
+#doc
+ получить Catalogs.Nrec по KatPodr.Nrec
+#end
+Function MyGetCatalogsNrec(_pPodr:comp):comp; Cacheable;
+{ Result:=comp(0);
+  pPodr:=_pPodr;
+  if getfirst extcatlinks=tsok
+     Result:=extcatlinks.staffcat
+} //Function GetCatalogsNrec(_pPodr:comp):comp; Cacheable;
+
+#doc
+Получить дату закрытия подразделения
+#end
+Function MyGetKatPodrDClose(_pPodr:comp):date; Cacheable;
+var ww_dt:date;
+{ ww_dt:=ZeroDate;
+  pPodr:=_pPodr;
+  if getfirst katpodr=tsok
+    ww_dt:=KATPODR.LASTDATE;
+  if ww_dt=ZeroDate
+   ww_dt:=KATPODR.DTO;
+  if ww_dt=ZeroDate
+    if getfirst extcatlinks=tsok
+      if getfirst Catalogs=tsok
+        ww_dt:=Catalogs.DATOK;
+  Result:=ww_dt;
+} //Function GetKatPodrDClose(_pPodr:comp):date; Cacheable;
+#doc
+Проверить подразделение на архивность
+#end
+Function MyGetKatPodr_isArh_On_Date(_pPodr:comp;_Date:date):boolean;Cacheable;
+var _wdt:date;
+{ _wdt:=GetKatPodrDClose(_pPodr);
+  Result:=(_wdt<_Date and _wdt<>ZeroDate);
+
+} //Function GetKatPodrDClose(_pPodr:comp):date; Cacheable;
+
+#doc
+Проверить подразделение на видимость для пользователя в интерфейсе выбора
+#end
+Function MyGetKatPodr_isVisible_InPickInterface(_pPodr: comp): boolean; Cacheable;
+{
+  //обновляем настройки
+  var wNewTune: word;
+  //wNewTune := wGetTune('PICK.PODR.FILTER_BY_DATE_MODE');
+  if PODR_FILTER_BY_DATE_MODE != wTunePickPodrVisiblityMode
+  {
+    wTunePickPodrVisiblityMode := PODR_FILTER_BY_DATE_MODE;
+    dTunePickPodrVisibleOnDate :=
+    case(
+       wTunePickPodrVisiblityMode;
+       1: cur_date,                                                                                               //Активные на текущую дату
+       2: date(last_day(dGetTune('DAT_M_OT')), month(dGetTune('DAT_M_OT')), year(dGetTune('DAT_M_OT'))),          //Активные на конец месяца отчетного периода бухгалтерского контура
+       3: dGetTune('FIN.USER.DTECBUH'),                                                                           //Активные на дату закрытого отчетного периода бухгалтерского контура
+       4: dGetTune('OPER.DATECLOSEPERIOD'),                                                                       //Активные на дату закрытого отчетного периода контура логистики
+       5: date(last_day(dGetTune('UP.DATOTCH')), month(dGetTune('UP.DATOTCH')), year(dGetTune('UP.DATOTCH'))),    //Активные на конец месяца отчетного периода контура Управление персоналом
+       6: strtodate(Expression(sGetTune('PICK.PODR.FILTER_BY_DATE_FORMULA')), 'DD/MM/YYYY');                      //Произвольная формула, возвращающая дату
+       cur_date
+    );
+  }
+
+  //если выставлена настройка "Не проверять" - всегда возвращаем, что подразделение видимо
+  if wTunePickPodrVisiblityMode = 0
+    result := true;
+  else
+  {
+    //видимость текущего подразделения = неархивность
+    result := not GetKatPodr_isArh_On_Date(_pPodr, dTunePickPodrVisibleOnDate);
+    //если подразделение невидимо, смотрим на видимость подчиненных подразделений
+    //если хотя бы одно подчиненное подразделение видимо - текущее подразделение видимо
+    if not result
+    {
+      var arrChildPodrNrec: array[0..0] of comp;
+      var cnt, i: longint = 0;
+      //формируем массив нреков подчиненных подразделений
+      pPodr := _pPodr;
+      _loop ChildPodr
+      {
+        arrChildPodrNrec[cnt] := ChildPodr.Nrec;
+        cnt++;
+      }
+      //проверяем видимость подчиненных в цикле. если подчиненное видимо - прерываем цикл
+      for(i := 0; i < cnt and not result; i++)
+        if MyGetKatPodr_isVisible_InPickInterface(arrChildPodrNrec[i])
+        {
+          result := true;
+          break;
+        }
+    }
+  }
+} //Function GetKatPodr_isVisible_InPickInterface(_pPodr: comp): boolean; Cacheable;
+
+//---------------------------------------------
+#doc
+Получить руководителя подразделения
+#end
+Function MyGetKatPodr_Boss(_pPodr:comp;var _pPost:comp;var _pPersons:comp;_DDate:date=ZeroDate):string;
+var _pDepartment:comp;
+{ Result:='';
+  var _DDateB:date;
+  if _DDate=ZeroDate _DDate:=Cur_Date;
+  _DDateB:=Date(1 ,month(_DDate),year(_DDate));
+  _DDate :=Date(Last_Day(_DDate),month(_DDate),year(_DDate));
+
+  //_pDepartment:=MyGetCatalogsNrec(_pPodr);
+  //Result:=GetCatalogs_Boss(_pDepartment,_pPost,_pPersons,_DDate);
+  _Try
+  { if getlast tmp_podr_post where ((
+            3 == tmp_podr_post.PA
+        //and _pDepartment == tmp_podr_post.cDepartment
+        and _pPodr == tmp_podr_post.cDepartment
+        and _DDate == tmp_podr_post.DT
+          )) <>tsok
+    { sql
+      //select Persons.Fio,Appointments.Post,Persons.nrec
+      select Persons.Fio FIO
+         ,Appointments.Post cPost
+         ,Persons.nrec cPersons
+         ,Appointments.AppointDate
+         //,Appointments.Department as cDepartment
+         ,:(_pPodr) as cDepartment
+         ,3 as PA
+         ,:(_DDate) as DT
+      from extcatlinks
+      Inner join Appointments on Appointments.Department= extcatlinks.staffcat
+           and (Appointments.DisMissDate=#Date(0,0,0) or Appointments.DisMissDate>=:(_DDateB))
+           and Appointments.AppointDate<=:(_DDate)
+           and Appointments.Lprizn<>2 // не будем пока брать заместителей
+           and Appointments.Person<>#comp(0)
+      inner join Catalogs on Catalogs.Nrec = Appointments.Post
+         and BITAND(Catalogs.bMulti,1)>0
+      inner join Persons on Persons.Nrec = Appointments.Person
+      //into (Result,_pPost,_pPersons);
+      Where
+           extcatlinks.objtype =11
+      and  extcatlinks.modtype =1
+      and  extcatlinks.extcat  =:(_pPodr)
+      into tmp_podr_post;
+      if (getlast tmp_podr_post where ((
+            3 == tmp_podr_post.PA
+        //and _pDepartment == tmp_podr_post.cDepartment
+        and _pPodr == tmp_podr_post.cDepartment
+        and _DDate == tmp_podr_post.DT
+          ))
+      ordered by index tmp_podr_post01)=tsok
+      { Result   :=tmp_podr_post.Fio;
+        _pPost   :=tmp_podr_post.cPost;
+        _pPersons:=tmp_podr_post.cPersons;
+#IFDEF GP_KatPodr_Func_Debug
+        if Timelog_Status>0
+          Timelog('GP_KatPodr_Func->MyGetKatPodr_Boss:Result='+string(Result,0,0));
+#ENDIF
+      }
+    }
+    else
+    { Result   :=tmp_podr_post.Fio;
+      _pPost   :=tmp_podr_post.cPost;
+      _pPersons:=tmp_podr_post.cPersons;
+#IFDEF GP_KatPodr_Func_Debug
+      if Timelog_Status>0
+        Timelog('GP_KatPodr_Func->GetCatalogs_Boss:Result='+string(Result,0,0));
+#ENDIF
+    }
+  }
+  _Except
+  else
+  { if Timelog_Status>0
+      Timelog('GP_KatPodr_Func->GetKatPodr_Boss:Error!');
+  }
+  _finally
+  {
+
+  }
+#IFDEF GP_KatPodr_Func_Debug
+  if Timelog_Status>0
+   Timelog('GP_KatPodr_Func->GetKatPodr_Boss:_pPodr='+string(_pPodr,0,0)+',_pDepartment='+string(_pDepartment,0,0)
+     +','+DateToStr(_DDate,'DD/MM/YYYY')+', Result='+String(Result,0,0));
+#ENDIF
+  if Result<>'' Exit;
+  pPodr:=_pPodr;
+  if getfirst KatPodr=tsok
+  {  Result:=KatPodr.FIO;
+     _pPersons:=KatPodr.cUser;
+  }
+} //Function GetKatPodr_Boss(_pPodr:comp;var _pPost:comp;var _pPersons:comp;_DDate:date=ZeroDate):string;
+
+#doc
+Получить фио руководителя подразделения
+#end
+Function MyGetKatPodr_Boss_Fio(_pPodr:comp;_DDate:date=ZeroDate):string;Cacheable;
+var _pPost:comp;
+    _pPersons:comp;
+{ _pPost:=_pPersons:=0;
+  Result:=MyGetKatPodr_Boss(_pPodr,_pPost,_pPersons,_DDate);
+}
+
+#doc
+Получить фио руководителя СЕШР
+#end
+Function MyGetCatalogs_Boss_Fio(_pDepartment:comp;_DDate:date=ZeroDate):string;Cacheable;
+var _pPost:comp;
+    _pPersons:comp;
+{ _pPost:=_pPersons:=0;
+  Result:=MyGetCatalogs_Boss(_pDepartment,_pPost,_pPersons,_DDate);
+}
+
+//---------------------------------------------
+#doc
+Получить руководителя СЕШР
+#end
+Function MyGetCatalogs_Boss(_pDepartment:comp;var _pPost:comp;var _pPersons:comp;_DDate:date=ZeroDate):string;
+var _DDateB:date;
+{ Result:='';
+  _pPersons:=0;
+  _pPost:=0;
+  if _DDate=ZeroDate _DDate:=Cur_Date;
+  _DDateB:=Date(1 ,month(_DDate),year(_DDate));
+  _DDate :=Date(Last_Day(_DDate),month(_DDate),year(_DDate));
+#IFDEF GP_KatPodr_Func_Debug
+  if Timelog_Status>0
+   Timelog('GP_KatPodr_Func->GetCatalogs_Boss:_pDepartment='+string(_pDepartment,0,0)+','+DateToStr(_DDate,'DD/MM/YYYY'));
+#ENDIF
+  _Try
+  { if getlast tmp_podr_post where ((
+            1 == tmp_podr_post.PA
+        and _pDepartment == tmp_podr_post.cDepartment
+        and _DDate == tmp_podr_post.DT
+          )) <>tsok
+    { sql
+      //select Persons.Fio,Appointments.Post,Persons.nrec
+      select Persons.Fio FIO
+         ,Appointments.Post cPost
+         ,Persons.nrec cPersons
+         ,Appointments.AppointDate
+         ,Appointments.Department as cDepartment
+         ,1 as PA
+         ,:(_DDate) as DT
+      from Persons
+      Inner join Appointments on Appointments.Person = Persons.Nrec
+                  //and (Appointments.lPrizn=0 or
+           and Appointments.Department= :(_pDepartment)
+           and (Appointments.DisMissDate=#Date(0,0,0) or Appointments.DisMissDate>=:(_DDateB))
+           and Appointments.AppointDate<=:(_DDate)
+           and Appointments.Lprizn<>2 // не будем пока брать заместителей
+           and Appointments.Person<>#comp(0)
+      inner join Catalogs on Catalogs.Nrec = Appointments.Post
+         and BITAND(Catalogs.bMulti,1)>0
+      //into (Result,_pPost,_pPersons);
+      into tmp_podr_post;
+      if (getlast tmp_podr_post where ((
+            1 == tmp_podr_post.PA
+        and _pDepartment == tmp_podr_post.cDepartment
+        and _DDate == tmp_podr_post.DT
+          ))
+      ordered by index tmp_podr_post01)=tsok
+      { Result   :=tmp_podr_post.Fio;
+        _pPost   :=tmp_podr_post.cPost;
+        _pPersons:=tmp_podr_post.cPersons;
+#IFDEF GP_KatPodr_Func_Debug
+        if Timelog_Status>0
+          Timelog('GP_KatPodr_Func->GetCatalogs_Boss:Result='+string(Result,0,0));
+#ENDIF
+      }
+    }
+    else
+    { Result   :=tmp_podr_post.Fio;
+      _pPost   :=tmp_podr_post.cPost;
+      _pPersons:=tmp_podr_post.cPersons;
+#IFDEF GP_KatPodr_Func_Debug
+      if Timelog_Status>0
+        Timelog('GP_KatPodr_Func->GetCatalogs_Boss:Result='+string(Result,0,0));
+#ENDIF
+    }
+  }
+  _Except
+  else
+  {
+
+  }
+  _finally
+  {
+
+  }
+
+  if Result<>'' Exit;
+  pPodr:=MyGetKatpodrNrec(_pDepartment);
+  if getfirst KatPodr=tsok
+  {  Result:=KatPodr.FIO;
+     _pPersons:=KatPodr.cUser;
+  }
+
+} //Function GetCatalogs_Boss(_pDepartment:comp;var _pPost:comp;var _pPersons:comp;_DDate:date=ZeroDate):string;
+
+#doc
+Получить функционального руководителя по штатному расписанию  СЕШР
+#end
+Function MyGet_Func_Boss(_pStaffStruct:comp;var _pPost:comp;var _pPersons:comp;_DDate:date=ZeroDate):string;
+var _pAttrNam:comp;
+var _DDateB:date;
+{ Result:='';
+  _pPersons:=0;
+  _pPost:=0;
+  _pAttrNam:=VA_StaffStruct_ZGD;
+  if timelog_status>0
+  { timelog('MyGet_Func_Boss _pAttrNam='+string(_pAttrNam)
+     +',_pStaffStruct='+string(_pStaffStruct,0)+', _DDate='+DateToStr(_DDate,'') );
+  }
+  if _pAttrNam=0 then Exit;
+  if _DDate=ZeroDate _DDate:=Cur_Date;
+  _DDateB:=Date(1 ,month(_DDate),year(_DDate));
+  _DDate :=Date(Last_Day(_DDate),month(_DDate),year(_DDate));
+  _Try
+  { //delete all tmp_podr_post;
+    if (getlast tmp_podr_post where ((
+            2 == tmp_podr_post.PA
+        and _pStaffStruct == tmp_podr_post.cDepartment
+        and _DDate == tmp_podr_post.DT
+          ))  ordered by index tmp_podr_post01)<>tsok
+    { do {
+        sql
+        select Persons.Fio FIO
+             ,Appointments.Post cPost
+             ,Persons.nrec cPersons
+             ,Appointments.AppointDate AppointDate
+             ,:(_pStaffStruct) as cDepartment
+             ,2 as PA
+             ,:(_DDate) as DT
+        from StaffStruct
+        inner join AttrVal on AttrVal.cRec = StaffStruct.Nrec
+           and AttrVal.cAttrNam= :(_pAttrNam)
+        Inner join Appointments on Appointments.StaffStr = AttrVal.vComp
+             and ( ( Appointments.LPrizn<>2 and
+                     (Appointments.DisMissDate=#Date(0,0,0) or Appointments.DisMissDate>=:(_DDateB))
+                   )
+                   or
+                   ( Appointments.LPrizn=2 and
+                     (Appointments.DateEnd=#Date(0,0,0) or Appointments.DateEnd>=:(_DDateB))
+                   )
+                 )
+             and Appointments.AppointDate<=:(_DDate)
+             and Appointments.Person<>#comp(0) // только прошедшие по приказу
+        Inner join Persons on Persons.Nrec = Appointments.Person
+        inner join Catalogs on Catalogs.Nrec = Appointments.Post
+        where ( StaffStruct.Nrec =:(_pStaffStruct))
+        into tmp_podr_post;
+        // чтоб быстрее было
+        if timelog_status>0
+        { timelog('MyGet_Func_Boss запрос '+string(RecordsInTable(#tmp_podr_post))) ;
+        }
+        if (getlast tmp_podr_post where (( 2 == tmp_podr_post.PA
+          and _pStaffStruct == tmp_podr_post.cDepartment and _DDate == tmp_podr_post.DT
+            ))  ordered by index tmp_podr_post01)=tsok
+        { Result   :=tmp_podr_post.Fio;
+          _pPost   :=tmp_podr_post.cPost;
+          _pPersons:=tmp_podr_post.cPersons;
+          timelog('MyGet_Func_Boss нашли ') ;
+          break;
+        }
+        //--------------------------
+        //не нашли, найдем уволенных
+       sql
+        select Persons.Fio FIO
+             ,Appointments.Post cPost
+             ,Persons.nrec cPersons
+             ,Appointments.AppointDate AppointDate
+             ,:(_pStaffStruct) as cDepartment
+             ,2 as PA
+             ,:(_DDate) as DT
+        from StaffStruct
+        inner join AttrVal on AttrVal.cRec = StaffStruct.Nrec
+           and AttrVal.cAttrNam= :(_pAttrNam)
+        Inner join Appointments on Appointments.StaffStr = AttrVal.vComp
+             and Appointments.AppointDate<=:(_DDate)
+             and Appointments.Person<>#comp(0) // только прошедшие по приказу
+        Inner join Persons on Persons.Nrec = Appointments.Person
+        inner join Catalogs on Catalogs.Nrec = Appointments.Post
+        where ( StaffStruct.Nrec =:(_pStaffStruct))
+        into tmp_podr_post;
+        if (getlast tmp_podr_post where (( 2 == tmp_podr_post.PA
+          and _pStaffStruct == tmp_podr_post.cDepartment and _DDate == tmp_podr_post.DT
+            ))  ordered by index tmp_podr_post01)=tsok
+        { Result   :=tmp_podr_post.Fio;
+          _pPost   :=tmp_podr_post.cPost;
+          _pPersons:=tmp_podr_post.cPersons;
+          timelog('MyGet_Func_Boss нашли 2 ') ;
+          break;
+        }
+        timelog('MyGet_Func_Boss не нашли !!! ') ;
+        insert into tmp_podr_post set
+           tmp_podr_post.PA:=2
+          ,tmp_podr_post.cDepartment:=_pStaffStruct
+          ,tmp_podr_post.DT:=tmp_podr_post.DT
+      } while false;
+    }
+    else
+    { Result   :=tmp_podr_post.Fio;
+      _pPost   :=tmp_podr_post.cPost;
+      _pPersons:=tmp_podr_post.cPersons;
+
+    }
+  }
+  _Except
+  else
+  {
+  }
+  _finally
+  {
+  }
+  if timelog_status>0
+  { timelog('MyGet_Func_Boss ='+String(Result)+', _pPost='+string(_pPost)+', _pPersons='+string(_pPersons));
+  }
+} //Function Get_Func_Boss(_pStaffStruct:comp;var _pPost:comp;var _pPersons:comp;_DDate:date=ZeroDate):string;
+
+
+//--------------------------------
+#doc
+Получить функционального руководителя сотрудника по текущему назначению на дату
+#end
+Function MyGet_Func_Boss_By_Pers(_pPersFrom:comp;var _pPost:comp;var _pPersons:comp;_DDate:date=ZeroDate):string;
+var _pStaffStruct:comp;
+{ Result:='';
+  _pPost:=0;_pPersons:=0;
+  if _pPersFrom='' then Exit;
+  if _DDate=ZeroDate  _DDate:=Cur_Date;
+  _pStaffStruct:=0;
+  if timelog_status>0
+  { timelog('MyGet_Func_Boss_By_Pers '+string(_pPersFrom,0,0)+',_DDate='+DateToStr(_DDate,''));
+  }
+  if False
+  { vPers.DDate:=_DDate;
+    vPers.pPersons:=_pPersFrom;
+    if vPers.GetLast Appointments=tsok
+    { timelog('MyGet_Func_Boss_By_Pers назначения ='+DateToStr(vPers.Appointments.AppointDate,''));
+      _pStaffStruct:=vPers.Appointments.StaffStr;
+    }
+  }
+  else
+  { _Try
+    { SQL select Appointments.StaffStr
+      from Appointments
+      where Appointments.Person =:(_pPersFrom) and (Appointments.Lprizn=0)
+        and Appointments.AppointDate in (
+           select Max(Appointments1.AppointDate)
+           From Appointments Appointments1
+           where Appointments1.Person =:(_pPersFrom) and (Appointments1.Lprizn=0)
+           and Appointments1.AppointDate<=:(_DDate)
+      )
+      into (_pStaffStruct)    ;
+    }
+    _Except
+    else
+    { timelog('MyGet_Func_Boss_By_Pers ERR '+ExploreException);
+    }
+  }
+  if _pStaffStruct>0
+    Result:=MyGet_Func_Boss(_pStaffStruct,_pPost,_pPersons,_DDate);
+
+} //Function Get_Func_Boss_By_Pers(_pPersFrom:comp;var _pPost:comp;var _pPersons:comp;_DDate:date=ZeroDate):string;
+
+//--------------------------------
+#doc
+Заполнить маркер по подразделениям по иерархии
+#end
+Procedure MyFillMarker_PodrByIE(_Marker:longint;_pKatPodr:comp );
+{ if _Marker=0 then Exit;
+  if _pKatPodr=0 then exit;
+
+  InsertMarker(_Marker,_pKatPodr);
+  _Loop KatPodr where (( _pKatPodr == KatPodr.cPodr ))
+  { PushPos(#KatPodr);
+    MyFillMarker_PodrByIE(_Marker,KatPodr.Nrec);
+    PopPos(#KatPodr);
+  }
+} //Procedure MyFillMarker_PodrByIE(_Marker:longint;_pKatPodr:comp );
+
+
+//--------------------------------
+#doc
+Получить Nrec пользователя по Persons.Nrec
+#end
+Function MyGet_User_By_Persons(_pPersons:comp):comp;
+{ Result:=0;
+  var _User:comp=0;
+  _Try
+  { SQL
+    select max(TuneVal.CUSER)
+    from TuneDef
+    inner join TuneVal on TuneVal.cTune = TuneDef.Nrec
+          and TuneVal.COMPVAL = :(_pPersons)
+    where TuneDef.Code='USER.PERSON'
+    into  (_User) ;
+    Result:=_User;
+  }
+  _except
+  else
+  {
+
+  }
+
+} //Function Get_User_By_Persons(_pPersons:comp):comp;
+
+//--------------------------------
+#doc
+Получить Nrec пользователя по Persons.Nrec
+#end
+Function MyGet_Persons_By_User(_pUser:comp):comp;
+var  LObj:longint;//для поиска настройки
+{ Result:=0;
+  if _pUser=0 _pUser:=UserId();
+  lObj:=UserOfficeFilial(_pUser);
+  //2018.03.16 ДОБАВИЛИ НОВУЮ НАСТРОЙКУ В СТАНДАРТЕ Result:=coGetTuneEx('USER.PERS',LObj,pcCurUser)
+  //"Настройки Галактики \ Общие настройки системы \ Табельный номер"
+  Result:=coGetTuneEx('USER.PERSON',LObj,_pUser)
+
+} //Function Get_Persons_By_User(_pUser:comp):comp;
+
+
+#doc
+#3533  Получить ФИО по дескриптору
+#end
+Function MyGetFioByDescr(_Descr:string;_boInitial:boolean):string; cacheable;
+{ Result:='';
+  var _pUser: comp=0;
+  var _sFio:string='';
+  //---- найдем пользователя
+  _Try
+  { SQL Select Max(TuneVal.CUSER) From TuneVal
+    inner join TuneDef on TuneDef.Nrec = TuneVal.cTune
+             and TuneDef.Code='USER.DESCR'
+    where TuneVal.STRVAL=:(_Descr)
+    into (_pUser);
+  }
+  _Except
+  else
+  {}
+  //---- найдем ФИО
+  if _pUser=0 then exit;
+  _Try
+  { SQL Select Max(TuneVal.Strval) From TuneVal
+    inner join TuneDef on TuneDef.Nrec = TuneVal.cTune
+             and TuneDef.Code='USER.FIO'
+    where TuneVal.cUser=:(_pUser)
+    into (_sFio);
+  }
+  _Except
+  else
+  {}
+  Result:=_sFio;
+  if _boInitial
+    Result:=MyGetInitial(_sFio,True);
+}//Function GetFioByDescr(_Descr:string;_boInitial:boolean):string; cacheable;
+
+//--------------------------------
+#doc
+Получить Persons.Nrec по дескриптору
+#end
+Function MyGetPersonsByDescr(_Descr:string):comp;
+{ Result:=0;
+  var _pUser: comp=0;
+  var _pPersons:comp=0;
+  //---- найдем пользователя
+  _Try
+  { SQL Select Max(TuneVal.CUSER) From TuneVal
+    inner join TuneDef on TuneDef.Nrec = TuneVal.cTune
+             and TuneDef.Code='USER.DESCR'
+    where TuneVal.STRVAL=:(_Descr)
+    into (_pUser);
+  }
+  _Except
+  else
+  {}
+  //---- найдем ФИО
+  if _pUser=0 then exit;
+  _Try
+  { SQL Select Max(TuneVal.CompVal) From TuneVal
+    inner join TuneDef on TuneDef.Nrec = TuneVal.cTune
+             and TuneDef.Code='USER.PERSON'
+    where TuneVal.cUser=:(_pUser)
+    into (_pPersons);
+  }
+  _Except
+  else
+  {}
+  Result:=_pPersons;
+
+} //Function MyGetPersonsByDescr(_Descr:string):comp;
+end.

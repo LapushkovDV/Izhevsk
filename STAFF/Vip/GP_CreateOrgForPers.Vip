@@ -1,0 +1,442 @@
+/*************************************************************************************************\
+* Наименование:  Создать организацию для сотрудника                                               *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#3727         |07/12/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+#include CLSFUNCS.VIH // ф-ии пересканирования текущих л/с
+#include PAFILTER.VIH // функц-л работы с подразделениями и тек. лицевыми счетами
+#include ChoiseYourPersons.vih
+#include Query.vih
+#include CatFunc.Vih
+#include GetKau.Vih
+//-------------------------
+#include GP_QueryBuilder.vih
+#include GP_Log.Vih
+#Include GP_Staff_Func.Vih
+//**********************************************
+VipInterface GP_CreateOrgForPers Licensed(free);
+//**********************************************
+#doc
+#3727 Создать организацию для сотрудника
+Настройка  - Администрирование - Утилиты ЭМ - Создать организацию для сотрудника
+УП - НПО Энергомаш - Мотивация - Настройка - Создать организацию для сотрудника
+#end
+
+//**********************************************
+Interface GP_CreateOrgForPers 'Создать организацию для сотрудника' , EscClose;
+Show at (,,50,13);
+//**********************************************
+// Forward описания
+//**********************************************
+  procedure SelectMarKat;forward;
+  Procedure SetFilterNM(_Field:longint=0);forward;
+//**********************************************
+// Переменные
+//**********************************************
+#include GetKau.Var
+var
+  CS: IContextSession; // для захвата прикладного контекста табеля
+  //---------------
+  //iCatFunc            : CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+  //iQBuilder:GP_QueryBuilder new;
+  //для стандартного фильтра по подразделению
+  PAF:  TraditionalPersonalAccountFilter;
+  CLSF:      CurLSFunctions;
+  //-----------------------
+  viCYPersons      : ChoiseYourPersons;
+  //-----------------------
+  pGp_Log          : Gp_Log;
+  pGP_Staff_Func   : GP_Staff_Func;
+  //-----------------------
+  DtRep            : date;
+  sUserName        : string;
+  //-----------------------------------------
+  pVA_Persons_KatOrg : comp;//'Физическое лицо (контрагент)'; #219
+  pVA_KatOrg_Persons : comp;//'.Сотрудник (ссылка на карточку)'; #219.#30
+  //-----------------------------------------
+  // Фильтры
+  //-----------------------------------------
+   wFilter:word;
+   Marker_Count :longint;
+    wc_nrec : comp;//  - var_name, тип должен совпадать с типом маркера
+   KauMarkerName:string;
+   Marker_Tmp :longint;
+   #mrkfld_(Persons)
+   //---------------
+   DepList :longint;
+   //------------------------
+   VidKat      : string[100];
+   MarkKat:longint;
+//**********************************************
+// Таблицы
+//**********************************************
+Table Struct local tmp_report
+(  cPersons    : comp       //ссылка на Persons
+  ,Fio         : string[50]
+  ,cKatOrg     : comp
+  ,cLschet     : Comp
+)
+with index
+(   tmp_report01 = Fio
+  , tmp_report02 = cPersons
+);
+//****************************************8
+Create view
+as select
+  Zar_User.Nrec
+, (PAF.GetDepartmentFilterStr)  (fieldname = FiltrPodr)
+, tmp_report.*
+From
+    Zar_User
+  , Catalogs CatPost_Flt
+  , KlKatego KlKatego_Flt
+  , Persons Persons_Flt
+  , tmp_report(tmp_report01)
+where ((
+    sUserName == Zar_User.OwnName
+and tmp_report.cKatOrg == KatOrg.Nrec
+//------- фильтры
+and wc_nrec == Persons_Flt.Nrec
+and wc_nrec == KlKatego_Flt.Nrec
+and wc_nrec == CatPost_Flt.Nrec
+
+)); //create view
+
+//------------------------------------
+Create view vKlkatego
+var
+  pKlkatego:comp;
+as select
+  Klkatego.nrec
+From
+   Klkatego
+where ((
+  pKlkatego == Klkatego.nrec
+)); //Create view vKlkatego
+//------------------------------------
+create view vPodr
+var
+ sPodr_kod:string;
+as select KatPodr.nrec
+From KatPodr
+where (( sPodr_kod == KatPodr.kod));
+
+//====================================
+#include Sql_Func.Vpp
+//====================================
+//***********************************************
+// Процедуры и функции
+
+//========================================
+// Сохранить параметры
+//------------------------------------
+Procedure SaveParam;
+{ SaveMyDsk(wFilter  ,'GP_CreateOrgByPers_wFilter'  );
+  DoneMarker(MarkKat ,'GP_CreateOrgByPers_MarkKat');
+  DoneMarker(Marker_Persons, 'GP_CreateOrgByPers_Persons');
+
+}
+
+//========================================
+// Сохранить параметры
+//------------------------------------
+Procedure ReadParam;
+{ if not ReadMyDsk(wFilter  ,'GP_CreateOrgByPers_wFilter' ,False)  wFilter:=0  ;
+  MarkKat := InitMarker('GP_CreateOrgByPers_MarkKat', 8, 10, 10);
+  Marker_Persons  :=InitMarker('GP_CreateOrgByPers_Persons' , 8, 50, 10, True);
+  SelectMarKat;
+  SetFilterNM(0);
+} //Procedure ReadParam;
+
+//------------------------------------------------------------------------------
+// Пометка категорий
+//------------------------------------------------------------------------------
+  procedure SelectMarKat;
+  var i1:longint;
+      _pNrec:comp;
+  {
+      VidKat := '';
+      if GetMarkerCount(MarkKat)>1
+      { set VidKat:='множественный выбор ('+string(GetMarkerCount(MarkKat))+')';
+      }
+      else
+      for (I1 := 0; I1 < GetMarkerCount(MarkKat); I1 := I1 + 1)
+      { if (GetMarker(MarkKat, I1, vKlkatego.pKlkatego))
+        if (vKlkatego.GetFirst Klkatego = tsOk)
+        { set VidKat:=vKlkatego.Klkatego.naikat;
+          break;
+        }
+      }
+
+    if (VidKat= '')
+      set VidKat:='не установлен';
+    redrawpanel(#Zar_User);
+  } // procedure SelectMarKat
+
+//------------------------------------------------------------------------------
+// обработка изменения фильтра по подразделениям  - см CompSrc\Z\Z_PayRep\vip\VIEWREES.VIP
+//------------------------------------------------------------------------------
+  procedure SetupDepartments(Change: comp);
+  {
+    var p2: double;    // для компиляции
+    var PrCex: comp;
+    PrCex := ZAR_USER.CURCEX;
+    RunInterface('GetPodaln', Change, prCex, p2);
+  }
+
+  //---------------------------------------
+  // Установка наименований фильтров
+  //---------------------------------------
+  Procedure SetFilterNM(_Field:longint=0);
+  { if _Field=0 or _Field=#Filtr_Persons
+    { #mrkfiltr_(Persons_Flt,Persons,Nrec,wc_nrec,Persons_Flt.Fio)
+    }
+    ReScanPanel(#Zar_User);
+  } //Procedure SetFilterNM(_Field:longint)
+
+//==============================
+// сбор данных
+//==============================
+Function SborData : boolean;
+var wErr:longint;
+{ Result:=False;
+  timelog('GP_CreateOrgByPers->SborData:start');
+  DtRep:=Cur_Date;
+  //-------------------------------
+  MTRetrieve(#tmp_report,mfFilters); //
+  delete all tmp_report;
+  ReReadRecord(#tmp_report);
+  //-------------------------------
+  _Try
+  { CreateTempVib;
+    ClearQuery(vliSQLCommand);
+    //--------------------------
+    if IsBitCTW(wFilter,1) InsTempVibByMarker(01,DepList) ;//
+    if IsBitCTW(wFilter,2) InsTempVibByMarker(02,MarkKat);//
+    if IsBitCTW(wFilter,3) InsTempVibByMarker(03,Marker_Persons);
+    //--------------------------
+
+    var _pAVidProizv:comp=ExtAttr_ID(coCatalogs,'Вид производства');
+
+    //-------------------
+    PrepareSQLQuery('  select  Distinct');
+    PrepareSQLQuery('    Persons.Nrec as cPersons');     //ссылка на Persons
+    PrepareSQLQuery('   ,Persons.Fio as Fio');      //ФИО
+    PrepareSQLQuery('   ,COALESCE(AttrVal.vComp,#comp(0)) as cKatOrg');     //ФИО
+    PrepareSQLQuery('  From Persons');
+    PrepareSQLQuery('  Inner join Appointments on Appointments.Nrec = CASE WHEN Persons.AppointCur = #Comp(0) THEN Persons.AppointLast ELSe  Persons.AppointCur END');
+    PrepareSQLQuery('  inner join extcatlinks  on extcatlinks.objtype =11');
+    PrepareSQLQuery('                         and extcatlinks.modtype  =1');
+    PrepareSQLQuery('                         and extcatlinks.staffcat = Appointments.Department');
+    //-----------------------------
+    if IsBitCTW(wFilter,1)
+    {  PrepareSQLQuery(' inner join tempvib VibPodr on VibPodr.wlist=1 and VibPodr.crec = extcatlinks.extcat ');
+    }
+    if IsBitCTW(wFilter,2)
+    {  PrepareSQLQuery(' inner join tempvib VibKat on VibKat.wlist=2 and VibKat.crec = Appointments.EmpCategory ');
+    }
+    if IsBitCTW(wFilter,3)
+    {  PrepareSQLQuery(' inner join tempvib VibPers on VibPers.wlist=3 and VibPers.crec = Persons.Nrec ');
+    }
+    if Zar_User.POdrShare = '+'
+    { PrepareSQLQuery('inner join USERRIGHTS UR on UR.crecds=extcatlinks.extcat and UR.OWNNAME='''+sUserName+''' ' );
+    }
+    //-----------------------------
+    PrepareSQLQuery('  Inner join KatPodr      on KatPodr.Nrec = extcatlinks.extcat');
+    //-----------------------------
+    PrepareSQLQuery(' Left Outer join AttrVal on AttrVal.wTable= 25001'); // coPersons
+    PrepareSQLQuery('           and AttrVal.cRec = Persons.Nrec'); // coPersons
+    PrepareSQLQuery('           and AttrVal.cAttrNam = #comp('+String(pVA_Persons_KatOrg ,0,0)+')'); // coPersons
+
+    //-----------------------------
+    PrepareSQLQuery('  where  (Persons.ISEMPLOYEE>=''С'' and Persons.ISEMPLOYEE<=''У'' )');
+    //----------------------------------------------------
+    stmt:=0;
+    stmt := sqlAllocStmt;
+    wErr:=ExecDSQLex(tntmp_report);
+
+    if (wErr<>0)
+    { message('Ошибка выполнения DSQL запроса 1 при отборе значений ('+string(wErr)+').',error);
+      Exit;
+    }
+  }
+  _except
+  else
+  { timelog('Возникло исключение при запуске запроса 001 '+ExploreException);
+  }
+  _finally
+  {
+  }
+  StopVisual('',0);
+  StartNewVisual(vtIndicatorVisual,vfTimer + vfBreak + vfConfirm,'Формирование организаций',RecordsInTable(#Tmp_report));
+  ReReadRecord(#tmp_report);
+  //-------------------------------------
+  var _sum, _Proc:double;
+  _Loop fullcache Tmp_report
+  { if not NextVisual then exit;
+    if timelog_status>1
+      timelog('GP_CreateOrgByPers->SborData:Расчет '+string(Tmp_report.fio));
+    pGP_Staff_Func.CheckKatOrgByPers(Tmp_report.cPersons,True,False);
+    var _sLastError:string=pGP_Staff_Func.GetLastError;
+    pGp_Log.write(Norm_Fld(Tmp_report.fio,40)+' '+_sLastError);
+  } //_Loop Tmp_report
+  Result:=True;
+  timelog('GP_CreateOrgByPers->SborData:finish');
+} //Function SborData : boolean;
+
+
+//------------------------------------
+// Сбор данных
+//------------------------------------
+Function FormDoc:boolean;
+var
+   werr:word;
+{ timelog('FormDoc:Start');
+  if IsBitCTW(wFilter,1)
+  { if DepList <> 0
+      DoneMarker(DepList, '');
+    DepList := CLSF.LoadCurrentDepartmentList;
+  }
+  ClearFuncCache;
+
+  Result:=SborData;
+  Result:=True;
+} //Function FormDoc:boolean;
+
+//************************************************
+// визуальные элементы
+//-------------------------------------
+Screen scrParam 'Параметры формирования' (,,sci1Esc);
+Table Zar_User;
+Fields
+  wFilter  :NoProtect;
+  //FILTR_KatPodr : Protect,PickButton;
+  FiltrPodr: Protect,PickButton;
+  VidKat   : Protect,PickButton;
+  Filtr_Persons: Protect,PickButton;
+Buttons
+  cmOk,default,,'Сформировать отчет', hcOplTrudhlp, sci1Esc;
+  cmCancel,,,'Выход', hcOplTrudhlp, sci1Esc;
+<<
+  `Формирование организаций по сотрудникам`
+
+  `Фильтры`
+  [.] По подразделению`.@@@@@@@@@@@@@@@@@@@@@
+  [.] По категории`    .@@@@@@@@@@@@@@@@@@@@@
+  [.] По сотруднику`   .@@@@@@@@@@@@@@@@@@@@@
+
+  <.~С~формировать.>   <.  ~О~тмена  .>
+>>
+end; //scrParam 'Параметры формирования' (,,sci1Esc), Cyan;
+
+
+//--------------------------------------------
+// Обработчик событий интерфейса
+//--------------------------------------------
+HandleEvent
+//------------------------------
+cmInit:
+{ TimeLog_Init;
+  timelog('GP_CreateOrgByPers->cmInit');
+  sUserName:=UserName();
+  if boGetTune('RGHTBL.NOUPDATE.KATORG')
+  { Message('У вас нет прав на изменение каталога контрагентов!');
+    CloseInterface(cmDone);
+    abort;
+    exit;
+  }
+  //-------------------------
+  pVA_Persons_KatOrg:=ExtAttr_ID(coPersons,VA_Persons_KatOrg);
+  pVA_KatOrg_Persons:=ExtAttr_ID(coKatOrg ,VA_KatOrg_Persons);//'Сотрудник (ссылка на карточку)'); #219
+
+  ReadParam;
+  var CL: ContextList;
+  if (not CL.Add(CS, 'WorkingTable'))
+  { CloseInterface(cmDone);
+    abort;
+    exit;
+  }
+  if Getfirst Zar_user=tsok {}
+  ReScanPanel(#Zar_user);
+}
+//------------------------------
+cmDone:
+{ SaveParam;
+}
+//------------------------------
+cmPick:
+{  case CurField of
+   //------------
+   #FiltrPodr:
+   {
+     SetupDepartments(comp(11));
+     //UpdateFilter;
+     if PAF.IsDepartmentFilterSet <> IsBitCtW(wFilter,1)
+       BitOnW(wFilter,1);
+   }
+   //------------------------------
+   #VidKat:
+   {
+      RunInterface(pickkat1,word(0), MarkKat, vfMultipleSelection);
+      SelectMarKat;
+      BitOnW(wFilter,2);
+   }
+   //------------------------------
+   #Filtr_Persons:
+   { KauMarkerName := iGetKau.GetMarkerName(cgKau_Persons);
+     StoreMarker(Marker_Persons,KauMarkerName);
+     If (iGetKau.GetCodeKau(cgiPickMult+cgiNotClear,cgKau_Persons,Comp(0)) <> 0)
+     { Marker_Tmp  :=InitMarker(KauMarkerName, 8, 50, 10, True);
+       CopyMarker(Marker_Persons,Marker_Tmp);
+       DoneMarker(Marker_Tmp,'');
+       SetFilterNm(#Filtr_Persons);
+       BitOnW(wFilter,3);
+     }
+   }
+   end;
+} //cmPick:
+cmDelOnProtect:
+{
+   case CurField of
+   //--------------
+   #FiltrPodr:
+   {
+     PAF.ClearDepartmentFilter;
+     ReReadRecord(#ZAR_USER);
+     BitOffW(wFilter,1);
+     //   UpdateFilter;
+   }
+   //------------------------------
+   #VidKat:
+   { ClearMarker(MarkKat);
+      SelectMarKat;
+      BitOffW(wFilter,2);
+   }
+   //------------------------------
+   #Filtr_Persons:
+   { ClearMarker(Marker_Persons);
+     BitOffW(wFilter,3);
+     SetFilterNm(#Filtr_Persons);
+   }
+   end;
+} //cmDelOnProtect:
+//------------------------------
+cmCheckField:
+{
+}
+//------------------------------
+cmOk:
+{  StartNewVisual(vtNumericVisual,vfTimer + vfBreak + vfConfirm,'Формирование организаций',0);
+   pGP_Log.Init('GP_CreateOrgByPers.log', true, true, true);
+   if not FormDoc then message('Ошибки при формировании');
+   StopVisual('',0);
+   pGP_Log.Done(True);
+   //CloseInterFace(cmDone);
+}
+end; //HandleEvent
+end. //Interface GP_CreateOrgForPers

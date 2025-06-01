@@ -1,0 +1,1876 @@
+//------------------------------------------------------------------------------
+//                                                      (c) корпорация Галактика
+// Версия      : 8.10
+// Назначение  : Функции для работы с внешними атрибутами документов
+//------------------------------------------------------------------------------
+/*
+  Параметры:
+    __wTable     - co-код Таблицы
+    _AttrName    - наименование атрибута
+    _cAttrNam    - код атрибута
+    _cRec        - ссылка на запись в таблице
+    _AttrType    - Тип значения атрибута
+       cgAttrType_Str    = 0;   // 0 -  STRING [80]
+       cgAttrType_Dbl    = 1;   // 1 -  DOUBLE
+       cgAttrType_Date   = 2;   // 2 -  DATE
+       cgAttrType_Time   = 3;   // 3 -  TIME
+       cgAttrType_Memo   = 4;   // 4 -  MEMO
+       cgAttrType_Comp   = 5;   // 5 -  COMP
+       cgAttrType_bool   = 7;   // 7 -  BOOLEAN
+
+    _NeedMessage - выдавать сообщение об ошибке
+*/
+
+
+#include ExtAttr.vih
+#include AttrTablePick.vih  // Объектный интерфейс для работы с атрибутом ССЫЛКА
+
+#IFDEF _GP_
+#component "C_ExtClass"
+#ENDIF
+#doc
+Функции для работы с внешними атрибутами документов<br>
+#end
+
+Interface iExtAttr cacheable;
+
+//таблицы для временной вставки внешних атрибутов
+table struct tmpAttrNam = AttrNam;
+table struct tmpAttrVal
+(
+  NREC             : comp,
+#IFDEF _GP_
+#ELSE
+  ATL_LASTDATE     : date,
+  ATL_LASTTIME     : time,
+  ATL_LASTUSER     : comp,
+  ATL_ORIGINOFFICE : word,
+  ATL_OWNER        : comp,
+  LASTUSER         : string,
+  LASTTIME         : time,
+  LASTDATE         : date,
+  FILIALNO         : longInt,
+#ENDIF
+  WTABLE           : word,
+  CREC             : comp,
+  CATTRNAM         : comp,
+  VSTRING          : string,
+  VDOUBLE          : double,
+  VDATE            : date,
+  VTIME            : time,
+  VCOMP            : comp,
+  VLONGINT         : longInt,
+  vLVar            : boolean //для того что б не ругалось на мемо поле
+)
+with Index
+(
+  index01  = NRec(Unique, Surrogate),
+  index02  = CATTRNAM,
+  index03  = WTABLE + CREC + CATTRNAM
+);
+#IFDEF _GP_
+#ELSE
+Create view
+#ENDIF
+ Var
+  pwTable, pAttrType  : word;
+  pcAttrNam,
+  pcRec      : comp;
+  pName      : string;
+  pCoTable, pSysNumKau   : word;
+  pString    : string;      // "string-значение  атрибута",
+  pDouble    : double;      // "double-значение  атрибута",
+  pDate      : date;        // "date-значение атрибута",
+  pTime      : time;        // "time-значение атрибута",
+  pComp      : comp;        // "comp-значение атрибута",
+  pBoolean   : boolean;
+  Err, ErrBtr  : word;
+  ErrMessage   : string ;
+  NeedMessage  : boolean;   // выдавать сообщение об ошибке
+  isCreateAttr : boolean;   // создавать атрибут в AttrNam если не найден
+
+#IFDEF _GP_
+  wXF_Code : word; // код таблицы
+  wKodGroup: word; // код аналитики
+  pAttrVal:comp;
+Create view viExtAttr
+#ELSE
+#ENDIF
+
+as select
+#IFDEF _GP_
+  AttrNam.Nrec
+ ,AttrVal.NREC,AttrVal.WTABLE,AttrVal.CREC
+ ,AttrVal.CATTRNAM
+ ,AttrVal.VSTRING,AttrVal.VDOUBLE,AttrVal.VDATE,AttrVal.VTIME,AttrVal.VCOMP,AttrVal.VLONGINT
+#ELSE
+ *
+#ENDIF
+ from
+      AttrNam,
+      AttrVal,
+      X$FILES(ReadOnly),
+      KatKau(ReadOnly),
+#IFDEF _GP_
+#ELSE
+      AttrNam AttrNamTmp,
+#ENDIF
+      AttrVal AttrValTmp,
+      tmpAttrNam,
+      tmpAttrVal,
+      tmpAttrNam tmpAttrNam1
+ where
+  ((
+        pwTable   == AttrNam.wTable
+    and pName     == AttrNam.Name
+
+    and pwTable   == AttrVal.wTable
+    and pcRec     == AttrVal.cRec
+    and pcAttrNam == AttrVal.cAttrNam
+
+    and pwTable   == tmpAttrNam.wTable
+    and pName     == tmpAttrNam.Name
+
+    and pwTable   == tmpAttrVal.wTable
+    and pcRec     == tmpAttrVal.cRec
+    and pcAttrNam == tmpAttrVal.cAttrNam
+#IFDEF _GP_
+    and wXF_Code  == x$Files.xf$code
+    and wKodGroup == KatKau.KodGroup
+    and  pAttrVal == AttrValTmp.Nrec
+#ENDIF
+  ))
+;
+#IFDEF _GP_
+create view vTmp
+var
+  pAttrNam:comp;
+as select AttrNamTmp.Nrec
+From
+  AttrNam AttrNamTmp
+where
+((
+     pAttrNam == AttrNamTmp.Nrec
+
+));
+
+#ENDIF
+
+File MemoFile;
+//bRealTbl - fakse указывает что работа ведется с временными таблицами, по умолчанию работаем по старому алгоритму.
+Function InsAttr  (bRealTbl : boolean = true): word   ; forward;
+Function FindID   (bRealTbl : boolean = true): boolean; forward;
+Function FindValue(bRealTbl : boolean = true): boolean; forward;
+#IFDEF _GP_
+Function FindID_tmp   (bRealTbl : boolean = true): boolean; forward;
+Function FindValue_tmp(bRealTbl : boolean = true): boolean; forward;
+#ENDIF
+Function SetValue (bRealTbl : boolean = true): boolean; forward;
+Function CopyAttrVal ( _cAttrVal: comp; _cRecTo: comp ): word; forward;
+var refAttrComp : AttrTablePick;  // для типа comp - вернуть строковое значение
+var m_wInsertDbMode : boolean;
+
+!------------------------------------------------------------------------------
+!   Набор функций для создания атрибута, получения ID, показа ошибки
+!------------------------------------------------------------------------------
+// Возвращает ID атрибута по коду таблицы и наименованию. 0 - не найден
+PUBLIC Function AttrID(_wTable : word; _Name : string): comp;
+{
+  result := 0;
+  pwTable := _wTable;
+  pName   := _Name;
+  pAttrType :=0;
+
+  if (FindID)
+    result := pcAttrNam;
+}
+// Возвращает наименование атрибута по его ID (NRec)
+PUBLIC Function AttrName(_cRec: comp): string;
+{
+  result := '';
+#IFDEF _GP_
+  vTmp.pAttrNam:=_cRec;
+  vTmp._Loop AttrNamTmp
+  {  result := vTmp.AttrNamTmp.Name;
+     break;
+  }
+#ELSE
+  if (GetFirst AttrNamTmp where ((_cRec == AttrNamTmp.nRec)) = tsOk)
+    result := AttrNamTmp.Name;
+#ENDIF
+}
+PUBLIC Function AttrTable(_cRec: comp): word;
+{
+  result := 0;
+#IFDEF _GP_
+  vTmp.pAttrNam:=_cRec;
+  vTmp._Loop AttrNamTmp
+  {  result := vTmp.AttrNamTmp.wTable;
+     break;
+  }
+#ELSE
+  if GetFirst AttrNamTmp where ((_cRec == AttrNamTmp.nRec)) = tsOk
+    result := AttrNamTmp.wTable;
+#ENDIF
+}
+// Возвращает тип атрибута по коду таблицы и нименованию. 13 - не найден
+PUBLIC Function AttrType(_wTable : word; _Name : string): word;
+{
+  result := 13;
+  pwTable := _wTable;
+  pName   := _Name;
+  pAttrType :=0;
+
+  if (FindID)
+    result := pAttrType;
+}
+// Возвращает true, если у записи с номером _cRec таблицы с кодом _wTable
+// существует значение внешнего атрибута с именем _Name
+PUBLIC function ValueExists(_wTable : word; _cRec: comp; _Name: string): boolean;
+{
+  result := false;
+  pwTable := _wTable;
+  pName   := _Name;
+  pcRec   := _cRec;
+  pAttrType := 0;
+
+  if (FindID)
+    result := getfirst ATTRVAL = tsOk;
+}
+// Возвращает true, если у записи с номером _cRec таблицы с кодом _wTable
+// существует значение внешнего атрибута с номером _cAttrNam
+PUBLIC function ValueExistsID(_wTable : word; _cRec: comp; _cAttrNam: comp): boolean;
+{
+  pwTable := _wTable;
+  pcRec   := _cRec;
+  pcAttrNam := _cAttrNam;
+  pAttrType := 0;
+
+  result := (getfirst ATTRVAL = tsOk);
+}
+// Удалить значение внешнего атрибута с именем _Name у у записи с номером _cRec
+// таблицы с кодом _wTable
+PUBLIC function DeleteValue(_wTable : word; _cRec: comp; _Name: string): integer;
+{
+  pwTable := _wTable;
+  pName   := _Name;
+  pcRec   := _cRec;
+  pAttrType := 0;
+
+  if(FindID)
+  {
+    if (GetFirst AttrVal <> tsOk)
+      Exit;
+    result := delete current ATTRVAL;
+  }
+  else
+    result := tsOk;
+}
+// Удалить значение внешнего атрибута с номером _cAttrNam у записи с номером _cRec
+// таблицы с кодом _wTable
+PUBLIC function DeleteValueID(_wTable : word; _cRec: comp; _cAttrNam: comp): integer;
+{
+  pwTable := _wTable;
+  pcRec   := _cRec;
+  pcAttrNam  := _cAttrNam;
+  pAttrType := 0;
+
+  result := (getfirst ATTRVAL);
+  if (result = tsOk)
+    result := delete current ATTRVAL;
+}
+//возвращает ссылку на внешний атрибут если существует, если не найден - добавляет
+Function CreateAttrEx(_wTable : word; _Name : string; _Type : word; bRealTbl : boolean = true): comp ;
+{
+  result := 0;
+  pwTable   := _wTable;
+  pName     := _Name;
+  pAttrType := _Type;
+
+  isCreateAttr  := true;
+  if (FindId(bRealTbl))
+  {
+    if (bRealTbl)
+      result := AttrNam.nRec;
+    else
+      result := tmpAttrNam.nRec;
+  }
+
+  isCreateAttr  := false;
+}
+PUBLIC Function CreateAttr(_wTable : word;_Name : string;_Type : word): comp ;
+{
+  result := CreateAttrEx(_wTable, _Name,_Type, m_wInsertDbMode);
+}
+
+// Выдать сообщение об ошибке
+Public Procedure ShowError (_err : word);
+{
+  CASE _err OF
+   1 :
+     message ('Нет внешнего атрибута для таблицы с кодом ' + string(pwTable) + '. Наименование атрибута- ' + pName,Error);
+   2 :
+     message ('Не совпадает тип внешнего атрибута запрашиваемого и реального для таблицы с кодом ' + string(pwTable) + '. Наименование атрибута- ' + pName +
+       ' Тип в таблице ' + string(AttrNam.AttrType) + '. Тип в функции ' + string(pAttrType) , Error);
+   3 :
+     message ('Не найдено значение внешнего атрибута для таблицы с кодом ' + string(pwTable) + '. Наименование  атрибута- ' + pName,Error);
+   4 :
+     message ('Физическая ошибка записи в AttrNam для таблицы с кодом ' + string(pwTable) + '. Наименование атрибута- ' + pName + '. Ошибка ' + string(errBtr),Error);
+   5 :
+     message ('Физическая ошибка записи в AttrVal для таблицы с кодом ' + string(pwTable) + '. Наименование атрибута- ' + pName + '. Ошибка ' + string(errBtr),Error);
+   6 :
+     message ('Недопустимый тип атрибута для таблицы с кодом ' + string(pwTable) + '. Наименование атрибута- ' + pName,Error);
+   7 :
+     message ('Физическая ошибка удаления записи в AttrVal для таблицы с кодом ' + string(pwTable) + '. Наименование атрибута- ' + pName + '. Ошибка ' + string(errBtr),Error);
+   8 :
+     message ('Неверный системный номер КАУ для таблицы с кодом ' + string(pwTable) + '. Наименование атрибута- ' + pName + '. Системный номер ' + string(pSysNumKau),Error);
+   9 :
+     message ('Неверный код КАУ(код таблицы) для таблицы с кодом ' + string(pwTable) + '. Наименование атрибута- ' + pName + '. Код КАУ ' + string(pCoTable),Error);
+  10 :
+     message ('Физическая ошибка удаления записи в AttrNam для таблицы с кодом ' + string(pwTable) + '. Наименование атрибута- ' + pName + '. Ошибка ' + string(errBtr),Error);
+  END ;
+}
+
+// установка требования выдачи сообщения при ошибке; Возвращает предыдущее значение
+PUBLIC function SetNeedMessage(_NeedMessage : boolean): boolean;
+{
+  result  := NeedMessage;
+  NeedMessage := _NeedMessage;
+}
+
+// получить номер последней ошибки
+PUBLIC Function LastError : word ;
+{
+  result := Err;
+}
+
+
+ // Создает внешний атрибут с типом Comp. Если существует - возвращает ссылку.
+PUBLIC  Function CreateAttrCompEx(_wTable : word; _Name : string; _Type : word; _SysNumKau : word; _KodKau : word; bRealTbl : boolean = true): comp;
+{
+#IFDEF _GP_
+  timelog('CreateAttrCompEx '+string(_wTable)+','+ _Name+','+string( _Type));
+#ENDIF
+  pwTable   := _wTable;
+  pName     := _Name;
+  pAttrType := _Type;
+  pSysNumKau := _SysNumKau;
+  pCoTable   := _KodKau;
+
+  result := 0;
+  case _SysNumKau of
+    cgKatKau_Table, cgKatKau_User :
+    {
+#IFDEF _GP_
+      set wKodGroup:=_KodKau;
+      if (GetFirst FastFirstRow Katkau <> tsOk)
+      //if (RecordExists Katkau<>tsok)
+#ELSE
+      if (GetFirst Katkau where ((_KodKau == KatKau.KodGroup)) <> tsOk)
+#ENDIF
+      {
+        Err :=9;  if NeedMessage ShowError(Err); Exit;
+      }
+    }
+    cgKatKau_System :
+    {
+#IFDEF _GP_
+      wXF_Code:=_KodKau;
+      if (GetFirst FastFirstRow x$Files  <> tsOk)
+      //if not (RecordExists x$Files) <> tsOk
+#ELSE
+      if (GetFirst x$Files where ((_KodKau == x$Files.xf$code)) <> tsOk)
+#ENDIF
+      {
+        Err :=9;  if NeedMessage ShowError(Err); Exit;
+      }
+    }
+    else
+    {
+       Err :=8;  if NeedMessage ShowError(Err);  Exit;
+    }
+  end; // case
+  isCreateAttr  := true;
+#IFDEF _GP_
+  timelog('CreateAttrCompEx isCreateAttr= '+string(isCreateAttr));
+#ENDIF
+
+  if (FindId(bRealTbl))
+  {
+    if (bRealTbl)
+      result := AttrNam.nRec;
+    else
+      result := tmpAttrNam.nRec;
+  }
+#IFDEF _GP_
+  timelog('CreateAttrCompEx result= '+string(result));
+#ENDIF
+
+  isCreateAttr  := false;
+}
+
+PUBLIC  Function CreateAttrComp(_wTable : word; _Name : string; _Type : word; _SysNumKau : word; _KodKau : word): comp;
+{
+  result := CreateAttrCompEx(_wTable, _Name, _Type, _SysNumKau, _KodKau, m_wInsertDbMode);
+}
+
+// Возвращает код КАУ по ID атрибута
+PUBLIC Function AttrCompKodKau( _cAttrNam: comp): word;
+{
+  result := 0;
+#IFDEF _GP_
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  result := vTmp.AttrNamTmp.rObject;
+     break;
+  }
+#ELSE
+  if (GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk)
+    result := AttrNamTmp.rObject;
+#ENDIF
+}
+// Возвращает системный номер КАУ по ID атрибута
+PUBLIC  Function AttrCompSysNumKau(_cAttrNam: comp): word;
+{
+  result := cgKatKau_Error;
+#IFDEF _GP_
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  result := vTmp.AttrNamTmp.rType;
+     break;
+  }
+#ELSE
+  if (GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk)
+    result := AttrNamTmp.rType;
+#ENDIF
+}
+!------------------------------------------------------------------------------
+// Функции возвращают значение внешнего атрибута по коду таблицы, имени атрибута и nRec-ку записи
+// для разных типов атрибута.
+// sGetAttr - возвращает строку для всех типов, преобразовав тип в строку
+!------------------------------------------------------------------------------
+PUBLIC Function sGetAttr(_wTable : word; _cRec : comp; _Name : string): string ;
+{
+  pAttrType := cgAttrType_Str;
+  pwTable := _wTable;
+  pName   := _Name;
+  pcRec   := _cRec;
+
+  result :='';
+  if (FindID)
+    if (FindValue)
+      result := pString;
+}
+
+PUBLIC Function doGetAttr(_wTable : word; _cRec : comp;_Name : string): double ;
+{
+  pAttrType := cgAttrType_Dbl ;
+  pwTable := _wTable;
+  pName   := _Name;
+  pcRec   := _cRec;
+
+  result :=0;
+  if (FindID)
+    if (FindValue)
+      result := pDouble;
+}
+
+PUBLIC Function dGetAttr(_wTable : word; _cRec : comp; _Name : string): date ;
+{
+  pAttrType := cgAttrType_Date;
+  pwTable := _wTable;
+  pName   := _Name;
+  pcRec   := _cRec;
+
+  result := date(0,0,0);
+  if (FindID)
+    if (FindValue)
+      result := pDate;
+}
+
+PUBLIC Function tGetAttr ( _wTable : word;  _cRec : comp; _Name : string ) : time ;
+{
+  pAttrType := cgAttrType_Time;
+  pwTable := _wTable;
+  pName   := _Name;
+  pcRec   := _cRec;
+
+  result := time(0,0,0,0);
+  if (FindID)
+    if (FindValue)
+      result := pTime;
+}
+
+PUBLIC Function mGetAttr ( _wTable : word;  _cRec : comp; _Name : string ) : string ;
+{
+  pAttrType := cgAttrType_Memo;
+  pwTable := _wTable;
+  pName   := _Name;
+  pcRec   := _cRec;
+
+  result :='';
+  if (FindID)
+    if (FindValue)
+      result := pString;
+}
+
+PUBLIC function coGetAttr(_wTable : word; _cRec : comp; _Name : string) : comp;
+{
+  pAttrType := cgAttrType_Comp;
+  pwTable := _wTable;
+  pName   := _Name;
+  pcRec   := _cRec;
+
+  result := 0;
+  if (FindID)
+    if (FindValue)
+      result := pComp;
+}
+
+PUBLIC Function bGetAttr(_wTable : word; _cRec : comp;_Name : string): boolean ;
+{
+  pAttrType := cgAttrType_Bool ;
+  pwTable := _wTable;
+  pName   := _Name;
+  pcRec   := _cRec;
+
+  result := false;
+  if (FindID)
+    if (FindValue)
+      result := pBoolean;
+}
+
+
+!------------------------------------------------------------------------------
+// Функции возвращают значение внешнего атрибута по коду таблицы, коду атрибута и nRec-ку записи
+// для разных типов атрибута.
+// sGetAttrID - возвращает строку для всех типов, преобразовав тип в строку
+!------------------------------------------------------------------------------
+PUBLIC Function sGetAttrID(_wTable : word; _cRec : comp; _cAttrNam : comp): string ;
+{
+  pAttrType  := cgAttrType_Str;
+  pwTable    := _wTable;
+  pcRec      := _cRec;
+  pcAttrNam  := _cAttrNam;
+
+  result :='';
+#IFDEF _GP_
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  pName := vTmp.AttrNamTmp.Name;
+     if (FindID_tmp)
+      if (FindValue_tmp)
+        result := pString;
+     break;
+  }
+#ELSE
+  if GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk
+  {
+    pName := AttrNamTmp.Name;
+    if (FindID)
+      if (FindValue)
+        result := pString;
+  }
+#ENDIF
+}
+PUBLIC Function doGetAttrID(_wTable : word; _cRec : comp; _cAttrNam : comp): double ;
+{
+  pAttrType  := cgAttrType_Dbl ;
+  pwTable    := _wTable;
+  pcRec      := _cRec;
+  pcAttrNam  := _cAttrNam;
+
+  result :=0;
+#IFDEF _GP_
+  /*
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  pName := vTmp.AttrNamTmp.Name;
+     if (FindID_tmp)
+      if (FindValue_tmp)
+        result := pDouble;
+     break;
+  }
+  */
+  _Loop AttrVal
+  { Result:=AttrVal.vDouble;
+  }
+#ELSE
+  if GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk
+  {
+    pName := AttrNamTmp.Name;
+    if (FindID)
+      if (FindValue)
+        result := pDouble;
+  }
+#endif
+}
+
+PUBLIC Function dGetAttrID(_wTable : word; _cRec : comp; _cAttrNam : comp): date ;
+{
+  pAttrType  := cgAttrType_Date;
+  pwTable    := _wTable;
+  pcRec      := _cRec;
+  pcAttrNam  := _cAttrNam;
+
+  result := date(0,0,0);
+#IFDEF _GP_
+  /*
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  pName := vTmp.AttrNamTmp.Name;
+     if (FindID_tmp)
+      if (FindValue_tmp)
+        result := pDate;
+     break;
+  }
+  */
+  _Loop AttrVal
+  { Result:=AttrVal.vDate;
+    break;
+  }
+
+#ELSE
+  if GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk
+  {
+    pName := AttrNamTmp.Name;
+    if (FindID)
+      if (FindValue)
+        result := pDate;
+  }
+#ENDIF
+}
+
+PUBLIC Function tGetAttrID ( _wTable : word;  _cRec : comp; _cAttrNam : comp ) : time ;
+{
+  pAttrType  := cgAttrType_Time;
+  pwTable    := _wTable;
+  pcRec      := _cRec;
+  pcAttrNam  := _cAttrNam;
+
+  result := time(0,0,0,0);
+#IFDEF _GP_
+  /*
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  pName := vTmp.AttrNamTmp.Name;
+     if (FindID_tmp)
+      if (FindValue_tmp)
+        result := pTime;
+     break;
+  }
+  */
+  _Loop AttrVal
+  { Result:=AttrVal.vTime;
+    break;
+  }
+
+#ELSE
+  if (GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk)
+  {
+    pName := AttrNamTmp.Name;
+    if (FindID)
+      if (FindValue)
+        result := pTime;
+  }
+#ENDIF
+}
+
+PUBLIC Function mGetAttrID ( _wTable : word;  _cRec : comp; _cAttrNam : comp ) : string ;
+{
+  pAttrType  := cgAttrType_Memo;
+  pwTable    := _wTable;
+  pcRec      := _cRec;
+  pcAttrNam  := _cAttrNam;
+
+  result :='';
+#IFDEF _GP_
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  pName := vTmp.AttrNamTmp.Name;
+     if (FindID_tmp)
+      if (FindValue_tmp)
+        result := pString;
+     break;
+  }
+#ELSE
+  if (GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk)
+  {
+    pName := AttrNamTmp.Name;
+    if (FindID)
+      if (FindValue)
+        result := pString;
+  }
+#ENDIF
+}
+
+PUBLIC function coGetAttrID(_wTable : word; _cRec : comp; _cAttrNam : comp) : comp;
+{
+  pAttrType  := cgAttrType_Comp;
+  pwTable    := _wTable;
+  pcAttrNam  := _cAttrNam;
+  pcRec      := _cRec;
+  result := 0;
+#IFDEF _GP_
+  /*
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  pName := vTmp.AttrNamTmp.Name;
+     if (FindID_tmp)
+      if (FindValue_tmp)
+        result := pComp;
+     break;
+  }
+  */
+  _Loop AttrVal
+  { Result:=AttrVal.vComp;
+    break;
+  }
+
+#ELSE
+  if (GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk)
+  {
+    pName := AttrNamTmp.Name;
+    if (FindID)
+      if (FindValue)
+        result := pComp;
+  }
+#ENDIF
+}
+
+function GetAttrValueStr(_wTable : word; _cRec : comp; _Name : string) : string;
+{
+  case AttrType(_wTable, _Name) of
+    cgAttrType_Str  : Result :=         sGetAttr(_wTable, _cRec, _Name);
+    cgAttrType_Dbl  : Result := string(doGetAttr(_wTable, _cRec, _Name));
+    cgAttrType_Date : Result := string( dGetAttr(_wTable, _cRec, _Name));
+    cgAttrType_Time : Result := string( tGetAttr(_wTable, _cRec, _Name));
+    cgAttrType_Memo : Result :=         mGetAttr(_wTable, _cRec, _Name);
+    cgAttrType_Comp : Result := string(coGetAttr(_wTable, _cRec, _Name));
+    cgAttrType_Bool : Result := string(bGetAttr(_wTable, _cRec, _Name));
+  else
+                      Result := '';
+  end;
+}
+
+function GetAttrValueStrID(_wTable : word; _cRec : comp; _cAttrNam : comp) : string;
+{
+#IFDEF _GP_
+  vTmp.pAttrNam:=_cAttrNam;
+  if vTmp.getfirst AttrNamTmp=tsok
+    Result := GetAttrValueStr(_wTable, _cRec, vTmp.AttrNamTmp.Name)
+#ELSE
+  if (GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk)
+    Result := GetAttrValueStr(_wTable, _cRec, AttrNamTmp.Name)
+#ENDIF
+  else
+    Result := '';
+}
+
+PUBLIC Function bGetAttrID ( _wTable : word;  _cRec : comp; _cAttrNam : comp ) : boolean ;
+{
+  pAttrType  := cgAttrType_Bool;
+  pwTable    := _wTable;
+  pcRec      := _cRec;
+  pcAttrNam  := _cAttrNam;
+
+  result := false;
+#IFDEF _GP_
+  /*
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  pName := vTmp.AttrNamTmp.Name;
+     if (FindID_tmp)
+      if (FindValue_tmp)
+        result := pBoolean;
+     break;
+  }
+  */
+  _Loop AttrVal
+  { Result:=boolean( AttrVal.VLONGINT );
+    break;
+  }
+
+#ELSE
+  if (GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk)
+  {
+    pName := AttrNamTmp.Name;
+    if (FindID)
+      if (FindValue)
+        result := pBoolean;
+  }
+#endif
+}
+
+!------------------------------------------------------------------------------
+!   Набор функций для установки содержания внешних атрибутов для различных типов
+// Функции устанавливает значение внешнего атрибута по коду таблицы, имени атрибута и nRec-ку записи
+// для разных типов атрибута.
+// Если атрибут не найден, то он создается
+// Возвращает true - успешно, false - ошибка
+!------------------------------------------------------------------------------
+function sSetAttrEx(_wTable : word; _cRec : comp; _Name : string; _Val : string; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Str;
+  pwTable   := _wTable;
+  pName     := _Name;
+  pcRec     := _cRec;
+  pString   := _Val;
+  result    := false;
+  isCreateAttr  := true;
+  if FindID(bRealTbl)
+    if SetValue(bRealTbl)
+      result := true;
+  isCreateAttr  := false;
+}
+
+PUBLIC function sSetAttr ( _wTable : word; _cRec : comp; _Name : string; _Val : string) : boolean;
+{
+  result := sSetAttrEx(_wTable, _cRec, _Name, _Val, m_wInsertDbMode);
+}
+
+function doSetAttrEx (_wTable : word; _cRec : comp; _Name : string; _Val : double; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Dbl ;
+  pwTable   := _wTable;
+  pName     := _Name;
+  pcRec     := _cRec;
+  pDouble   := _Val;
+  result    := false;
+
+  isCreateAttr  := true;
+  if FindID(bRealTbl)
+   if SetValue(bRealTbl)
+     result := true;
+  isCreateAttr  := false;
+}
+
+PUBLIC function doSetAttr(_wTable : word; _cRec : comp; _Name : string; _Val : double) : boolean;
+{
+  result := doSetAttrEx(_wTable, _cRec, _Name, _Val, m_wInsertDbMode);
+}
+
+function dSetAttrEx(_wTable : word; _cRec : comp; _Name : string; _Val : date; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Date;
+  pwTable   := _wTable;
+  pName     := _Name;
+  pcRec     := _cRec;
+  pDate     := _Val;
+  result    := false;
+
+  isCreateAttr  := true;
+  if FindID(bRealTbl)
+    if SetValue(bRealTbl)
+      result := true;
+  isCreateAttr  := false;
+}
+
+PUBLIC function dSetAttr(_wTable : word; _cRec : comp; _Name : string; _Val : date) : boolean;
+{
+  result := dSetAttrEx(_wTable, _cRec, _Name, _Val, m_wInsertDbMode);
+}
+
+function tSetAttrEx(_wTable : word; _cRec : comp; _Name : string; _Val : time; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Time;
+  pwTable   := _wTable;
+  pName     := _Name;
+  pcRec     := _cRec;
+  pTime     := _Val;
+  result    := false;
+
+  isCreateAttr  := true;
+  if FindID(bRealTbl)
+   if SetValue(bRealTbl)
+     result := true;
+  isCreateAttr  := false;
+}
+
+PUBLIC function tSetAttr(_wTable : word; _cRec : comp; _Name : string; _Val : time) : boolean;
+{
+  result := tSetAttrEx(_wTable, _cRec, _Name, _Val, m_wInsertDbMode);
+}
+
+PUBLIC function mSetAttr( _wTable : word; _cRec : comp; _Name : string; _Val : string) : boolean;
+{
+  pAttrType := cgAttrType_Memo;
+  pwTable   := _wTable;
+  pName     := _Name;
+  pcRec     := _cRec;
+  pString     := _Val;
+  result  := false;
+
+  isCreateAttr  := true;
+  if FindID
+    if SetValue
+      result := true;
+  isCreateAttr  := false;
+}
+
+function coSetAttrEx(_wTable : word; _cRec : comp; _Name : string; _Val : comp; _ValStr : string; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Comp;
+  pwTable   := _wTable;
+  pName     := _Name;
+  pcRec     := _cRec;
+  pComp     := _Val;
+  pString   := _ValStr;
+
+  result := false;
+
+  isCreateAttr  := true;
+  if FindID(bRealTbl)
+   if SetValue(bRealTbl)
+     result := true;
+  isCreateAttr  := false;
+}
+
+PUBLIC function coSetAttr(_wTable : word; _cRec : comp; _Name : string; _Val : comp; _ValStr : string) : boolean;
+{
+  result := coSetAttrEx(_wTable, _cRec, _Name, _Val, _ValStr, m_wInsertDbMode);
+}
+
+function bSetAttrEx(_wTable : word; _cRec : comp; _Name : string; _Val : boolean; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Bool;
+  pwTable   := _wTable;
+  pName     := _Name;
+  pcRec     := _cRec;
+  pBoolean  := _Val;
+  result    := false;
+
+  isCreateAttr  := true;
+  if FindID(bRealTbl)
+    if SetValue(bRealTbl)
+      result := true;
+  isCreateAttr  := false;
+}
+
+PUBLIC function bSetAttr(_wTable : word; _cRec : comp; _Name : string; _Val : boolean) : boolean;
+{
+  result := bSetAttrEx(_wTable, _cRec, _Name, _Val, m_wInsertDbMode);
+}
+
+!------------------------------------------------------------------------------
+// Функции устанавливает значение внешнего атрибута по коду таблицы, ID атрибута и nRec-ку записи
+// для разных типов атрибута.  Возвращает true - успешно, false - ошибка
+function SetAttrIdCommon(_cAttrNam : comp; bRealTbl : boolean) : boolean;
+{
+  var bFindAttrNam : boolean = false;
+  result := false;
+  isCreateAttr  := true;
+
+#IFDEF _GP_
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  pName := vTmp.AttrNamTmp.Name;
+     if (FindID_tmp(bRealTbl))
+      if (SetValue(bRealTbl))
+        result := true;
+     break;
+  }
+#ELSE
+  if GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk
+  {
+    pName := AttrNamTmp.Name;
+    if (FindID(bRealTbl))
+      if (SetValue(bRealTbl))
+        result := true;
+  }
+#ENDIF
+  isCreateAttr  := false;
+}
+
+function sSetAttrIDEx ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : string; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Str;
+  pwTable   := _wTable;
+  pcAttrNam := _cAttrNam;
+  pcRec     := _cRec;
+  pString   := _Val;
+
+  result := SetAttrIdCommon(_cAttrNam, bRealTbl);
+}
+
+PUBLIC function sSetAttrID (_wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : string) : boolean;
+{
+  result := sSetAttrIDEx(_wTable, _cRec, _cAttrNam, _Val, m_wInsertDbMode);
+}
+
+function doSetAttrIDEx ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : double; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Dbl ;
+  pwTable   := _wTable;
+  pcAttrNam := _cAttrNam;
+  pcRec     := _cRec;
+  pDouble   := _Val;
+
+  result := SetAttrIdCommon(_cAttrNam, bRealTbl);
+}
+PUBLIC function doSetAttrID ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : double ) : boolean;
+{
+  result := doSetAttrIDEx ( _wTable, _cRec, _cAttrNam, _Val, m_wInsertDbMode);
+}
+
+function dSetAttrIDEx ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : date; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Date;
+  pwTable   := _wTable;
+  pcAttrNam := _cAttrNam;
+  pcRec     := _cRec;
+  pDate     := _Val;
+
+  result := SetAttrIdCommon(_cAttrNam, bRealTbl);
+}
+PUBLIC function dSetAttrID ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : date ) : boolean;
+{
+  result := dSetAttrIDEx ( _wTable, _cRec, _cAttrNam, _Val, m_wInsertDbMode);
+}
+
+function tSetAttrIDEx ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : time; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Time;
+  pwTable   := _wTable;
+  pcAttrNam := _cAttrNam;
+  pcRec     := _cRec;
+  pTime     := _Val;
+
+  result := SetAttrIdCommon(_cAttrNam, bRealTbl);
+}
+
+PUBLIC function tSetAttrID ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : time ) : boolean;
+{
+  result := tSetAttrIDEx ( _wTable, _cRec, _cAttrNam, _Val, m_wInsertDbMode);
+}
+
+PUBLIC function mSetAttrID ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : string ) : boolean;
+{
+  pAttrType := cgAttrType_Memo;
+  pwTable   := _wTable;
+  pcAttrNam := _cAttrNam;
+  pcRec     := _cRec;
+  pString   := _Val;
+
+  mSetAttrID := false;
+  isCreateAttr  := true;
+#IFDEF _GP_
+  vTmp.pAttrNam:=_cAttrNam;
+  vTmp._Loop AttrNamTmp
+  {  pName := vTmp.AttrNamTmp.Name;
+     if (FindID_tmp)
+       if SetValue  mSetAttrID := true;
+     break;
+  }
+#ELSE
+  if GetFirst AttrNamTmp where ((_cAttrNam == AttrNamTmp.nRec)) = tsOk
+  {
+    pName := AttrNamTmp.Name;
+    if (FindID)
+      if SetValue  mSetAttrID := true;
+  }
+#ENDIF
+  isCreateAttr  := false;
+}
+
+function coSetAttrIDEx ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : comp; _ValStr : string; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Comp;
+  pwTable   := _wTable;
+  pcAttrNam := _cAttrNam;
+  pcRec     := _cRec;
+  pComp     := _Val;
+  pString   := _ValStr;
+
+  result := SetAttrIdCommon(_cAttrNam, bRealTbl);
+}
+
+PUBLIC function coSetAttrID ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : comp; _ValStr : string ) : boolean;
+{
+  result := coSetAttrIDEx ( _wTable, _cRec, _cAttrNam, _Val, _ValStr, m_wInsertDbMode);
+}
+
+function bSetAttrIDEx ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : boolean; bRealTbl : boolean = true) : boolean;
+{
+  pAttrType := cgAttrType_Bool;
+  pwTable   := _wTable;
+  pcAttrNam := _cAttrNam;
+  pcRec     := _cRec;
+  pBoolean  := _Val;
+
+  result := SetAttrIdCommon(_cAttrNam, bRealTbl);
+}
+
+PUBLIC function bSetAttrID ( _wTable : word;  _cRec : comp; _cAttrNam : comp; _Val : boolean) : boolean;
+{
+  result := bSetAttrIDEx ( _wTable, _cRec, _cAttrNam, _Val, m_wInsertDbMode);
+}
+
+!------------------------------------------------------------------------------
+!   Набор функций для удаления, перемещения и копирования атрибутов
+ #declare CopyAllAttr(NameTblAttrVal,NameTblAttrNam, view)
+  #(view)._Loop #NameTblAttrNam where ((_wTableFrom == #NameTblAttrNam.wTable))
+  // создаем атрибуты, если у них есть значение в первоисточнике
+    if ( Getfirst #NameTblAttrVal where ((_wTableFrom          == #NameTblAttrVal.wTable and
+                                          _cRecFrom            == #NameTblAttrVal.cRec   and
+                                          #(view).#NameTblAttrNam.nRec == #NameTblAttrVal.cAttrNam )) = tsOk)
+    {
+      if (_wTableFrom = _wTableTO) and (bRealTbl)
+        idAttr := #(view).#NameTblAttrNam.nRec
+      else
+        if (#(view).#NameTblAttrNam.AttrType <> cgAttrType_Comp)
+          idAttr := CreateAttrEx (_wTableTO, #(view).#NameTblAttrNam.Name, #(view).#NameTblAttrNam.AttrType)
+        else
+        {
+          //атрибут типа ссылка должен быть в БД
+          //rType, rObject заполняем для корректного копирования атрибута типа ссылка
+          var w_rType, w_rObj : word;
+          w_rType := w_rObj := 0;
+          if (not bRealTbl)
+          {
+//IFDEF _GP_
+//ELSE
+            //if GetFirst AttrNamTmp where ((_wTableTO == AttrNamTmp.WTABLE and #NameTblAttrNam.Name == AttrNamTmp.NAME )) = tsOk
+            if vTmp.GetFirst AttrNamTmp where ((_wTableTO == AttrNamTmp.WTABLE and #(view).#NameTblAttrNam.Name == AttrNamTmp.NAME )) = tsOk
+            {
+              w_rType := vTmp.AttrNamTmp.rType;
+              w_rObj  := vTmp.AttrNamTmp.rObject;
+            }
+//ENDIF
+          }
+          idAttr := CreateAttrCompEx (_wTableTO, #(view).#NameTblAttrNam.Name, #(view).#NameTblAttrNam.AttrType, if(bRealTbl,#(view).#NameTblAttrNam.rType,w_rType), if(bRealTbl,#(view).#NameTblAttrNam.rObject,w_rObj) );
+        }
+
+      if ( delete AttrValTmp where ((_wTableTo == AttrValTmp.wTable and
+                                     _cRecTo   == AttrValTmp.cRec   and
+                                     idAttr    == AttrValTmp.cAttrNam )) <> tsOk )
+      {
+        Err := 5;
+        if NeedMessage
+          ShowError(Err);
+        result := false;
+      }
+      else if (not bRealTbl)
+      {
+        ClearBuffer(#AttrVal);
+//IFDEF _GP_
+
+//ELSE
+/*
+        AttrVal.ATL_LASTDATE     := tmpAttrVal.ATL_LASTDATE;
+        AttrVal.ATL_LASTTIME     := tmpAttrVal.ATL_LASTTIME;
+        AttrVal.ATL_LASTUSER     := tmpAttrVal.ATL_LASTUSER;
+        AttrVal.ATL_ORIGINOFFICE := tmpAttrVal.ATL_ORIGINOFFICE;
+        AttrVal.ATL_OWNER        := tmpAttrVal.ATL_OWNER;
+        AttrVal.LASTUSER         := tmpAttrVal.LASTUSER;
+        AttrVal.LASTTIME         := tmpAttrVal.LASTTIME;
+        AttrVal.LASTDATE         := tmpAttrVal.LASTDATE;
+        AttrVal.FILIALNO         := tmpAttrVal.FILIALNO;
+*/
+//ENDIF
+        AttrVal.VSTRING          := tmpAttrVal.VSTRING;
+        AttrVal.VDOUBLE          := tmpAttrVal.VDOUBLE;
+        AttrVal.VDATE            := tmpAttrVal.VDATE;
+        AttrVal.VTIME            := tmpAttrVal.VTIME;
+        AttrVal.VCOMP            := tmpAttrVal.VCOMP;
+        AttrVal.VLONGINT         := tmpAttrVal.VLONGINT;
+      }
+
+      AttrVal.NRec     := 0;
+      AttrVal.wTable   := _wTableTo;
+      AttrVal.cRec     := _cRecTo;
+      AttrVal.cAttrNam := idAttr;
+
+      errBtr := insert current AttrVal;
+
+      if (errBtr <> tsOk)
+      {
+        Err := 5;
+        if NeedMessage
+          ShowError(Err);
+        result := false;
+      }
+
+      if (not bRealTbl)
+        delete current tmpAttrVal;
+    }
+ #end
+//*******************************************************************
+// копирование атрибутов, возможно для разных таблиц. Если атрибут в AttrNam не существует, то он создается.
+Function CopyAllAttrEx1(_wTableFrom: word; _cRecFrom: comp; _wTableTo: word; _cRecTo: comp; bRealTbl : boolean = true) : boolean;
+{
+var  idAttr : comp;
+
+  result := true;
+  err := 0;
+
+  // выходим если программист ошибся
+  if (_wTableFrom = _wTableTO) and (_cRecFrom = _cRecTo)
+    Exit;
+
+  if (bRealTbl)
+  {
+    #CopyAllAttr(AttrVal,AttrNamTmp, vtmp)
+  }
+  else
+  {
+    #CopyAllAttr(tmpAttrVal,tmpAttrNam1,viExtAttr)
+  }
+}
+
+Public Function CopyAllAttrEx(_wTableFrom: word; _cRecFrom: comp; _wTableTo: word; _cRecTo: comp) : boolean;
+{
+  result := CopyAllAttrEx1(_wTableFrom, _cRecFrom, _wTableTo, _cRecTo, m_wInsertDbMode);
+}
+ // копирование атрибутов
+Public Function CopyAllAttr ( _wTableFrom: word; _cRecFrom: comp;  _cRecTo: comp ) : boolean;
+{
+  CopyAllAttr := true;
+  // выходим если программист ошибся
+  if (_cRecFrom = _cRecTo) Exit;
+  CopyAllAttr := CopyAllAttrEx ( _wTableFrom, _cRecFrom, _wTableFrom, _cRecTo );
+}
+
+//*******************************************************************
+// удаление всех значений (при удалении записи в таблице)
+function DeleteAllAttrEx(_wTable: word; _cRec: comp; bRealTbl : boolean = true): boolean;
+{
+  pwTable := _wTable;
+
+  err := 0;
+
+  if (bRealTbl)
+    errBtr := delete all AttrVal where ((_wTable == AttrVal.wTable and _cRec == AttrVal.cRec));
+  else
+    errBtr := delete all tmpAttrVal where ((_wTable == tmpAttrVal.wTable and _cRec == tmpAttrVal.cRec));
+
+ if (ErrBtr = 0)
+   result := true
+ else
+   {
+     err := 7;
+
+     result := false;
+
+     if NeedMessage
+       ShowError(err);
+   }
+}
+
+public function DeleteAllAttr(_wTable: word; _cRec: comp): boolean;
+{
+  result := DeleteAllAttrEx(_wTable, _cRec, m_wInsertDbMode);
+}
+
+//*******************************************************************
+// перенос от старой записи к новой
+public function MoveAllAttr (_wTable: word; _cRecFrom: comp; _cRecTo : comp): boolean;
+{
+  MoveAllAttr := true;
+  err:=0;
+
+  // на всякий случай - чтобы не зациклилось
+  if (_cRecFrom = _cRecTo) exit;
+
+  while getfirst AttrVal where ((
+         _wTable    == AttrVal.wTable and
+         _cRecFrom  == AttrVal.cRec)) = tsOk
+   {
+     AttrVal.cRec   := _cRecTo;
+     if update current AttrVal <> tsOk
+      {
+        if NeedMessage
+          message(''#3'Ошибка при переподвязке внешних атрибутов');
+        MoveAllAttr := false;
+        break;
+      }
+   }
+}
+
+//*******************************************************************
+// просмотр/редактирование значения в интерфейсе
+public function Pick (_CanEdit: boolean; _wTable: word; _cRec: comp): boolean;
+{
+  Pick := true;
+  RunInterface('Attribute', _wTable, _cRec, (not _CanEdit));
+}
+
+//*******************************************************************
+// Модификация названия внешнего атрибута (для _isCreateAttr=True: если не найден - создаст)
+Public Function ReNameAttr ( _wTable : word; _Name : string; _Type : word;
+                             _SysNumKau : word; _KodKau : word; _NameNew : string;
+                             _isCreateAttr : boolean) : comp ;
+var fbIsFind : boolean;
+{
+  ReNameAttr := 0;
+  pwTable    := _wTable;
+  pName      := _Name;
+  pAttrType  := _Type;
+  pSysNumKau := _SysNumKau;
+  pCoTable   := _KodKau;
+
+  fbIsFind := False;
+  _Loop AttrNam
+  {
+    if (pAttrType = AttrNam.AttrType)
+     if (pAttrType <> cgAttrType_Comp)
+       {
+         fbIsFind := True;
+         Break;
+       }
+     else
+     {
+       if ((AttrNam.rType = pSysNumKau) and (AttrNam.rObject = pCoTable))
+         {
+          fbIsFind := True;
+          Break;
+         }
+     }
+  }
+
+
+  if (fbIsFind)
+  {
+    AttrNam.Name := _NameNew;
+    if (update current AttrNam = tsOk)
+      ReNameAttr := AttrNam.NRec
+    else
+    {
+      err := 4;
+      if (NeedMessage)
+        ShowError(err);
+    }
+  }
+  else
+    if (_isCreateAttr)
+    {
+      pName := _NameNew;
+      if (InsAttr = tsOk)
+        ReNameAttr := AttrNam.NRec
+      else
+      {
+        err := 4;
+        if (NeedMessage)
+          ShowError(err);
+      }
+    }
+}
+
+//*******************************************************************
+// Удаление внеш.атрибута по его имени и типу
+Public Function DeleteAttr (_wTable: word; _Name : string; _Type : word) : boolean;
+{
+  DeleteAttr := False;
+
+  pwTable   := _wTable;
+  pName     := _Name;
+  pAttrType := _Type;
+
+  if (FindID)
+  {
+    err := 0;
+    ErrBtr := Delete All AttrVal where ((pcAttrNam == AttrVal.cAttrNam));
+    if (ErrBtr <> 0)
+    {
+      err := 7;
+      DeleteAttr := False;
+      if NeedMessage ShowError(err);
+      Exit;
+    }
+    ErrBtr := Delete AttrNam where ((pcAttrNam == AttrNam.NRec));
+    if (ErrBtr <> 0)
+    {
+      err := 10;
+      DeleteAttr := False;
+      if NeedMessage ShowError(err);
+      Exit;
+    }
+  }
+
+  DeleteAttr := True;
+}
+
+Public Function DeleteAllAtrForTbl(coTbl : word; bRealTbl : boolean = true) : boolean;
+{
+  result := false;
+  if (bRealTbl)
+  {
+    err := 0;
+#IFDEF _GP_
+    vTmp._Loop AttrNamTmp where((coTbl == AttrNamTmp.wTable))
+#ELSE
+    _Loop AttrNamTmp where((coTbl == AttrNamTmp.wTable))
+#ENDIF
+    {
+#IFDEF _GP_
+      ErrBtr := delete AttrValTmp where((vTmp.AttrNamTmp.nRec == AttrValTmp.cAttrNam));
+#ELSE
+      ErrBtr := delete AttrValTmp where((AttrNamTmp.nRec == AttrValTmp.cAttrNam));
+#ENDIF
+      if (ErrBtr <> 0)
+      {
+        err := 7;
+        result := False;
+        if NeedMessage ShowError(err);
+        Exit;
+      }
+    }
+#IFDEF _GP_
+    ErrBtr := vTmp.delete AttrNamTmp where((coTbl == AttrNamTmp.wTable));
+#ELSE
+    ErrBtr := delete AttrNamTmp where((coTbl == AttrNamTmp.wTable));
+#ENDIF
+    if (ErrBtr <> 0)
+    {
+      err := 10;
+      result := False;
+      if NeedMessage ShowError(err);
+      Exit;
+    }
+  }
+  else
+  {
+    _Loop tmpAttrNam where((coTbl == tmpAttrNam.wTable))
+      delete tmpAttrVal where((tmpAttrNam.nRec == tmpAttrVal.cAttrNam));
+    delete tmpAttrNam where((coTbl == tmpAttrNam.wTable));
+  }
+  result := true;
+}
+
+
+! ==============================================================================
+Function CopyAttrPick ( _wTable: word; _cRecFrom: comp; _cRecTo: comp ) : boolean;
+{
+var MarkVal: TPtr;
+var rec: comp;
+var i: word;
+
+   CopyAttrPick:= false;
+   // выходим если программист ошибся
+   if (_cRecFrom = _cRecTo) Exit;
+
+   MarkVal := InitMarker('AttrVal_' + string(_wTable),8,50,10);
+   for (i := 0; i < GetMarkerCount(MarkVal); i := i+1)
+   {
+      if (GetMarker(MarkVal, i, rec))
+        if (GetFirst AttrVal where ((rec == AttrVal.nRec)) = tsOk)
+          CopyAttrVal ( AttrVal.nRec, _cRecTo );
+      if (errBtr <> tsOk)
+      {
+        Err :=5;  if NeedMessage ShowError(Err);
+        CopyAttrPick := false;
+        break;
+      }
+      else   CopyAttrPick:= true;
+   }
+   DoneMarker(MarkVal,'AttrVal_' + string(_wTable));
+}
+
+Function CopyAttrName ( _wTable: word; _cRecFrom: comp;  _cRecTo: comp; _Name : string ) : boolean;
+{
+  CopyAttrName:= false;
+  err:=0;
+
+  // выходим если программист ошибся
+  if (_cRecFrom = _cRecTo) Exit;
+
+  if ValueExists(_wTable, _cRecFrom, _Name)
+  {
+      CopyAttrVal ( AttrVal.nRec, _cRecTo );
+
+      if (errBtr <> tsOk)
+      {
+        Err :=5;  if NeedMessage ShowError(Err);
+        CopyAttrName := false;
+      }
+      else
+        CopyAttrName:= true;
+  }
+}
+
+Function CopyAttrID ( _wTable: word; _cRecFrom: comp;  _cRecTo: comp; _cAttrNam : comp ) : boolean;
+{
+  CopyAttrID:= false;
+  err:=0;
+
+  // выходим если программист ошибся
+  if (_cRecFrom = _cRecTo) Exit;
+
+  if ValueExistsID(_wTable, _cRecFrom, _cAttrNam)
+  {
+      CopyAttrVal ( AttrVal.nRec, _cRecTo );
+
+      if (errBtr <> tsOk)
+      {
+        Err :=5;  if NeedMessage ShowError(Err);
+        CopyAttrID := false;
+      }
+      else
+        CopyAttrID:= true;
+  }
+}
+
+! ==============================================================================
+! внутренние функции
+!==============================================================================
+// копировать атрибут из одной AttrVal в другую
+Function CopyAttrVal ( _cAttrVal: comp; _cRecTo: comp ) : word;
+{
+  type TAttrVal = record as table AttrVal;
+
+  var recAttrVal : TAttrVal;
+
+  Result := 3;
+
+  PushPos(#AttrVal);
+
+  if ( GetFirst AttrVal where ((_cAttrVal == AttrVal.nRec)) = tsOk )
+    {
+      var IsMemo   : boolean;
+      var aFileName: string;
+      aFileName := '';
+
+      IsMemo := GetFieldFromMemo(0, 2, ftString, tnAttrVal) <> '';
+
+      if IsMemo
+      {
+        aFileName := CreateTmpFileName;
+
+        ExportMemoToFile(AttrVal.vLVar, aFileName, False);
+      }
+      if (getFirst AttrValTmp where (( AttrVal.wTable == AttrValTmp.wTable and
+                                             _cRecTo  == AttrValTmp.cRec   and
+                                     AttrVal.cAttrNam == AttrValTmp.cAttrNam )) = tsOk)
+      {
+        var cRec: comp; cRec := AttrValTmp.nRec;
+
+        CopyTableFields(tnAttrVal, tnAttrValTmp);
+
+        AttrValTmp.nRec := cRec;
+        AttrValTmp.cRec := _cRecTo;
+
+        if (IsMemo)
+          ImportFileToMemo(AttrValTmp.vLVar, aFileName, False);
+
+        errBtr := Update current AttrValTmp;
+      }
+      else
+      {
+        ClearBuffer(#AttrValTmp);
+
+        CopyTableFields(tnAttrVal, tnAttrValTmp);
+
+        AttrValTmp.nRec := 0;
+        AttrValTmp.cRec := _cRecTo;
+
+        if IsMemo
+          ImportFileToMemo(AttrValTmp.vLVar, aFileName, False);
+
+        errBtr := Insert current AttrValTmp;
+      }
+
+      if IsMemo
+        DeleteFile(aFileName);
+    }
+
+  Result := errBtr;
+
+  PopPos(#AttrVal);
+}
+
+#declare InsAttrTbl(nameTbl)
+  ClearBuffer(tn#nameTbl);
+  #nameTbl.wTable   := pwTable;
+  #nameTbl.Name     := pName;
+  #nameTbl.AttrType := pAttrType;
+  if (pAttrType = cgAttrType_Comp)
+  {
+    #nameTbl.rType    := pSysNumKau;
+    #nameTbl.rObject  := pCoTable;
+    if #nameTbl.rType = cgKatKau_System  // не аналитика
+      #nameTbl.coTable := pCoTable;
+    else
+      #nameTbl.coTable := GetKauCoTable (pCoTable);
+  }
+    result := insert current #nameTbl;
+    ErrBtr := InsAttr;
+#end
+// Создает внешний атрибут
+function InsAttr(bRealTbl : boolean = true) : word;
+{
+  if (bRealTbl)
+  {
+    #InsAttrTbl(AttrNam)
+  }
+  else
+  {
+    #InsAttrTbl(tmpAttrNam)
+  }
+}
+
+#declare FindIdTbl(nameTbl1)
+  if (GetFirst #nameTbl1 = tsOk)
+  {
+     if (pAttrType <> 0) and (pAttrType <> #nameTbl1.AttrType)
+     {
+       err := 2;
+       if NeedMessage ShowError(Err);
+     }
+     else
+     {
+       result := true;
+       pcAttrNam  := #nameTbl1.nRec;
+       pAttrType  := #nameTbl1.AttrType;
+     }
+  }
+  else
+  {
+     if (isCreateAttr)    // создовать атрибут в AttrNam если не найден
+     {
+       ErrBtr := InsAttr(bRealTbl);
+       if (ErrBtr <> 0)
+       {
+         err := 4;
+         if NeedMessage ShowError(Err);
+         Exit;
+       }
+       else
+       {
+         result := true;
+         pcAttrNam  := #nameTbl1.nRec;
+       }
+     }
+     else
+     {
+       err := 1;
+       if NeedMessage ShowError(Err);
+     }
+  }
+#end
+!------------------------------------------------------------------------------
+// Ищет код атрибута по наименованию
+function FindID(bRealTbl : boolean = true) : boolean ;
+{
+  result := false;
+  pcAttrNam  := 0;
+  err:=0;
+  if (bRealTbl)
+  {
+    #FindIdTbl(AttrNam)
+  }
+  else
+  {
+    #FindIdTbl(tmpAttrNam)
+  }
+}
+
+!------------------------------------------------------------------------------
+// Ищет код атрибута по наименованию
+function FindID_TMP(bRealTbl : boolean = true) : boolean ;
+{
+  result := false;
+  pcAttrNam  := 0;
+  err:=0;
+  if (bRealTbl)
+  {
+     if (pAttrType <> 0) and (pAttrType <> vTmp.AttrNamTmp.AttrType)
+     {
+       err := 2;
+       if NeedMessage ShowError(Err);
+     }
+     else
+     {
+       result := true;
+       pcAttrNam  := vTmp.AttrNamTmp.nRec;
+       pAttrType  := vTmp.AttrNamTmp.AttrType;
+     }
+  }
+  else
+  {
+    #FindIdTbl(tmpAttrNam)
+  }
+}
+
+#declare FindValueTbl(NameTbl1,NameTbl2,view)
+  //_GP_ if (GetFirst #NameTbl2 = tsOk)
+  var _boFind:boolean=False;
+  _Loop #NameTbl2
+  { _boFind:=True;
+    Result:=true;
+    CASE #(view).#NameTbl1.AttrType OF
+     cgAttrType_Str : pString := #NameTbl2.vString ;
+     cgAttrType_Dbl :
+        {
+          pDouble  := #NameTbl2.vDouble;
+          pString := string ( #NameTbl2.vDouble ) ;
+        }
+     cgAttrType_Date :
+        {
+          pDate := #NameTbl2.vDate;
+          pString  := string ( #NameTbl2.vDate ) ;
+        }
+     cgAttrType_Time :
+        {
+          pTime := #NameTbl2.vTime;
+          pString  := string ( #NameTbl2.vTime ) ;
+        }
+     cgAttrType_Memo :
+        {
+          if (bRealTbl)
+          {
+            MemoFile.OpenMemo(AttrVal.vLVar);
+            MemoFile.ReadLn(pString);
+            MemoFile.Close;
+          }
+        }
+     cgAttrType_Comp :
+        {
+
+          pComp   := #NameTbl2.vComp;
+//GP      pString := refAttrComp.sGetValue(#NameTbl2.wTable,#NameTbl2.cAttrNam, #NameTbl2.cRec);
+          /*  вариант 1
+          if (#(view).#NameTbl1.RTYPE=100)
+            pString := refAttrComp.sGetValue(#NameTbl2.wTable,#NameTbl2.cAttrNam, #NameTbl2.cRec);
+          else
+            pString := ShowKau(#(view).#NameTbl1.rObject, pComp)
+          */
+          if (#(view).#NameTbl1.rType <> cgKatKau_System)
+          { if (#(view).#NameTbl1.rObject=0)
+              pString := string(pComp)
+            else
+             pString := ShowKau(#(view).#NameTbl1.rObject, pComp)
+          }
+          else
+            pString := #NameTbl2.vString;
+
+
+        }
+     cgAttrType_Bool :
+        {
+          pBoolean := boolean( #NameTbl2.VLONGINT );
+          pString  := string ( #NameTbl2.VLONGINT );
+        }
+     else
+        {
+          result :=false;
+          Err :=6;
+          if NeedMessage ShowError(Err);
+        }
+    END ;
+    //_GP_
+    break;
+  }
+  //_GP_else
+  if not _bofind
+  {   result:=false;
+      Err :=3;
+      if NeedMessage ShowError(Err);
+  }
+#end
+!------------------------------------------------------------------------------
+// Ищет значение атрибута и записывает его в глобальные переменные
+Function FindValue (bRealTbl : boolean = true) : boolean ;
+{
+  Err :=0;
+  if (bRealTbl)
+  {
+    #FindValueTbl(AttrNam,AttrVal,viExtAttr)
+  }
+  else
+  {
+    #FindValueTbl(tmpAttrNam,tmpAttrVal,viExtAttr)
+  }
+}
+
+// Ищет значение атрибута и записывает его в глобальные переменные
+Function FindValue_tmp (bRealTbl : boolean = true) : boolean ;
+{
+  Err :=0;
+  if (bRealTbl)
+  {
+    #FindValueTbl(AttrNamTmp,AttrVal,vTmp)
+  }
+  else
+  {
+    #FindValueTbl(tmpAttrNam,tmpAttrVal,viExtAttr)
+  }
+}
+
+
+!------------------------------------------------------------------------------
+#declare SetValueTbl(NameTbl)
+  if (GetFirst fastFirstRow #NameTbl <> tsOk)
+  {
+    clearBuffer(tn#NameTbl);
+    #NameTbl.wTable   := pwTable;
+    #NameTbl.cRec     := pcRec;
+    #NameTbl.cAttrNam := pcAttrNam;
+    isExsist:= false;
+  }
+  else
+    isExsist:= true;
+    CASE pAttrType OF
+     cgAttrType_Str : #NameTbl.vString := pString;
+     cgAttrType_Dbl : #NameTbl.vDouble := pDouble;
+     cgAttrType_Date : #NameTbl.vDate   := pDate;
+     cgAttrType_Time : #NameTbl.vTime   := pTime;
+     cgAttrType_Memo :
+     {
+       MemoFile.OpenMemo(AttrVal.vLVar);
+       MemoFile.Writeln(pString);
+       MemoFile.Close;
+     }
+     cgAttrType_Comp :
+     {
+       #NameTbl.vString := pString;
+       #NameTbl.vComp   := pComp;
+     }
+     cgAttrType_Bool: #NameTbl.VLONGINT := longint(pBoolean);
+     else
+     {
+        SetValue:=false;
+        Err :=6;  if NeedMessage ShowError(Err);
+        Exit;
+     }
+    END;
+
+    if isExsist
+      ErrBtr := update current #NameTbl;
+    else
+      ErrBtr := insert current #NameTbl;
+
+  if errBtr <> 0
+  {   SetValue := false;
+      Err := 5;  if NeedMessage ShowError(Err);
+  }
+#end
+// Устанавливает значение атрибута по глобальным переменным
+Function SetValue (bRealTbl : boolean = true) : boolean ;
+{
+  var isExsist : boolean;
+  Err :=0;
+  result := true;
+
+  if (bRealTbl)
+  {
+    #SetValueTbl(AttrVal)
+  }
+  else
+  {
+    #SetValueTbl(tmpAttrVal)
+  }
+}
+
+// режим работы post обработки
+property InsertDbMode : boolean read m_wInsertDbMode write m_wInsertDbMode := result;
+
+HandleEvent
+cmOnVipLoad :
+  m_wInsertDbMode := true;
+
+cmOnVipUnload :
+  m_wInsertDbMode := true;
+
+end;
+
+end.

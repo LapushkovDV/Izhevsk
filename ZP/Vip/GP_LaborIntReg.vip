@@ -1,0 +1,733 @@
+/*************************************************************************************************\
+* Наименование: Ведомость трудоемкости КБ и НИК (табель)                                          *
+* Контур/Модуль: Заработная плата                                                                 *
+* Пункт меню: Отчеты / Отчеты пользователя / Экономическая и статистическая отчетность /          *
+* Ведомость трудоемкости КБ и НИК (табель)                                                        *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи  |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#829          |24/04/18|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include GP_StrFunc.vih
+#include GP_Filter.vih
+#include Query.vih
+
+#define GPInt GP_LaborIntReg // #(GPInt)
+#define GPNam Ведомость трудоемкости КБ и НИК (табель) // #(GPNam)
+
+interface GP_LaborIntReg '#(GPNam)' EscClose;
+
+  const
+    // FLT_KATPODR = 1;
+    REP_TITLE = 'Распечатка трудоёмкости по отделам и заказам КБ'; // Заголовок отчёта
+    TAB_CNT = 1; // Количество закладок в отчёте
+    TAB_TITLE_1 = 'Отчёт'; // Название закладки 1
+    // Константы ошибок при работе с Excel
+    XE_BAD_OP           =  0; // не удалось выполнить операцию с Excel-файлом
+    XE_CREATE_FILE      =  1; // не удалось создать файл
+    XE_OPEN_FILE        =  2; // не удалось открыть файл
+    XE_INIT_FILE        =  3; // не удалось инициализировать Excel
+    XE_CREATE_MATRIX    =  4; // не удалось создать матрицу
+    XE_FREE_MATRIX      =  5; // не удалось освободить матрицу
+    XE_OUT_MATRIX       =  6; // не удалось вывести матрицу в отчёт
+    XE_WRITE_TO_MATRIX  =  7; // не удалось записать значение в матрицу
+    XE_FORMAT_CELL      =  8; // не удалось отформатировать ячейку
+    XE_SET_CELL_VALUE   =  9; // не удалось записать значение в ячейку
+    XE_SET_CELL_FORMULA = 10; // не удалось записать формулу
+    XE_RUN_MACRO        = 11; // не удалось запустить макрос
+    XE_ADD_SHEET        = 12; // не удалось добавить вкладку
+    XE_DEL_SHEET        = 13; // не удалось удалить вкладку
+    XE_RENAME_SHEET     = 14; // не удалось переименовать вкладку
+    XE_WRONG_TEMPLATE   = 15; // в xlt шаблоне не найден лист с именем
+  end;
+
+  #include GP_StrFunc.var
+
+  // Таблица для хранения результатов DirectSQL запроса, на основании которого строится форма
+  // Можно было бы построить всю форму одним DirectSQL запросом, но для возможности анализа
+  // данных в случае проблем выбран двухэтапный подход - на первом этапе выбираем DirectSQL
+  // запросом данные, сгруппированные по подразделениям, заказам и видам оплат, а на втором
+  // этапе формируем саму выходную форму
+  table struct SData
+  (
+    cPodr: tNRec, // Ссылка на подразделение
+    PodrKod: string[20], // Код подраздления
+    cOrder: tNRec, // Ссылка на заказ
+    OrderNum: string[20], // Код заказа
+    VidOplP: longint, // Код вида оплаты польз.
+    VidOplS: longint, // Код вида оплаты сист.
+    Hours: double // Количество часов
+  )
+  with index
+  (
+    SData01 = PodrKod + OrderNum + VidOplP
+  );
+
+  table struct SDep
+  (
+    cKatPodr: tNRec,
+    Code: string[21]
+  )
+  with index
+  (
+    SDep01 = cKatPodr,
+    SDep02 = Code
+  );
+
+  // Номер заказа
+  table struct SOrder
+  (
+    cOrder: tNRec,
+    Code: string[21]
+  )
+  with index
+  (
+    SOrder01 = cOrder,
+    SOrder02 = Code
+  );
+
+  // Для этой формы можно было бы обойтись без отдельной таблицы для хранения итогов по часам.
+  // Так сделано на случай, если захочется сделать отдельный столбец на каждый заказ -
+  // при такой организации данных, сделать такую доработку будет несложно
+  table struct SHours
+  (
+    cKatPodr: tNRec,
+    cOrder: tNRec,
+    Hours: double
+  )
+  with index
+  (
+    SHours01 = cKatPodr + cOrder
+  );
+
+  var
+    oGP_Filter_KatPodr: GP_Filter; // Фильтр по подразделениям
+
+  create view
+    var
+      pMonth: Byte; // Месяц начала отчётного периода
+      pYear: word; // Год отчётного периода
+      pBDate: Date; // Дата начала отчётного периода
+      pEDate: Date; // Дата окончания отчётного периода
+      IsAborted: Boolean;
+      SumFormat2D: string;
+    as select
+      (oGP_Filter_KatPodr.GetState) (fieldName = FltKatPodrSt)
+    from
+      Zar_User,
+      KatPodr,
+      MnPlan,
+      SData (SData01),
+      SDep (SDep02),
+      SOrder (SOrder02)
+    where ((
+          UserName      == Zar_User.OwnName
+      and SDep.cKatPodr == SHours.cKatPodr
+      and SOrder.cOrder == SHours.cOrder
+    ));
+
+  #include GP_Log.var
+
+  window winParam '#(GPNam)' DoAccept, EscClose, Gray;
+    show at (,, 74, 7);
+
+    screen scrParam ('',, sci1EnEsc);
+    fields
+      pMonth ('Месяц отчетного периода',, sci13EnEsc):
+       [LIST  1 'Январь',
+              2 'Февраль',
+              3 'Март',
+              4 'Апрель',
+              5 'Май',
+              6 'Июнь',
+              7 'Июль',
+              8 'Август',
+              9 'Сентябрь',
+             10 'Октябрь',
+             11 'Ноябрь',
+             12 'Декабрь'
+       ], protect;
+      pYear ('Год отчетного периода'): noprotect, SpinButton [1, 1, 9999];
+      FltKatPodrSt ('Список подразделений',, sci13Esc): protect;
+    buttons
+      cmOk,,, 'Ввод - принять выбор',,sci1Esc;
+      cmCancel,,, 'Отмена',,sci1Esc;
+    <<
+
+ Отчетный период: .@@@@@@@@@@@@@.@@@@@ года
+
+`Цех`             .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+                        <.  ~O~K  .> <.О~т~мена.>
+    >>
+    end;
+
+    handleEvent
+      cmOk:
+        PutCommand(cmDefault);
+      cmDefault:
+        if (oGP_Filter_KatPodr.SelCount = 0)
+        {
+          Message('В поле "Цех" должно быть выбрано хотя бы одно подразделение');
+          abort;
+        }
+    end;
+  end;
+
+  function InitParam: Boolean;
+  {
+    InitParam := False;
+    var pYearRas: integer = 0;
+    var pMonthRas: integer = 0;
+    if (not GetUserDate(pYearRas, pMonthRas, 0, ZeroDate, ZeroDate))
+      exit;
+    if (not ReadMyDsk(pMonth, '#(GPInt)_pMonth', false))
+      pMonth := pMonthRas;
+    if (not ReadMyDsk(pYear, '#(GPInt)_pYear', false))
+      pYear := pYearRas;
+    InitParam := True;
+  }
+
+  procedure SaveParam;
+  {
+    SaveMyDsk(pMonth, '#(GPInt)_pMonth');
+    SaveMyDsk(pYear, '#(GPInt)_pYear');
+  }
+
+  function AskParam: Boolean;
+  {
+    AskParam := False;
+    if (not InitParam)
+      exit;
+    if (RunWindowModal(winParam) = cmDefault)
+    {
+      AskParam := True;
+      SaveParam;
+      pBDate := To_Date(1, pMonth, pYear);
+      pEDate := To_Date(Last_Day(pBDate), pMonth, pYear);
+    }
+  }
+
+  function AddSDep(_cKatPodr: tNRec): Boolean;
+  {
+    result := false;
+    if (getFirst KatPodr where ((_cKatPodr == KatPodr.NRec)) != tsOk)
+    {
+      oGP_Log.Error('Не найдена запись в таблице KatPodr с NRec = ' + To_Char(_cKatPodr, 0, 0));
+      exit;
+    }
+    if (getFirst SDep where ((_cKatPodr == SDep.cKatPodr)) != tsOk)
+    {
+      // ClearBuffer(#SDep); // Чистить нет нужды - все поля присваиваются
+      SDep.cKatPodr := _cKatPodr;
+      SDep.Code := KatPodr.Kod;
+      if (insert current SDep != tsOk)
+        oGP_Log.Error('Не удалось вставить запись в таблицу SDep');
+    }
+    result := true;
+  }
+
+  function AddSOrder(_cOrder: tNRec): Boolean;
+  {
+    result := false;
+    if (getFirst MnPlan where ((_cOrder == MnPlan.NRec)) != tsOk)
+    {
+      oGP_Log.Error('Не найдена запись в таблице MnPlan с NRec = ' + To_Char(_cOrder, 0, 0));
+      exit;
+    }
+    if (getFirst SOrder where ((_cOrder == SOrder.cOrder)) != tsOk)
+    {
+      // ClearBuffer(#SOrder); // Чистить нет нужды - все поля присваиваются
+      SOrder.cOrder := _cOrder;
+      SOrder.Code := MnPlan.Number;
+      if (insert current SOrder != tsOk)
+        oGP_Log.Error('Не удалось вставить запись в таблицу SOrder');
+    }
+    result := true;
+  }
+
+  procedure AddSHours(_cKatPodr: tNRec; _cOrder: tNRec; _Hours: double);
+  {
+    if (AddSDep(_cKatPodr))
+    {
+      if (AddSOrder(_cOrder))
+      {
+        if (getFirst SHours where ((_cKatPodr == SHours.cKatPodr and _cOrder == SHours.cOrder)) != tsOk)
+        {
+          // ClearBuffer(#SHours); // Чистить нет нужды - все поля присваиваются
+          SHours.cKatPodr := _cKatPodr;
+          SHours.cOrder := _cOrder;
+          SHours.Hours := _Hours;
+          if (insert current SHours != tsOk)
+            oGP_Log.Error('Не удалось вставить запись в таблицу SHours');
+        }
+        else
+        {
+          SHours.Hours += _Hours;
+          if (update current SHours != tsOk)
+            oGP_Log.Error('Не удалось обновить запись в таблице SHours');
+        }
+      }
+    }
+  }
+
+  // Создает и заполняет временную таблицу со списком выбранных подразделений
+  procedure FillPodrList;
+  {
+    SqlDropTmpTable('TmpSelKatPodr');
+    if (sqlCreateTmpTable('TABLE TmpSelKatPodr (NRec: COMP) WITH INDEX (TmpSelKatPodr01 = NRec);', ctmNormal) != tsOk)
+    {
+      IsAborted := true;
+      oGP_Log.Error('Ошибка создания таблицы TmpSelKatPodr');
+      exit;
+    }
+
+    var i: longint;
+    for (i := 0; i < oGP_Filter_KatPodr.SelCount; i++)
+    {
+      var _cKatPodr: tNRec = oGP_Filter_KatPodr.GetSelected(I);
+      var stmt: longint = sqlAllocStmt;
+      SQLPrepare(stmt, 'insert into TmpSelKatPodr (nrec) values (#comp(' + To_Char(_cKatPodr) + '))');
+      if (SQLExecute(stmt) != tsOk)
+        oGP_Log.Error('Не удалось добавить запись в таблицу TmpSelKatPodr');
+      SQLFreeStmt(stmt);
+    }
+  }
+
+  // Заполняет с помощью DirectSQL запроса таблицу SData
+  procedure FillSData;
+  {
+    SetVisualHeader('Получение данных по оплатам...');
+
+    SQLCopyInto(
+      QueryManager.CreateQuery(
+        SQLQuery(
+          SELECT
+            KatPodr.NRec AS cPodr,
+            KatPodr.Kod AS PodrKod,
+            MnPlan.NRec AS cOrder,
+            MnPlan.Number AS OrderNum,
+            NachislZakaz.VidOpl AS VidOplP,
+            NachislZakaz.VidOplS AS VidOplS,
+            Sum(NachislZakaz.ChasF) AS Hours
+          FROM
+            NachislZakaz
+            LEFT JOIN KatPodr ON NachislZakaz.CexOZ = KatPodr.NRec
+            LEFT JOIN MnPlan ON CASE
+                WHEN NachislZakaz.TblD[1] = 7 THEN NachislZakaz.cKAUD[1]
+                WHEN NachislZakaz.TblD[2] = 7 THEN NachislZakaz.cKAUD[2]
+                WHEN NachislZakaz.TblD[3] = 7 THEN NachislZakaz.cKAUD[3]
+                WHEN NachislZakaz.TblD[4] = 7 THEN NachislZakaz.cKAUD[4]
+                WHEN NachislZakaz.TblD[5] = 7 THEN NachislZakaz.cKAUD[5]
+                WHEN NachislZakaz.TblD[6] = 7 THEN NachislZakaz.cKAUD[6]
+            END = MnPlan.NRec
+          WHERE
+                :pYear = NachislZakaz.YearN
+            and :pMonth = NachislZakaz.MesN
+            and NachislZakaz.VidOpl in (1, 3, 5, 9, 10)
+            and NachislZakaz.CexOZ in (SELECT TmpSelKatPodr.NRec FROM TmpSelKatPodr)
+          GROUP BY
+            KatPodr.NRec,
+            KatPodr.Kod,
+            MnPlan.NRec,
+            MnPlan.Number,
+            NachislZakaz.VidOpl,
+            NachislZakaz.VidOplS
+          ORDER BY
+            KatPodr.Kod,
+            MnPlan.Number
+        )
+      ).SetParam('pYear', pYear).SetParam('pMonth', pMonth)
+    , #SData, true);
+  }
+
+  procedure PrepareData;
+  {
+    IsAborted := false;
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, ''#3'Анализ данных...'#13, 1);
+
+    #ifdef __DEBUG__
+    oGP_Log.Info('Анализ данных:');
+    #end
+
+    if (not IsAborted)
+      FillPodrList;
+    if (not IsAborted)
+      FillSData;
+
+    _loop SData
+    {
+      if (not NextVisual)
+        IsAborted := true;
+      if (IsAborted)
+        break;
+      #ifdef __DEBUG__
+      oGP_Log.Info('');
+      oGP_Log.Info('SData.cPodr: ' + To_Char(SData.cPodr, 0, 0));
+      oGP_Log.Info('SData.PodrKod: ' + SData.PodrKod);
+      oGP_Log.Info('SData.cOrder: ' + To_Char(SData.cOrder, 0, 0));
+      oGP_Log.Info('SData.OrderNum: ' + SData.OrderNum);
+      oGP_Log.Info('SData.VidOplP: ' + To_Char(SData.VidOplP));
+      oGP_Log.Info('SData.VidOplS: ' + To_Char(SData.VidOplS));
+      oGP_Log.Info('SData.Hours: ' + To_Char(SData.Hours, 0, 2));
+      #end
+      AddSHours(SData.cPodr, SData.cOrder, SData.Hours);
+    }
+    StopVisual('', 0);
+  }
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  var
+    // Переменные для работы с Excel
+    RecCnt: longint; // Количество строк в отчёте
+    FirstCol: longint; // Номер первой колонки отчёта
+    LastCol: longint; // Номер последней колонки отчёта
+    FirstHeadRow: longint; // Номер первой строки отчёта
+    FirstBodyRow: longint; // Номер первой строки тела отчёта
+    LastBodyRow: longint; // Номер последней строки отчёта
+    FirstDepRow: longint; // Номер первой строки данных по текущему отделу
+
+  // Исключение для генерации ошибок, связанных с выводом в Excel файл
+  exception ExOnExecelError;
+
+  // Генерирует ошибку, связанную с выводом в Excel файл
+  procedure ExcelError(ErrCode: word; AddInfo: string);
+  {
+    var ErrText: string;
+    case ErrCode of
+      XE_BAD_OP:
+        ErrText := 'не удалось выполнить операцию с Excel-файлом';
+      XE_CREATE_FILE:
+        ErrText := 'не удалось создать файл';
+      XE_OPEN_FILE:
+        ErrText := 'не удалось открыть файл';
+      XE_INIT_FILE:
+        ErrText := 'не удалось инициализировать Excel';
+      XE_CREATE_MATRIX:
+        ErrText := 'не удалось создать матрицу';
+      XE_OUT_MATRIX:
+        ErrText := 'не удалось вывести матрицу в отчёт';
+      XE_WRITE_TO_MATRIX:
+        ErrText := 'не удалось записать значение в матрицу';
+      XE_WRONG_TEMPLATE:
+        ErrText := 'в xlt шаблоне не найден лист с именем';
+      XE_FORMAT_CELL:
+        ErrText := 'не удалось отформатировать ячейку';
+      XE_SET_CELL_VALUE:
+        ErrText := 'не удалось записать значение в ячейку';
+      XE_RUN_MACRO:
+        ErrText := 'не удалось запустить макрос';
+      XE_ADD_SHEET:
+        ErrText := 'не удалось добавить вкладку';
+      XE_DEL_SHEET:
+        ErrText := 'не удалось удалить вкладку';
+      XE_RENAME_SHEET:
+        ErrText := 'не удалось переименовать вкладку';
+      XE_FREE_MATRIX:
+        ErrText := 'не удалось освободить матрицу';
+      XE_SET_CELL_FORMULA:
+        ErrText := 'не удалось записать формулу';
+    else
+      ErrText := '';
+    end;
+    oGP_Log.Error(ErrText + ' ' + AddInfo);
+    _raise ExOnExecelError;
+  }
+
+  // Эта Функция делает более удобной проверку результата операции с Excel
+  // Первым параметром передаем функцию, которая работает с Excel, а вторым и третьим - информацию об ошибке,
+  // которая будет выведена, если эта функция вернёт false (т.е. выполнится с ошибкой)
+  procedure xlOp(IsCorrect: Boolean; ErrCode: word; AddInfo: string);
+  {
+    if (not IsCorrect)
+      ExcelError(ErrCode, AddInfo);
+  }
+
+  // Преобразовывает строку так, чтобы при выводе в Excel сохранились лидирующие нули
+  // (добавляет в начало строки одиночную кавычку, если строка начинается с нуля)
+  function SaveLeadZeros(Code: string): string;
+  {
+    result := Code;
+    if (SubStr(Code, 1, 1) = '0')
+      result := Chr(39) + result;
+  }
+
+  // Создаёт Excel файл и создаёт в нём вкладки для вывода отчёта
+  procedure PrepareExcelFile(OutFileName: string);
+  {
+    if (ExistFile(OutFileName))
+      DeleteFile(OutFileName);
+    SetVisualHeader('Создание Excel-файла...');
+    // Создаем файл Excel
+    xlOp(xlCreateExcel(OutFileName, True), XE_CREATE_FILE, OutFileName);
+    xlOp(xlIsExcelValid, XE_INIT_FILE, '');
+    // Переименуем вкладки
+    // Если в отчете меньше вкладок, чем нам нужно добавим недостающие
+    var TabCnt: word = 0;
+    xlOp(xlGetSheetsCount(TabCnt), XE_ADD_SHEET, '');
+    while TabCnt < TAB_CNT do
+    {
+      xlOp(xlAddSheet, 11, '');
+      TabCnt++;
+    }
+    // Если в больше вкладок, чем нам нужно, удалим лишние
+    while TabCnt > TAB_CNT do
+    {
+      xlOp(xlDeleteSheet(1), XE_DEL_SHEET, '');
+      TabCnt--;
+    }
+    // Переименуем вкладки
+    xlOp(xlSetSheetName(1, TAB_TITLE_1), XE_RENAME_SHEET, '');
+  }
+
+  procedure OutTitle(var R: longint);
+  {
+    // Выводим заголовок
+    xlOp(xlSetCellStringValue(REP_TITLE + ' ' + oGP_SF.PeriodName(pBDate, pEDate), R, 1, R, 1), XE_SET_CELL_VALUE, '');
+    // сделаем его жирным
+    xlOp(xlSetFontStyle(xlBold, R, 1, R + 1, 1), XE_FORMAT_CELL, '');
+    // и крупным
+    xlOp(xlSetFontSize(12, R, 1, R + 1, 1), XE_FORMAT_CELL, '');
+    R += 1;
+  }
+
+  // Вывод шапки отчёта
+  procedure OutHeader(var R: longint);
+  {
+    SetVisualHeader('Форматирование Excel-файла...');
+    FirstCol := 1;
+
+    var C: word = FirstCol - 1;
+    // Отдел
+    xlOp(xlSetCellStringValue('Отдел', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(20, R, C, R, C), XE_FORMAT_CELL, '');
+    // Заказ
+    xlOp(xlSetCellStringValue('Заказ', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(20, R, C, R, C), XE_FORMAT_CELL, '');
+    // Время
+    xlOp(xlSetCellStringValue('Время', R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetColumnWidth(30, R, C, R, C), XE_FORMAT_CELL, '');
+
+    LastCol := C;
+
+    // Выравниваем содержимое ячеек шапки по верхнему краю и по центру
+    xlOp(xlAlignCellsEx(xlCenter, xlTop, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Устанавливаем текстовый формат для всех ячеек шапки
+    xlOp(xlSetNumberFormat('@', R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    // Делаем шрифт шапки жирным
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');;
+    // Увеличиваем высоту шапки
+    xlOp(xlSetRowHeight(15, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+
+    // Рисуем границы ячеек для шапки
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0, 
+     R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+
+    R += 1;
+  }
+
+  procedure OutTotal(var R: longint; Title: string; THours: double);
+  {
+    var C: word = FirstCol - 1;
+    // Отдел
+    xlOp(xlMergeCells(R, ++C, R, C + 1), XE_FORMAT_CELL, '');
+    xlOp(xlSetCellStringValue(Title, R, C, R, C), XE_SET_CELL_VALUE, '');
+    C++;
+    // Время
+    xlOp(xlSetCellNumberValue(THours, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+    xlOp(xlSetNumberFormat(SumFormat2D, R, C, R, C), XE_FORMAT_CELL, '');
+    // Рисуем границы ячеек
+    xlOp(xlFrameCells(xlBorderL or xlBorderR or xlBorderT or xlBorderB + xlInsideV + xlInsideH, xlThin, 0, 0,
+     FirstDepRow, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    xlOp(xlSetFontStyle(xlBold, R, FirstCol, R, LastCol), XE_FORMAT_CELL, '');
+    R++;
+  }
+
+  // Вывод тела отчёта
+  procedure OutBody(var R: longint);
+  {
+    SumFormat2D := '# ##0' + GetDecimalSeparator + '00';
+    SetVisualHeader('Вывод данных в отчет...');
+    #ifdef __DEBUG__
+    oGP_Log.Info('#(GPNam) ' + oGP_SF.PeriodName(pBDate, pEDate));
+    #end
+    var THours: double = 0;
+    var T3DHours: double = 0;
+    var CurDep3DCode: string[3];
+    var PrevDep3DCode: string[3] = '';
+    _loop SDep
+    {
+      if (IsAborted)
+        break;
+      NextVisual;
+      CurDep3DCode := SubStr(SDep.Code, 1, 3);
+      if (PrevDep3DCode = '' or CurDep3DCode != PrevDep3DCode)
+      {
+        if (PrevDep3DCode != '')
+        {
+          OutTotal(R, 'Всего по отделу ' + PrevDep3DCode + ':', T3DHours);
+          T3DHours := 0;
+        }
+        PrevDep3DCode := CurDep3DCode;
+      }
+      FirstDepRow := R;
+      var TDepHours: double = 0;
+      _loop SOrder
+      {
+        if (IsAborted)
+          break;
+        NextVisual;
+        _loop SHours
+        {
+          if (IsAborted)
+            break;
+          NextVisual;
+          var C: word = FirstCol - 1;
+          // Отдел
+          xlOp(xlSetCellStringValue(SaveLeadZeros(SDep.Code), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+          // Заказ
+          xlOp(xlSetCellStringValue(SaveLeadZeros(SOrder.Code), R, ++C, R, C), XE_SET_CELL_VALUE, '');
+          // Время
+          xlOp(xlSetCellNumberValue(SHours.Hours, R, ++C, R, C), XE_SET_CELL_VALUE, '');
+          xlOp(xlSetNumberFormat(SumFormat2D, R, C, R, C), XE_FORMAT_CELL, '');
+          // Выравниваем содержимое ячеек
+          xlOp(xlAlignCellsEx(xlCenter, xlTop, R, FirstCol, R, FirstCol + 1), XE_FORMAT_CELL, '');
+          TDepHours += SHours.Hours;
+          T3DHours += SHours.Hours;
+          R++;
+        }
+      }
+      THours += TDepHours;
+      OutTotal(R, 'Итого по отделу ' + SDep.Code + ':', TDepHours);
+    }
+    if (PrevDep3DCode != '')
+      OutTotal(R, 'Всего по отделу ' + PrevDep3DCode + ':', T3DHours);
+    OutTotal(R, 'Всего:', THours);
+  }
+
+  // Формирует отчёт
+  procedure CreateReport;
+  {
+    IsAborted := false;
+    PrepareData;
+    if (IsAborted)
+      exit;
+
+    RecCnt := RecordsInTable(#SHours);
+    if (RecCnt = 0)
+    {
+      Message('Нет данных для формирования отчёта');
+      exit;
+    }
+
+    var OutFileName: string = GetDefaultUserPath + '#(GPNam) ' + oGP_SF.PeriodName(pBDate, pEDate) + '.xlsx';
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отчета...', 1);
+    _try
+    {
+      PrepareExcelFile(OutFileName);
+      var R: longint = 1;
+      // Выводим заголовок отчёта
+      OutTitle(R);
+      FirstHeadRow := R;
+      FirstBodyRow := FirstHeadRow + 1; // Высота шапки - 1 строка
+      LastBodyRow := FirstBodyRow + RecCnt - 1;
+      // Выводим шапку отчёта
+      OutHeader(R);
+      // Выводим тело отчёта
+      OutBody(R);
+    end
+    _except on ExOnExecelError, ExUserBreak:
+    {
+      IsAborted := true;
+    }
+    StopVisual('',0);
+    xlKillExcel;
+  }
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  handleEvent
+    cmInit:
+      {
+        // Фильтр по видам оплат
+        if (LoadVipInterface(oGP_Filter_KatPodr))
+        {
+          oGP_Filter_KatPodr.Init(GP_FLT_KAT_PODR, 'GP_LaborIntReg_Deps', 'Выбор подразделений', GP_FLT_ST_NIK_OR_KB);
+          if (AskParam)
+          {
+            oGP_Log.Init('#(GPInt).log', true, true, true);
+            CreateReport;
+            oGP_Log.Done(true);
+          }
+          oGP_Filter_KatPodr.Done;
+          FreeVipInterface(oGP_Filter_KatPodr);
+        } else
+          Message(''#10#13' Ошибка! Не удалось инициализировать фильтр по подразделениям', Error);
+        abort;
+      }
+    cmPick:
+      case CurField of
+        #FltKatPodrSt:
+          if (oGP_Filter_KatPodr.Pick)
+          {
+            // pFilters := pFilters or FLT_KATPODR;
+            RescanPanel(CurTable);
+          }
+      end;
+    cmDelOnProtect:
+      case CurField of
+        #FltKatPodrSt:
+          {
+            oGP_Filter_KatPodr.Reset;
+            // pFilters := pFilters and (not FLT_KATPODR);
+            RescanPanel(CurTable);
+          }
+      end;
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_GP_LaborIntReg implements IUserReport;
+
+interface UserReport_GP_LaborIntReg;
+
+  procedure Run;
+  {
+    RunInterface('GP_LaborIntReg');
+  }
+
+  function GetReportName: string;
+  {
+    result := 'Ведомость трудоемкости КБ и НИК (табель)';
+  }
+
+  function GetGroupName(Level: word): string;
+  {
+    result := '';
+    case Level of
+      1: result := 'Экономическая и статистическая отчетность';
+    end;
+  }
+
+  function GetPriority: integer;
+  {
+    result := 0;
+  }
+
+  function VisibleInModule(Ind: Byte): string;
+  {
+    result := '';
+    case Ind of
+      1: result := 'MENUZARP';
+    end;
+  }
+
+end.

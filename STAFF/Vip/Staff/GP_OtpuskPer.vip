@@ -1,0 +1,494 @@
+/*************************************************************************************************\
+* Наименование: Отпуска сотрудников по периодам                                                   *
+* Контур/Модуль: ЗП                                                                               *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#2318         |02/08/18|Синяк Е.П.             |НПО Энергомаш                      *
+* Разработка  |#52911        |27/06/23|kurennykh              |НПО Энергомаш                      *
+\*************************************************************************************************/
+
+#include PAFilter.vih
+#include CatFunc.vih
+#include FactVacation.vih    // для расчета остатков отпусков
+#include APPFUNCS.VIH // объект для работы с назначениями
+
+interface GP_OtpuskPer 'Отпуска сотрудников по периодам' EscClose, Gray;
+  show at (,,80,13);
+
+var iCatFunc   : CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+var iFV        : iFactVacation New;
+var VAppFuncs  : AppointmentsFunctions;
+
+create view
+var
+ dTuneDateOtch
+ ,dLastOtchDay    : date;
+ SumPutVac        : integer;
+ SumDate          : Double;
+ dateSts          : date;          // Дата
+ _wTypeRun        : word;
+  #include PAFilter.var
+(
+  FiltrPodr,
+  FiltrPublic
+)
+as select
+  #include GP_Podrfiltr1.vpp  // вычисляемые поля для фильтров по сотрудн. и подразд.
+  ,if(isValid(tnAppointments), 
+    if(Appointments.LPrizn=0,'Основной',
+      if(Appointments.LPrizn=2,'Заместитель',
+        if(Appointments.LPrizn=3,'Совместитель',
+          'другое'))),'')
+  ( FieldName = sPrizn)
+
+from
+  Zar_User
+ ,Lschet
+ ,Lschet Lschet1
+ ,Lschet LschetN
+ ,Persons PersonsN
+ ,Persons Persons1
+ ,Appointments
+ ,WorkPeriod
+ ,PutVacation
+ ,KlOtpusk
+ ,KlKatego AppEmpCategoryCat
+ ,CurLSchet
+
+where 
+((
+  _cLSchet                  == Formarks.Choice     
+  and Formarks.cLschet      == Lschet1.nrec
+  and LSchet1.tPerson       == Persons1.Nrec
+  and Appointments.EmpCategory == AppEmpCategoryCat.Nrec
+  and workperiod.CAPPOINTMENT == appointments.nrec
+
+  and word(0)               == WorkPeriod.wTypePeriod(noindex)
+  and Persons1.nrec         == WorkPeriod.cPerson
+  and WorkPeriod.nRec       == PutVacation.cWorkPeriod
+  and ( word(0)              = PutVacation.wTypeVac or (
+           comp(0)           = PutVacation.cPersVac
+       and comp(0)           = PutVacation.cShRVac
+       and comp(0)           = PutVacation.cPutVacation
+       and comp(0)           = PutVacation.ResComp[1]
+  ))
+
+  and PutVacation.CKLOTPUSK == KlOtpusk.nRec
+
+  and #include GP_Podrfiltr2.vpp // вычисляемые поля для фильтров по сотрудн. и подразд.
+));
+
+#include GP_PODRPAFilter.vpp
+
+screen scr1;
+fields
+  dateSts ('Дата отчета'), noprotect;
+
+  Zar_User.GrupStN ('Выбор фильтра для отчета', hcNoContext): noprotect;
+  FiltrPodr  ('Фильтр по подразделению', hcNoContext): protect, pickbutton;
+  FiltrPublic('Фильтр по работникам', hcNoContext): protect,pickbutton;
+  _wTypeRun   noProtect, NoFrame;
+buttons
+  cmOK;
+  cmCancel;
+<<
+  `Дата отчета`      .@@@@@@@@@@@
+
+  Фильтр по: 
+  [.] подразделению` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+  [.] работникам   ` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  [:] Показывать не системные записи отпусков`
+
+     <.Продолжить.>                           <.  Отмена  .>
+
+>>
+end;
+
+// возвращает положение РП относительно отчетного
+// раньше отчетного  = 0
+// входит в отчетный = 1
+// позже отчетного   = 2
+function CheckPeriodPosition(dWPBeg, dWPEnd: date): word;
+{
+  result := word(0);
+
+  if ( dWPBeg <= dTuneDateOtch and dTuneDateOtch <= dWPEnd ) or
+     ( dWPBeg <= dLastOtchDay and dLastOtchDay <= dWPEnd )
+  {
+    result := word(1);
+    exit;
+  }
+
+  if ( dWPBeg > dLastOtchDay )
+    result := word(2);
+}
+// расчет поля "осталось"
+function CalcRemaindPutVac(dVacDate, dWPB, dWPE: date; cPutVctn: comp; wProvidW: word ): integer;
+var
+  dTmp     : double;
+  dDopDate : date;
+{
+  result := integer(0);
+
+  dTmp     := double(0);
+  dDopDate := dVacDate;
+
+  if ( Day(dVacDate) = 0 )
+  {
+    dVacDate := Sub_Date(dateSts, dWPB);
+
+    if (Year(dVacDate) <= 1)
+      dVacDate := dateSts;
+    else
+      dVacDate := dWPE;
+
+    case CheckPeriodPosition(dWPB,dWPE) of
+      0: dDopDate := dWPE;
+      1: dDopDate := dVacDate;
+    end;
+  }
+
+  if ( iFV.funGetDaysHarmVac(cPutVctn, dVacDate, dTmp) )
+    result := word(dTmp);
+  else
+    result := word(if ((wProvidW <> 1),
+                     iFV.funGetBalanceVac(cPutVctn,0,date(0,0,0)),
+                     iFV.funGetDayProportionCur(dWPB, dDopDate, cPutVctn, 0 )));
+} // function CalcRemaindPutVac
+
+HandleEvent
+
+
+cmInit:
+{
+  InitUser(1); // Инициализация Zar_User
+  if not(ReadMyDsk(dateSts, 'OtpuskPer', false))
+    dateSts := Cur_Date;
+
+  _wTypeRun := wGetTune('UP.FakelGAL.Fakel');
+}
+
+cmUpdateRecord : update current zar_user;
+
+cmCheckField:
+{
+  PodrPubCheck; //Процедура для фильтров по подразд. и работникам
+  RedrawPanel(#Zar_User);
+}//cmCheckField
+
+cmPick:
+{
+  PodrPubPick; //Процедура для фильтров по подразд. и работникам
+  RedrawPanel(#Zar_User);
+} // cmPick
+
+cmOk:
+{
+
+  update current Zar_User;
+
+  if not FillMarks then  // Заполнение Formarks
+  {
+    abort;
+    exit;
+  }
+
+  var nom:integer;
+  var Numcol:integer;
+  nom:=3;
+  Numcol:=1;
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Формирование отпусков сотрудников по периодам...', RecordsInTable(#Formarks));
+
+  xlCreateExcel('Отпуска сотрудников по периодам',true);
+
+  XLPAGESETUPSETORIENTATION(xlLandscape);
+  XLPAGESETUPSETPAPERSIZE(xlPaperA4);
+
+  xlSetCellStringValue('Отпуска сотрудников по периодам', 2, 1, 2, 1);
+  xlSetFontStyle(xlBold, 2, 1, 2, 1);
+  xlSetFontSize(18, 2, 1, 2, 1);
+
+  xlSetCellStringValue('Отчет на дату',nom, 1, nom, 1);
+  xlSetCellStringValue(DateToStr(dateSts, 'DD.MM.YYYY'),nom, 2, nom, 2);
+
+  Numcol:=1;
+
+  xlMergeCells(++nom, numCol, nom, numCol);
+  xlSetCellStringValue('Подразделение',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(12, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Участок',nom , Numcol, nom, Numcol);
+  xlSetColumnWidth(12, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Таб.номер',nom , Numcol, nom, Numcol);
+  xlSetColumnWidth(12, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('ФИО',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(40, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Должность',nom , Numcol, nom, Numcol);
+  xlSetColumnWidth(30, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Категория',nom , Numcol, nom, Numcol);
+  xlSetColumnWidth(12, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Вид назначения',nom , Numcol, nom, Numcol);
+  xlSetColumnWidth(12, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Дата приёма',nom , Numcol, nom, Numcol);
+  xlSetColumnWidth(12, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Дата увольнения',nom , Numcol, nom, Numcol);
+  xlSetColumnWidth(12, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Дата начала рабочего периода',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(12, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Дата окончания рабочего периода',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(12, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Вид отпуска',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(40, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Полагающееся кол-во дней',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(10, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Количество дней*',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(10, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Использовано дней',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(10, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Остаток дней',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(10, nom, Numcol, nom, Numcol);
+
+  xlMergeCells(nom, ++numCol, nom, numCol);
+  xlSetCellStringValue('Остаток дней с учетом даты',nom, Numcol, nom, Numcol);
+  xlSetColumnWidth(10, nom, Numcol, nom, Numcol);
+
+
+  xlSetFontStyle(xlBold, nom, 1, nom, Numcol);
+  xlAlignCellsEx(xlCenter,xlCenter, nom, 1, nom, Numcol);
+  xlSetFontSize(13, nom, 1, nom, Numcol);
+
+  _loop Formarks ordered by Formarks.FIO
+  {
+
+    if not NextVisual
+      break;
+
+    _loop Lschet1
+    {
+
+      if getfirst fastfirstrow Persons1 = tsOk
+      {
+        // обходим тех, кто еще не принят на работу
+        if ( Persons1.AppDate > dateSts)
+          continue;
+        // уволенных обходим
+        if (Persons1.DisDate > date(0,0,0) and  Persons1.DisDate < dateSts)
+          continue;
+
+        _loop WorkPeriod
+        {
+                if WorkPeriod.dperBeg>DateSts continue;
+
+         if lschet1.nrec <> appointments.caddnrec2 continue;
+
+		if appointments.lprizn<>0
+		{
+
+            if (day(appointments.dismissdate) > 0 and  appointments.dismissdate<dateSts) continue;
+		}
+        
+          _loop PutVacation
+          {
+            if (_wTypeRun = 0) then
+            {
+              if (PutVacation.wTypeVac <> word(0)) then
+              {
+                Continue;
+              }
+            }
+
+            SumPutVac := CalcRemaindPutVac(date(0,0,0), WorkPeriod.dPerBeg, WorkPeriod.dPerEnd, PutVacation.NRec, PutVacation.wProvidWay);
+
+                if SumPutVac = 0 and WorkPeriod.dPerEnd<DateSts continue;
+        
+            Numcol:=1;
+
+            xlSetCellStringValue(SubStr(iCatFunc.GetCatalogsCode(Persons1.Department),1,3), ++nom, Numcol, nom, Numcol);
+            
+            xlSetCellStringValue(iCatFunc.GetCatalogsCode(appointments.Department), nom, ++Numcol, nom, Numcol);
+
+            xlSetCellStringValue(''''+Persons1.StrTabn, nom, ++Numcol, nom, Numcol);
+            
+            xlSetCellStringValue(Persons1.FIO, nom, ++Numcol, nom, Numcol);
+            
+            xlSetCellStringValue(iCatFunc.GetCatalogsName(Appointments.Post), nom, ++Numcol, nom, Numcol);
+
+            xlSetCellStringValue(AppEmpCategoryCat.KOD, nom, ++Numcol, nom, Numcol);
+
+            xlSetCellStringValue(sPrizn, nom, ++Numcol, nom, Numcol);
+
+			if appointments.lprizn=0
+			{
+            xlSetCellStringValue(DateToStr(Persons1.AppDate, 'DD.MM.YYYY'), nom, ++Numcol, nom, Numcol);
+
+            if day(Persons1.DisDate) > 0
+              xlSetCellStringValue(DateToStr(Persons1.DisDate, 'DD.MM.YYYY'), nom, ++Numcol, nom, Numcol);
+            else
+              Numcol++;
+			}
+			else
+			{
+            xlSetCellStringValue(DateToStr(appointments.appointdate, 'DD.MM.YYYY'), nom, ++Numcol, nom, Numcol);
+
+            if day(appointments.dismissdate) > 0
+              xlSetCellStringValue(DateToStr(appointments.dismissdate, 'DD.MM.YYYY'), nom, ++Numcol, nom, Numcol);
+            else
+              Numcol++;
+
+			}
+
+            xlSetCellStringValue(DateToStr(WorkPeriod.dPerBeg, 'DD.MM.YYYY'), nom, ++Numcol, nom, Numcol);
+            
+            xlSetCellStringValue(DateToStr(WorkPeriod.dPerEnd, 'DD.MM.YYYY'), nom, ++Numcol, nom, Numcol);
+
+            xlSetCellStringValue(if(GetFirst KlOtpusk = tsOk, KlOtpusk.NOtpus, '??'), nom, ++Numcol, nom, Numcol);
+            
+            xlSetCellStringValue(PUTVACATION.WDAYCOUNT, nom, ++Numcol, nom, Numcol);
+
+            if WorkPeriod.dPerBeg <= dateSts and dateSts <= WorkPeriod.dPerEnd
+            {
+              SumDate := (To_Days(dateSts)-To_Days(WorkPeriod.dPerBeg))/(To_Days(WorkPeriod.dPerEnd)-To_Days(WorkPeriod.dPerBeg))*PUTVACATION.WDAYCOUNT;
+
+              xlSetCellStringValue(SumDate , nom, ++Numcol, nom, Numcol);
+            }
+            else
+            {
+              xlSetCellStringValue(if(SumPutvac=0,0,PUTVACATION.WDAYCOUNT), nom, ++Numcol, nom, Numcol);
+            }
+
+
+
+
+            xlSetCellStringValue(PUTVACATION.WDAYCOUNT - SumPutVac, nom, ++Numcol, nom, Numcol);
+
+            xlSetCellStringValue(SumPutVac, nom, ++Numcol, nom, Numcol);
+
+
+            if WorkPeriod.dPerBeg <= dateSts and dateSts <= WorkPeriod.dPerEnd
+            {
+              xlSetCellStringValue(SumDate- (PUTVACATION.WDAYCOUNT - SumPutVac), nom, ++Numcol, nom, Numcol);
+            }
+            else
+            {
+              xlSetCellStringValue(SumPutVac, nom, ++Numcol, nom, Numcol);
+            }
+
+        
+          }
+
+        }
+
+      }//if getlast fastfirstrow Persons1
+
+    }//_loop Lschet1
+
+  }//_loop Formarks
+
+  xlSetCellStringValue('Итого', ++nom, 12, nom, 12);
+  xlSetCellFormula('=СУММ(R[-'+(nom-4)+']C:R[-1]C)', nom, 16, nom, 16);
+  xlSetCellFormula('=СУММ(R[-'+(nom-4)+']C:R[-1]C)', nom, 17, nom, 17);
+
+  xlAlignCellsEx(xlCenter,xlTop, 5, 1, nom, 1);
+
+  xlAlignCellsEx(xlLeft,xlTop, 5, 2, nom, 4);
+
+  xlAlignCellsEx(xlCenter,xlTop, 5, 5, nom, Numcol);
+
+  xlWrapText(4, 1, nom, Numcol);
+  xlFrameCells(xlBorderL + xlBorderR + xlBorderT + xlBorderB + xlInsideV + xlInsideH,
+                      xlThin, xlContinuous, 0, 4, 1, nom, Numcol);
+
+  xlKillExcel;
+
+  StopVisual('', 0);
+
+  ShowErrors;
+
+}
+
+cmDone:
+{
+  SaveMyDsk(dateSts, 'OtpuskPer');
+}
+
+end;
+end.
+
+/*  Письмо клиента от 8 ноября 2018 г. 13:23
+#include UserReport.vih
+
+vipinterface UserReport_OtpuskPer implements IUserReport;
+
+interface UserReport_OtpuskPer;
+
+create view
+  var
+    Dummy: Byte;
+;
+
+procedure Run;
+begin
+  RunInterface('GP_OtpuskPer');
+end;
+
+function GetReportName: String;
+begin
+  GetReportName := 'Отпуска сотрудников по периодам';
+end;
+
+function GetGroupName(Level: Word): String;
+begin
+  GetGroupName := '';
+  case Level of
+    1: GetGroupName := 'Отпуска';
+  end;
+end;
+
+function GetPriority: Integer;
+begin
+  GetPriority := 0;
+end;
+
+function VisibleInModule(Ind: Byte): String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1: VisibleInModule := 'StaffMainMenu';
+  end;
+end;
+
+end.
+*/

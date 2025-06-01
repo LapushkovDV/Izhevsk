@@ -1,0 +1,1458 @@
+/*************************************************************************************************\
+* Наименование:  Разработка отчетной формы                                                        *
+*                "Табель учета рабочего времени Т-12"                                             *
+* Контур/Модуль: Управление персоналом                                                            *
+* Примечание:    Учет времени->Табели учета рабочего времени->Типовая форма Т-13                  *
+*                                                           ->Табель учета рабочего времени Т-12  *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#166          |20/04/17|Валента А.В.             |НПО Энергомаш                    *
+* Разработка  |#166 #96      |29/08/19|Шунин А.Г.               |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+//**********Кириллов Э.П. 2018.06.27 ЗАБЛОКИРОВАЛ ОБРАБОТКУ Appointments.LPrizn=2
+
+#include xlReport.vih
+#include GetKau.vih    // Объектный интерфейс выбора КАУ
+#include FeeSigners.Vih
+#include CatFunc.Vih
+#include CLSFuncs.vih // ф-ии пересканирования текущих л/с
+
+Interface iEMTabWorkTime 'Табель учета рабочего времени Т-12'  escclose, cyan, doaccept;
+  Show at (, , 60, 8);
+//******************************************************************************
+#include GetKau.var    // Переменная типа "Интерфейса выбора КАУ"
+#include FeeSigners.var
+//******************************************************************************
+table struct tmpSigners
+(
+  kod   : word
+, FIO   : string
+, Dol   : string
+)
+with index
+(
+  tmpSignersO1 = kod
+);
+table struct SAbsence
+(
+  NRec        : comp
+, Sign        : string
+, Mark        : string[5]
+, Description : string
+, Days        : byte
+, Hours       : double
+, Beginning   : date
+, Ending      : date
+, Kind        : word
+, Additive    : boolean
+, PlansHours  : double
+, isMissed    : boolean
+)
+with index
+(
+  SAbsence01 = NRec(Surrogate, Unique)
+, SAbsence02 = isMissed + MARK
+);
+//*****************************************************************************
+table struct tmpAllPodr 
+(
+  NRec    : comp
+, cParent : comp
+, Name    : string
+)
+with index
+(
+  tmpAllPodr01 = NRec (Unique, Surrogate)
+);
+
+//******************************************************************************
+var
+  iCatFunc      : CatalogsFunctions;   // Переменная типа интерфейс CatalogsFunctions
+  WT_MaskDay:longint;// handler для DM_SetupDay
+
+  lNpp:longint;
+  sFeeSigners
+, sPodpis1
+, sPodpis2//Работник кадровой службы
+, sSogls
+, sSogls2
+, sUtve
+, sPodpis1Dol
+, sPodpis2Dol
+, sSoglsDol
+, sSogls2Dol
+, sUtveDol           : string;
+
+  SeparateTablePrinting
+, EnhancedTimeFormat : boolean;
+
+  wShowFirstPage     : word;
+  wOutHHDouble: word;
+
+  sPodr
+, ID
+, sXLSFileName
+, SXLTFileName
+, Logfilenm          : string;
+
+  pxlrepsetup        : xlrepsetup;
+  pXL                : XlsRepBuilder;
+
+  dBeg
+, dEnd               : date;
+  dBeginning
+, dEnding            : date;
+  dayBeg
+, dayEnd            : word;
+
+  bIncludeHolydays   : boolean;
+
+  wMode: word;    // #166 #96 0- работать как раньше. 1- выводить все отклонения для Г, ГЧ и др.
+  boGch: boolean; // #166 #96 при wMode = 1 - true
+  boDbl: boolean; // EM-54 wOutHHDouble >  0 выводить время в долях часа
+
+
+  _sDeskr: string;
+
+//******************************************************************************
+Create view vM
+var
+  pMnPlan:comp;
+  pMyOrg :comp;
+as select
+  tmpTabWorkTime.*
+from 
+  tmpTabWorkTime
+, tmpAllPodr
+, LsTab
+, Appointments(APNTBYPERSON)
+, tmpSigners
+, SABSENCE, SAbsence SAbsence2
+, MnPlan
+, KlKatego AppEmpCategoryCat
+, KatOrg
+, Prvidopl
+//, PrVidopl PrVidopl_F
+//, PrVidopl PrVidopl_IT
+, GP_TimeTable
+, LSchet   LSchetPodr
+, KatPodr
+, em_unidoc_head euhPers
+where
+((
+    tmpTabWorkTime.LSTABNREC  == LStab.NRec
+AND LStab.cLSchet             == LSchet.NRec
+AND LSchet.tPerson            == Persons.NRec
+
+AND LSTab.tPerson             == Appointments.Person
+AND LSchet.NRec               == Appointments.cAddNRec2 (NoIndex)
+//AND (dEnd  >= Appointments.AppointDate
+//   AND (//dBeg  <= Appointments.DismissDate// or
+//      Appointments.DismissDate = ZeroDate
+//       )
+//    )
+
+AND Appointments.cAddNRec2    == LSchetPodr.NRec
+AND LStab.Cex                 == KatPodr.NRec
+
+AND Appointments.EmpCategory == AppEmpCategoryCat.NRec
+AND LStab.NRec               == LSTABMSK.CLSTAB
+
+AND pMnPlan                  == MnPlan.Nrec
+AND pMyOrg                   == KatOrg.NRec
+/*
+AND pcCostSharing            == PrVidopl_F.Choice
+AND LSchet.NRec              == PrVidopl_F.cLSch
+AND dBeg                     == PrVidopl_F.DATAN (noindex)
+AND Prvidopl.Dataf           == PrVidopl_F.DataF(noindex)
+AND (Prvidopl.Nrec <> Prvidopl_F.Nrec)
+
+AND pcCostSharing            == PRVIDOPL_IT.CHOICE
+AND LSchet.NRec              == PrVidopl_IT.cLSch
+AND dBeg                     == PrVidopl_IT.DATAN (noindex)
+AND (Prvidopl.Nrec <> Prvidopl_IT.Nrec)
+*/
+AND LSTab.cLSchet            == GP_TimeTable.cLSchet
+AND LSTab.YearN              == GP_TimeTable.YearN
+AND LSTab.MesN               == GP_TimeTable.MonthN
+))
+
+
+bounds ByPersonalAccount =
+    pcCostSharing             == PrVidOpl.Choice
+AND LSchet.NRec               == PrVidOpl.cLSch
+AND dBeg                      == PrVidOpl.DataN (noindex)
+and dBeg <<=  PrVidOpl.DataF (noindex)
+and ( tmpTabWorkTime.MaskDay[Day(PrVidOpl.DataF)] )
+//AND dBeginning                == PrVidOpl.DataF (noindex) //разобьем по периодам
+
+
+bounds ByTemplate =
+  pcCostsSharingTemplates == PRVIDOPL.CHOICE
+  and pMnPlan == PRVIDOPL.MNREC
+  and dBeg == PRVIDOPL.DATAN (noindex)
+
+;
+
+//Для определения подразделений верхнего уровня в фильтрах
+create view vPodr
+var
+  _katpodrNrec: comp;
+as select tmpAllPodr.Nrec
+from KatPodr,
+     tmpAllPodr,
+     tmpAllPodr tmpAllPodrParent
+where ((
+  _katpodrNrec == KatPodr.Nrec and
+  tmpAllPodr.cParent == tmpAllPodrParent.Nrec
+))
+;
+
+Parameters
+  sPodr
+, dBeg
+, dEnd
+, wMode  // #166 #96
+;
+
+//*****************************************************************************
+/*
+Function Calc_ChasF_Sum(i : word) :double;
+{
+  var isFind : boolean; isFind := false;
+  Result := 0;
+
+  _Loop PrVidopl_F
+    if (PrVidopl_F.TblD[i] <> PrVidopl.TblD[i])
+    {
+      isFind := true;
+      Result += PrVidopl_F.Chasf;
+    }
+
+  if (NOT isFind)
+    {
+      _Loop PrVidopl_IT
+        if (PrVidopl_IT.TblD[i] <> PrVidopl.TblD[i])
+          Result += PrVidopl_IT.Chasf;
+    }
+}
+*/
+
+ //*****************************************************************************
+Function GetPodr : string;
+{
+  var sName : string; sName := '';
+  vPodr._loop tmpAllPodr
+    if vPodr.getfirst tmpAllPodrParent != tsOk
+      sName += if(sName='', '', ', ') + vPodr.tmpAllPodr.Name;
+  result := sName;
+}
+//*****************************************************************************
+Procedure MyLog(const ww:string);
+{ if Length(logfilenm)>0
+    logstrtofile(logfilenm,ww)
+}
+//*****************************************************************************
+Function TryDouble(value : string) : double;
+{
+  var res : double; res := 0;
+
+  _try
+  {
+     res := double(value);
+  }
+  _except else
+  {
+  }
+
+  result := res;
+}
+//*****************************************************************************
+Function HideTime(dayType : string) : boolean;
+{
+   result := false;
+   case dayType of
+     'К' : result := true;
+   end;
+
+}
+
+//*****************************************************************************
+Function GetNormDate2(d : double) : string;
+{
+  if boDbl
+  {
+    result := doubletostr(d,'66.88');
+//         result := doubletostr(d,'77.88');
+    exit;
+  }
+  var h : word; h := word(Trunc(d));
+  var m : word; m := word((d-h)*60);
+
+  result := if (h > 9, '', '0') + string(h) + ':' + if (m > 9, '', '0') + string(m);
+}
+//*****************************************************************************
+function TryGetDouble(s : string) : double;
+{ result:=0;
+  var res : double; res := 0;
+
+  var n : word; n := InStr(':', s);
+
+  if (n <> 0)
+    {
+      var s1 : string; s1 := SubStr(s, 1, n - 1);
+      var s2 : string; s2 := SubStr(s, n + 1, length(s) - n);
+      res := longint(s1) + (word(s2) / 60)
+    }
+  else res := TryDouble(s);    
+
+  result := res; 
+}
+//*****************************************************************************
+Function GetNormDate(dt : string) : string;
+{
+  result := dt;
+
+  if (Trim(dt) = '')
+    Exit;
+
+  var firstSymbol : string; firstSymbol := SubStr(dt, 1, 1);
+  if (InStr(firstSymbol, 'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯABCDEFGHIKLMNOPQRSTVXYZ') <> 0)
+    exit;
+
+  var pref : string; pref := '';
+  var n    : word;
+
+  n := InStr('.', dt);
+  if (n <> 0)
+    {
+      pref := '.';
+    } 
+  else 
+    {
+      n := InStr(',', dt);
+      if (n <> 0)
+        {
+          pref := ',';
+        }
+      else
+        {
+          n := InStr(' ', dt);
+          if (n <> 0)
+            {
+              pref := ' ';
+            }
+          else
+            if (InStr(':', dt) = 0 AND InStr('-', dt) = 0)
+              {
+                result := dt + ':00';
+                Exit;
+              }
+        }
+    }
+
+  if (n > 0)
+    {
+      var h : string; h := SubStr(dt, 1, n -1);
+      var m : string; m := SubStr(dt, n + 1, length(dt) - n);
+      if boDbl
+      {
+        var mm : word; mm := word(m);
+        result := '''' + if (word(h) > 9, '', '0') + h + '.' + if (mm > 9, '', '0') + string(mm);
+      }
+      else
+      {
+          var mm : word; mm := word(60*(double('0.' + m)));
+          result := '''' + if (word(h) > 9, '', '0') + h + ':' + if (mm > 9, '', '0') + string(mm);
+      }
+    }
+}
+//*****************************************************************************
+Function CheckMissing(sMark : string) : boolean;
+{
+  case sMark of
+     'Я'
+   , 'С' 
+   , 'РВ'
+   , 'РО': {
+             result := false;
+             Exit; 
+           }
+  end;
+
+  result := true;
+}
+//*****************************************************************************
+Procedure PrintAbcence(nField : word; nCol : word);
+{
+  if (tmpTabWorkTime.kodMiss[nField] <> '')
+    {
+      pXL.SetTblStringFldValue('missKod' + string(nCol) + 'T', '''' + tmpTabWorkTime.kodMiss[nField]);
+      pXL.SetTblNumberFldValue('missDay' + string(nCol) + 'T', tmpTabWorkTime.dayMiss[nField]);      
+    }
+}
+
+//******************************************************************************
+Procedure PrintLine;
+{  lNpp:=0;
+timelog('iEMTabWorkTime->PrintLine wMode= ' + string(wMode) + '  режим Г_ГЧ= ' + string(boGch) + '  RecordsInTable(#tmpTabWorkTime) = ' + RecordsInTable(#tmpTabWorkTime));
+//if boGch vM.PutTableToDBF (#tmpTabWorkTime,'tmpTabWorkTime.xls',0);
+   _LOOP tmpTabWorkTime
+     if (Not NextVisual)
+     {
+           timelog('iEMTabWorkTime->PrintLine User break;' );
+           break;
+     }
+     else
+     {
+       _LOOP Appointments
+        {
+
+          if Appointments.lPrizn = 2
+            if wGetTune('NPOEM_OWN.TABEL.PRINTZAMESTITEL') = 0 then  continue; // пока не ясно, что сделать с заместительством 20210222 - сделали настройку печатать или нет
+          if NOT (dEnd  >= Appointments.AppointDate
+                   AND (
+                      (Appointments.lPrizn<>2
+                         and  (dBeg  <= Appointments.DismissDate or  Appointments.DismissDate = ZeroDate)
+                      )
+                   or (Appointments.lPrizn=2
+                         and  (dBeg  <= Appointments.DateEnd or  Appointments.DateEnd = ZeroDate)
+                      )
+                       )
+                  )
+            continue;
+
+       var dSumHours : double; dSumHours := 0;
+       //-----------------------
+       lNpp++;
+       pXL.ClearTblBuffer;
+       pXL.SetTblStringFldValue('npp', lNpp);// tmpTabWorkTime.npp);
+       //-----------------------
+       MyLog(' tmpTabWorkTime.LSTABNREC='+string(tmpTabWorkTime.LSTABNREC,0,0)
+          +', cPEREXOD='+string(tmpTabWorkTime.cPEREXOD,0,0)
+          );
+       if (LoadWorkingTable(LStab.cLSchet, LStab.MesN, LStab.YearN) = 0)
+       { MyLog('LoadWorkingTable ');
+       } //if (LoadWorkingTable(LStab.cLSchet, LStab.MesN, LStab.YearN) = 0)
+       WT_ReSetFilter;  //снимаем фильтры по датам, чтоб они не мешали функциям получения итоговых количеств дней и часов за месяц
+       dBeginning:=dBeg;
+       dEnding  :=dEnd;
+       var i, j : word;
+       if SeparateTablePrinting
+       { j:=0;
+         for(i:=1;i<=31;i++)
+         { DM_SetupDay(WT_MaskDay,i,tmpTabWorkTime.MaskDay[i]);
+           if j=0
+           { if tmpTabWorkTime.MaskDay[i]
+             { j:=1;
+               dBeginning:=date(i,lstab.mesn,Lstab.yearN)
+               //ФИО, телефон, дата
+
+             }
+           } //
+         } //for(i:=1;i<=31;i++);
+         WT_AddFilter(WT_MaskDay);
+       } //if SeparateTablePrinting
+       else
+       { if Appointments.AppointDate>dBeg
+         { dBeginning:=Appointments.AppointDate;
+
+         }
+         if (Appointments.lprizn=2  and Appointments.DateEnd<>ZeroDate and Appointments.DateEnd<dEnd )
+         { dEnding:=Appointments.DateEnd;
+         }
+         else
+         if (Appointments.lprizn<>2 and Appointments.DismissDate<>ZeroDate and Appointments.DismissDate<dEnd )
+         { dEnding  :=Appointments.DismissDate;
+
+         }
+
+         MyLog('  Beginning, Ending = '+DateToStr(dBeginning,'DD.MM.YYYY -')+DateToStr(dEnding,'DD.MM.YYYY'));
+         WT_AddDayRangeFilter(AD_DayNo(dBeginning), AD_DayNo(dEnding));
+         //---------------
+         // задается в форме, переопределим
+         var _sPost:string;
+         _sPost:=iCatFunc.GetCatalogsName(Appointments.post);
+         tmpTabWorkTime.sDol1:=GroupWrap(_sPost,1,22);
+         tmpTabWorkTime.sDol2:=GroupWrap(_sPost,2,22);
+         tmpTabWorkTime.sDol3:=GroupWrap(_sPost,3,22);
+       } //else if SeparateTablePrinting
+       dayBeg :=day(dBeginning);
+       dayEnd:=day(dEnding);
+       //-----------------------------------------
+       pXL.SetTblStringFldValue('Person', tmpTabWorkTime.sFIO  + chr(10) + chr(10)+
+                                          tmpTabWorkTime.sDol1 + chr(10) + 
+                                          tmpTabWorkTime.sDol2 + chr(10) + 
+                                          tmpTabWorkTime.sDol3);
+
+
+
+       pXL.SetTblStringFldValue('TabNum'  , tmpTabWorkTime.sTabNum);
+
+
+       var sCat : string; sCat := '';
+       if (GetFirst AppEmpCategoryCat = tsOk)
+         {    
+           pXL.SetTblStringFldValue('Category', AppEmpCategoryCat.Kod);
+           sCat := Trim(AppEmpCategoryCat.Kod);
+         }
+       
+       var sumDaysFirst    : double; sumDaysFirst    := 0;
+       var sumHoursFirst   : double; sumHoursFirst   := 0;
+       var sumDaysSecond   : double; sumDaysSecond   := 0;
+       var sumHoursSecond  : double; sumHoursSecond  := 0;
+       var nightHours      : double; nightHours      := 0;   
+       var totalOverTime   : double; totalOverTime   := 0;   
+       var wKolWeekendDays : word;   wKolWeekendDays := 0;
+       var kolLCh          : double; kolLCh          := 0;
+       var kolKP           : double; kolKP           := 0;
+
+       delete all SABSENCE;
+       //--------------------- Заполним неявки за период
+
+       //if not WT_LoadPeriods( cfChanges )        continue;
+       totalOverTime := WT_GHBD(hkOvertimeWorkOrder, 0, 0, stActual, dBeginning, dEnding );
+             MyLog('totalOverTime= '+string(totalOverTime));
+             /*
+             var j : integer;
+             for(j := 0; j < WT_GetPeriodCount; inc(j))  // обход данных по периодам
+             { MyLog(' Period  j= '+string(j));
+               if not WT_GetPeriod(j, dBeginning, dEnding)
+                 continue;
+               MyLog('  Beginning, Ending = '+DateToStr(dBeginning,'DD.MM.YYYY -')+DateToStr(dEnding,'DD.MM.YYYY'));
+               WT_ReSetFilter;
+               WT_AddDayRangeFilter(AD_DayNo(dBeginning), AD_DayNo(dEnding));
+            */
+               if (WT_LoadMonthlyAbsences <> 0)
+                 continue;
+
+               var rr : longint; rr := WT_GetMonthlyAbsenceCount;
+               for (i := 0; i < rr; inc(i))
+               { MyLog(' ABSENCE i='+string(i));
+                 ClearBuffer(#SABSENCE);
+
+                 // выбрать значения атрибутов неявки
+                 if  WT_GetAbsenceAttribute(atMonthly, I, aaMark       , SABSENCE.MARK)
+                 and WT_GetAbsenceAttribute(atMonthly, I, aaDescription, SABSENCE.DESCRIPTION)
+                 and WT_GetAbsenceAttribute(atMonthly, I, aaDays       , SABSENCE.DAYS)
+                 and WT_GetAbsenceAttribute(atMonthly, I, aaHours      , SABSENCE.HOURS)
+                 and WT_GetAbsenceAttribute(atMonthly, I, aaBeginning  , SABSENCE.BEGINNING)
+                 and WT_GetAbsenceAttribute(atMonthly, I, aaEnding     , SABSENCE.ENDING)
+                 and WT_GetAbsenceAttribute(atMonthly, I, aaKind       , SABSENCE.KIND)
+                 and WT_GetAbsenceAttribute(atMonthly, I, aaAdditive   , SABSENCE.ADDITIVE)
+                 {
+
+                 }
+                 // вынес за IF
+                 SABSENCE.isMissed   := CheckMissing(SABSENCE.MARK);
+                 insert current SABSENCE;
+                 MyLog('SABSENCE SABSENCE.DAYS='+string(SABSENCE.DAYS)+', MARK='+SABSENCE.MARK
+                    +', BEGINNING='+DateToStr(SABSENCE.BEGINNING,'DD.MM.YYYY')
+                    +', Hours='+string(SABSENCE.Hours,0,2)
+                    +', isMissed='+ String(SABSENCE.isMissed)
+                    )
+               } //for (i := 0; i < rr; inc(i))
+             //}  //for(j := 0; j < WT_GetPeriodCount; inc(j))  // обход данных по периодам
+
+
+       //-----------------------------------------------
+       var ddTotalPOHours : double; ddTotalPOHours  := 0;
+       var ddTotalPODays  : double; ddTotalPODays   := 0;
+       var ddTotalPBHours : double; ddTotalPBHours  := 0;
+       var ddTotalPBDays  : double; ddTotalPBDays   := 0;
+       var indKP          : word;   indKP           := 0;
+       var indLCh         : word;   indLCh          := 0;
+       _LOOP SabSence
+         {
+           j := day(SabSence.BEGINNING);
+           MyLog('обработка SabSence.Mark='+SabSence.Mark);
+           if ('С' = SabSence.Mark)
+             {
+               var begDay : word; begDay := day(SABSENCE.BEGINNING);
+               var endDay : word; endDay := day(SABSENCE.ENDING);  
+               var ddAy   : word;
+               var ttH    : double; tth := SABSENCE.Hours;
+               for (dday := begDay; dday <= endDay; inc(dday))
+                 if (tth > 0)   
+                 { var _testDay:boolean;
+                   _testDay:=WT_TestDay(dday, cfDisregardPeriod or cfDisregardFilters or dkWorking, stActual);
+                   var _systemAbsence:longint;
+                   _systemAbsence:=WT_GetSystemAbsenceKindOnDate(AD_Date(dday, LStab.MesN, LStab.YearN));
+                   var work : double; work := if(_testDay and (_systemAbsence = 0),
+                                      WT_GetHoursInDay(dday, cfDisregardPeriod or cfDisregardFilters or hkWorking, stActual)
+                                      // добавим подсчет сверхурочных, иначе получаем 7 вместо 11
+                                    + WT_GetHoursInDay(dday, cfDisregardPeriod or cfDisregardFilters or hkOverwork , stActual)
+                                    + WT_GetHoursInDay(dday, cfDisregardPeriod or cfDisregardFilters or hkOverworkRest, stActual),
+                                     if(LStab.DAYCHF[dday] > 0 AND LSTAB.DAYCHF[dday] <= MaxWorkingHours,
+                                        LSTAB.DAYCHF[dday], TryDouble(LSTAB.DAYS[dday])));
+             
+                   var plan : double; plan := if (WT_TestDay(dday, cfDisregardPeriod or cfDisregardFilters or dkWorking, stPlanned),
+                                   WT_GetHoursInDay(dday, cfDisregardPeriod or cfDisregardFilters or hkWorking, stPlanned),
+                                   0);
+
+                   var pp : double; pp := work - plan;
+                   MyLog(' "С" - work='+string(work)+', plan='+string(plan)+','+string(_testDay)+', '+string(_systemAbsence) );
+
+                   if (pp > 0)
+                     {
+                       var tt : double; tt := if (pp > tth, tth, pp);
+                       if (dday < 16)
+                         {
+                           //формула не отрабатывает - оставим как есть
+                           //tmpTabWorkTime.day1[16 + dday]  :=  GetNormDate2(TryDouble(tmpTabWorkTime.day1[16 + dday]) - tt);
+                           tmpTabWorkTime.day1[16 + dday]  :=  GetNormDate2(plan);
+                           tmpTabWorkTime.day1[32 + dday]  :=  SabSence.Mark;
+                           tmpTabWorkTime.day1[48 + dday]  :=  GetNormDate2(tt);
+                           //уже есть  sumHoursFirst += tt;
+                         }
+                       else
+                         {
+                           // формула не отрабатывает - оставим как есть - вывелось 65532:00
+                           //tmpTabWorkTime.day2[16 + dday - 15] :=  GetNormDate2(TryDouble(tmpTabWorkTime.day2[16 + dday - 15]) - tt);
+                           tmpTabWorkTime.day2[16 + dday - 15] :=  GetNormDate2(plan);
+                           tmpTabWorkTime.day2[32 + dday - 15] :=  SabSence.Mark;
+                           tmpTabWorkTime.day2[48 + dday - 15] :=  GetNormDate2(tt);
+                           //уже есть в sumHoursSecond += tt;
+                         }
+
+                       tth := tth - tt;
+                     }
+                 }
+             }  
+           else if ('В' = SabSence.Mark) 
+             {
+               wKolWeekendDays += SabSence.Days;
+             }  
+           else if (('ОТ'  = SabSence.Mark)
+                 or ('ОТГ' = SabSence.Mark)
+                 or ('ОЖ'  = SabSence.Mark))
+             {
+               var jj : word; jj := 0;
+               var n  : word;  n := 0; 
+               for (jj := 1; jj <= 16; inc(jj))
+                 {
+                   if (tmpTabWorkTime.kodMiss[jj] = '' AND n = 0)
+                   {  n := jj;
+                      //break;
+                   }
+                   if (tmpTabWorkTime.kodMiss[jj] = SabSence.Mark)
+                     {
+                       n := 0;
+                       tmpTabWorkTime.dayMiss[jj] := tmpTabWorkTime.dayMiss[jj] + SabSence.Days;
+                       break; 
+                     }
+                 }
+
+               if (n <> 0)
+                 {
+                   tmpTabWorkTime.kodMiss[n] := SabSence.Mark;
+                   tmpTabWorkTime.dayMiss[n] := SabSence.Days;
+                 }  
+             }  
+           else if ('РВ' = SabSence.Mark or 'ВД' = SabSence.Mark) 
+             {
+               ddTotalPBHours  += SABSENCE.HOURS;
+               ddTotalPBDays   += SABSENCE.DAYS;
+             }
+           else if ('РО' = SabSence.Mark) 
+             {
+               ddTotalPOHours  += SABSENCE.HOURS;
+               ddTotalPODays   += SABSENCE.DAYS;
+             }
+           else
+           if (SabSence.IsMissed AND trim(SabSence.Mark) <> '')
+             {  
+               var begDay : word; begDay := day(SABSENCE.BEGINNING);
+               var endDay : word; endDay := day(SABSENCE.ENDING);  
+               var ddAy   : word;
+               var ddPlanHours : double=0;
+
+               for (dday := begDay; dday <= endDay; inc(dday))
+                 {  
+                   if (dday < 16)
+                     {
+                       if  (tmpTabWorkTime.day1[dday] <> SabSence.Mark)
+                       //если в табеле выходной, то день пропускаем
+                       and (tmpTabWorkTime.day1[dday] <> 'В')
+                         {
+                           tmpTabWorkTime.day1[32 + dday]  :=  SabSence.Mark;
+
+                           if not HideTime(SabSence.Mark)
+                           tmpTabWorkTime.day1[48 + dday]  :=  GetNormDate2(SabSence.Hours/SabSence.Days);
+                     //  MyLog(' dday='+string(dday)+',tmpTabWorkTime.day1['+string(32 + dday )+']='+tmpTabWorkTime.day1[32 + dday ] );
+                      // MyLog(' dday='+string(dday)+',tmpTabWorkTime.day1['+string(48 + dday )+']='+tmpTabWorkTime.day1[48 + dday ] );
+                         }
+                         else
+                         if boGch
+                         if ((tmpTabWorkTime.day1[dday] = SabSence.Mark and tmpTabWorkTime.day1[dday+16] = '')) // выводим часы отклонений за полный день
+                         {
+                           if not HideTime(SabSence.Mark)
+                           tmpTabWorkTime.day1[dday+16] :=  GetNormDate2(SabSence.Hours/SabSence.Days);
+                          // MyLog(' dday='+string(dday)+',tmpTabWorkTime.day1['+string(dday)+']='+tmpTabWorkTime.day1[dday] );
+                          // MyLog(' dday='+string(dday)+',tmpTabWorkTime.day1['+string(dday+16)+']='+tmpTabWorkTime.day1[dday+16] );
+                         }
+                     }
+                   else
+                      if  (tmpTabWorkTime.day2[dday - 15] <> SabSence.Mark)
+                      //если в табеле выходной, то день пропускаем
+                      and (tmpTabWorkTime.day2[dday - 15] <> 'В')
+                     {
+                       tmpTabWorkTime.day2[32 + dday - 15] :=  SabSence.Mark;
+                       if not HideTime(SabSence.Mark)
+                       tmpTabWorkTime.day2[48 + dday - 15] :=  GetNormDate2(SabSence.Hours/SabSence.Days);
+                     //  MyLog(' dday='+string(dday)+',tmpTabWorkTime.day2['+string(32 + dday - 15)+']='+tmpTabWorkTime.day2[32 + dday - 15] );
+                     //  MyLog(' dday='+string(dday)+',tmpTabWorkTime.day2['+string(48 + dday - 15)+']='+tmpTabWorkTime.day2[48 + dday - 15] );
+                     }
+                     else
+                     if boGch
+                     if ((tmpTabWorkTime.day2[dday- 15] = SabSence.Mark and tmpTabWorkTime.day2[dday+1] = '')) // выводим часы отклонений за полный день
+                     {
+
+                       if not HideTime(SabSence.Mark)
+                       tmpTabWorkTime.day2[dday+1] :=  GetNormDate2(SabSence.Hours/SabSence.Days);
+
+                      // MyLog(' dday='+string(dday)+',tmpTabWorkTime.day2['+string(dday- 15)+']='+tmpTabWorkTime.day2[dday- 15] );
+                      // MyLog(' dday='+string(dday)+',tmpTabWorkTime.day2['+string(dday+1)+']='+tmpTabWorkTime.day2[dday+1] );
+                     }
+
+                   // день, считающийся рабочим по закону (зависит от настроек)
+                   //dkWorking               = 2;
+                   // без учета фильтров
+                   //cfDisregardFilters      = 128;
+                   // без учета дат приема на работу/увольнения
+                   //cfDisregardPeriod       = 64;
+                   // плановый график
+                   //stPlanned   = 0;
+                   if WT_TestDay(dday, cfDisregardPeriod or cfDisregardFilters or dkWorking, stPlanned)
+                   {
+                    ddPlanHours += WT_GetHoursInDay(dday, cfDisregardPeriod or cfDisregardFilters or hkWorking, stPlanned);
+                    if SAbsence.Mark = 'Б'
+                    {
+                      _loop SAbsence2 where ((true == SAbsence2.isMissed and 'НР' == SAbsence2.Mark))
+                      {
+                        if SAbsence2.Beginning = SAbsence2.Ending and day(SAbsence2.Beginning) = dday
+                          ddPlanHours -= SAbsence2.Hours;
+                        else if day(SAbsence2.Beginning) <= dday and dday <= day(SAbsence2.Ending)
+                          ddPlanHours -= WT_GetHoursInDay(dday, cfDisregardPeriod or cfDisregardFilters or hkWorking, stPlanned);
+                      }
+                    }
+                   }
+
+                   MyLog(' dday='+string(dday)+',ddPlanHours='+string(ddPlanHours,0,2)
+                                 +', SabSence.Hours='+string(SabSence.Hours,0,2)
+                                 +', SabSence.Days='+string(SabSence.Days,0,2)
+                                 +', GetNormDate2(SabSence.Hours/SabSence.Days) = ' + GetNormDate2(SabSence.Hours/SabSence.Days) );
+                 }  //for (dday := begDay; dday <= endDay; inc(dday))
+
+               var jj : word; jj := 0;
+               var n  : word;  n := 0;
+               var nn : word; nn := 0;
+               var nb : word; nb := 1;//if (dday < 16, 1,  9);
+               var ne : word; ne := 16;//if (dday < 16, 8, 16);
+
+               for (jj := nb; jj <= ne; inc(jj))
+                 {
+                   if (tmpTabWorkTime.kodMiss[jj] = '' AND n = 0)
+                     n := jj;
+
+                   if (tmpTabWorkTime.kodMiss[jj] = SabSence.Mark)
+                     {
+                       if ((SabSence.Mark = 'КР' OR SabSence.Mark = 'ЛЧ') )
+                         {}
+
+                       n := 0;
+                       tmpTabWorkTime.dayMiss[jj] += if (SabSence.Hours = 0, SabSence.Days, SabSence.Hours * SabSence.Days / ddPlanHours);
+                       break;
+                     }
+                 }
+
+               if (n <> 0)
+                 {
+                   tmpTabWorkTime.kodMiss[n] := SabSence.Mark;
+                   //tmpTabWorkTime.dayMiss[n] := if (SabSence.Hours = 0, SabSence.Days, SabSence.Hours / SabSence.Days / ddPlanHours);
+                   if (SabSence.Mark <> 'КР' AND SabSence.Mark <> 'ЛЧ')
+                     tmpTabWorkTime.dayMiss[n] := if (SabSence.Hours = 0, SabSence.Days, SabSence.Hours * SabSence.Days / ddPlanHours);
+
+                   if (SabSence.Mark = 'КР')
+                     indKP := n;
+                   if (SabSence.Mark = 'ЛЧ')
+                     indLch := n;
+                 }
+             }
+           update current tmpTabWorkTime;
+         }
+
+       var hightHours1    : double; hightHours1    := 0;
+       var EVENINGHOURS1  : double = 0;
+       var hightHours2    : double; hightHours2    := 0;
+       var EVENINGHOURS2  : double = 0;
+       var dm_day1: array[1..64] of string;
+       var dm_day2: array[1..64] of string;
+       for(i := 1; i <= 64; inc(i))
+       { dm_day1[i]:=tmpTabWorkTime.day1[i];
+         dm_day2[i]:=tmpTabWorkTime.day2[i];
+         // если не разит по переходам, разобьем по назначениям
+         if not SeparateTablePrinting
+         {
+           var _wDay1,_wDay2:integer=0;
+           var _sMask:string='';
+           case i of
+           1..16 : //дни
+           { _wDay1:=i; if(i>15) _wDay1:=0;
+             _wDay2:=i+15;
+             _sMask:='X';
+           }
+           17..32:// часы
+           { _wDay1:=i-16;
+             _wDay2:=i-1;
+             _sMask:='';
+           }
+           33..48: //дни
+           { _wDay1:=i-32; if _wDay1>15 _wDay1:=0;
+             _wDay2:=i-17;
+             _sMask:='';
+           }
+           49..64:// часы
+           { _wDay1:=i-48; if _wDay1>15 _wDay1:=0;
+             _wDay2:=i-48+15;
+             _sMask:='';
+           }
+
+           end;
+           if  _wDay1<dayBeg
+           or  _wDay1>dayEnd
+           { dm_day1[i]:=_sMask;
+           }
+           if  _wDay2<dayBeg
+           or  _wDay2>dayEnd
+           { dm_day2[i]:=_sMask;
+           }
+         } //if not SeparateTablePrinting
+       } //for(i := 1; i <= 64; inc(i))
+
+       for(i := 1; i <= 64; inc(i))
+       {
+         if (i <= 8)
+         {  
+           pXL.SetTblStringFldValue('nightJobP' + i + 'T', tmpTabWorkTime.nightJobP[i]);
+         }
+         //ДНИ
+         if (i <= 16)
+         { if ((dm_day1[i] <> 'РВ' AND dm_day1[i] <> 'РО') OR bIncludeHolydays)
+           { sumHoursFirst  += TryGetDouble(dm_day1[16 + i]);
+             //не будем добавлять доп.часы + TryGetDouble(dm_day1[32 + i]) + TryGetDouble(dm_day1[48 + i]);
+             sumDaysFirst   += if (TryGetDouble(dm_day1[16+i]) > 0, 1, 0);//if (TryGetDouble(dm_day1[i]) + TryGetDouble(dm_day1[16+i]) + TryGetDouble(dm_day1[32 + i]) + TryGetDouble(dm_day1[48 + i]) > 0, 1, 0);
+           }
+           if ((dm_day2[i] <> 'РВ' AND dm_day2[i] <> 'РО') OR bIncludeHolydays)
+           { sumHoursSecond += TryGetDouble(dm_day2[16 + i]);
+             //не будем добавлять доп.часы  + TryGetDouble(dm_day2[32 + i]) + TryGetDouble(dm_day2[48 + i]);
+             sumDaysSecond  += if (TryGetDouble(dm_day2[16+i]) > 0, 1, 0);//if (TryGetDouble(dm_day2[i]) + TryGetDouble(dm_day2[16+i]) + TryGetDouble(dm_day2[32 + i]) + TryGetDouble(dm_day2[48 + i]) > 0, 1, 0);
+           }
+           MyLog('i='+string(i)+',sumHoursFirst ='+string(sumHoursFirst ,0,2)
+                   +','+dm_day1[i]     +',' + dm_day1[16 + i]
+                   +','+dm_day1[32 + i]+',' + dm_day1[48 + i]
+                   );
+           MyLog('i='+string(i)+',sumHoursSecond='+string(sumHoursSecond,0,2)
+                  +',' + dm_day2[i]     +',' +dm_day2[16 + i]
+                  +',' + dm_day2[32 + i]+',' +dm_day2[48 + i]
+                  );
+         }
+       
+         var ddPlanHours : double; ddPlanHours := 0;
+
+         if (i > 32 AND i <= 48)
+         {
+           //dSumHours := dSumHours + TryDouble(dm_day1[i]) + TryDouble(dm_day2[i]);
+           //var ddPlanHours : double; ddPlanHours := 0;
+
+           if (dm_day1[i-32] = 'Я')
+             {
+               if (i-32 <= 15)
+                 {
+                   ddPlanHours := if (WT_TestDay(i-32, cfDisregardPeriod or cfDisregardFilters or dkWorking, stPlanned),
+                                      WT_GetHoursInDay(i-32, cfDisregardPeriod or cfDisregardFilters or hkWorking, stPlanned), 0);
+                 }
+
+               kolLCh := kolLCh + if (dm_day1[i] = 'ЛЧ', if (ddPlanHours = 0, 0, TryGetDouble(dm_day1[i+16]) / ddPlanHours), 0);
+               kolKP  := kolKP  + if (dm_day1[i] = 'КР', if (ddPlanHours = 0, 0, TryGetDouble(dm_day1[i+16]) / ddPlanHours), 0);
+             }
+
+           if (dm_day2[i-32] = 'Я')
+             {
+               ddPlanHours := if (WT_TestDay(i-17, cfDisregardPeriod or cfDisregardFilters or dkWorking, stPlanned),
+                                  WT_GetHoursInDay(i-17, cfDisregardPeriod or cfDisregardFilters or hkWorking, stPlanned), 0);
+
+               kolLCh := kolLCh + if (dm_day2[i] = 'ЛЧ', if (ddPlanHours = 0, 0, TryGetDouble(dm_day2[i+16]) / ddPlanHours), 0);
+               kolKP  := kolKP  + if (dm_day2[i] = 'КР', if (ddPlanHours = 0, 0, TryGetDouble(dm_day2[i+16]) / ddPlanHours), 0);
+             }
+         }
+
+
+         var sDayTValue : string; sDayTValue := dm_day1[i];
+         var sDayDValue : string; sDayDValue := dm_day2[i];
+
+         if (i <= 31)
+         if  (   (SeparateTablePrinting and tmpTabWorkTime.MaskDay[i])
+              or ( (not SeparateTablePrinting) and i>=daybeg and i<=dayend )
+             )
+           {
+             var _testDay:boolean;
+                   _testDay:=WT_TestDay(i, cfDisregardPeriod or cfDisregardFilters or dkWorking, stActual);
+                   var _systemAbsence:longint;
+                   _systemAbsence:=WT_GetSystemAbsenceKindOnDate(AD_Date(i, LStab.MesN, LStab.YearN));
+
+             var work : double; work := if(_testDay and (_systemAbsence = 0),
+                                  WT_GetHoursInDay(i, cfDisregardPeriod or cfDisregardFilters or hkWorking, stActual)
+                                  // добавим подсчет сверхурочных, иначе получаем 7 вместо 11
+                                + WT_GetHoursInDay(i, cfDisregardPeriod or cfDisregardFilters or hkOverwork , stActual)
+                                + WT_GetHoursInDay(i, cfDisregardPeriod or cfDisregardFilters or hkOverworkRest, stActual),
+                                 if(LStab.DAYCHF[i] > 0 AND LSTAB.DAYCHF[i] <= MaxWorkingHours,
+                                    LSTAB.DAYCHF[i], TryDouble(LSTAB.DAYS[i])));
+
+             if (LSTABMSK.NIGHTHOURS[i] > 0 AND work > 0)
+               { 
+                 if (i < 16)
+                   {
+                     hightHours1 += LSTABMSK.NIGHTHOURS[i];  
+                     dm_day1[32 + i] := 'Н';
+                     dm_day1[48 + i] := GetNormDate2(LSTABMSK.NIGHTHOURS[i]);
+                   }
+                 else
+                   {   
+                     hightHours2 += LSTABMSK.NIGHTHOURS[i];    
+                     dm_day2[32 + i - 15] := 'Н';
+                     dm_day2[48 + i - 15] := GetNormDate2(LSTABMSK.NIGHTHOURS[i]);
+                   }    
+               }
+// пробуем вечерние добавить
+             if (LSTABMSK.EVENINGHOURS[i] > 0 AND work > 0)
+               {
+                 if (i < 16)
+                   {
+                     EVENINGHOURS1 += LSTABMSK.EVENINGHOURS[i];
+                     dm_day1[32 + i] := dm_day1[32 + i] + 'ВЧ';
+                     dm_day1[48 + i] := dm_day1[48 + i]+ GetNormDate2(LSTABMSK.EVENINGHOURS[i]);
+                   }
+                 else
+                   {
+                     EVENINGHOURS2 += LSTABMSK.EVENINGHOURS[i];
+                     dm_day2[32 + i - 15] := 'ВЧ';
+                     dm_day2[48 + i - 15] := dm_day2[48 + i - 15] + GetNormDate2(LSTABMSK.EVENINGHOURS[i]);
+                   }
+               }
+
+
+          }
+
+         if (i <= 16)
+           {
+             if (tmpTabWorkTime.wOJ[i] = 1 AND i < 16)
+               if (GetNormDate(sDayTValue) = 'Б') 
+                 pXL.SetTblStringFldValue('LineA' + i + 'T', 'Б');
+               else 
+                 {
+                   pXL.SetTblStringFldValue('LineA' + i + 'T', 'ОЖ');
+                   pXL.SetTblStringFldValue('day' + i + 'T', GetNormDate(sDayTValue));
+                 } 
+             else 
+               pXL.SetTblStringFldValue('day' + i + 'T', GetNormDate(sDayTValue));
+
+             if (tmpTabWorkTime.wOJ[15 + i] = 1)
+               if (GetNormDate(sDayDValue) = 'Б') 
+                 pXL.SetTblStringFldValue('LineB' + i + 'T', 'Б');
+               else 
+                 {
+                   pXL.SetTblStringFldValue('LineB' + i + 'T', 'ОЖ');
+                   pXL.SetTblStringFldValue('day' + i + 'D', GetNormDate(sDayDValue));
+                 } 
+             else 
+               pXL.SetTblStringFldValue('day' + i + 'D', GetNormDate(sDayDValue));
+           }
+         else if (i > 16 AND i <= 32)
+           {
+             if (dm_day1[i-16] <> 'НН' AND dm_day1[i-16] <> 'НВ')
+               pXL.SetTblStringFldValue('day' + i + 'T', GetNormDate(sDayTValue));
+             if (dm_day2[i-16] <> 'НН' AND dm_day2[i-16] <> 'НВ')
+               pXL.SetTblStringFldValue('day' + i + 'D', GetNormDate(sDayDValue));
+           }
+         else if (i > 32 AND i <= 48)
+           {
+             if boGch
+             {
+                 pXL.SetTblStringFldValue('day' + i + 'T', GetNormDate(sDayTValue)) ;
+                 pXL.SetTblStringFldValue('day' + i + 'D', GetNormDate(sDayDValue))
+             }
+             else
+             {
+               if (dm_day1[i] = 'КР' OR  dm_day1[i] <> 'ЛЧ')
+                 if (dm_day1[i-32] = 'Я' OR dm_day1[i-32] = 'РВ')
+                   pXL.SetTblStringFldValue('day' + i + 'T', GetNormDate(sDayTValue))
+                 else
+                   {}
+               else
+                 pXL.SetTblStringFldValue('day' + i + 'T', GetNormDate(sDayTValue));
+
+               if (dm_day2[i] = 'КР' OR  dm_day2[i] <> 'ЛЧ')
+                  if (dm_day2[i-32] = 'Я' OR dm_day2[i-32] = 'РВ')
+                   pXL.SetTblStringFldValue('day' + i + 'D', GetNormDate(sDayDValue))
+                 else
+                   {}
+               else
+                 pXL.SetTblStringFldValue('day' + i + 'D', GetNormDate(sDayDValue));
+             }
+           }
+         else if (i > 48 AND i <= 64)
+           {
+
+             if boGch
+             {
+               pXL.SetTblStringFldValue('day' + i + 'T', GetNormDate(sDayTValue)) ;
+               pXL.SetTblStringFldValue('day' + i + 'D', GetNormDate(sDayDValue));
+             }
+             else
+             {
+               if (dm_day1[i-16] = 'КР' OR  dm_day1[i-16] <> 'ЛЧ')
+                 if (dm_day1[i-48] = 'Я' OR dm_day1[i-48] = 'РВ')
+                   pXL.SetTblStringFldValue('day' + i + 'T', GetNormDate(sDayTValue))
+                 else
+                   {}
+               else
+                 pXL.SetTblStringFldValue('day' + i + 'T', GetNormDate(sDayTValue));
+
+               if (dm_day2[i-16] = 'КР' OR  dm_day2[i-16] <> 'ЛЧ')
+                 if (dm_day2[i-48] = 'Я' OR dm_day2[i-48] = 'РВ')
+                   pXL.SetTblStringFldValue('day' + i + 'D', GetNormDate(sDayDValue))
+                 else
+                   {}
+               else
+                 pXL.SetTblStringFldValue('day' + i + 'D', GetNormDate(sDayDValue));
+             }
+           }
+       }
+
+       if (indKP <> 0)
+         tmpTabWorkTime.dayMiss[indKP]  := kolKP;
+       if (indLCh <> 0)
+         tmpTabWorkTime.dayMiss[indLCh] := kolLCh;
+
+       PrintAbcence( 1,  1);
+       PrintAbcence( 2,  9);
+       PrintAbcence( 3,  2);
+       PrintAbcence( 4, 10);
+       PrintAbcence( 5,  3);
+       PrintAbcence( 6, 11);
+       PrintAbcence( 7,  4);
+       PrintAbcence( 8, 12);
+       PrintAbcence( 9,  5);
+       PrintAbcence(10, 13);
+       PrintAbcence(11,  6);
+       PrintAbcence(12, 14);
+       PrintAbcence(13,  7);
+       PrintAbcence(14, 15);
+       PrintAbcence(15,  8);
+       PrintAbcence(16, 16);
+
+       if (hightHours1 > 0)
+         pXL.SetTblStringFldValue('nightJobH1T', '''' + GetNormDate2(hightHours1));
+
+       if (hightHours2 > 0)
+         pXL.SetTblStringFldValue('nightJobH5T', '''' + GetNormDate2(hightHours2));
+
+       if (EVENINGHOURS1> 0)
+         pXL.SetTblStringFldValue('EveningJobH1T', '''' + GetNormDate2(EVENINGHOURS1));
+
+       if (EVENINGHOURS2> 0)
+         pXL.SetTblStringFldValue('EveningJobH5T', '''' + GetNormDate2(EVENINGHOURS2));
+
+       if (totalOverTime > 0)
+         pXL.SetTblStringFldValue('nightJobC1T', '''' + GetNormDate2(totalOverTime));
+
+       var totalDays  : double; totalDays  := sumDaysFirst  + sumDaysSecond;
+       var totalHours : double; totalHours := sumHoursFirst + sumHoursSecond;
+
+       /// Добавлено по просьбе Плинды Н. 
+       var ph : double; ph := wt_ghbd(4,0,24,1,date(1, LStab.MesN, LStab.YearN), date(last_Day(date(1, LStab.MesN, LStab.YearN)), LStab.MesN, LStab.YearN));
+       if (ph <> 0)
+         {
+           sumHoursFirst := wt_ghbd(1,0,24,1, date(1, LStab.MesN, LStab.YearN), date(15, LStab.MesN, LStab.YearN));
+           sumDaysFirst  := wt_gDbd(2, 1    , date(1, LStab.MesN, LStab.YearN), date(15, LStab.MesN, LStab.YearN));
+           totalHours    := wt_ghbd(1,0,24,1, date(1, LStab.MesN, LStab.YearN), date(last_Day(date(1, LStab.MesN, LStab.YearN)), LStab.MesN, LStab.YearN));
+           totalDays     := wt_gDbd(2, 1    , date(1, LStab.MesN, LStab.YearN), date(last_Day(date(1, LStab.MesN, LStab.YearN)), LStab.MesN, LStab.YearN));
+         }
+       //первая половиеа
+       if (sumDaysFirst > 0)
+         pXL.SetTblNumberFldValue('otrbHM1T', sumDaysFirst);
+
+       if (sumHoursFirst > 0)
+         pXL.SetTblNumberFldValue('otrbHM2T', sumHoursFirst);
+       //вторая половина - вопрос - а надо ди
+       if (totalDays-sumDaysFirst > 0)
+         pXL.SetTblNumberFldValue('otrbHM5T', totalDays-sumDaysFirst);
+
+       if (totalHours-sumHoursFirst > 0)
+         pXL.SetTblNumberFldValue('otrbHM6T', totalHours-sumHoursFirst);
+       if (totalDays > 0)
+         pXL.SetTblNumberFldValue('otrbM5T' , totalDays);
+
+       if (totalHours > 0)
+         pXL.SetTblNumberFldValue('otrbM6T' , totalHours);
+
+       j := 0;
+       MyLog('sCat='+sCat);
+       if True // не известно зачем (sCat <>'1')
+         {
+           PushBounds(tbByPersonalAccount);
+
+           _LOOP PrVidOpl
+             { MyLog('_LOOP PrVidOpl PrVidOpl.CHASF='+String(PrVidOpl.CHASF,0,2));
+
+               for (i := 1; i <= 6; inc(i))
+               { if (PrVidOpl.TblD[i] = 7)
+                 { set pMnPlan:=PrVidOpl.cKauD[i];
+                   if (GetFirst MnPlan  = tsOk)
+                   {
+                     inc(j);
+                     pXL.SetTblStringFldValue('korSchet'  +  j      + 'T', '''' + MnPlan.Number);
+                     var dd : double; dd := 0;
+                     /*
+                     if (SeparateTablePrinting
+                         and tmpTabWorkTime.sTabNum<>'002029') //Ларина Татьяна
+
+                       dd := Calc_ChasF_Sum(i) + PrVidOpl.CHASF;
+                     else
+                     */
+                     dd := PrVidOpl.CHASF ;
+                     MyLog(' dd='+String(dd,0,2));
+                     pXL.SetTblStringFldValue('korDays'   + (j * 2) + 'T', 
+                       if (EnhancedTimeFormat, Time2StrSep(dd, 0, ':'), string(dd, 0, 2)));
+                   }
+                 }
+               }
+             }
+
+           PopBounds(tbByPersonalAccount);
+
+           if (j = 0)
+             {
+               PushBounds(tbByTemplate);
+
+               for (i := 1; i <= 6; inc(i))
+               { if (LSchet.TblD[i] = 7)
+                 { set pMnPlan:=LSchet.cKauD[i];
+                   if (GetFirst MnPlan /*where ((PrVidOpl.cKauD[i] == MnPlan.NRec))*/ = tsOk)
+                   {
+                     inc(j);
+                     pXL.SetTblStringFldValue('korSchet' +  j      + 'T', '''' + MnPlan.Number);
+                     //маску зададим выше
+                     //WT_ReSetFilter;
+                     //WT_UndoDayMask;
+                     //SetupDayMask(Day(dBeg), Day(dEnd));
+                     //WT_ApplyDayMask;
+
+                     var dd : double; dd := 0;
+                     //if LoadWorkingTable(LSCHET.NREC, Month(dBeg), Year(dBeg)) = 0
+                       dd := WT_GetHours(hkWholeWorking, stActual);
+                     pXL.SetTblStringFldValue('korDays'  + (j * 2) + 'T', if (EnhancedTimeFormat, Time2StrSep(dd, 0, ':'), string(dd, 0, 2)));
+                   }
+                 }
+               }
+
+               PopBounds(tbByTemplate);
+             }
+         }
+
+       if (nightHours > 0)
+         pXL.SetTblStringFldValue('nightJobH1T', '''' + GetNormDate2(nightHours));
+
+       if (ddTotalPBHours > 0)             
+         pXL.SetTblStringFldValue('nightJobP1T', '''' + GetNormDate2(ddTotalPBHours));
+       if (ddTotalPBDays  > 0)             
+         pXL.SetTblNumberFldValue('nightJobP2T', ddTotalPBDays );
+
+       if (ddTotalPOHours > 0)
+         pXL.SetTblStringFldValue('nightJobP5T', '''' + GetNormDate2(ddTotalPOHours));
+       if (ddTotalPODays > 0)
+         pXL.SetTblNumberFldValue('nightJobP6T', ddTotalPODays);
+
+       if (dSumHours > 0) 
+         pXL.SetTblStringFldValue('nightJobC1T', '''' + GetNormDate2(dSumHours));
+           
+       pXL.SetTblNumberFldValue('kolWeekends', wKolWeekendDays);
+
+       pXL.InsTblRow;
+       //=======================
+       if SeparateTablePrinting break;
+       //=======================
+
+     } //_LOOP Appointments
+   } //if (Not NextVisual)
+} //Procedure PrintLine;
+
+Procedure PrintRepost;
+{
+  ID := 'TabWorkTime';
+  if (NOT ReadMyDsk(sXLTFileName,ID,true))
+    set sXLTFileName := TranslatePath('%ClientStartPath%') + 'XLS_ЭМ\Staff\' + ID + '.xltm';
+
+  StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Идет формирование отчета', RecordsInTable(#tmpTabWorkTime));
+
+  //Set sXLSFileName := pXL.CreateXLT(sXLTFileName, True);
+  Set sXLSFileName := pXL.CreateReport(sXLTFileName, True);
+
+  if not pxlrepsetup.checkParam(0, ID, sXLTFileName)
+   {
+     Runinterface('XlRepSetup', 1, ID, sXLTFileName);
+     ReadMyDsk(sXLTFileName, ID, true);
+   }
+
+  delete all tmpSigners;
+
+  if (iFeeSigners.FeeSignersIsValid)
+  {
+    var wFeeSignersNum, wFeeSignersCount : word;
+    wFeeSignersCount := iFeeSigners.GetFeeSignersCount;
+
+    if (iFeeSigners.GetSignerFirst)
+    {
+      For (wFeeSignersNum := 1; wFeeSignersNum <= wFeeSignersCount; wFeeSignersNum++)
+      {
+         if (iFeeSigners.GetSignerRole = 'Согласовано')
+         {
+           sSogls     := iFeeSigners.GetSignerFIO(7);
+           sSoglsDol  := iFeeSigners.GetSignerPosition(1);
+         }
+         else if (iFeeSigners.GetSignerRole = 'Проверяющее лицо')
+         {
+           sPodpis2    := iFeeSigners.GetSignerFIO(7);
+           sPodpis2Dol := iFeeSigners.GetSignerPosition(1);
+         }
+         else if (iFeeSigners.GetSignerRole = 'Директор')
+         {  
+           sPodpis1    := iFeeSigners.GetSignerFIO(7);
+           sPodpis1Dol := iFeeSigners.GetSignerPosition(1);
+         }
+         else if (iFeeSigners.GetSignerRole = 'Ответственный')
+         {
+           sSogls2     := iFeeSigners.GetSignerFIO(7);
+           sSogls2Dol  := iFeeSigners.GetSignerPosition(1);
+         }
+
+        if (not iFeeSigners.GetSignerNext)
+          break;
+      }
+    }
+  }
+
+  _LOOP tmpSigners ordered by tmpSigners.Kod
+  {
+    if (sPodpis1 = '')
+    {
+      sPodpis1    := tmpSigners.Fio;
+      sPodpis1Dol := tmpSigners.Dol;
+    }
+    else if (sPodpis2 = '')
+    {
+      sPodpis2    := tmpSigners.Fio;
+      sPodpis2Dol := tmpSigners.Dol;
+    }
+  }
+
+  pXL.CreateVar(sXLSFileName);
+  pXL.SetStringVar('CFH'           , CommonFormHeader);
+  pXL.SetNumberVar('bShowFirstPage', wShowFirstPage  );
+  if (GetFirst KatOrg = tsOk)
+    pXL.SetStringVar('org'           , KatOrg.ShortName); 
+
+  pXL.SetStringVar('podr'          , GetPodr());
+
+  if (dBeg <> ZeroDate)
+    pXL.SetStringVar('dBeg'          , '''' + DateToStr(dBeg, 'DD.MM.YYYY'));
+
+  if (dEnd <> ZeroDate)
+    pXL.SetStringVar('dEnd'          , '''' + DateToStr(dEnd, 'DD.MM.YYYY'));
+
+  pXL.SetStringVar('SoglFIO'       , sSogls);
+  pXL.SetStringVar('SoglDol'       , sSoglsDol);
+  pXL.SetStringVar('Sogl2FIO'      , sSogls2);
+  pXL.SetStringVar('Sogl2Dol'      , sSogls2Dol);
+  pXL.SetStringVar('UtvrFIO'       , sUtve);
+  pXL.SetStringVar('UtvrDol'       , sUtveDol);
+  pXL.SetStringVar('sPodpis1FIO'   , sPodpis1);
+  pXL.SetStringVar('sPodpis1Dol'   , sPodpis1Dol);
+  pXL.SetStringVar('sPodpis2FIO'   , sPodpis2);
+  pXL.SetStringVar('sPodpis2Dol'   , sPodpis2Dol);
+
+  pXL.SetStringVar('dReport'       , '''' + DateToStr(Cur_Date, 'DD.MM.YYYY'));
+  
+  if (GetFirst GP_TimeTable = tsOk)
+    pXL.SetStringVar('sKorr', '(корректирующий)');
+  else
+    pXL.SetStringVar('sKorr', '');
+ 
+  pXL.PublishVar;  // Excel
+
+  pXL.CreateTbls(sXLSFileName);
+  pXL.CreateTbl('tblTabWorkTime');
+  pXL.CreateTblFld('npp');
+  pXL.CreateTblFld('Person');
+
+  var i : word;
+  pXL.CreateTblFld('TabNum');
+  pXL.CreateTblFld('Category');
+
+  for(i := 1; i <= 64; inc(i))
+  {
+    if (i <= 8)
+    {  
+      pXL.CreateTblFld('otrbHM'    + i + 'T');
+      pXL.CreateTblFld('otrbM'     + i + 'T');
+      pXL.CreateTblFld('nightJobH' + i + 'T');
+      pXL.CreateTblFld('nightJobC' + i + 'T');
+      pXL.CreateTblFld('nightJobP' + i + 'T');
+    }
+    if (i <= 16)
+    {
+      pXL.CreateTblFld('kodVidOpl' + i + 'T');
+      pXL.CreateTblFld('korSchet'  + i + 'T');
+      pXL.CreateTblFld('LineA'     + i + 'T');
+      pXL.CreateTblFld('LineB'     + i + 'T');
+    }
+    if (i <= 24)
+    {
+      pXL.CreateTblFld('missKod'   + i + 'T');
+      pXL.CreateTblFld('missDay'   + i + 'T');
+    }
+    if (i <= 32)
+    {
+      pXL.CreateTblFld('korDays'   + i + 'T');  
+    }
+
+    pXL.CreateTblFld('day' + i + 'T');
+    pXL.CreateTblFld('day' + i + 'D');
+  }  
+
+  pXL.CreateTblFld('kolWeekends');
+  pXL.CreateTblFld('EveningJobH1T');
+  pXL.CreateTblFld('EveningJobH5T');
+
+
+  Mylog('=== PrintLine == START');
+  PrintLine;
+  Mylog('=== PrintLine == FINISH');
+  pXL.PublishTbl('tblTabWorkTime');
+  Mylog('pXL.PublishTbl(tblTabWorkTime)');
+
+  pXL.LoadReport(sXLSFileName);
+  Mylog('pXL.LoadReport(sXLSFileName)');
+  pXL.DisConnectExcel;
+  Mylog('pXL.DisConnectExcel');
+  StopVisual('',0);
+
+}
+//*****************************************************************************
+//Заполняет временную таблицу подразделениями, выбранными в текущем фильтре
+Procedure GetAllPodr;
+var CLSF: CurLSFunctions;
+    mPodrs: TPtr;
+    i: longint;
+    cRec: comp;
+{
+  delete all tmpAllPodr;
+  if CLSF.IsDepartmentFilterSet
+  {
+    mPodrs := CLSF.LoadCurrentDepartmentList;
+    for (i := 0; i < GetMarkerCount(mPodrs); i++)
+    {
+      GetMarker(mPodrs, i, cRec);
+      if getfirst KatPodr where ((cRec == KatPodr.NRec)) = tsOk
+        insert tmpAllPodr set tmpAllPodr.Nrec := KatPodr.NRec, tmpAllPodr.cParent := KatPodr.cPodr, tmpAllPodr.Name := KatPodr.Name + ' (' + KatPodr.Kod + ')';
+    }
+    DoneMarker(mPodrs, '');
+  }
+  else
+  {
+    insert tmpAllPodr (Nrec, cParent, Name)
+    select KatPodr.Nrec,
+           KatPodr.cPodr,
+           KatPodr.Name + ' (' + KatPodr.Kod + ')'
+    from tmpTabWorkTime,
+         LsTab,
+         KatPodr,
+         Perexod
+    where ((
+      tmpTabWorkTime.LsTabNrec == LsTab.Nrec and
+      tmpTabWorkTime.cPerexod == Perexod.Nrec and
+      if(Perexod.Nrec <> 0 and Perexod.CexP<>0, Perexod.CexP, LsTab.Cex) == KatPodr.Nrec
+    ))
+    ignore_errors(tsDuplicateKey);  }
+}
+//*****************************************************************************
+HandleEvent
+
+cmInit: 
+  { timelog_init;
+    pMyOrg:=coGetTune('MyOrg');
+    boGch:= ((wMode and 01b) > 0 );
+    timelog('iEMTabWorkTime->cmInit wMode= ' + string(wMode) + '  режим Г_ГЧ= ' + string(boGch));
+    timelog('iEMTabWorkTime->cmInit dBeg= ' +  dBeg + ' dEnd= ' +  dEnd );
+    timelog('iEMTabWorkTime->cmInit sPodr= ' +  sPodr);
+
+     _sDeskr:=sGetTune('USER.OWNNAME');
+
+    bIncludeHolydays := (wGetTune('NPOEM_OWN.Tabel.T12IncludeHolydays') = 1);
+    lNpp:=0;
+    if not ReadMyDsk(SeparateTablePrinting, 'PrintT13_SeparateTablePrinting', false)
+      SeparateTablePrinting := true;
+    if SeparateTablePrinting
+    { WT_MaskDay:=CreateDM;
+    }
+    logfilenm:='';
+    if pr_CurUserAdmin
+    { logfilenm:=GetStringParameter('Files','OutputFilesDirectory',0)
+           +'\!TabWorkTime.log' ;
+      if fileexist(logfilenm) deletefile(logfilenm);
+    }
+    MyLog('SeparateTablePrinting='+string(SeparateTablePrinting));
+    iFeeSigners.InitFeeSigners(cgReport_KASSFRO);
+    ReadMyDsk(EnhancedTimeFormat, riWorkingTableEnhancedTimeFormat, true);
+
+    if (NOT ReadMyDsk(sFeeSigners, 'PRINTT13_sFeeSigners', True))
+      set sFeeSigners := '';
+
+    if (sFeeSigners <> '')
+      iFeeSigners.FindFeeSignersByName(cgReport_KASSFRO, sFeeSigners);
+
+    if (NOT ReadMyDSK(wOutHHDouble, 'PRINTT13_wOutHHDouble', FALSE))
+      set wOutHHDouble := word(0);
+    boDbl:= (wOutHHDouble  > 0 );
+
+    if (NOT ReadMyDSK(wShowFirstPage, 'PRINTT13_wShowFirstPage', FALSE))
+      set wShowFirstPage := word(0);
+
+    timelog('iEMTabWorkTime->cmInit wOutHHDouble= ' + string(wOutHHDouble) + '  время ЧЧ.dd = ' + string(boDbl) );
+
+    if vm.getfirst euhPers where ((1213==euhPers.wtype and (_sDeskr=euhPers.DESCRIPTION)))=tsok
+    {
+      vM._loop tmpTabWorkTime
+      {
+        if vm.getfirst euhPers where ((1213==euhPers.wtype and (_sDeskr=euhPers.DESCRIPTION and tmpTabWorkTime.sTabNum=euhPers.addstring[1])))<>tsok
+        {
+          vM.delete current tmpTabWorkTime;
+        }
+      }
+
+      sql delete from em_unidoc_head where wtype=1213 and description=:(_sDeskr);
+    }
+
+
+    GetAllPodr;
+    PrintRepost;
+    if WT_MaskDay<>0
+    { DestroyDF(WT_MaskDay);
+    }
+  }
+
+end;
+end.

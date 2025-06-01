@@ -1,0 +1,185 @@
+/*************************************************************************************************\
+* Наименование: Функции для работы с иерархией подразделений                                      *
+* Контур/Модуль: *                                                                                *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер задачи |Дата    |Исполнитель             |Проект                             *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#163         |23/01/17|Тищенко Р.Н.            |НПО Энергомаш                      *
+\*************************************************************************************************/
+
+#include GP_DepFunc.vih
+#include ExtAttr.Vih
+#include ODecl.vih // Объектный интерфейс для склонения фамилий
+
+interface GP_DepFunc;
+
+  const
+    ROOT_DEP_SYS_CODE = -11;
+    EXT_ATTR_HIDE_DEP = 'Не выводить при печати';
+    VAL_CODE_YES = 'да';
+    VAL_NAME_YES = 'да';
+  end;
+
+  create view
+    from
+      Catalogs,
+      SpKAU,
+      CatHist;
+
+  var
+    oExtAttr: iExtAttr;
+    IDecl: Declension;
+
+  // Возвращает название падежа
+  function CaseName(NCase: Byte): String;
+  begin
+    case NCase of
+      2: result := 'Родительный'; // Нет Кого? Чего?
+      3: result := 'Дательный'; // Дать Кому? Чему?
+      4: result := 'Винительный'; // Винить Кого? Что?
+      5: result := 'Творительный'; // Доволен Кем? Чем?
+      6: result := 'Предложный'; // Думать О ком? О чём? В ком? В чём? Где?
+    else
+      result := 'Именительный'; // Кто? Что?
+    end;
+  end;
+
+  // Возвращает код подразделения
+  function GetDepCode(cDep: Comp; Short: Boolean = false): String;
+  begin
+    result := '';
+    if not IsValidAll(tnCatalogs) or Catalogs.NRec != cDep then
+    begin
+      if getFirst Catalogs where ((cDep == Catalogs.NRec)) = tsOk then
+        result := Catalogs.Code;
+    end else
+      result := Catalogs.Code;
+    if Short then
+      result := SubStr(result, 1, 3);
+  end;
+
+  // Ищет запись в истории изменения Catalogs на указанную дату
+  function LocateCatHist(_cCatalogs: tNRec; OnDate: Date): tNRec;
+  begin
+    result := 0;
+    if OnDate != ZeroDate then
+      if getLast CatHist where ((
+            _cCatalogs  == CatHist.cCat
+        and OnDate     >>= CatHist.Dat1
+      )) = tsOk then
+        result := CatHist.NRec;
+  end;
+
+  // Возвращает наименование подразделения
+  // Перед вызовом этой функции нужно спозиционироваться на нужные записи в таблицах
+  // Catalogs и CatHist
+  function GetDepNameInt(cCatHist: tNRec; NCase: Byte = 1; Flags: Word = 0): String;
+  begin
+    result := '';
+    // Если нужно проверять атрибут "Не выводить при печати"
+    if (Flags and DF_CHK_ATTR) != 0 then
+    begin
+      // Вместо внешнего атрибута "Не выводить при печати" проверять параметр "не использовать при формировании полного наименования"
+      if (Flags and DF_USE_BPICK) != 0 then
+      begin
+        // Если параметр "не использовать при формировании полного наименования" включен
+        if (Catalogs.bPick and 1) != 0 then
+          exit;
+      end else
+      begin
+        // Получаем значение внещнего атрибута "Не выводить при печати"
+        var cSpKAU: tNRec = oExtAttr.coGetAttr(coCatalogs, Catalogs.NRec, 'Не выводить при печати');
+        // Если есть какое-то значение
+        if cSpKAU != 0 then
+          // Ищем соответствующую этому значениею аналитику
+          if getFirst SpKAU where ((cSpKAU == SpKAU.NRec)) = tsOk then
+            // Если код или наименование этой аналитики "да", не выводим название этого уровня
+            if LoCase(SPKAU.Code) = VAL_CODE_YES or LoCase(SPKAU.Name) = VAL_NAME_YES then
+              exit;
+      end;
+    end;
+    result := Trim(if(cCatHist != 0, CatHist.Name, Catalogs.Name));
+    if SubStr(result, 1, 4) = 'ЯЯЯ ' then
+      result := SubStr(result, 5, Length(result) - 4);
+    // Если нужен не именительный падеж
+    if NCase >= 2 and NCase <= 6 then
+    begin
+      // Если передан флаг проверки внешнего атрибут "Не выводить при печати", значит это уже не первый уровень -
+      // в этом случае все остальные уровни выводим в родительном падеже
+      if (Flags and DF_CHK_ATTR) != 0 then
+        NCase := 2; // Родительный падеж
+      // Проверим наличие внешних атрибутов со склонениямия
+      var ExtAttrVal: String = Trim(oExtAttr.SGetAttr(coCatalogs, Catalogs.NRec, CaseName(NCase) + ' падеж'));
+      if ExtAttrVal != '' then
+        // Есть внешний атрибут с соовтетствующим склонением
+        result := ExtAttrVal
+      else
+        // Внешнего атрибута нет склоняем с помощью функции склонения фамилий
+        result := Trim(IDecl.FIODeclension(0, result, NCase));
+    end;
+  end;
+
+  // Возвращает наименование подразделения
+  public function GetDepName(cDep: Comp; NCase: Byte = 1; Flags: Word = 0; OnDate: Date = ZeroDate): String;
+  var
+    cCatHist: tNRec;
+  begin
+    result := '';
+    if getFirst Catalogs where ((cDep == Catalogs.NRec)) = tsOk then
+    begin
+      cCatHist := LocateCatHist(Catalogs.NRec, OnDate);
+      result := GetDepNameInt(cCatHist, NCase, Flags);
+    end;
+  end;
+
+  // Возвращает полное название подразделения в иерархии от нижнего к верхнему
+  public function GetFullDepName(cDep: Comp; Flags: Word = 0; NCase: Byte = 1; Delimiter: String = ' '; OnDate: Date = ZeroDate): String;
+  var
+    DepName: String;
+    DepCode: String;
+    cCatHist: tNRec;
+  begin
+    // result := GetFulDepNameO(cDep);
+    result := '';
+    DepCode := '';
+    while true do
+    begin
+      if getFirst Catalogs where ((cDep == Catalogs.NRec)) = tsOk then
+      begin
+        cCatHist := LocateCatHist(Catalogs.NRec, OnDate);
+        // Для терминального уровня дерева подразделений значение атрибута "Не выводить при печати" не проверяем
+        DepName := GetDepNameInt(cCatHist, NCase, if(result = '' or (Flags and DF_FULL) != 0, 0, 
+         DF_CHK_ATTR or (Flags and DF_USE_BPICK)));
+        // Если запись в таблице Catalogs не найдена
+        if not IsValidAll(tnCatalogs) then
+          break;
+        // Если это терминальный уровень дерева подразделений, будем использовать его код
+        if result = '' then
+          DepCode := Trim(Catalogs.Code);
+        // Если добрались до верхнего уровня
+        if Catalogs.SysCode = ROOT_DEP_SYS_CODE then
+          break;
+        // Если нужно выводить только уровни с трехзначным кодом
+        if (Flags and DF_TOP_ONLY) != 0 then
+          if Length(DepCode) != 3 then
+            DepName := '';
+        // Если этот уровень дерева нужно выводить
+        if DepName != '' then
+          // Добавляем его название к результату
+          if (Flags and DF_FROM_ROOT) != 0 then
+            result := DepName + if(result != '', Delimiter, '') + result
+          else
+            result += if(result != '', Delimiter, '') + DepName;
+        cDep := if(cCatHist != 0, CatHist.cParent, Catalogs.cParent);
+        if cDep = 0 then
+          break;
+      end else
+        break;
+    end;
+    if (Flags and DF_ADD_CODE) != 0 then
+      if DepCode != '' then
+        result += ' (' + if((Flags and DF_FULL_CODE) != 0, DepCode, SubStr(DepCode, 1, 3)) + ')';
+  end;
+
+end.

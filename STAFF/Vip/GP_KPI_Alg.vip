@@ -1,0 +1,3822 @@
+/*************************************************************************************************\
+* Наименование: Реализация класса GP_KPI_Alg "Алгоритмы KPI"                                      *
+* Контур/Модуль: Кадры                                                                            *
+* Примечание:                                                                                     *
+* 783 Добавлен алгоритм EM_NachByMF                                                               *
+* 2350 Добавлен внешний вызов CalcRaiseProcent                                                    *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#195          |06/09/17|Кузьмин П.Ю.             |НПО Энергомаш                    *
+* Разработка  |#783          |26/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#2350         |26/01/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#3674         |24/11/18|Кириллов Э.П.            |НПО Энергомаш                    *
+\*************************************************************************************************/
+//расскоменитровать для подробного лога
+#DEFINE KPI_ALG_DEBUG
+#include GP_KPI_Doc.vih
+#include GP_KPI_RaiseEdit.vih
+#include GP_KPI_ALG_USER.Vih
+//#include GP_WorkTable.Vih
+#include GP_Status.Vih
+#include Query.vih
+#include GP_KPI_Alg.vih
+
+#include Contexts.vih // прикладные контексты (для инициализации табеля)
+
+#doc
+Реализация класса GP_KPI_Alg "Алгоритмы KPI"
+<p>#783 Добавлен алгоритм EM_NachByMF                                                               *
+<p>#2350 Добавлен внешний вызов CalcRaiseProcent                                                    *
+
+#end
+//**********************************************88
+Interface GP_KPI_Alg_Calc;
+//**********************************************88
+// список интерфейсов для пользовательских расчетов
+Table Struct tmp_Interface
+( Name        :string[100]
+ ,description :string[100]
+ ,num         :word
+)
+with index
+( tmp_Interface01=Name
+);
+table struct tmpTableVarDouble
+(
+ vDouble : double
+)
+with index
+(
+ ind0 = vDouble
+)
+;
+//для расчета подформул
+Table Struct tmp_Alg_Spec
+( Key   :string[100]
+ ,Number:longint
+ ,Value :string
+)
+with index
+( tmp_Alg_Spec01 = Number+Key
+);
+
+Table Struct tmp_kpi
+( cKpi :comp
+ ,Sum  :tSumma
+)
+with index
+( tmp_kpi01 = cKpi
+);
+
+Table Struct tmp_kpi_podr
+( cPodr :comp
+ ,cKlKatego:comp
+ ,cPost  :comp
+ ,Sum   :tSumma
+ ,Count :longint
+ ,DBegin:date
+)
+with index
+( tmp_kpi01 = cPodr+cKlKatego+DBegin
+);
+
+//-- для заполнения итогов по фондам
+table struct tmp_fond
+( cFond : Comp
+ ,Summa :tSumma
+ ,Rasp  :tSumma
+)
+with index
+( tmp_fond01 = cFond
+);
+//------------------------
+table Struct tmp_Fields = GP_KPI_FIELDS;
+//================================
+var
+  CS: IContextSession; // для захвата прикладного контекста табеля
+
+//================================
+// пока нет - тяжелый и не удобный  Status              : GP_Status NoAuto;
+  wType_Alg:word; //тип расчета алгоритма
+  sLastError:string;//последняя ошибка
+  pGP_KPI_Doc    : oGP_KPI_Doc;
+  //-----------------------------
+  Count_pokazatel:longint;
+  //-----------------------------
+  WT_Hanler_Filtr_Depart: Longint;// Для фильтрации табеля по подразделению
+  WT_Hanler_Filtr_Post  : Longint;// Для фильтрации табеля по должности
+  WT_PPodr_filter       : comp;
+  WT_PPost_filter       : comp;
+  boLoadInterFace:boolean;
+  BoLog   :boolean; //вести протокол расчета
+  boLoadZar:boolean;//загрузка зарплатных алгоритмов
+  boLoadWT :boolean;//загрузка табеля
+  boNotLoadZarLschet:boolean;//true -  признак, того что ранее был загружен только табель
+  boImmediately_SP:boolean;
+  wTypePeriod :word;// тип периода расчета
+  boAll       :boolean;//полный расчет
+  pCatClass        :comp;//coGetTune('NPOEM_OWN.Raise.Raise_Class');
+create view ltKPI_Alg
+var
+  wTypeDoc:word;
+  wTypeDoc_Status:word;
+  pDoc    :comp;
+  pDocSp  :comp;
+  wFldType:word;//0 - премии, 1 фонды, 3 - ведомости исп.дисц.
+  pFldDoc :comp;
+  //pLschet :comp;
+  //pLschet_Prev:comp=0;
+  RunDate :date;//Дата расчета
+  RunDate_Prev :date;//Дата расчета
+  PeriodBegin:date; // Период расчета премии - начало
+  PeriodEnd  :date; // Период расчета премии - конец
+  //----------------------
+  pGP_KPI_Doc_SP:comp;
+  ValuePrev:string;
+as select
+   GP_KPI_Alg.*,GP_KPI.*,Spec.*
+  ,GP_KPI_Doc.*
+  ,GP_KPI_Doc_SP.*,GP_KPI_Doc_SP_F.* //Для обеспечения доступа к полям из LotExpressionFunc
+//---------------------------------
+  , word(GP_KPI_Doc.HARRCOMP[1]) (FieldName=Rez_Kv_Mes ,FieldTitle='Квартальный резерв - месяц')
+  , word(GP_KPI_Doc.HARRCOMP[2]) (FieldName=Rez_Kv_Year,FieldTitle='Квартальный резерв - год')
+  , word(GP_KPI_Doc.HARRCOMP[3]) (FieldName=Rez_YP_Year,FieldTitle='Годовой резерв - год')
+  , word(GP_KPI_Doc.HARRCOMP[4]) (FieldName=Rez_Option ,FieldTitle='Резерв - опции')
+//---------------------------------
+
+from
+   GP_KPI
+  ,GP_KPI_Alg
+  ,GP_KPI_ALG_SPEC(GP_KPI_ALG_SPEC02)
+  ,GP_KPI_StatementSpec Spec
+  ,Tmp_KPi_Alg
+  ,Tmp_Interface
+  , tmpTableVarDouble
+  ,tmp_Alg_Spec
+  ,tmp_KPI_Doc_Val // GP_KPI_RaiseEdit.vih
+  //-----------------------------
+  //,Lschet
+  //,NacTmp //для расчета ЗП RunRaise
+  //Документы
+  ,GP_KPI_Statements, GP_KPI_StatementSpec
+  ,GP_KPI_DOC
+  ,GP_KPI_DOC_SP(GP_DOC_SP03)
+  ,GP_KPI_Doc_SP GP_KPI_Doc_SP_F
+  ,tmp_Fields
+  ,GP_KPI_RAISe
+  //--------------------------
+  ,GP_KPI_GroupPers_SP
+  //,GP_KPI_GroupPers
+  ,GP_KPI_DocSumFond
+  ,GP_KPI_Fond
+  ,tmp_fond
+  ,Appointments App1
+Where ((
+    GP_KPI_Alg.Nrec == GP_KPI_ALG_SPEC.cGP_KPI_Alg
+//---------------------------------
+and pDoc                   == GP_KPI_Statements.Nrec
+and GP_KPI_Statements.Nrec == GP_KPI_StatementSpec.cStatement
+//---------------------------------
+and pDoc            == GP_KPI_DOC.Nrec
+and GP_KPI_DOC.Nrec == GP_KPI_DOC_SP.cGP_KPI_DOC
+and GP_KPI_DOC.wType== GP_TypeDocs.wType
+//---------------------------
+and pGP_KPI_Doc_SP ==GP_KPI_Doc_SP_F.Nrec
+//----- Распределение по фондам
+and if(GP_KPI_DOC_SP.cGP_KPI_RAISe=0
+  ,case(wTypePeriod;2:GP_KPI_Doc.HARRCOMP[5],3:GP_KPI_Doc.HARRCOMP[6];0)
+  ,GP_KPI_DOC_SP.cGP_KPI_RAISe  )  == GP_KPI_RAISe.Nrec
+and GP_KPI_Doc_SP.cKlKatego       == GP_KPI_GroupPers_SP.cKlKatego
+//and GP_KPI_GroupPers_SP.cGroupPers== GP_KPI_GroupPers.Nrec
+and GP_KPI_GroupPers_SP.cGroupPers== GP_KPI_Fond.cGroupPers
+//and GP_KPI_RAISe.cDoplata         == GP_KPI_Fond.cKPI_RAISe(noindex)
+and GP_KPI_RAISe.Nrec             == GP_KPI_Fond.cKPI_RAISe(noindex)
+and GP_KPI_Doc.wType              == GP_KPI_DocSumFond.wType
+and GP_KPI_Doc.Nrec               == GP_KPI_DocSumFond.cDoc
+//and GP_KPI_Fond.Nrec              == GP_KPI_DocSumFond.cGP_KPI_Fond
+and tmp_fond.cFond                == GP_KPI_DocSumFond.cGP_KPI_Fond
+and wType_Alg                     == Tmp_Kpi_Alg.wType
+//---------------------------------
+/*
+and wFldType        == GP_KPI_Fields.wType
+and pFldDoc         == GP_KPI_Fields.cDoc
+and (GP_KPI_FIELDS.NPP>0
+  and GP_KPI_FIELDS.NPP<=GP_KPI_Doc_Max_FLD_SP
+    )
+*/
+and wFldType        == tmp_Fields.wType
+and pFldDoc         == tmp_Fields.cDoc
+
+//------------------------------------
+//and pLschet == Lschet.nrec
+))
+;
+//-------------------
+Create view vKatPodr
+var
+  pPodr:comp;
+as select KatPodr.Kod
+From
+  KatPodr
+where ((
+  pPodr == KatPodr.Nrec
+))  ;
+
+
+Create view vLschet
+var
+  pLschet :comp;
+  pLschet_Prev:comp=0;
+as select Lschet.nrec
+From Lschet
+  ,NacTmp //для расчета ЗП RunRaise
+where ((
+ pLschet == Lschet.nrec
+));
+
+
+// для поиска оклада на дату
+Create view vLschet_App
+var
+  pLschet :comp;
+  pDoplata:comp;
+  DT,DTB:date;
+as select Lschet.nrec, Appointments.Nrec
+From
+    Lschet
+  , Appointments(APNTBYPERSON)
+  , AppHist(APPHISTBYDREC)
+where ((
+    pLschet == Lschet.nrec
+and Lschet.tPerson == Appointments.Person
+and Lschet.Nrec == Appointments.cAddNrec2(Noindex)
+and DT >>= Appointments.AppointDate
+and ( (Appointments.lPrizn=2 and Appointments.DateEnd>=Dt
+// костыль,... изза того,что NREC в appointments качался как ИД из КИС,а вьюха строится с сортировкой по Appointments.NREC то при getlast выдается не послдеднее реальное, а херь из совместительства, если перемещениея не было потом
+    and Appointments.nrec <> 000A000000005FCBh
+)
+   or (Appointments.lPrizn<>2 and (Appointments.DisMissDate=ZeroDate or Appointments.DisMissDate>=DT )
+      )
+  )
+and Appointments.Nrec == AppHist.cAppoint
+and DT               >>= AppHist.DREC
+and               1   == AppHist.wState(noindex)
+and 0                 << AppHist.TaxRate(noindex) //могут встретится записи с 0
+
+//--------------------------------
+and  Lschet.tPerson == GP_KPI_Pers_Raise.cPersons
+and  pdoplata == GP_KPI_Pers_Raise.cDoplata(noindex)
+and   DT>>=GP_KPI_Pers_Raise.FromDate(noindex)
+and  ( GP_KPI_Pers_Raise.ToDate=ZeroDate or DTB<=GP_KPI_Pers_Raise.ToDate )
+
+))
+;
+
+//------------------------------------
+create view vApp
+var
+  pdoplata:comp;
+  pAppoint:comp;
+  PeriodBegin,PeriodEnd:date;
+as select Appointments.Nrec
+From
+  //-------------------------
+   Appointments
+  //-- Доплаты по штатному расписанию
+  /*,StaffStruct
+  ,Raise
+  ,RaiseSts
+  ,RaiseAlg
+  */
+  ,GP_KPI_Pers_Raise
+  ,GP_KPI_Raise_STS_SP
+  ,GP_KPI_Pers_Class
+where
+((
+// Для документов по премии
+    pAppoint                    == Appointments.Nrec
+and Appointments.TARIFF         == GP_TarStavExt.cTarStav
+//and Appointments.StaffStr       == StaffStruct.Nrec
+//--------------------------------
+/*
+and Appointments.Nrec           == Raise.Appoint
+and pdoplata                    == Raise.RaiseType(noindex)
+and PeriodEnd>>=Raise.FromDate(noindex)
+and  ( Raise.ToDate=ZeroDate or PeriodBegin<=Raise.ToDate )
+*/
+//--------------------------------
+and   Appointments.Nrec == GP_KPI_Pers_Raise.cAppoint
+// Будем проверять просто наличие
+//and   pdoplata == GP_KPI_Pers_Raise.cDoplata(noindex)
+and   PeriodEnd>>=GP_KPI_Pers_Raise.FromDate(noindex)
+and  ( GP_KPI_Pers_Raise.ToDate=ZeroDate or PeriodBegin<=GP_KPI_Pers_Raise.ToDate )
+//-- Доплаты по штатному расписанию
+and Appointments.StaffStr == GP_KPI_Raise_Sts_SP.cStaffStruct
+and   PeriodEnd>>=GP_KPI_Raise_STS_SP.DataN(noindex)
+and  ( GP_KPI_Raise_STS_SP.DatOk=ZeroDate
+  or (PeriodBegin<=GP_KPI_Raise_STS_SP.DatOk and Appointments.AppointDate<=GP_KPI_Raise_STS_SP.Datok)
+ )
+//--- Доплаты по классности
+and Appointments.Person == GP_KPI_Pers_Class.cPersons
+and pDoplata            == GP_KPI_Pers_Class.cDoplata
+//and Appointments.Nrec == GP_KPI_Pers_Class.cAppoint
+and   PeriodEnd>>=GP_KPI_Pers_Class.FromDate(noindex)
+and  ( GP_KPI_Pers_Class.ToDate=ZeroDate
+    or (   PeriodBegin<=GP_KPI_Pers_Class.ToDate
+       and Appointments.AppointDate<=GP_KPI_Pers_Class.ToDate
+       )
+     )
+
+/*
+and Appointments.StaffStr  == RaiseStS.StaffStr
+//and RaiseStS.RaiseType == RaiseCat.Nrec
+and pdoplata   == RaiseStS.RaiseType(noindex)
+and PeriodEnd>>= RaiseSts.Dat1(noindex)
+and ( RaiseSts.Dat2=ZeroDate or PeriodBegin<=RaiseSts.Dat2 )
+and RaiseSts.Nrec          == RaiseAlg.RaiseStSt
+*/
+));//vApp
+
+//----------------------------------------------
+Create View vKPI_KOEF
+var
+  DTBEG,DTEND:date;
+  _wMonth:word;
+  _wYear :word;
+  _cPodr:comp;
+  _cPost:comp;
+  _cKlKatego:comp;
+as select GP_KPI_StatementSpec.ImplProc
+From
+    tmp_kpi
+   ,GP_KPI_StatementSpec
+   ,GP_KPI_Statements
+   ,KatPodr
+   ,tmp_kpi_podr
+where
+((
+    11              == extcatlinks.objtype
+and  1              == extcatlinks.modtype
+and  _cPodr         == extcatlinks.extcat
+and  _cPodr         == KatPodr.Nrec
+and  _cPodr         == tmp_kpi_podr.cPodr
+and  _cKlKatego     == tmp_kpi_podr.cKlKatego
+and  DTBEG          == tmp_kpi_podr.DBegin
+and          _cPost == tmp_kpi_podr.cPost (noindex) // спустя 3 годя пробуем по долностям всетаки
+and  extcatlinks.staffcat == GP_KPI_StatementSpec.cPodr
+//не будем по должностям смотреть
+and  _cPost         == GP_KPI_StatementSpec.cPost
+and  DTBEG<<= GP_KPI_StatementSpec.DOCDATE
+and  DTEND>>= GP_KPI_StatementSpec.DOCDATE
+and  GP_KPI_StatementSpec.cStatement == GP_KPI_Statements.Nrec
+//будет только в статусе "утверждено"
+and  GP_KPI_Statements.cStatus == GP_Status.Nrec
+//исключения по категориям
+and  GP_KPI_StatementSpec.cKPI == GP_KPI_Excl_Kateg.cGP_KPI
+and  _cKlKatego                == GP_KPI_Excl_Kateg.cKlKatego
+and  GP_KPI_Excl_Kateg.Nrec    == GP_KPI_Excl_Kat_D.cGP_KPI_Excl_Kateg
+and  _wMonth                   == GP_KPI_Excl_Kat_D.wMonth
+and  _wYear                    == GP_KPI_Excl_Kat_D.wYear
+and  (_cPodr = GP_KPI_Excl_Kat_D.cKatPodr or GP_KPI_Excl_Kat_D.cKatPodr=0)
+));
+//-----------------------
+Create view vNachVid
+as select *
+From
+  Nachisl
+  ,prvidopl
+/*where
+((
+     18==prvidopl.choice(noindex)
+     and Nachisl.clsch=prvidopl.clsch
+     and Nachisl.datan=prvidopl.datan
+     and Nachisl.datok=prvidopl.datok
+
+)) */
+
+
+ ;
+
+//-----------------------
+var DM_ALG : Array [1..1] of IGP_KPI_ALG_USER;
+
+Procedure Init_WT;
+{ if boLoadWT exit;
+  boLoadWT:=true;
+  var CL: ContextList;
+  WT_Hanler_Filtr_Depart:=0;
+  WT_Hanler_Filtr_Post  :=0;
+  WT_PPodr_filter:=-9999;
+  WT_PPost_filter:=-9999;
+  if (not CL.Add(CS, 'WorkingTable'))
+  { abort;
+    exit;
+  }
+}
+//-------------------------------------------------
+// инициализировать зарплату
+//-------------------------------------------------
+Procedure Init_Zar;
+{  if boLoadZar exit;
+   boLoadZar:=true;
+   //-----------------
+   //IntInit;
+   var CL: ContextList;
+   if (not CL.Add(CS, 'IntInit'))
+   {
+   }
+   if ( not PrVidInit(100,1) ) {}
+   Init_WT
+} //Procedure Init_Zar;
+
+
+//-------------------------------------------------
+// Заполнить временную таблицу с настройкой полей
+//-------------------------------------------------
+Procedure Fill_tmp_Fields;
+var _wFldType:word;
+{ ResetBounds(#tmp_Fields);
+  MTRetrieve(#tmp_Fields,mfFilters + mfClear); //+mfClearFilters
+  delete all tmp_Fields;
+  SetBounds(#tmp_Fields);
+  _wFldType:=wFldType;
+  insert into tmp_Fields select GP_KPI_FIELDS.* from GP_KPI_FIELDS
+  where (( _wFldType == GP_KPI_FIELDS.wType ));
+} //Procedure Fill_tmp_Fields;
+
+Function MysqlAddStr(var query_handle: tptr; add_query_str: string): tptr;
+{
+   Result:=sqlAddStr(query_handle, add_query_str);
+   if timelog_Status>2 timelog(add_query_str)
+} //Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
+
+//----------------------------------
+#doc
+ Установить период расчета для внешних вызовов
+#end
+Function SetPeriodByParam(_PeriodBegin,_PeriodEnd:date):boolean;
+{ Result:=false;
+  if _PeriodBegin=ZeroDate or _PeriodEnd=ZeroDate
+  { sLastError:='Не заполнены даты:_PeriodBegin='+DateToStr(_PeriodBegin,'DD.MM.YYYY')+',_PeriodEnd='+DateToStr(_PeriodEnd,'DD.MM.YYYY');
+    exit;
+  }
+  PeriodBegin:=_PeriodBegin;
+  PeriodEnd  :=_PeriodEnd;
+  vApp.PeriodBegin:=_PeriodBegin;
+  vApp.PeriodEnd  :=_PeriodEnd;
+  Result:=true;
+} //Function SetPeriod(_PeriodBegin,_PeriodEnd:date):boolean;
+
+
+//-------------------------------------------------
+#doc
+ Рассчитать нормативный процент премии за классность
+ _cAppointments - ссылка на назначение
+ _cDoplata - ссылка на справочник доплат - Catalogs.
+ _Type -0 Факт, 1 Нормативный
+ _Summa - возвращаемый сумма
+ Возвращает процент премии
+ премия берется по Премми  за классность
+#end
+Function CalcRaiseProcentClass(_cAppointments:comp;_cDoplata:comp;_Type:word;var _Summa:double):double;
+{
+  Result:=0;
+  _Summa:=0;
+  vApp.pAppoint:=_cAppointments;// GP_KPI_DOC_SP.cAppointments;
+  vApp.pDoplata:=_cDoplata     ;// GP_KPI_RAISe.cDoplata;
+  //if vApp.getfirst Appointments<>tsok exit;
+  vApp._Loop fullcache Appointments
+  {
+#IFDEF KPI_ALG_DEBUG
+    if timelog_Status>2
+    { timelog('CalcRaiseProcent '+string(_Type)+', таб№='+vApp.Appointments.StrTabn
+     +', премия '+string(vApp.pDoplata,0,0));
+    }
+#ENDIF
+    // GetLast
+    vApp._Loop backward fullcache GP_KPI_Pers_Class
+    { Result:=vApp.GP_KPI_Pers_Class.Procent ;
+      break;
+    }
+    break;
+  } //vApp._Loop Appointments<>tsok
+} //Function CalcRaiseProcentClass(_cAppointments:comp;_cDoplata:comp;_Type:word;var _Summa:double):double;
+
+//-------------------------------------------------
+#doc
+ Рассчитать нормативный процент
+ _cAppointments - ссылка на назначение
+ _cDoplata - ссылка на справочник доплат - Catalogs.
+ _Type -0 Факт, 1 Нормативный
+ _Summa - возвращаемый сумма
+ Возвращает процент премии
+#end
+//-------------------------------------------------
+Function CalcRaiseProcent(_cAppointments:comp;_cDoplata:comp;_Type:word;var _Summa:double):double;
+var jj:word;
+{ Result:=0;
+  _Summa:=0;
+  vApp.pAppoint:=_cAppointments;// GP_KPI_DOC_SP.cAppointments;
+  vApp.pDoplata:=_cDoplata     ;// GP_KPI_RAISe.cDoplata;
+  //if vApp.getfirst Appointments<>tsok exit;
+  vApp._Loop fullcache Appointments
+  {
+#IFDEF KPI_ALG_DEBUG
+    if timelog_Status>2
+    { timelog('CalcRaiseProcent '+string(_Type)+', таб№='+vApp.Appointments.StrTabn
+       +', премия '+string(vApp.pDoplata,0,0));
+    }
+#ENDIF
+    if true // будем искать всегдп_Type=0 // пробуем найти базовый процент
+    {
+      //-----------------------------------------------
+      //--- Премии персональные
+      // если есть хоть одна, проверяем только их
+      var _boGP_KPI_Pers_Raise:boolean=false;
+      vApp._Loop fullcache GP_KPI_Pers_Raise
+      {
+#IFDEF KPI_ALG_DEBUG
+        if timelog_Status>2
+           timelog('CalcRaiseProcent Pers_Raise ') ;
+#ENDIF
+        _boGP_KPI_Pers_Raise:=True;
+        if vApp.pDoplata =  vApp.GP_KPI_Pers_Raise.cDoplata
+        { Result:=vApp.GP_KPI_Pers_Raise.Procent;
+         _Summa:=vApp.GP_KPI_Pers_Raise.Summa;
+        }
+      } //vApp._Loop fullcache GP_KPI_Pers_Raise
+      if _boGP_KPI_Pers_Raise exit;
+
+      //-----------------------------------------------
+      //--- Премии по штатному расписанию
+      _boGP_KPI_Pers_Raise:=false;
+      //if vApp.Getfirst GP_KPI_Raise_STS_SP=tsok
+      vApp._Loop fullcache GP_KPI_Raise_STS_SP
+      {  _boGP_KPI_Pers_Raise:=True;
+         if timelog_Status>2
+            timelog('CalcRaiseProcent  GP_KPI_Raise_STS_SP.cDoplata= '+string(vApp.GP_KPI_Raise_STS_SP.cDoplata));
+          if vApp.pDoplata =  vApp.GP_KPI_Raise_STS_SP.cDoplata
+          { Result:=vApp.GP_KPI_Raise_STS_SP.Procent;
+           _Summa:=vApp.GP_KPI_Raise_STS_SP.Summa;
+#IFDEF KPI_ALG_DEBUG
+           if timelog_Status>2
+              timelog('CalcRaiseProcent  нашли доплату по штатке '+string(Result,0,0));
+#ENDIF
+            if Result>0 break;
+          }
+        //проверим - а вдруг есть
+        /* ПЕРЕНЕС В Function CalcRaiseProcentClass
+        if Result>0 and _Type=0 //только для факта,1971 от 02.03.2018
+        { if vApp.GetLast GP_KPI_Pers_Class=tsok
+          Result:=vApp.GP_KPI_Pers_Class.Procent
+        }
+        */
+      } //vApp._Loop GP_KPI_Raise_STS_SP
+      if _boGP_KPI_Pers_Raise exit;
+    } //if _Type=0
+
+#IFDEF KPI_ALG_DEBUG
+           if timelog_Status>2
+              timelog('Ищем по тарифной сетке');
+#ENDIF
+
+    vApp._Loop GP_TarStavExt
+    { for(jj:=1;jj<=3;jj++)
+      { if vApp.GP_TarStavExt.MonthlyBonus[jj]>0
+        { if vApp.GP_TarStavExt.cMonthlyBonusType[jj]=vApp.pDoplata
+          {  Result:=vApp.GP_TarStavExt.MonthlyBonus[jj];
+#IFDEF KPI_ALG_DEBUG
+                if timelog_Status>2
+                  timelog('Нашли процент месячной премии=' +String(vApp.GP_TarStavExt.MonthlyBonus[jj]));
+#ENDIF
+          }
+        }
+      } //for(jj:=1;jj<=3;jj++)
+      if Result=0
+      if vApp.GP_TarStavExt.QuarterlyBonus>0
+      { if vApp.GP_TarStavExt.cQuarterlyBonusType=vApp.pDoplata
+        { Result:=vApp.GP_TarStavExt.QuarterlyBonus;
+#IFDEF KPI_ALG_DEBUG
+                if timelog_Status>2
+                  timelog('Нашли процент квартаьллной премии=' +String(vApp.GP_TarStavExt.QuarterlyBonus));
+#ENDIF
+        }
+      } //if GP_TarStavExt.QuarterlyBonus>0
+      if Result=0
+      if vApp.GP_TarStavExt.AnnualBonus>0
+      { if vApp.GP_TarStavExt.cAnnualBonusType=vApp.pDoplata
+        { Result:=vApp.GP_TarStavExt.AnnualBonus;
+        }
+      } //if GP_TarStavExt.QuarterlyBonus>0
+    } //vApp._Loop GP_TarStavExt
+    if Result>0 and _Type=0 //только для факта,1971 от 02.03.2018
+    { if pCatClass=_cDoplata
+      { vApp._Loop backward GP_KPI_Pers_Class
+        { Result:=vApp.GP_KPI_Pers_Class.Procent;
+          break;
+        }
+      }
+    }
+    if _summa=0
+    { _summa:=Round(vApp.Appointments.Taxrate*Result/100,2);
+    }
+#IFDEF KPI_ALG_DEBUG
+                if timelog_Status>2
+                  timelog('_SUMMA=' +_summa);
+#ENDIF
+
+  } //vApp._Loop Appointments
+} //Function CalcRaiseProcent(_Type:word):double;
+
+//-------------------------------------------------------------
+//01, %EM_FieldDocbyPers(wtype,Filedname,param)% -  wtype = word,
+// Filedname = string, param - string. Получает значение поля ведомости по типу док-та
+//и наименованию поля: в текущем месяце находится док-нт типа,
+//в нем ищется строка по человеку и в этой строке берется значение поля
+//FieldName. Param - дополнительный параметр');
+//---------------------------------------------
+Function EM_FIELDDOCBYPERS(
+          _Wtype   :word;//где ищем
+          _WtypeIst:word;//из какой ведомости ищем
+          _wYear:word;
+          _wMonth:word;
+          _cLschet:comp;
+          _pPost:comp;
+          _pPodr:comp;
+          _sFld:string;
+          _Param:string
+
+          ):string;
+var _pNrec:comp;
+    sFormula,tmpRes,sError:string;
+    _Num:word;
+
+{ #__UNUSED__(_Wtype,_WtypeIst,_wYear,_wMonth,_cLschet,_pPost,_pPodr,_sFld,_Param)
+  result:='';
+  _pNrec:=0;
+#IFDEF KPI_ALG_DEBUG
+  if timelog_Status>2
+    timelog('EM_FIELDDOCBYPERS _Wtype='+string(_Wtype)+', _wYear='+string(_wYear)
+           +', _wMonth='+string(_wMonth)+','+string(_cLschet) );
+#ENDIF
+  _Try
+  { sql
+    select GP_KPI_Doc_Sp.Nrec
+    from GP_KPI_Doc_SP
+    Inner join GP_KPI_Doc on GP_KPI_Doc.Nrec = GP_KPI_Doc_SP.cGP_KPI_Doc
+                and GP_KPI_Doc.wYear = :(_wYear) and GP_KPI_Doc.wMonth = :(_wMonth)
+    where( :(_cLschet)=GP_KPI_Doc_SP.cLschet and :(_wType)=GP_KPI_Doc_SP.wType
+       and (  ( :(_pPost)  =GP_KPI_Doc_SP.CPOST    and :(_wTypeIst)=101)
+           or ( :(_pPodr)  =GP_KPI_Doc_SP.cKatPodr and :(_wTypeIst)<>101)
+          )
+        )
+    into (_pNrec);
+  }
+  _Except
+  else
+  {
+
+  }
+  _finally
+  {
+
+  }
+    if _pNrec=0  Exit;
+    set pGP_KPI_Doc_SP:=_pNrec;
+
+  if Getfirst GP_KPI_Doc_SP_F<>tsok then exit;
+  _Num:=0;
+  if _sFld<>''
+  { _Num:=word(_sFld);
+
+  }
+  if _Num<>0
+    sFormula:='GP_KPI_Doc_SP_F.FARRVALUE['+string(_sFld)+']';
+  else
+    sFormula:='GP_KPI_Doc_SP_F.'+_sFld;
+  sError:='';
+  tmpRes := LotExpressionFunc(sFormula, sError);
+#IFDEF KPI_ALG_DEBUG
+  if timelog_Status>2
+    timelog('EM_FIELDDOCBYPERS sFormula='+sFormula+', tmpRes='+tmpRes+', sError='+sError);
+#ENDIF
+  if sError=''
+  {  Result:=tmpRes;
+  }
+  else
+  { sLastError:='ошибка '+sError;
+  }
+} //Function EM_FIELDDOCBYPERS(_Wtype:word;_cLschet:comp;_wFld:string;_Param):string
+
+
+
+//---------------------------------
+//проверить статус ведомости на оценку
+//---------------------------------
+Function CheckStateKPIStat(_cStatus:comp):boolean;cacheable;
+{ #__UNUSED__(_cStatus)
+  Result:=false;
+  if vKPI_KOEF.getfirst GP_Status<>tsok then exit;
+  if locase(vKPI_KOEF.GP_Status.Name)<>'утверждено' then exit;
+  Result:=true;
+}
+
+//---------------------------------------------
+//02, '%EM_TotalWeightKoef(wType, param)% wTtype= word. За месяц собираются все документы с типом wType по подразделению строки и по ним суммируются значения полей
+//с типом <результат> = <+> (итоговое поле). Param - дополнительный параметр');
+// Возможно нужно набить таблицу показателей сразу, но нужен массив данны
+//---------------------------------------------
+Function EM_TOTALWEIGHTKOEF_Koef(_cPodr:comp
+  ;_cKateg:comp
+  ;_cPost:comp
+  ;_wYear:word
+  ;_wMonth:word
+  ;_Param:string
+  ;_OnlyConfirm:boolean=true
+  ):double;//cacheable;
+var _vPokazatel:tSumma;
+{ Result:=0;
+
+  vKPI_KOEF._cPodr    :=_cPodr;
+  vKPI_KOEF._cKlKatego:=_cKateg;
+  vKPI_KOEF._cPost    := _cPost;
+  vKPI_KOEF.DTBEG:=date(1,_wMonth,_wYear);
+if timelog_Status>2   timelog('EM_TOTALWEIGHTKOEF_Koef  _cPost = ' +  _cPost);
+if timelog_Status>2   timelog('EM_TOTALWEIGHTKOEF_Koef  _cPodr = ' +  _cPodr);
+if timelog_Status>2   timelog('EM_TOTALWEIGHTKOEF_Koef _cKateg = ' +  _cKateg);
+
+  if vKPI_KOEF.getfirst tmp_kpi_podr=tsok
+  { Count_pokazatel:=vKPI_KOEF.tmp_kpi_podr.Count;
+    Result:= vKPI_KOEF.tmp_kpi_podr.Sum;
+    exit;
+  }
+  vKPI_KOEF.DTEND:=date(Last_Day(vKPI_KOEF.DTBEG),_wMonth,_wYear);
+  vKPI_KOEF._wMonth:=_wMonth;
+  vKPI_KOEF._wYear :=_wYear;
+  vKPI_KOEF._cPost:=_cPost;
+
+  vKPI_KOEF.delete all tmp_kpi;
+  vKPI_KOEF.delete all tmp_kpi;
+  Count_pokazatel:=0;
+  //if vKPI_KOEF.getfirst extcatlinks<>tsok exit;
+
+  vKPI_KOEF._Loop extcatlinks
+  vKPI_KOEF._Loop fullcache GP_KPI_StatementSpec
+  {
+
+    Count_pokazatel++;
+      if Timelog_Status>2
+      { if vKPI_KOEF.getfirst GP_KPI_Statements=tsok {}
+        timelog('EM_TOTALWEIGHTKOEF_Koef ведомость '+ vKPI_KOEF.GP_KPI_Statements.DOCNUMBER+' от'+DateToStr(vKPI_KOEF.GP_KPI_Statements.DOCDate,'DD/MM/YYYY'));
+      }
+      if _OnlyConfirm
+      if vKPI_KOEF.getfirst GP_KPI_Statements=tsok
+      { if not CheckStateKPIStat(vKPI_KOEF.GP_KPI_Statements.cStatus) then continue;
+      }
+      _vPokazatel:=if(vKPI_KOEF.GP_KPI_StatementSpec.ImplProc<100,vKPI_KOEF.GP_KPI_StatementSpec.ImplProc/100,1)*vKPI_KOEF.GP_KPI_StatementSpec.UdVes;
+      //Коэффициент качества труда п. 2.1.2
+      if _vPokazatel<>vKPI_KOEF.GP_KPI_StatementSpec.UdVes
+      { if (vKPI_KOEF.RecordExists  GP_KPI_Excl_Kateg)=tsok
+        {  //timelog('EM_TOTALWEIGHTKOEF_Koef нашли искл. категории '+string(_cKateg));
+           if (vKPI_KOEF.RecordExists  GP_KPI_Excl_Kat_D)<>tsok
+           { _vPokazatel  :=  vKPI_KOEF.GP_KPI_StatementSpec.UdVes;
+             //timelog('EM_TOTALWEIGHTKOEF_Koef изм. коэф. '+string(_vPokazatel,0,2));
+           }
+        } //if (vKPI_KOEF.RecordExists  GP_KPI_Excl_Kateg)=tsok
+      } //if _vPokazatel<>vKPI_KOEF.GP_KPI_StatementSpec.UdVes
+      if vKPI_KOEF.getfirst tmp_kpi where (( vKPI_KOEF.GP_KPI_StatementSpec.cKpi == tmp_kpi.cKpi  ))<>tsok
+      { vKPI_KOEF.insert into tmp_kpi set tmp_kpi.cKpi :=vKPI_KOEF.GP_KPI_StatementSpec.cKpi
+          ,tmp_kpi.Sum:=_vPokazatel
+        ;
+        /*
+        if Timelog_Status>2
+          timelog('EM_TOTALWEIGHTKOEF_Koef INS '+ string(vKPI_KOEF.tmp_kpi.cKpi,0,0)+','+string(vKPI_KOEF.tmp_kpi.Sum,0,4)
+            +',kateg='+string(_cKateg));
+        */
+      }
+      else
+      { if _vPokazatel<vKPI_KOEF.tmp_kpi.Sum
+         vKPI_KOEF.update current tmp_kpi set tmp_kpi.Sum:=_vPokazatel;
+        /*
+        if Timelog_Status>2
+          timelog('EM_TOTALWEIGHTKOEF_Koef UPD '+ string(vKPI_KOEF.tmp_kpi.cKpi,0,0)+','+string(vKPI_KOEF.tmp_kpi.Sum,0,4)
+           +',kateg='+string(_cKateg));
+        */
+      }
+  } //vKPI_KOEF._Loop fullcache GP_KPI_StatementSpec
+if timelog_Status>2 timelog('EM_TOTALWEIGHTKOEF_Koef Count_pokazatel= ' + Count_pokazatel);
+  if Count_pokazatel=0
+  {
+    exit;
+    /* проход по вышестоящим реалищован в цикле где вызывается эта функция
+    if vKPI_KOEF.Getfirst KatPodr=tsok
+    { if Length(vKPI_KOEF.KatPodr.Kod)<=3 or vKPI_KOEF.KatPodr.cPodr=0 exit;
+      // Поищем по вышестоящим.
+      _cPodr:=vKPI_KOEF.KatPodr.cPodr ;
+      Result:=EM_TOTALWEIGHTKOEF_Koef(_cPodr,_cKateg,_cPost,_wYear, _wMonth, _Param);
+    }
+    */
+  }
+  else
+  { vKPI_KOEF._Loop tmp_kpi
+      Result:=Result+vKPI_KOEF.tmp_kpi.sum;
+  }
+  vKPI_KOEF.INSERT Into tmp_kpi_podr set
+        tmp_kpi_podr.cPodr     :=_cPodr
+       ,tmp_kpi_podr.Sum       :=Result
+       ,tmp_kpi_podr.Count      :=Count_pokazatel
+       ,tmp_kpi_podr.cPost     := _cPost
+       ,tmp_kpi_podr.DBegin    :=DTBEG
+       ,tmp_kpi_podr.cKlKatego := _cKateg
+       ;
+if timelog_Status>2  timelog('EM_TOTALWEIGHTKOEF_Koef result='+string(Result,0,4));
+
+} //Function EM_TOTALWEIGHTKOEF_Koef(_cPodr:comp;_cPost:comp;_wYear:word;  _wMonth:word; _Param:string):double;cacheable;
+
+
+//---------------------------------------------
+//02, '%EM_TotalWeightKoef(wType, param)% wTtype= word. За месяц собираются все документы с типом wType по подразделению строки и по ним суммируются значения полей
+//с типом <результат> = <+> (итоговое поле). Param - дополнительный параметр');
+//---------------------------------------------
+Function EM_TOTALWEIGHTKOEF(_Wtype:word;
+          _wYear:word;
+          _wMonth:word;
+          _Param:string
+          ):string;
+var _ItSum:double;
+    _ItCol:longint;
+    _pPost:comp;
+    _pPodr:comp;
+    _pKateg:comp;
+    ii,jj:word;
+    isAllOk:boolean;
+{ #__UNUSED__(_Wtype,_wYear,_wMonth,_Param)
+  Result:='';
+
+  _ItSum:=0;
+  _ItCol:=0;
+  case _wType of
+  //------------------------------
+  1: //премиальные коэффициенты
+  { _pPost:=0;
+    //Пока не нужно по должности
+    /*if pLschet<>0
+    { _pPost:=Lschet.cappoint;
+    } */
+    _ItCol:=0;
+    isAllOk:=false;
+
+     _pPost := GP_KPI_Doc_SP.CPOST ;// попробуйем по должностям найти
+
+    //Пока не нужно по должности
+    //for(ii:=2;ii<=2;ii++)
+    //{ if _pPost=0 and ii=1 then continue;// не проверяем по должности
+    _pKateg:=GP_KPI_DOC_SP.cKlKatego;
+      for(jj:=1;jj<=2;jj++)
+      { _pPodr:=if(jj=1,GP_KPI_DOC_SP.cKatPodr,GP_KPI_DOC.cKatPodr);
+if timelog_Status>2         timelog('EM_TOTALWEIGHTKOEF_Koef run with post');
+        _ItSum:=EM_TOTALWEIGHTKOEF_Koef(_pPodr,_pKateg,_pPost,_wYear, _wMonth, _Param);
+if timelog_Status>2         timelog('EM_TOTALWEIGHTKOEF_Koef _ItSum ' + _ItSum);
+        if Count_pokazatel>0 { isAllOk:=True; break; }
+if timelog_Status>2         timelog('EM_TOTALWEIGHTKOEF_Koef run withOUT post');
+        _ItSum:=EM_TOTALWEIGHTKOEF_Koef(_pPodr,_pKateg,    0h,_wYear, _wMonth, _Param); // не нашли по долдности, то пойжем как раньше без нее
+if timelog_Status>2         timelog('EM_TOTALWEIGHTKOEF_Koef _ItSum ' + _ItSum);
+        if Count_pokazatel>0 { isAllOk:=True; break; }
+      }//for(jj:=1;jj<=2;jj++)
+      //_pPost:=0;
+      //if isAllOk  break;
+    //} //for(ii:=1;ii<=2;ii++)
+    if Count_pokazatel=0
+      _ItSum:=1; // По умолчанию 1
+  } //1
+  //------------------------------
+  else
+  { sql
+    select Sum(GP_KPI_Doc.Summa)
+    from GP_KPI_Doc
+    where   GP_KPI_Doc.wYear = :(_wYear) and GP_KPI_Doc.wMonth = :(_wMonth)
+        and :(_wType)=GP_KPI_Doc.wType
+    into (_ItSum);
+  }
+  end;
+  Result:=String(Round(_ItSum,4),0,4);
+} //Function EM_TOTALWEIGHTKOEF(_Wtype:word;
+
+Function FindKatpodrKod3(_pPodr :comp) :string;cacheable;
+{ vKatPodr.pPodr:=_pPodr;
+  Result:='' ;
+  if vKatPodr.Getfirst katpodr=tsok
+  { Result:=SubStr(vKatPodr.KatPodr.Kod,1,3);
+
+  }
+}
+
+//---------------------------------------------
+//подсчитать начисления за текущий месяц
+//---------------------------------------------
+Function EM_NACHO(_pLschet:comp;_wYear:word;_wMes:word; _pPodr :comp; _pPost:comp; _wVo:word ) :double; cacheable;
+var _wkod_Podr:string;
+{ Result:=0;
+  _wkod_Podr:=FindKatpodrKod3(_pPodr);
+  sql
+    select Sum(Nachisl.Summa)
+  from Nachisl
+  inner join KatPodr on KatPodr.Nrec  = Nachisl.Cexoz
+     and SubString(Katpodr.Kod,1,3) =:(_wkod_Podr)
+  where Nachisl.cLsch =:(_pLschet)
+   and Nachisl.MesN  = :(_wMes)
+   and Nachisl.YearN = :(_wYear)
+   // просьба клиента от 02.02.2018
+   and Nachisl.Mes   = :(_wMes)
+   and Nachisl.YearK = :(_wYear)
+   //----------------------
+   //and Nachisl.Cexoz = :(_pPodr)
+   and Nachisl.Vidopls= :(_wVo)
+   and (:(_pPost)=0 or Nachisl.cAppoint=:(_pPost) )
+  INTO (Result);
+  if timelog_status>2
+    timelog('EM_NACHO '+string(_pLschet,0,0)+', _wYear='+string(_wYear)+', _wMes='+string(_wMes)
+       +', _pPodr='+string(_pPodr,0,0)+', _wVo='+string(_wVo)+', Result='+string(result,0,2) )
+} //Function EM_NACHO(_pLschet:comp;_wYear:word;_wMes:word; _pPodr :comp; _wVo:word ) :double;
+
+
+Function EM_VIDNACH(_pLschet:comp;_wMes:word;_wNach:word;_wOsn:word;_dproc:double ) :double; cacheable;
+var _dsumnach,_dnormvrem:double;
+var dat1,dat2:word;
+{ Result:=0;
+  _dsumnach:=0;
+  //logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'EM_VIDNACH'+string(_pLschet,0,0)+', _wOsn='+string(_wOsn)+', _wMes='+string(_wMes) ) ;
+  vNachVid._loop Nachisl where ((_pLschet==Nachisl.clsch and _wNach==Nachisl.vidopls(noindex) and _wMes==Nachisl.mes(noindex) ))
+  {
+
+    if vNachVid.getfirst prvidopl where ((18==prvidopl.choice(noindex) and Nachisl.clsch==prvidopl.clsch(noindex) and (Nachisl.datan=prvidopl.dataf
+                                          and Nachisl.datok=prvidopl.datok) ))=tsok
+    {
+      //logstrtofile('result3.txt','if');
+      vNachVid._loop prvidopl where ((18==prvidopl.choice(noindex) and Nachisl.clsch==prvidopl.clsch(noindex) and (Nachisl.datan=prvidopl.dataf
+                                          and Nachisl.datok=prvidopl.datok) ))
+      {
+        If _wOsn=vNachVid.prvidopl.filialno
+        {
+        //logstrtofile('result3.txt','if2');
+        dat1:=day(vNachVid.prvidopl.dataf);
+        dat2:=year(cur_date);
+        _dnormvrem:=ZARALG('GP_ZP::GP_AvgMonthHours', ''+WT_GetOperatingMode(dat1)+','+dat2+', true');
+
+        _dsumnach+= (vNachVid.Nachisl.summavkl+(vNachVid.Nachisl.summavkl*_dproc/100))/_dnormvrem*vNachVid.Nachisl.chasf;
+
+       // logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'1EM_VIDNACH '+string(vNachVid.Nachisl.summavkl,0,0)+', dat1='+string(dat1)+', dat2='+string(dat2)
+       //+', _dnormvrem='+string(_dnormvrem,0,2)+', vNachVid.Nachisl.chasf='+string(vNachVid.Nachisl.chasf,0,2)+', _dsumnach='+string(_dsumnach,0,2));
+        }
+      }
+
+    }
+    else
+    {
+      //logstrtofile('result3.txt','else');
+      if _wOsn=1
+      {
+        dat1:=day(vNachVid.Nachisl.datan);
+        dat2:=year(cur_date);
+       _dnormvrem:=ZARALG('GP_ZP::GP_AvgMonthHours', ''+WT_GetOperatingMode(dat1)+','+dat2+', true');
+
+        _dsumnach+= (vNachVid.Nachisl.summavkl+(vNachVid.Nachisl.summavkl*_dproc/100))/_dnormvrem*vNachVid.Nachisl.chasf;
+
+      //  logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'2EM_VIDNACH '+string(vNachVid.Nachisl.summavkl,0,0)+', dat1='+string(dat1)+', dat2='+string(dat2)
+       //+', _dnormvrem='+string(_dnormvrem,0,2)+', vNachVid.Nachisl.chasf='+string(vNachVid.Nachisl.chasf,0,2)+', _dsumnach='+string(_dsumnach,0,2))  ;
+      }
+
+    }
+
+  }
+  Result:=_dsumnach;
+//logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'3EM_VIDNACH '+string(_pLschet,0,0)+', _wNach='+string(_wNach)+', _wOsn='+string(_wOsn)
+  //    +', _dproc='+string(_dproc,0,2)+', _dsumnach='+string(_dsumnach,0,2)+', Result='+string(result,0,2)) ;
+  //if timelog_status>2
+
+} //Function EM_VIDNACH(_pLschet:comp;_wNach:word;_wOsn:word;_dproc:double) :double;
+Function EM_VIDNACHV(_pLschet:comp;_wMes:word;_wNach:word;_wOsn:word;_dproc:double ) :double; cacheable;
+var _dsumnach,_dnormvrem:double;
+var dat1,dat2:word;
+{ Result:=0;
+  _dsumnach:=0;
+  //logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'EM_VIDNACH'+string(_pLschet,0,0)+', _wOsn='+string(_wOsn)+', _wMes='+string(_wMes) ) ;
+  vNachVid._loop Nachisl where ((_pLschet==Nachisl.clsch and _wNach==Nachisl.vidopls(noindex) and _wMes==Nachisl.mes(noindex) ))
+  {
+
+    if vNachVid.getfirst prvidopl where ((18==prvidopl.choice(noindex) and Nachisl.clsch==prvidopl.clsch(noindex) and (Nachisl.datan>=prvidopl.dataf
+                                          and Nachisl.datok<=prvidopl.datok and ('РВ'=prvidopl.param or 'РО'=prvidopl.param)) ))=tsok
+    {
+      //logstrtofile('result3.txt','if');
+      vNachVid._loop prvidopl where ((18==prvidopl.choice(noindex) and Nachisl.clsch==prvidopl.clsch(noindex) and (Nachisl.datan>=prvidopl.dataf
+                                          and Nachisl.datok<=prvidopl.datok and ('РВ'=prvidopl.param or 'РО'=prvidopl.param)) ))
+      {
+        If _wOsn=vNachVid.prvidopl.filialno
+        {
+        //logstrtofile('result3.txt','if2');
+        dat1:=day(vNachVid.prvidopl.dataf);
+        dat2:=year(cur_date);
+        _dnormvrem:=ZARALG('GP_ZP::GP_AvgMonthHours', ''+WT_GetOperatingMode(dat1)+','+dat2+', true');
+
+        _dsumnach+= (vNachVid.Nachisl.summavkl+(vNachVid.Nachisl.summavkl*_dproc/100))/_dnormvrem*vNachVid.Nachisl.chasf;
+
+       // logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'1EM_VIDNACH '+string(vNachVid.Nachisl.summavkl,0,0)+', dat1='+string(dat1)+', dat2='+string(dat2)
+       //+', _dnormvrem='+string(_dnormvrem,0,2)+', vNachVid.Nachisl.chasf='+string(vNachVid.Nachisl.chasf,0,2)+', _dsumnach='+string(_dsumnach,0,2));
+        }
+      }
+
+    }
+    else
+    {
+      //logstrtofile('result3.txt','else');
+      if _wOsn=1
+      {
+        dat1:=day(vNachVid.Nachisl.datan);
+        dat2:=year(cur_date);
+       _dnormvrem:=ZARALG('GP_ZP::GP_AvgMonthHours', ''+WT_GetOperatingMode(dat1)+','+dat2+', true');
+
+        _dsumnach+= (vNachVid.Nachisl.summavkl+(vNachVid.Nachisl.summavkl*_dproc/100))/_dnormvrem*vNachVid.Nachisl.chasf;
+
+      //  logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'2EM_VIDNACH '+string(vNachVid.Nachisl.summavkl,0,0)+', dat1='+string(dat1)+', dat2='+string(dat2)
+     //  +', _dnormvrem='+string(_dnormvrem,0,2)+', vNachVid.Nachisl.chasf='+string(vNachVid.Nachisl.chasf,0,2)+', _dsumnach='+string(_dsumnach,0,2))  ;
+      }
+
+    }
+
+  }
+  Result:=_dsumnach;
+//logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'3EM_VIDNACH '+string(_pLschet,0,0)+', _wNach='+string(_wNach)+', _wOsn='+string(_wOsn)
+  //    +', _dproc='+string(_dproc,0,2)+', _dsumnach='+string(_dsumnach,0,2)+', Result='+string(result,0,2)) ;
+  //if timelog_status>2
+
+} //Function EM_VIDNACH(_pLschet:comp;_wNach:word;_wOsn:word;_dproc:double) :double;
+
+Function EM_VIDNACHS(_pLschet:comp;_wMes:word;_wNach:word;_wOsn:word;_dproc:double ) :double; cacheable;
+var _dsumnach,_dnormvrem:double;
+var dat1,dat2:word;
+{ Result:=0;
+  _dsumnach:=0;
+  //logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'EM_VIDNACH'+string(_pLschet,0,0)+', _wOsn='+string(_wOsn)+', _wMes='+string(_wMes) ) ;
+  vNachVid._loop Nachisl where ((_pLschet==Nachisl.clsch and _wNach==Nachisl.vidopls(noindex) and _wMes==Nachisl.mes(noindex) ))
+  {
+
+    if vNachVid.getfirst prvidopl where ((18==prvidopl.choice(noindex) and Nachisl.clsch==prvidopl.clsch(noindex) and (Nachisl.datan>=prvidopl.dataf
+                                          and Nachisl.datok<=prvidopl.datok and ('С'=prvidopl.param or 'СД'=prvidopl.param)) ))=tsok
+    {
+      //logstrtofile('result3.txt','if');
+      vNachVid._loop prvidopl where ((18==prvidopl.choice(noindex) and Nachisl.clsch==prvidopl.clsch(noindex) and (Nachisl.datan>=prvidopl.dataf
+                                          and Nachisl.datok<=prvidopl.datok and ('С'=prvidopl.param or 'СД'=prvidopl.param)) ))
+      {
+        If _wOsn=vNachVid.prvidopl.filialno
+        {
+        //logstrtofile('result3.txt','if2');
+        dat1:=day(vNachVid.prvidopl.dataf);
+        dat2:=year(cur_date);
+        _dnormvrem:=ZARALG('GP_ZP::GP_AvgMonthHours', ''+WT_GetOperatingMode(dat1)+','+dat2+', true');
+
+        _dsumnach+= (vNachVid.Nachisl.summavkl+(vNachVid.Nachisl.summavkl*_dproc/100))/_dnormvrem*vNachVid.Nachisl.chasf;
+
+       // logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'1EM_VIDNACH '+string(vNachVid.Nachisl.summavkl,0,0)+', dat1='+string(dat1)+', dat2='+string(dat2)
+       //+', _dnormvrem='+string(_dnormvrem,0,2)+', vNachVid.Nachisl.chasf='+string(vNachVid.Nachisl.chasf,0,2)+', _dsumnach='+string(_dsumnach,0,2));
+        }
+      }
+
+    }
+    else
+    {
+      //logstrtofile('result3.txt','else');
+      if _wOsn=1
+      {
+        dat1:=day(vNachVid.Nachisl.datan);
+        dat2:=year(cur_date);
+       _dnormvrem:=ZARALG('GP_ZP::GP_AvgMonthHours', ''+WT_GetOperatingMode(dat1)+','+dat2+', true');
+
+        _dsumnach+= (vNachVid.Nachisl.summavkl+(vNachVid.Nachisl.summavkl*_dproc/100))/_dnormvrem*vNachVid.Nachisl.chasf;
+
+      //  logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'2EM_VIDNACH '+string(vNachVid.Nachisl.summavkl,0,0)+', dat1='+string(dat1)+', dat2='+string(dat2)
+       //+', _dnormvrem='+string(_dnormvrem,0,2)+', vNachVid.Nachisl.chasf='+string(vNachVid.Nachisl.chasf,0,2)+', _dsumnach='+string(_dsumnach,0,2))  ;
+      }
+
+    }
+
+  }
+  Result:=_dsumnach;
+//logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'3EM_VIDNACH '+string(_pLschet,0,0)+', _wNach='+string(_wNach)+', _wOsn='+string(_wOsn)
+  //    +', _dproc='+string(_dproc,0,2)+', _dsumnach='+string(_dsumnach,0,2)+', Result='+string(result,0,2)) ;
+  //if timelog_status>2
+
+} //Function EM_VIDNACH(_pLschet:comp;_wNach:word;_wOsn:word;_dproc:double) :double;
+
+
+//---------------------------------------------
+#doc
+подсчитать начисления за произвольный  месяц
+#end
+Function EM_NachByMF(_pLschet:comp; _pPodr :comp;_pPost :comp; _wVo:word
+             ;_wMes:word
+             ;_wYear:word
+             ;_IE   :word // не учитываем
+  ) :double; cacheable;
+var
+  _suArch:double;
+  _wkod_Podr:string;
+{
+
+           if timelog_Status>2
+            {
+             timelog('  Function EM_NachByMF(_pLschet:comp; _pPodr :comp;_pPost :comp; _wVo:word');
+            }
+
+  Result:=0;
+  _suArch:=0;
+  if _IE=0
+    _wkod_Podr:=''
+  else
+    _wkod_Podr:=FindKatpodrKod3(_pPodr);
+                _try
+                {
+
+                  sql
+                    select Sum(SumVidop.Summa)
+                  from SumVidop
+                  inner join KatPodr on KatPodr.Nrec  = SumVidop.Cexoz
+                     and (:(_IE)=0 or SubString(Katpodr.Kod,1,3) =:(_wkod_Podr))
+                  where SumVidop.cLsch =:(_pLschet)
+                   and SumVidop.MesN  = :(_wMes)
+                   and SumVidop.YearN = :(_wYear)
+                   // просьба клиента от 02.02.2018
+                   //and SumVidop.Mes   = :(_wMes)
+                   //and SumVidop.YearK = :(_wYear)
+                   //------------ Фильтруем по цеху или подразделению отнесения затрат
+                   and ( (SumVidop.Cexoz = :(_pPodr) and :(_IE)=0)
+                      or (:(_IE)>0) // будет отобрано в inner join KatPodr
+                       )
+                   //------------
+                   and SumVidop.Vidopl=:(_wVo)
+                   and (:(_pPost)=0 or SumVidop.cAppoint=:(_pPost) )
+                  INTO (_suArch);
+                  //------------------
+                  sql
+                    select Sum(Nachisl.Summa)
+                  from Nachisl
+                  inner join KatPodr on KatPodr.Nrec  = Nachisl.Cexoz
+                     and (:(_IE)=0 or SubString(Katpodr.Kod,1,3) =:(_wkod_Podr))
+                  where Nachisl.cLsch =:(_pLschet)
+                   and Nachisl.MesN  = :(_wMes)
+                   and Nachisl.YearN = :(_wYear)
+                   // просьба клиента от 02.02.2018
+                   //and Nachisl.Mes   = :(_wMes)
+                   //and Nachisl.YearK  = :(_wYear)
+                   //--------------------------------
+                   //and Nachisl.Cexoz = :(_pPodr)
+                   //------------ Фильтруем по цеху или подразделению отнесения затрат
+                   and ( (Nachisl.Cexoz = :(_pPodr) and :(_IE)=0)
+                      or (:(_IE)>0) // будет отобрано в inner join KatPodr
+                       )
+                   //------------
+                   and Nachisl.Vidopls=:(_wVo)
+                   and (:(_pPost)=0 or Nachisl.cAppoint=:(_pPost) )
+                  INTO (Result);
+                }
+           _Except
+                else
+                {
+
+                }
+                _finally
+                {
+
+                }
+  Result:=Result+_suArch;
+  if timelog_status>2
+    timelog('END EM_NachByMF '+string(_pLschet,0,0)+', _wYear='+string(_wYear)+', _wMes='+string(_wMes)
+       +', _pPodr='+string(_pPodr,0,0)+', _pPost='+String(_pPost)+ ', _wVo='+string(_wVo)+', Result='+string(result,0,2) )
+} //Function EM_NachByMF(_pLschet:comp; _pPodr :comp;_pPost :comp; _wVo:word
+
+//---------------------------------------------
+//подсчитать часы за указанный месяц периода - фильтры не срабатываю на не первый
+//---------------------------------------------
+Function EM_KV_WT_GHBD_1(_pLschet:comp //ссылка на лиц.счет
+             ;_pPodr :comp //подразделение
+             ;_pPost :comp //должность
+             ;_wMes:word   //месяц в периоде
+             ;_ScheduleType :integer //-1 - балансный график,0 - плановый,1 - факт
+  ) :double; cacheable;
+{ Result:=0;
+  if _wMes=0 then exit;
+  var ww_dt :date=Add_months(PeriodBegin,_wMes-1);
+  var _year :word=year (ww_dt);
+  var _month:word=month(ww_dt);
+  var ww_dt2:date=date(Last_Day(ww_dt),_month,_year);
+  Loadworkingtable(_pLschet,_month,_year);
+  WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+  if _ScheduleType=1
+  { if WT_Hanler_Filtr_Depart<>0
+    { DestroyDF(WT_Hanler_Filtr_Depart);
+    }
+    if WT_Hanler_Filtr_Post<>0
+    { DestroyDF(WT_Hanler_Filtr_Post);
+    }
+    WT_Hanler_Filtr_Depart := CreateDepartmentDF(_PPodr); // создали фильтр
+    WT_AddFilter(WT_Hanler_Filtr_Depart); // наложили фильтр
+    if _pPost<>0
+    { WT_Hanler_Filtr_Post   := CreateAppointmentDF(_PPost); // создали фильтр
+      if WT_Hanler_Filtr_Post<>0
+        WT_AddFilter(WT_Hanler_Filtr_Post); // наложили фильтр
+    }
+    WT_PPodr_filter:=_PPodr;
+    WT_PPost_filter:=_PPost;
+  }
+  else
+  { WT_PPodr_filter:=0;
+    WT_PPost_filter:=0;
+  }
+  Result:=WT_GHBDEx(1,0,0,_ScheduleType,ww_dt,ww_dt2,64+if(_ScheduleType=1,0,128));
+} //Function EM_KV_WT_GHBD_1(_pLschet:comp //ссылка на лиц.счет
+
+//---------------------------------------------
+//подсчитать часы за указанный месяц периода - фильтры не срабатываю на не первый
+//с учетом отклонений
+//---------------------------------------------
+Function EM_KV_WT_GHBD_2(_pLschet:comp //ссылка на лиц.счет
+             ;_pPodr :comp //подразделение
+             ;_pPost :comp //должность
+             ;_wMes:word   //месяц в периоде
+             ;_ScheduleType :integer //-1 - балансный график,0 - плановый,1 - факт
+             ;_wType :word=1//1 - высш.звено, 2 среднее звено, 2 вариант от 20.06.2018:double;
+  ) :double; cacheable;
+{ Result:=0;
+  if _wMes=0 then exit;
+  var ww_dt :date=Add_months(PeriodBegin,_wMes-1);
+  var _year :word=year (ww_dt);
+  var _month:word=month(ww_dt);
+  var ww_dt2:date=date(Last_Day(ww_dt),_month,_year);
+  Loadworkingtable(_pLschet,_month,_year);
+  WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+  if _ScheduleType=1
+  { if WT_Hanler_Filtr_Depart<>0
+    { DestroyDF(WT_Hanler_Filtr_Depart);
+    }
+    if WT_Hanler_Filtr_Post<>0
+    { DestroyDF(WT_Hanler_Filtr_Post);
+    }
+    WT_Hanler_Filtr_Depart := CreateDepartmentDF(_PPodr); // создали фильтр
+    WT_AddFilter(WT_Hanler_Filtr_Depart); // наложили фильтр
+    if _pPost<>0
+    { WT_Hanler_Filtr_Post   := CreateAppointmentDF(_PPost); // создали фильтр
+      if WT_Hanler_Filtr_Post<>0
+        WT_AddFilter(WT_Hanler_Filtr_Post); // наложили фильтр
+    }
+    WT_PPodr_filter:=_PPodr;
+    WT_PPost_filter:=_PPost;
+  }
+  else
+  { WT_PPodr_filter:=0;
+    WT_PPost_filter:=0;
+  }
+  var _ch_month_p:double=0;
+  var _ch_month_f:double=0;
+  //всегда пляшем от факта
+  _ch_month_f:=WT_GHBDEx(1,0,0,_ScheduleType,ww_dt,ww_dt2,64+if(_ScheduleType=1,0,128));
+  _ch_month_p:=WT_GHBDEx(1,0,0,-1,ww_dt,ww_dt2,64+if(_ScheduleType=1,0,128));
+  if WT_LoadMonthlyAbsences = 0
+  { var _AbsenceCount:longint=WT_GetAbsenceCount(atMonthly);
+    var jj:integer;
+    for(jj := 0; jj < _AbsenceCount; Inc(jj))
+    { var _aaMark:string;
+      _aaMark:='';
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaMark, _aaMark) then continue;
+      //минус плановые дни за периоды неявок с условными обозначениями "У; УД; Р; ОЖ" , так-же с учетом назначения сотрудника
+      if timelog_status>0
+      { timelog('EM_YEAR_WT_GDBD _aaMark='+_aaMark);
+      }
+      case _wType of
+      1: //высшее звено - вычитаем
+      { CASE _aaMark  of
+          'ОТ','ОЖ','ОД','ОЗ','ДБ'
+        , 'У' ,'УД','Р' ,'В' ,'ДО'
+        , 'РВ','РО','Т' ,'Б' : continue;
+        else {}
+        end;
+      }
+      2: //среднее звено - прибавляем
+      { CASE _aaMark  of
+        'К','КП','Г','ГО','Д' : {}
+        else continue;
+        end;
+      }
+      3:// //среднее звено - прибавляем второй вариант
+      CASE _aaMark  of
+      'ВП','Г' ,'ГО','Д' ,'ЗБ','К' ,'К91','КП','НВ','НЗ'
+     ,'НО','НП','ОВ','ПВ','ПК','ПМ','НР' ,'РП'
+     //-------------- не должны использоваться, но могут быть
+     ,'ОТГ','Я'
+       :{}
+      else continue;
+      end;
+      end;
+      var _aaBeginning , _aaEnding :date=ZeroDate;
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaBeginning, _aaBeginning) then continue;
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaEnding   , _aaEnding   ) then continue;
+      if timelog_status>0
+      { timelog('EM_YEAR_WT_GDBD _aaBeginning='+String(_aaBeginning)+', _aaEnding='+string(_aaEnding));
+      }
+      //поскольку плановые часы не учитывают переходов
+      //то всегда прибавляем к факту.
+      case _wType of
+      1  : _ch_month_f:=_ch_month_f+ WT_GetHoursBwDatesEx(hkWorking ,0,0,-1,_aaBeginning,_aaEnding, 0);
+      2,3: _ch_month_f:=_ch_month_f+ WT_GetHoursBwDatesEx(hkWorking ,0,0,-1,_aaBeginning,_aaEnding, 0);
+      end;
+    } //for(jj := 0; jj < WT_GetAbsenceCount(atMonthly); Inc(jj))
+  } //if WT_LoadMonthlyAbsences = 0
+  if _ch_month_f>_ch_month_p _ch_month_f:=_ch_month_p;
+  if _ch_month_f<0 _ch_month_f:=0;
+  Result:=_ch_month_f;
+} //Function EM_KV_WT_GHBD_2(_pLschet:comp //ссылка на лиц.счет
+
+
+//========================================
+// расчет дней для годовой премии за месяц с учетом отклонений
+Function EM_YEAR_WT_GDBD_Calc(
+               _ScheduleType :integer //-1 - балансный график,0 - плановый,1 - факт
+               ;_wType :word//1 - высш.звено, 2 среднее звено, 2 вариант от 20.06.2018:double;
+             ):double;
+{ Result:=0;
+
+  if vLschet_App.pDoplata>0
+  { if vLschet_App.getfirst GP_KPI_Pers_Raise<>tsok
+     exit;
+  }
+  var _ch_month_p:double=0;
+  var _ch_month_f:double=0;
+      //всегда пляшем от факта
+      _ch_month_f:=WT_GetDaysEx(2, 1,0);
+      _ch_month_p:=WT_GetDaysEx(2,-1,0);//WT_GetDaysEx(2,-1,0);
+      if WT_LoadMonthlyAbsences = 0
+      { var _AbsenceCount:longint=WT_GetAbsenceCount(atMonthly);
+        var jj:integer;
+        for(jj := 0; jj < _AbsenceCount; Inc(jj))
+        { var _aaMark:string;
+          _aaMark:='';
+          if not WT_GetAbsenceAttribute(atMonthly, jj, aaMark, _aaMark) then continue;
+          //минус плановые дни за периоды неявок с условными обозначениями "У; УД; Р; ОЖ" , так-же с учетом назначения сотрудника
+          if timelog_status>0
+          { timelog('EM_YEAR_WT_GDBD _aaMark='+_aaMark);
+          }
+          case _wType of
+          1: //высшее звено - вычитаем
+          { CASE _aaMark  of
+            'У','УД','Р','ОЖ','В','РВ','РО' : continue;
+            else {}
+            end;
+          }
+          2: //среднее звено - прибавляем
+          { CASE _aaMark  of
+            'К','КП','Г','ГО','Д' : {}
+            else continue;
+            end;
+          }
+          3:// //среднее звено - прибавляем второй вариант
+          CASE _aaMark  of
+          'ВП','Г' ,'ГО','Д' ,'ЗБ','К' ,'К91','КП','НВ','НЗ'
+         ,'НО','НП','ОВ','ПВ','ПК','ПМ','НР' ,'РП'
+         //-------------- не должны использоваться, но могут быть
+         ,'ОТГ','Я'
+           :{}
+          else continue;
+          end;
+          end;
+          var _aaBeginning , _aaEnding :date=ZeroDate;
+          if not WT_GetAbsenceAttribute(atMonthly, jj, aaBeginning, _aaBeginning) then continue;
+          if not WT_GetAbsenceAttribute(atMonthly, jj, aaEnding   , _aaEnding   ) then continue;
+          if timelog_status>0
+          { timelog('EM_YEAR_WT_GDBD _aaBeginning='+String(_aaBeginning)+', _aaEnding='+string(_aaEnding));
+          }
+          //поскольку плановые часы не учитывают переходов
+          //то всегда прибавляем к факту.
+          case _wType of
+          1  : _ch_month_f:=_ch_month_f+ WT_GetDaysBwDatesEx(2,-1,_aaBeginning,_aaEnding, 0);
+          2,3: _ch_month_f:=_ch_month_f+ WT_GetDaysBwDatesEx(2,-1,_aaBeginning,_aaEnding, 0);
+          end;
+        } //for(jj := 0; jj < WT_GetAbsenceCount(atMonthly); Inc(jj))
+      } //if WT_LoadMonthlyAbsences = 0
+      if _ch_month_f>_ch_month_p _ch_month_f:=_ch_month_p;
+      if _ch_month_f<0 _ch_month_f:=0;
+      Result:=_ch_month_f;
+} //Function EM_YEAR_WT_GDBD_Calc
+
+//---------------------------------------------
+//подсчитать  дни за период для годовой премии
+//рассчитываются по алгоритму: Плановые дни за год, с учетом назначения сотрудника,
+//минус плановые дни за периоды неявок с условными обозначениями "У; УД; Р; ОЖ" , так-же с учетом назначения сотрудника
+//---------------------------------------------
+Function EM_YEAR_WT_GDBD(_pLschet:comp //ссылка на лиц.счет
+             ;_pPodr :comp //подразделение
+             ;_pPost :comp //должность
+             ;_ScheduleType :integer //-1 - балансный график,0 - плановый,1 - факт
+             ;_wType :word//1 - высш.звено, 2 среднее звено, 2 вариант от 20.06.2018
+             ;_pDoplata:comp
+  ) :double; cacheable;
+{ Result:=0;
+  //----------------------
+  set vLschet_App.pDoplata:=if(_wType>0 and _wType<4,_pDoplata,0);
+  set vLschet_App.pLschet:=_pLschet;
+  if  vLschet_App.getfirst Lschet<>tsok then exit;
+  //----------------------
+  var _year :word=year (PeriodBegin);
+  var _month:word=1;
+  var _monthb:word=month(PeriodBegin);
+  var _monthe:word=month(PeriodEnd);
+  var _ch_month_p:double=0;
+  var _ch_month_f:double=0;
+  var _wOption  : word;
+  _wOption:=0;
+  if _ScheduleType=0
+  { _wOption:=64+128;
+  }
+  for(_month:=_monthb;_month<=_monthe;_month++)
+  { Loadworkingtable(_pLschet,_month,_year);
+    WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+    if _ScheduleType=1
+    { if WT_Hanler_Filtr_Depart<>0
+      { DestroyDF(WT_Hanler_Filtr_Depart);
+      }
+      if WT_Hanler_Filtr_Post<>0
+      { DestroyDF(WT_Hanler_Filtr_Post);
+      }
+      WT_Hanler_Filtr_Depart := CreateDepartmentDF(_PPodr); // создали фильтр
+      WT_AddFilter(WT_Hanler_Filtr_Depart); // наложили фильтр
+      if _pPost<>0
+      { WT_Hanler_Filtr_Post   := CreateAppointmentDF(_PPost); // создали фильтр
+        if WT_Hanler_Filtr_Post<>0
+          WT_AddFilter(WT_Hanler_Filtr_Post); // наложили фильтр
+      }
+      WT_PPodr_filter:=_PPodr;
+      WT_PPost_filter:=_PPost;
+      //---------- может нужно еще проверить период на наличие персональной доплаты
+      vLschet_App.DTB:=Date(1,_month,_year);
+      vLschet_App.DT :=Date(Last_Day(vLschet_App.DTB),_month,_year);
+      //--- Рассчитаем дни
+      _ch_month_f:=EM_YEAR_WT_GDBD_Calc(_ScheduleType,_wType);
+      Result:=Result+_ch_month_f;
+      if timelog_status>0
+      { timelog('EM_YEAR_WT_GDBD 001 _month='+string(_month)+', Result='+string(Result,0,2));
+      }
+    } //if _ScheduleType=1
+    else
+    { if WT_Hanler_Filtr_Depart<>0
+      { DestroyDF(WT_Hanler_Filtr_Depart);
+      }
+      if WT_Hanler_Filtr_Post<>0
+      { DestroyDF(WT_Hanler_Filtr_Post);
+      }
+      WT_PPodr_filter:=0;
+      WT_PPost_filter:=0;
+      Result:=WT_GetDaysEx(2,_ScheduleType,64+128);
+    } //ELSE if _ScheduleType=1
+  } //for(_month:=1;_month<=12;_month++)
+} //Function EM_YEAR_WT_GDBD(_pLschet:comp //ссылка на лиц.счет
+
+
+
+//---------------------------------------------
+//Получить средний оклад
+//Сумма оклада за период делится на кол-во дней за год и умножается на кол-во дней
+//---------------------------------------------
+Function EM_SR_OKL(_pLschet:comp //ссылка на лиц.счет
+             ;_pPodr :comp //подразделение
+             ;_pPost :comp //должность
+             ;_ScheduleType :integer //-1 - балансный график,0 - плановый,1 - факт
+             ;_wType :word//1 - высш.звено, 2 среднее звено, 2 вариант от 20.06.2018
+             ;_pDoplata:comp
+  ) :double; cacheable;
+{ Result:=0;
+  //----------------------------
+  set vLschet_App.pDoplata:=if(_wType>0 and _wType<4,_pDoplata,0);
+  vLschet_App.pLschet:=_pLschet;
+  if vLschet_App.getlast Lschet<>tsok then exit;
+  //----------------------------
+  var _year :word=year (PeriodBegin);
+  var _month:word=1;
+  var _ch_month_p:double=0;
+  var _ch_month_f:double=0;
+  var _year_dn:double=0;
+  var _wOption  : word;
+  var _TaxRate:double;
+  _wOption:=0;
+  if _ScheduleType=0
+  { _wOption:=64+128;
+  }
+  if boAll
+  { displ(' ');
+    displ('====== EM_SR_OKL Расчет среднего оклада === Таб.№ '+GetStrTabn(vLschet_App.Lschet.Tabn,vLschet_App.Lschet.StrTabn));
+    displ('Месяц │ Оклад         │ Дни   │ Сред.Мес.Оклад│');
+  }
+  Loadworkingtable(_pLschet,1,_year);
+  WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+  // плановые часы за год 247 за 2017 год
+  //_year_dn:=WT_GetDaysBwDatesEx(dkWorking,0,PeriodBeg, PeriodEnd ,64 );
+  _year_dn:=WT_GetDaysBwDatesEx(dkWorking,-1,PeriodBegin, PeriodEnd ,64+128 );
+  if timelog_status>0 timelog('EM_YEAR_SR_OKL START '+vLschet_App.Lschet.StrTabn+', _year_dn='+string(_year_dn,0,2));
+
+  for(_month:=1;_month<=12;_month++)
+  {   Loadworkingtable(_pLschet,_month,_year);
+      //загрузим периоды
+      if timelog_status>0
+      { timelog('EM_YEAR_SR_OKL _month='+string(_month)+', Result='+string(Result,0,2));
+      }
+      if WT_LoadPeriods(cfChanges+cfHired)
+      { var _PeriodsCount:longint=WT_GetPeriodCount;
+        var jj:integer;
+        var _Change:comp=0;
+        for(jj := 0; jj < _PeriodsCount; Inc(jj))
+        { var _aaBeginning , _aaEnding :date=ZeroDate;
+          if not WT_GetPeriod(jj,_aaBeginning , _aaEnding) then continue;
+          _Change := WT_GetChange(AD_DayNo(_aaBeginning));
+          //WT_AddChangeFilter(_Change);
+          //--- УСТАНОВИМ ФИЛЬТРЫ >>>>>>>>>>>>>>>>>>>>>>>>>
+          WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+          WT_SetAttributeFilter(wtaChange, _Change);
+          if WT_Hanler_Filtr_Depart<>0
+          { DestroyDF(WT_Hanler_Filtr_Depart);
+          }
+          if WT_Hanler_Filtr_Post<>0
+          { DestroyDF(WT_Hanler_Filtr_Post);
+          }
+          WT_Hanler_Filtr_Depart := CreateDepartmentDF(_PPodr); // создали фильтр
+          WT_AddFilter(WT_Hanler_Filtr_Depart); // наложили фильтр
+          if _pPost<>0
+          { WT_Hanler_Filtr_Post   := CreateAppointmentDF(_PPost); // создали фильтр
+            if WT_Hanler_Filtr_Post<>0
+              WT_AddFilter(WT_Hanler_Filtr_Post); // наложили фильтр
+          }
+          WT_PPodr_filter:=_PPodr;
+          WT_PPost_filter:=_PPost;
+          //--- УСТАНОВИМ ФИЛЬТРЫ <<<<<<<<<<<<<<<<<<<<<<<<
+          //---------- может нужно еще проверить период на наличие персональной доплаты
+          vLschet_App.DTB:=Date(1,_month,_year);
+          vLschet_App.DT :=Date(Last_Day(vLschet_App.DTB),_month,_year);
+          //--- Рассчитаем дни
+          _ch_month_f:=EM_YEAR_WT_GDBD_Calc(1,_wType);
+          //----- Найдем оклад
+          _TaxRate:=0;
+          vLschet_App.DT:=_aaEnding;
+          if timelog_status>0 timelog('EM_YEAR_SR_OKL jj:='+string(jj)
+              +', _Change='+string(_Change,0,0)
+              +', DT='+DatetoStr(vLschet_App.DT,'DD/MM/YYYY'));
+          if vLschet_App.getlast GP_KPI_PERS_RAISE=tsok
+          { //#783.#26
+            if vLschet_App.GP_KPI_PERS_RAISE.Summa>0
+            { _TaxRate:=vLschet_App.GP_KPI_PERS_RAISE.Summa;
+            }
+            else
+            if vLschet_App.GetLast Appointments=tsok
+            { _TaxRate:=vLschet_App.Appointments.TaxRate;
+
+              if vLschet_App.GetLast AppHist=tsok
+              _TaxRate:=vLschet_App.AppHist.TaxRate;
+
+            }
+          }
+          // итого
+          //месяц │ Оклад      │ часы   │ сред.м.оклад
+          var _fMes:double=Round(_TaxRate*Round(_ch_month_f/_year_dn,3),2);
+          displ(
+            string(_month     , 5,0)+' │'
+           +String(_TaxRate   ,14,2)+' │'
+           +String(_ch_month_f, 6,1)+' │'
+           +String(_fMes      ,14,2)+' │'
+          );
+          Result:=//=ОКРУГЛ(B4*ОКРУГЛ(C4/D4; 3); 2)
+             Result+_fMes;
+          if timelog_status>0
+          { timelog('EM_YEAR_SR_OKL TaxRate='+string(_TaxRate,0,2)
+              +', _ch_month_f='+string(_ch_month_f,0,2)
+              +', Result='+string(Result,0,2)
+              );
+          }
+        } //for(jj := 0; jj < _PeriodsCount; Inc(jj))
+      } //if WT_LoadMonthlyAbsences = 0
+  } //for(_month:=1;_month<=12;_month++)
+} //Function EM_SR_OKL(_pLschet:comp //ссылка на лиц.счет
+
+
+Function EM_YEAR_WT_GHBD_Calc(
+               _ScheduleType :integer //-1 - балансный график,0 - плановый,1 - факт
+               ;_wType :word//1 - высш.звено, 2 среднее звено, 2 вариант от 20.06.2018:double;
+             ):double;
+{ Result:=0;
+
+  if vLschet_App.pDoplata>0
+  { if vLschet_App.getfirst GP_KPI_Pers_Raise<>tsok
+     exit;
+  }
+  var _ch_month_p:double=0;
+  var _ch_month_f:double=0;
+      //всегда пляшем от факта
+      _ch_month_f:=WT_GHBDEx(1,0,0,1,PeriodBegin,PeriodEnd,0);
+      _ch_month_p:=WT_GHBDEx(1,0,0,-1,PeriodBegin,PeriodEnd,64+128);//WT_GetDaysEx(2,-1,0);
+      if WT_LoadMonthlyAbsences = 0
+      { var _AbsenceCount:longint=WT_GetAbsenceCount(atMonthly);
+        var jj:integer;
+        for(jj := 0; jj < _AbsenceCount; Inc(jj))
+        { var _aaMark:string;
+          _aaMark:='';
+          if not WT_GetAbsenceAttribute(atMonthly, jj, aaMark, _aaMark) then continue;
+          //минус плановые дни за периоды неявок с условными обозначениями "У; УД; Р; ОЖ" , так-же с учетом назначения сотрудника
+          if timelog_status>0
+          { timelog('EM_YEAR_WT_GDBD _aaMark='+_aaMark);
+          }
+          case _wType of
+          1: //высшее звено - вычитаем
+          { CASE _aaMark  of
+            'У','УД','Р','ОЖ','В','РВ','РО' : continue;
+            else {}
+            end;
+          }
+          2: //среднее звено - прибавляем
+          { CASE _aaMark  of
+            'К','КП','Г','ГО','Д' : {}
+            else continue;
+            end;
+          }
+          3:// //среднее звено - прибавляем второй вариант
+          CASE _aaMark  of
+          'ВП','Г' ,'ГО','Д' ,'ЗБ','К' ,'К91','КП','НВ','НЗ'
+         ,'НО','НП','ОВ','ПВ','ПК','ПМ','НР' ,'РП'
+         //-------------- не должны использоваться, но могут быть
+         ,'ОТГ','Я'
+           :{}
+          else continue;
+          end;
+          end;
+          var _aaBeginning , _aaEnding :date=ZeroDate;
+          if not WT_GetAbsenceAttribute(atMonthly, jj, aaBeginning, _aaBeginning) then continue;
+          if not WT_GetAbsenceAttribute(atMonthly, jj, aaEnding   , _aaEnding   ) then continue;
+          if timelog_status>0
+          { timelog('EM_YEAR_WT_GDBD _aaBeginning='+String(_aaBeginning)+', _aaEnding='+string(_aaEnding));
+          }
+          //поскольку плановые часы не учитывают переходов
+          //то всегда прибавляем к факту.
+          case _wType of
+          1  : _ch_month_f:=_ch_month_f+ WT_GHBDEx(1,0,0,-1,_aaBeginning,_aaEnding, 0);
+          2,3: _ch_month_f:=_ch_month_f+ WT_GHBDEx(1,0,0,-1,_aaBeginning,_aaEnding, 0);
+          end;
+        } //for(jj := 0; jj < WT_GetAbsenceCount(atMonthly); Inc(jj))
+      } //if WT_LoadMonthlyAbsences = 0
+      if _ch_month_f>_ch_month_p _ch_month_f:=_ch_month_p;
+      if _ch_month_f<0 _ch_month_f:=0;
+      Result:=_ch_month_f;
+} //Function EM_YEAR_WT_GDBD_Calc
+
+
+
+//---------------------------------------------
+//подсчитать  часы за период для годовой премии
+//рассчитываются по алгоритму: Плановые дни за год, с учетом назначения сотрудника,
+//минус плановые дни за периоды неявок с условными обозначениями "У; УД; Р; ОЖ" , так-же с учетом назначения сотрудника
+//---------------------------------------------
+Function EM_YEAR_WT_GHBD(_pLschet:comp //ссылка на лиц.счет
+             ;_pPodr :comp //подразделение
+             ;_pPost :comp //должность
+             ;_ScheduleType :integer //-1 - балансный график,0 - плановый,1 - факт
+             ;_wType :word//1 - высш.звено, 2 среднее звено, 2 вариант от 20.06.2018
+             ;_pDoplata:comp
+  ) :double; cacheable;
+{ Result:=0;
+  //----------------------
+  set vLschet_App.pDoplata:=if(_wType>0 and _wType<4,_pDoplata,0);
+  set vLschet_App.pLschet:=_pLschet;
+  if  vLschet_App.getfirst Lschet<>tsok then exit;
+  //----------------------
+  var _year :word=year (PeriodBegin);
+  var _month:word=1;
+  var _monthb:word=month(PeriodBegin);
+  var _monthe:word=month(PeriodEnd);
+  var _ch_month_p:double=0;
+  var _ch_month_f:double=0;
+  var _wOption  : word;
+  _wOption:=0;
+  if _ScheduleType=0
+  { _wOption:=64+128;
+  }
+  for(_month:=_monthb;_month<=_monthe;_month++)
+  { Loadworkingtable(_pLschet,_month,_year);
+    WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+    if _ScheduleType=1
+    { if WT_Hanler_Filtr_Depart<>0
+      { DestroyDF(WT_Hanler_Filtr_Depart);
+      }
+      if WT_Hanler_Filtr_Post<>0
+      { DestroyDF(WT_Hanler_Filtr_Post);
+      }
+      WT_Hanler_Filtr_Depart := CreateDepartmentDF(_PPodr); // создали фильтр
+      WT_AddFilter(WT_Hanler_Filtr_Depart); // наложили фильтр
+      if _pPost<>0
+      { WT_Hanler_Filtr_Post   := CreateAppointmentDF(_PPost); // создали фильтр
+        if WT_Hanler_Filtr_Post<>0
+          WT_AddFilter(WT_Hanler_Filtr_Post); // наложили фильтр
+      }
+      WT_PPodr_filter:=_PPodr;
+      WT_PPost_filter:=_PPost;
+      //---------- может нужно еще проверить период на наличие персональной доплаты
+      vLschet_App.DTB:=Date(1,_month,_year);
+      vLschet_App.DT :=Date(Last_Day(vLschet_App.DTB),_month,_year);
+      //--- Рассчитаем дни
+      _ch_month_f:=EM_YEAR_WT_GHBD_Calc(_ScheduleType,_wType);
+      Result:=Result+_ch_month_f;
+      if timelog_status>0
+      { timelog('EM_YEAR_WT_GHBD 001 _month='+string(_month)+', Result='+string(Result,0,2));
+      }
+    } //if _ScheduleType=1
+    else
+    { if WT_Hanler_Filtr_Depart<>0
+      { DestroyDF(WT_Hanler_Filtr_Depart);
+      }
+      if WT_Hanler_Filtr_Post<>0
+      { DestroyDF(WT_Hanler_Filtr_Post);
+      }
+      WT_PPodr_filter:=0;
+      WT_PPost_filter:=0;
+      Result:=WT_GetDaysEx(2,_ScheduleType,64+128);
+    } //ELSE if _ScheduleType=1
+  } //for(_month:=1;_month<=12;_month++)
+} //Function EM_YEAR_WT_GHBD(_pLschet:comp //ссылка на лиц.счет
+
+
+//---------------------------------------------
+//Получить средний оклад
+//Сумма оклада за период делится на кол-во дней за год и умножается на кол-во дней
+//---------------------------------------------
+Function EM_SR_OKL_H(_pLschet:comp //ссылка на лиц.счет
+             ;_pPodr :comp //подразделение
+             ;_pPost :comp //должность
+             ;_ScheduleType :integer //-1 - балансный график,0 - плановый,1 - факт
+             ;_wType :word//1 - высш.звено, 2 среднее звено, 2 вариант от 20.06.2018
+             ;_pDoplata:comp
+  ) :double; cacheable;
+{ Result:=0;
+  //----------------------------
+
+  set vLschet_App.pDoplata:=if(_wType>0 and _wType<4,_pDoplata,0);
+  vLschet_App.pLschet:=_pLschet;
+  if vLschet_App.getlast Lschet<>tsok then exit;
+  //----------------------------
+
+  var _year  :word=year (PeriodBegin);
+  var _month :word=1;
+  var _monthb:word=month(PeriodBegin);
+  var _monthe:word=month(PeriodEnd);
+  var _ch_month_p:double=0;
+  var _ch_month_f:double=0;
+  var _year_ch:double=0;
+  var _wOption  : word;
+  var _TaxRate:double;
+  _wOption:=0;
+  if _ScheduleType=0
+  { _wOption:=64+128;
+  }
+
+if timelog_Status>2   timelog('  vLschet_App.pLschet  =' +vLschet_App.pLschet);
+if timelog_Status>2   timelog('  vLschet_App.pDoplata =' +vLschet_App.pDoplata);
+if timelog_Status>2   timelog('  vLschet_App.DT       =' +vLschet_App.DT      );
+if timelog_Status>2   timelog('  vLschet_App.DTB      =' +vLschet_App.DTB     );
+
+if timelog_Status>2   timelog('  _monthb     =' +_monthb   );
+if timelog_Status>2   timelog('  _monthe     =' +_monthe     );
+if timelog_Status>2   timelog('  PeriodBegin =' +PeriodBegin );
+if timelog_Status>2   timelog('  PeriodEnd   =' +PeriodEnd   );
+
+  if boAll
+  { displ(' ');
+    displ('====== EM_SR_OKL_H Расчет среднего оклада === Таб.№ '+GetStrTabn(vLschet_App.Lschet.Tabn,vLschet_App.Lschet.StrTabn));
+    displ('Месяц │ Оклад         │ Дни   │ Сред.Мес.Оклад│');
+  }
+  Loadworkingtable(_pLschet,_monthb,_year);
+  WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+  // плановые часы за год 247 за 2017 год
+  //_year_dn:=WT_GetDaysBwDatesEx(dkWorking,0,PeriodBeg, PeriodEnd ,64 );
+  _year_ch:=WT_GHBDEx(1,0,0,-1,PeriodBegin,PeriodEnd,64+128);;
+  if timelog_status>0 timelog('EM_YEAR_SR_OKL START '+vLschet_App.Lschet.StrTabn+', _year_ch='+string(_year_ch,0,2));
+
+  for(_month:=_monthb;_month<=_monthe;_month++)
+  {   Loadworkingtable(_pLschet,_month,_year);
+      //загрузим периоды
+      if timelog_status>0
+      { timelog('EM_YEAR_SR_OKL _month='+string(_month)+', Result='+string(Result,0,2));
+      }
+      if WT_LoadPeriods(cfChanges+cfHired)
+      { var _PeriodsCount:longint=WT_GetPeriodCount;
+        var jj:integer;
+        var _Change:comp=0;
+        for(jj := 0; jj < _PeriodsCount; Inc(jj))
+        { var _aaBeginning , _aaEnding :date=ZeroDate;
+          if not WT_GetPeriod(jj,_aaBeginning , _aaEnding) then continue;
+          _Change := WT_GetChange(AD_DayNo(_aaBeginning));
+          //WT_AddChangeFilter(_Change);
+          //--- УСТАНОВИМ ФИЛЬТРЫ >>>>>>>>>>>>>>>>>>>>>>>>>
+          WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+          WT_SetAttributeFilter(wtaChange, _Change);
+          if WT_Hanler_Filtr_Depart<>0
+          { DestroyDF(WT_Hanler_Filtr_Depart);
+          }
+          if WT_Hanler_Filtr_Post<>0
+          { DestroyDF(WT_Hanler_Filtr_Post);
+          }
+          WT_Hanler_Filtr_Depart := CreateDepartmentDF(_PPodr); // создали фильтр
+          WT_AddFilter(WT_Hanler_Filtr_Depart); // наложили фильтр
+          if _pPost<>0
+          { WT_Hanler_Filtr_Post   := CreateAppointmentDF(_PPost); // создали фильтр
+            if WT_Hanler_Filtr_Post<>0
+              WT_AddFilter(WT_Hanler_Filtr_Post); // наложили фильтр
+          }
+          WT_PPodr_filter:=_PPodr;
+          WT_PPost_filter:=_PPost;
+          //--- УСТАНОВИМ ФИЛЬТРЫ <<<<<<<<<<<<<<<<<<<<<<<<
+          //---------- может нужно еще проверить период на наличие персональной доплаты
+          vLschet_App.DTB:=Date(1,_month,_year);
+          vLschet_App.DT :=Date(Last_Day(vLschet_App.DTB),_month,_year);
+          //--- Рассчитаем дни
+          _ch_month_f:=EM_YEAR_WT_GHBD_Calc(1,_wType);
+          //----- Найдем оклад
+          _TaxRate:=0;
+          vLschet_App.DT:=_aaEnding;
+          if timelog_status>0 timelog('EM_YEAR_SR_OKL jj:='+string(jj)
+              +', _Change='+string(_Change,0,0)
+              +', DT='+DatetoStr(vLschet_App.DT,'DD/MM/YYYY'));
+          if vLschet_App.getlast GP_KPI_PERS_RAISE=tsok
+          { //#783.#26
+            if vLschet_App.GP_KPI_PERS_RAISE.Summa>0
+            { _TaxRate:=vLschet_App.GP_KPI_PERS_RAISE.Summa;
+            }
+            else
+            if vLschet_App.GetLast Appointments=tsok
+            { _TaxRate:=vLschet_App.Appointments.TaxRate;
+
+              if vLschet_App.GetLast AppHist=tsok
+              _TaxRate:=vLschet_App.AppHist.TaxRate;
+
+            }
+          }
+          // итого
+          //месяц │ Оклад      │ часы   │ сред.м.оклад
+//          var _fMes:double=Round(_TaxRate*Round(_ch_month_f/_year_ch,3),2); так несколько криво считает с 3 знаками после запятой(((
+          var _fMes:double=Round(_TaxRate*Round(_ch_month_f/_year_ch,7),2);
+          displ(
+            string(_month     , 5,0)+' │'
+           +String(_TaxRate   ,14,2)+' │'
+           +String(_ch_month_f, 6,1)+' │'
+           +String(_fMes      ,14,2)+' │'
+          );
+          Result:=//=ОКРУГЛ(B4*ОКРУГЛ(C4/D4; 3); 2)
+             Result+_fMes;
+          if timelog_status>0
+          { timelog('EM_YEAR_SR_OKL TaxRate='+string(_TaxRate,0,2)
+              +', _ch_month_f='+string(_ch_month_f,0,2)
+              +', Result='+string(Result,0,2)
+              );
+          }
+        } //for(jj := 0; jj < _PeriodsCount; Inc(jj))
+      } //if WT_LoadMonthlyAbsences = 0
+  } //for(_month:=1;_month<=12;_month++)
+} //Function EM_SR_OKL_H(_pLschet:comp //ссылка на лиц.счет
+
+//---------------------------------------------
+//убираем одинарные кавычки
+//---------------------------------------------
+Function Remove39(_s:string):string;
+{ if Substr(_s,1,1)=chr(39)
+    _s:=substr(_s,2,255);
+  if Substr(_s,length(_s),1)=chr(39)
+    _s:=substr(_s,1,length(_s));
+  _s:=replace(_s,chr(39)+chr(39),chr(39));
+  Result:=_s;
+} //Function Remove39(_s:string):string;
+
+#doc
+getEM_KOEFF_IND_NZ(_cLschet : comp; _wMonth,_wYear : word; _maxKoeff double = 1): double;
+получить Коэффициент индивидуально выработки = отношение нормо-часов по наряду к часам по табелю
+#end
+function getEM_KOEFF_IND_NZ( _pLschet : comp
+                           ; _wMonth:word
+                           ; _wYear : word
+                           ; _maxKoeff : double = 1
+                           ): double;
+{
+if timelog_Status>2 timelog('function getEM_KOEFF_IND_NZ( _pLschet =' +_pLschet);
+if timelog_Status>2 timelog('                           ; _wMonth  =' +_wMonth );
+if timelog_Status>2 timelog('                           ; _wYear   =' +_wYear  );
+if timelog_Status>2 timelog('                           ; _maxKoeff=' +_maxKoeff);
+
+
+ var SumChasNar : double = 0;
+
+ _try
+ {
+  sql
+   select
+     sum(coalesce(Prnaryad.ChasF,0)) as SumChasNar
+   from sys_nar
+   join prnaryad on prnaryad.MNREC = sys_nar.nrec
+   where
+         sys_nar.Choice = 3
+     and prnaryad.clsch = :(_pLschet)
+     and PRNARYAD.VIDOPL  in  (1,7) // Сдельная оплата по расценкам и Повременная оплата (оклад, мес. тариф)
+     and prnaryad.DataN between :(PeriodBegin) and :(PeriodEnd)
+   into (SumChasNar)
+   ;
+ }
+ _except else {}
+
+ if timelog_Status>2 timelog('function getEM_KOEFF_IND_NZ SumChasNar =' +SumChasNar);
+
+   Loadworkingtable(_pLschet,_wMonth,_wYear);
+  var _chasFact: double = WT_GHBD(1,0,0,1,PeriodBegin,PeriodEnd);
+
+
+ if timelog_Status>2 timelog('function getEM_KOEFF_IND_NZ  PeriodBegin = ' +PeriodBegin+ '  PeriodEnd='+ PeriodEnd);
+ if timelog_Status>2 timelog('function getEM_KOEFF_IND_NZ _chasFact(WT_GHBD) =' +_chasFact);
+
+ result := if(SumChasNar = 0, 0 , if(SumChasNar/_chasFact>_maxKoeff
+                                  ,_maxKoeff
+                                  ,SumChasNar/_chasFact)
+             );
+if timelog_Status>2 timelog('function getEM_KOEFF_IND_NZ _result =' +result);
+}
+
+#doc
+getEM_KOEFF_IND_NZ_NEW(_cLschet : comp; _wMonth,_wYear : word; _maxKoeff double = 1): double;
+получить Коэффициент индивидуально выработки = отношение нормо-часов по наряду к часам по табелю
+Под ТВ понимается фактическое время пребывания рабочих - сдельщиков на территории предприятия, т.е. ТВ = фактическое время нахождения работника на предприятии (в том числе сверхурочно и работа в выходные и праздничные дни) за вычетом времени отгулов.
+
+
+#end
+
+function getEM_KOEFF_IND_NZ_NEW( _pLschet : comp
+                           ; _wMonth:word
+                           ; _wYear : word
+                           ; _maxKoeff : double = 1
+                           ): double;
+{
+if timelog_Status>2 timelog('function getEM_KOEFF_IND_NZ_NEW( _pLschet =' +_pLschet);
+if timelog_Status>2 timelog('                           ; _wMonth  =' +_wMonth );
+if timelog_Status>2 timelog('                           ; _wYear   =' +_wYear  );
+if timelog_Status>2 timelog('                           ; _maxKoeff=' +_maxKoeff);
+
+
+ var SumChasNar : double = 0;
+
+ _try
+ {
+  sql
+   select
+     sum(coalesce(Prnaryad.ChasF,0)) as SumChasNar
+   from sys_nar
+   join prnaryad on prnaryad.MNREC = sys_nar.nrec
+   where
+         sys_nar.Choice = 3
+     and prnaryad.clsch = :(_pLschet)
+//     and PRNARYAD.VIDOPL   20211005 - Маляров сказал берем все!! in  (1,7) // Сдельная оплата по расценкам и Повременная оплата (оклад, мес. тариф)
+     and prnaryad.DataN between :(PeriodBegin) and :(PeriodEnd)
+   into (SumChasNar)
+   ;
+ }
+ _except else {}
+
+ if timelog_Status>2 timelog('function getEM_KOEFF_IND_NZ_NEW SumChasNar =' +SumChasNar);
+
+   Loadworkingtable(_pLschet,_wMonth,_wYear);
+  var _chasFact  : double = WT_GHBDEx(1,0,0,1,PeriodBegin,PeriodEnd,64); //hkWorking  1  рабочие часы
+  var _chasVIHOD : double = 0; // WT_GHBDEx(13,0,0,1,PeriodBegin,PeriodEnd,64); //hkOrderedWeekendWorkForLeave  13  часы работы по приказу на работу в выходные/праздники за отгул (сумма hkWeekendForLeave и hkHolidayForLeave )
+  var _chasPaidOrderedWeekendWork : double = WT_GHBDEx(30,0,0,1,PeriodBegin,PeriodEnd,64); // hkPaidOrderedWeekendWork  30  оплачиваемые часы работы по приказу на работу в выходные
+  var _chasOrderedOvertimeWorkForLeave : double = WT_GHBDEx(15,0,0,1,PeriodBegin,PeriodEnd,64); // hkOrderedOvertimeWorkForLeave  15  часы работы по приказу на сверхурочную работу за отгул
+  var _chasOvertimeWorkOrder : double = WT_GHBDEx(31,0,0,1,PeriodBegin,PeriodEnd,64); // hkOvertimeWorkOrder  31  часы работы по приказу на сверхурочную работу за оплату
+
+
+
+var _chasOTGUL: double = 0;
+
+
+  if WT_LoadMonthlyAbsences = 0
+  {
+    var _AbsenceCount:longint=WT_GetAbsenceCount(atMonthly);
+    var jj:integer;
+    for(jj := 0; jj < _AbsenceCount; Inc(jj))
+    {
+     var _aaMark:string;
+      _aaMark:='';
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaMark, _aaMark) then continue;
+
+     if timelog_status>0 timelog('getEM_KOEFF_IND_NZ_NEW _aaMark='+_aaMark);
+
+     if not (_aaMark = 'ОТГ') then continue;
+
+      var _aaBeginning , _aaEnding :date=ZeroDate;
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaBeginning, _aaBeginning) then continue;
+      if not WT_GetAbsenceAttribute(atMonthly, jj, aaEnding   , _aaEnding   ) then continue;
+      if timelog_status>0
+      { timelog('getEM_KOEFF_IND_NZ_NEW _aaBeginning='+String(_aaBeginning)+', _aaEnding='+string(_aaEnding));
+      }
+
+      case _aaMark of
+        'ОТГ' : _chasOTGUL := _chasOTGUL + WT_GetHoursBwDatesEx(hkWorking ,0,0,-1,_aaBeginning,_aaEnding, 0);
+      end;
+    } //for(jj := 0; jj < WT_GetAbsenceCount(atMonthly); Inc(jj))
+  } //if WT_LoadMonthlyAbsences = 0
+
+ if timelog_Status>2  {
+    timelog('function getEM_KOEFF_IND_NZ_NEW _chasFact  = ' + _chasFact);
+    timelog('function getEM_KOEFF_IND_NZ_NEW _chasVIHOD = ' + _chasVIHOD);
+    timelog('function getEM_KOEFF_IND_NZ_NEW _chasOTGUL = ' + _chasOTGUL);
+    timelog('function getEM_KOEFF_IND_NZ_NEW _chasPaidOrderedWeekendWork      = ' + _chasPaidOrderedWeekendWork);
+    timelog('function getEM_KOEFF_IND_NZ_NEW _chasOrderedOvertimeWorkForLeave = ' + _chasOrderedOvertimeWorkForLeave);
+    timelog('function getEM_KOEFF_IND_NZ_NEW _chasOvertimeWorkOrder           = ' + _chasOvertimeWorkOrder);
+   }
+ result := if(SumChasNar = 0, 0 , if(SumChasNar/(_chasFact + _chasVIHOD + _chasPaidOrderedWeekendWork + _chasOrderedOvertimeWorkForLeave + _chasOvertimeWorkOrder - _chasOTGUL)>_maxKoeff
+                                    ,_maxKoeff
+                                    ,SumChasNar/(_chasFact + _chasVIHOD + _chasPaidOrderedWeekendWork + _chasOrderedOvertimeWorkForLeave + _chasOvertimeWorkOrder - _chasOTGUL)
+                                   )
+             );
+if timelog_Status>2 timelog('function getEM_KOEFF_IND_NZ_NEW _result =' +result);
+}
+#doc
+getEM_KOEFF_ERS(_cLschet : comp) : double;
+получить Коэффициент за качество по листам оценки сотрудника
+Получает коэффициент из последнего листа утвержденного по лицевому счету.
+#end
+
+function getEM_KOEFF_ERS(_pLschet : comp; _dateEnd: date) : double;
+{
+/*  var _tmpSum : double = 0;
+ на 36 атлантисе данный объект стал рабьотать писец как нестабильно
+  _try
+   {
+     sql
+     Select
+       t.Koef
+     from(
+            select top 1
+              coalesce(case when EM_ERS_HEAD.DIRISN = 0 then EM_ERS_HEAD.ISN else EM_ERS_HEAD.DIRISN end /100,0) as Koef
+             ,EM_ERS_HEAD.DDate
+            from EM_ERS_HEAD
+            join gp_status on gp_status.nrec = EM_ERS_HEAD.CSTATUS
+            join lschet on lschet.tPerson = EM_ERS_HEAD.CPERSON
+            where upper(gp_status.name) = 'УТВЕРЖДЕН'
+                        and lschet.nrec        = :(_pLschet)
+                        and EM_ERS_HEAD.DDate <= :(Cur_date)
+             order by EM_ERS_HEAD.DDate desc
+         ) t
+      into (_tmpSum)
+      ;
+   }
+   _except else {}
+  result := _tmpSum;
+*/
+if timelog_Status>2 Timelog('getEM_KOEFF_ERS. Подготовка запроса');
+result := 0;
+      var hstr : tptr = 0;
+/*
+    MysqlAddStr(hstr, 'Select                                  ');
+    MysqlAddStr(hstr, '       t.Koef   as vDouble              ');
+    MysqlAddStr(hstr, '     from(                              ');
+    MysqlAddStr(hstr, '            select top 1                ');
+    MysqlAddStr(hstr, '              coalesce(case when EM_ERS_HEAD.DIRISN = 0 then EM_ERS_HEAD.ISN else EM_ERS_HEAD.DIRISN end /100,0) as Koef');
+    MysqlAddStr(hstr, '             ,EM_ERS_HEAD.DDate                                     ');
+    MysqlAddStr(hstr, '            from EM_ERS_HEAD                                        ');
+    MysqlAddStr(hstr, '            join gp_status on gp_status.nrec = EM_ERS_HEAD.CSTATUS  ');
+    MysqlAddStr(hstr, '            join lschet on lschet.tPerson = EM_ERS_HEAD.CPERSON     ');
+    MysqlAddStr(hstr, '            where upper(gp_status.name) = ''УТВЕРЖДЕН''               ');
+    MysqlAddStr(hstr, '                        and lschet.nrec        = #comp('+String(_pLschet)+') ');
+    MysqlAddStr(hstr, '                        and EM_ERS_HEAD.DDate <= #date('+datetostr(Cur_date,'DD,MM,YYYY')+')        ');
+    MysqlAddStr(hstr, '             order by EM_ERS_HEAD.DDate desc                        ');
+    MysqlAddStr(hstr, '         ) t                                                        ');
+
+*/
+
+    MysqlAddStr(hstr, ' Select                                   ');
+    MysqlAddStr(hstr, '  t.vDouble                               ');
+    MysqlAddStr(hstr, '  from                                    ');
+    MysqlAddStr(hstr, '  (                                       ');
+    MysqlAddStr(hstr, ' Select top 1                             ');
+    MysqlAddStr(hstr, '  t.vDouble                               ');
+    MysqlAddStr(hstr, ' ,t.ddate                                 ');
+    MysqlAddStr(hstr, ' from                                     ');
+    MysqlAddStr(hstr, ' (                                        ');
+    MysqlAddStr(hstr, ' Select                                   ');
+    MysqlAddStr(hstr, '          t.Koef   as vDouble             ');
+    MysqlAddStr(hstr, '        , t.ddate                         ');
+    MysqlAddStr(hstr, '      from(                               ');
+    MysqlAddStr(hstr, '             select top 1                 ');
+    MysqlAddStr(hstr, '               coalesce(case when EM_ERS_HEAD.DIRISN = 0 then EM_ERS_HEAD.ISN else EM_ERS_HEAD.DIRISN end /100,0) as Koef');
+    MysqlAddStr(hstr, '              ,EM_ERS_HEAD.DDate as ddate                                                                                ');
+    MysqlAddStr(hstr, '             from EM_ERS_HEAD                                                                                            ');
+    MysqlAddStr(hstr, '             join gp_status on gp_status.nrec = EM_ERS_HEAD.CSTATUS                                                      ');
+    MysqlAddStr(hstr, '             join lschet on lschet.tPerson = EM_ERS_HEAD.CPERSON                                                         ');
+    MysqlAddStr(hstr, '             where upper(gp_status.name) = ''УТВЕРЖДЕН''                                                                 ');
+    MysqlAddStr(hstr, '                         and lschet.nrec        = #comp('+String(_pLschet)+')                                            ');
+    MysqlAddStr(hstr, '                         and EM_ERS_HEAD.DDate <= #date('+datetostr(Cur_date,'DD,MM,YYYY')+')                            ');
+    MysqlAddStr(hstr, '              order by EM_ERS_HEAD.DDate desc                                                                            ');
+    MysqlAddStr(hstr, '          ) t                                                                                                            ');
+    MysqlAddStr(hstr, '                                                                                                                         ');
+    MysqlAddStr(hstr, ' union all                                                                                                               ');
+    MysqlAddStr(hstr, '                                                                                                                         ');
+    MysqlAddStr(hstr, ' Select                                                                                                                  ');
+    MysqlAddStr(hstr, '          t.Koef   as vDouble                                                                                            ');
+    MysqlAddStr(hstr, '        , t.ddate                                                                                                        ');
+    MysqlAddStr(hstr, '      from(                                                                                                              ');
+    MysqlAddStr(hstr, '             select top 1                                                                                                ');
+    MysqlAddStr(hstr, '                ds.addDouble[1]/100 as Koef                                                                              ');
+    MysqlAddStr(hstr, '              , 256*256*dh.addWord[2]+256*dh.addWord[1]+1 as ddate                                                       ');
+    MysqlAddStr(hstr, '             from Em_Unidoc_Head dh                                                                                      ');
+    MysqlAddStr(hstr, '             join Em_unidoc_spec ds on ds.chead = dh.nrec                                                                ');
+    MysqlAddStr(hstr, '             join lschet on lschet.tPerson = ds.addComp[1]                                                               ');
+    MysqlAddStr(hstr, '             join appointments PersApp on persApp.person = lschet.tPerson and ds.addcomp[3] = persApp.post               ');
+    MysqlAddStr(hstr, '             where dh.wtype = 120                                                                                        ');
+    MysqlAddStr(hstr, '               and dh.cStatus = #comp(000A0000000000AEh)// Утвержден                                                     ');
+//    MysqlAddStr(hstr, '             //  and ds.addComp[2] = #comp(000000001004ECE7h)                          //должность                       ');
+    MysqlAddStr(hstr, '               and lschet.nrec        = #comp('+String(_pLschet)+')                                                      ');
+IF _dateEnd <> 0 THEN
+    MysqlAddStr(hstr, '               and persApp.APPOINTDATE <= #date('+datetostr(_dateEnd,'DD,MM,YYYY')+')  ');
+//    MysqlAddStr(hstr, '                    and 256*256*dh.addWord[2]+256*dh.addWord[1]+1 <= #date('+datetostr(Cur_date,'DD,MM,YYYY')+')         ');
+    MysqlAddStr(hstr, '                    order by 256*256*dh.addWord[2]+256*dh.addWord[1]+1 desc                                              ');
+    MysqlAddStr(hstr, '          ) t                                                                                                            ');
+    MysqlAddStr(hstr, ' ) t                                                                                                                     ');
+    MysqlAddStr(hstr, ' order by t.ddate desc                                                                                                   ');
+    MysqlAddStr(hstr, ' ) t                                                                                                                     ');
+
+
+
+
+    var objQuery: iQuery;
+      objQuery := queryManager.createQuery(hstr);
+   delete all tmpTableVarDouble;
+    if objQuery.execute.errorCode != tsOk
+     then {if timelog_Status>2 Timelog('getEM_KOEFF_ERS. Ошибка выполнения запроса '+ objQuery.errorCode);
+           exit;
+          }
+        else
+        {sqlCopyInto(objQuery, tntmpTableVarDouble, true);
+        }
+
+   if getfirst tmpTableVarDouble = tsOK
+    {
+     if timelog_Status>2 Timelog('getEM_KOEFF_ERS. Результат запроса: ' + tmpTableVarDouble.vDouble);
+     result := tmpTableVarDouble.vDouble;
+    }
+}
+#doc
+Оценка БТК. Получить коэффициент из листов оценки БТК
+#end
+Function GetEm_KoeffBTK(_cAppointments: comp;_month, _year: word) : double;
+{
+//  GP_KPI_DOC_SP.cAppointments
+/*
+var _Lschet :comp = 0h;
+if getfirst FaStFirstRow App1 where ((GP_KPI_DOC_SP.cAppointments == App1.nrec)) = tsOK
+ {
+   _Lschet := app1.CADDNREC2;
+ }
+  var _tmpSum : double = 0;
+  _try
+   {
+      sql select top 1
+        s.ADDDOUBLE[1]
+      from
+        EM_UNIDOC_HEAD d
+        join EM_UNIDOC_SPEC s on (s.chead = d.nrec)
+        join appointments app on s.ADDCOMP[1] = app.nrec
+      where
+        d.addword[1] = :(_month) and d.addword[2] = :(_year)
+        and app.CADDNREC2 = :(_Lschet) //s.ADDCOMP[1] = :(_cAppointments)
+        AND d.cstatus = #comp(000A000000000090h) // УТВЕРЖДЕН
+      into (_tmpSum)
+      ;
+   }
+  _except else {}
+  result := _tmpSum;
+  */
+  result := 0;
+var _Lschet :comp = 0h;
+if getfirst FaStFirstRow App1 where ((GP_KPI_DOC_SP.cAppointments == App1.nrec)) = tsOK
+ {
+   _Lschet := app1.CADDNREC2;
+ }
+  var _tmpSum : double = 0;
+
+if timelog_Status>2 Timelog('GetEm_KoeffBTK. Подготовка запроса');
+result := 0;
+      var hstr : tptr = 0;
+    MysqlAddStr(hstr, 'select top 1                ');
+    MysqlAddStr(hstr, '        s.ADDDOUBLE[1] as vDouble        ');
+    MysqlAddStr(hstr, '      from                     ');
+    MysqlAddStr(hstr, '        EM_UNIDOC_HEAD d       ');
+    MysqlAddStr(hstr, '        join EM_UNIDOC_SPEC s on (s.chead = d.nrec)         ');
+    MysqlAddStr(hstr, '        join appointments app on s.ADDCOMP[1] = app.nrec    ');
+    MysqlAddStr(hstr, '      where                                                 ');
+    MysqlAddStr(hstr, '        d.addword[1] = '+String(_month)+' and d.addword[2] = '+String(_year));
+    MysqlAddStr(hstr, '        and app.CADDNREC2 = #comp('+String(_Lschet)+') '); //s.ADDCOMP[1] = :(_cAppointments)
+    MysqlAddStr(hstr, '        AND d.cstatus = #comp(000A000000000090h)           '); // УТВЕРЖДЕН
+
+    var objQuery: iQuery;
+      objQuery := queryManager.createQuery(hstr);
+   delete all tmpTableVarDouble;
+    if objQuery.execute.errorCode != tsOk
+     then {if timelog_Status>2 Timelog('GetEm_KoeffBTK. Ошибка выполнения запроса '+ objQuery.errorCode);
+           exit;
+          }
+        else
+        {sqlCopyInto(objQuery, tntmpTableVarDouble, true);
+        }
+
+   if getfirst tmpTableVarDouble = tsOK
+    {
+     if timelog_Status>2 Timelog('GetEm_KoeffBTK. Результат запроса: ' + tmpTableVarDouble.vDouble);
+     result := tmpTableVarDouble.vDouble;
+    }
+}
+function Get_KOEFKACHESTTRUDA(_cPodr : comp;_wMonth,_wYear : word): double;
+{
+  /*
+  var _tmpSum : double = 0;
+  var _date : date = date(01,_wMonth,_wYear);
+
+  var _Code : string = FindKatpodrKod3(_cPodr);
+  case _Code of
+   '017','044','115','171','215','221','222','223','233','236','545': // согласно приказа 375 от 17/07/2019
+     {
+              _try
+               {
+                  sql select top 1
+                     Spec.ImplProc
+                    from GP_KPI_Statements Statements
+                     join GP_KPI_StatementSpec Spec on (Statements.NRec = Spec.cStatement)
+                     join Catalogs CatDep on (Spec.cPodr = CatDep.NRec)
+                     join GP_KPI on (Spec.cKPI = GP_KPI.NRec)
+                     join GP_STATUS on GP_STATUS.nrec = Statements.cStatus
+                    where
+                    Statements.docdate = :(_date)
+                    and GP_KPI.Name = 'Коэффициент качества труда'
+                    and CatDep.Code = :(_Code)
+                    and GP_STATUS.name = 'утверждено'
+                  into (_tmpSum)
+                  ;
+               }
+              _except else {}
+     }
+     else _tmpSum := 100;
+   end;
+  result := _tmpSum;
+
+  */
+
+  result := 0;
+  var _tmpSum : double = 0;
+  var _date : date = date(01,_wMonth,_wYear);
+
+  var _Code : string = FindKatpodrKod3(_cPodr);
+  case _Code of
+   '017','044','115','171','215','221','222','223','233','236','545': // согласно приказа 375 от 17/07/2019
+     {
+       if timelog_Status>2 Timelog('Get_KOEFKACHESTTRUDA. Подготовка запроса');
+        result := 0;
+              var hstr : tptr = 0;
+            MysqlAddStr(hstr, 'select top 1                                             ');
+            MysqlAddStr(hstr, '                     Spec.ImplProc  as vDouble                        ');
+            MysqlAddStr(hstr, '                    from GP_KPI_Statements Statements      ');
+            MysqlAddStr(hstr, '                     join GP_KPI_StatementSpec Spec on (Statements.NRec = Spec.cStatement)');
+            MysqlAddStr(hstr, '                     join Catalogs CatDep on (Spec.cPodr = CatDep.NRec)                   ');
+            MysqlAddStr(hstr, '                     join GP_KPI on (Spec.cKPI = GP_KPI.NRec)                             ');
+            MysqlAddStr(hstr, '                     join GP_STATUS on GP_STATUS.nrec = Statements.cStatus                ');
+            MysqlAddStr(hstr, '                    where                                                                 ');
+            MysqlAddStr(hstr, '                    Statements.docdate = #date('+datetostr(_date,'DD,MM,YYYY')+')          ');
+            MysqlAddStr(hstr, '                    and GP_KPI.Name = ''Коэффициент качества труда''                        ');
+            MysqlAddStr(hstr, '                    and CatDep.Code = '''+_Code+'''                                         ');
+            MysqlAddStr(hstr, '                    and GP_STATUS.name = ''утверждено''                                     ');
+
+            var objQuery: iQuery;
+              objQuery := queryManager.createQuery(hstr);
+           delete all tmpTableVarDouble;
+            if objQuery.execute.errorCode != tsOk
+             then {if timelog_Status>2 Timelog('Get_KOEFKACHESTTRUDA. Ошибка выполнения запроса '+ objQuery.errorCode);
+                   exit;
+                  }
+                else
+                {sqlCopyInto(objQuery, tntmpTableVarDouble, true);
+                }
+
+         if getfirst tmpTableVarDouble = tsOK
+          {
+           if timelog_Status>2 Timelog('Get_KOEFKACHESTTRUDA. Результат запроса: ' + tmpTableVarDouble.vDouble);
+           result := tmpTableVarDouble.vDouble;
+          }
+    }
+    else result := 100;
+   end;
+}
+Function get_EM_PROCDOPLPERIOD(_Parameter : string) : Double;
+{
+  result := 0;
+  if timelog_Status > 2 then timelog('EM_PROCDOPLPERIOD('+_Parameter+')');
+           var _vidOpl : word = word(_Parameter);
+           var _fdatB : date = Sub_Months(to_date(1,GP_KPI_Doc.wMonth,GP_KPI_Doc.wYear),wGetTune('NPOEM_OWN.Raise.ColMonthsForPremiya'));
+           var _fdatE : date = to_date(Last_day(_fdatB),month(_fdatB),year(_fdatB));
+           var _fcLSch : comp = GP_KPI_DOC_SP.cLschet;
+           var _fcAppv : comp = vApp.Appointments.nrec;
+           if _vidOpl = 0 then exit;
+
+  if timelog_Status > 2 then timelog('  before _fdatB='+_fdatB+'; _fdatE='+_fdatE+'; vApp.Appointments.nrec='+vApp.Appointments.nrec+' vApp.Appointments.appointDate='+ vApp.Appointments.appointDate + ' vApp.Appointments.DisMissDate='+vApp.Appointments.DisMissDate);
+
+     if vApp.Appointments.appointDate > _fdatB
+        then _fdatB := vApp.Appointments.appointDate;
+     if vApp.Appointments.DisMissDate < _fdatE and vApp.Appointments.DisMissDate <> 0
+        then _fdatE := vApp.Appointments.DisMissDate;
+// не срабатыввает гадина, возможно изза того, что они месяцем позже считают и начало расчета стоит уже новый месяц после рперехода ЗП           _Res := PDOPPROCDATE(WORD(_Parameter),_fdatB,_fdatE); // ЗП алгоритм
+    if timelog_Status > 2 then timelog('  between _fdatB = '+_fdatB +'; _fdatE = '+_fdatE+';  _Res   = '+result  );
+// посмотрим вных доплатах
+          _try
+          {
+            sql
+            select
+              DOPLATA.PROC
+            from doplata
+            where doplata.CLSCH = :(_fcLSch)
+              and doplata.vidopl = :(_vidOpl)
+              and DOPLATA.DATANN between :(_fdatB) and :(_fdatE)
+              and (doplata.datok = 0 or doplata.datok between :(_fdatB) and :(_fdatE)
+              )
+            into (result);
+          }
+          _Except
+          else {
+          }
+          _finally{ }
+       if result = 0
+       {
+        _try
+          {
+            //если в лицевом в постоянных доплатах пусто, то берем из 6 карточки - кнопка доплата
+            sql
+            select
+             RAISE.SUM
+             , RaiseCat.CATDATA
+            from  raise
+            join catalogs RaiseCat on Raise.RaiseType = RaiseCat.Nrec
+            where
+            Raise.Appoint = :(_fcAppv)
+            and RaiseCat.CATDATA = :(_vidOpl)
+            and Raise.RaiseAttr = 2 // проценты
+            and RAISE.FROMDATE <=  :(_fdatE)
+            and (RAISE.TODATE =0 or RAISE.TODATE between :(_fdatB) and :(_fdatE))
+            into (result);
+          }
+          _Except
+          else {
+          }
+          _finally{ }
+      }
+
+
+//           vLschet.pLschet
+    if timelog_Status > 2 then timelog('  after _fdatB = '+_fdatB +'; _fdatE = '+_fdatE+';  _Res   = '+result  );
+}
+//------------- заменить значения
+function ReplaceByValues(Formula:string):string;
+var _summa:double;
+    wTypeD:word;
+{
+if timelog_Status>2   timelog('ReplaceByValues(Formula ='+ Formula);
+  result:=UpCase(Formula);
+  /*
+  result:=Replace(result,'GP_KPI_STATEMENTSPEC.','Spec.');
+  result:=Replace(result,'ФАКТ','Spec.Fact');
+  result:=Replace(result,'ПЛАН','Spec.Plan');
+  result:=Replace(result,'ВЕС','Spec.UdVes');
+  result:=Replace(result,'НИЖНЯЯ ГРАНИЦА','Spec.LowLimit');
+  result:=Replace(result,'ВЕРХНЯЯ ГРАНИЦА','Spec.HighLimit');
+  */
+  // сначала заменим подключи
+  _Loop tmp_alg_spec
+  { result:=Replace(result,tmp_alg_spec.Key,tmp_alg_spec.Value);
+  }
+  _Loop tmp_KPI_Alg ordered by Index tmp_KPI_Alg03
+  { // если расчетов не предусмотрено - сразу заменим
+    if tmp_KPI_Alg.KeyR<>''
+    { result:=Replace(result,UpCase(tmp_KPI_Alg.Key),UpCase(tmp_KPI_Alg.KeyR));
+      //timelog('Заменили '+tmp_KPI_Alg.Key+'->'+UpCase(tmp_KPI_Alg.KeyR));
+    }
+    else
+    { //нужно вычислять
+      var _Key,_SubKey:string;
+      var _stop:word=0;
+      _SubKey:='';
+      _Key:=UpCase(tmp_KPI_Alg.Key);
+      if pos('(',_Key)>0
+      { _Key:=substr(_Key,1,pos('(',_Key));
+        _SubKey:=')%'
+      }
+//if timelog_Status>2 then timelog('_Key='+_Key+'; _SubKey='+_SubKey);
+      do {
+        var ii_first,_Len:word;
+        ii_first:=pos(_Key,Result);
+        var _Parameter:string='';
+        _Len:=0;
+        if ii_first=0 break;
+        //длина подстроки всегда короче на 2 символа
+        if _SubKey<>''
+        { _Len:=Pos(_SubKey,Substr(Result,ii_first+Length(_Key),255))-1;
+          _Parameter:=Substr(Result,ii_first+Length(_Key),_Len);
+
+        }
+        else _len:=0;
+
+if timelog_Status>2         timelog('_Len='+string(_Len)+'; _Parameter='+_Parameter+'; _Key='+_Key+'; Formula='+ Formula);
+
+        var _Res:string;//результат
+        _Res:='';
+        case _Key of
+        //01, %EM_FieldDocbyPers(wtype,Filedname,param)% -  wtype = word,
+        // Filedname = string, param - string. Получает значение поля ведомости по типу док-та
+        //и наименованию поля: в текущем месяце находится док-нт типа,
+        //в нем ищется строка по человеку и в этой строке берется значение поля
+        //FieldName. Param - дополнительный параметр');
+        '%EM_FIELDDOCBYPERS(':
+        {
+          wTypeD:=word(ParseWord(_Parameter,1,','));
+          _Res:=EM_FIELDDOCBYPERS(wTypeD
+                     ,GP_KPI_DOC.wType
+                     ,GP_KPI_DOC.wYear, GP_KPI_DOC.wMonth
+                     ,GP_KPI_DOC_SP.cLschet
+                     ,GP_KPI_DOC_SP.CPOST
+                     ,GP_KPI_DOC_SP.cKatPodr
+                     ,ParseWord(_Parameter,2,',')
+                     ,ParseWord(_Parameter,3,',')
+                     );
+        }
+        //02, '%EM_TotalWeightKoef(wType, param)% wTtype= word. За месяц собираются все документы с типом wType по подразделению строки и по ним суммируются значения полей
+        //с типом <результат> = <+> (итоговое поле). Param - дополнительный параметр');
+        '%EM_TOTALWEIGHTKOEF(':
+        { wTypeD:=word(ParseWord(_Parameter,1,','));
+          _Res:=EM_TOTALWEIGHTKOEF(wTypeD,GP_KPI_DOC.wYear, GP_KPI_DOC.wMonth,ParseWord(_Parameter,2,','));
+
+        }
+        //03, I = word. Получает значение i-ой колонки текущей строки');
+        '%EM_COL(':
+        { if boLoadInterFace
+          { _Res:=string(pGP_KPI_DOC.GetFieldVal(3,word(_Parameter)));
+          }
+
+        }
+        //04, размер базовой суммы для расчет премии из шапки премии'
+        '%EM_SumBase%':
+        { _Res:=string(GP_KPI_DOC.Summa_Base,0,2);
+        }
+        //05,'%EM_CRP%','',' - размер целевого значения премии из шапки премии');
+        '%EM_CRP%':
+        {
+          _Res:=string(GP_KPI_DOC.Summa_CRP,0,2);
+        }
+        //06,размер корр. Коэфф. Из шапки премии');
+        '%EM_KOEFKORR%':
+        { _Res:=string(GP_KPI_DOC.Coef,0,2);
+        }
+        //07,размер нормативной суммы из привязки премии к расстановке ШР
+        '%EM_NORM_SUM%':
+        { _Res:='0';
+          _summa:=0;
+          _Res:=string(CalcRaiseProcent(GP_KPI_DOC_SP.cAppointments,GP_KPI_RAISe.cDoplata,1,_summa),0,2);
+          _Res:=string(_summa,0,2);
+         }
+        //08,' - размер нормативного процента из привязки премии к расстановке ШР');
+        '%EM_NORM_PERC%':
+        {  _summa:=0;
+           _Res:=String(CalcRaiseProcent(GP_KPI_DOC_SP.cAppointments,GP_KPI_RAISe.cDoplata,1,_summa),0,2);
+        }
+        //09,'%EM_List(nameList)%','',' - данное поле будет выпадающим списком, список идентифицируется по имени.
+        //Пользовательская аналитика?
+        '%EM_LIST(':
+        { _Parameter:=Remove39(_Parameter);
+          PushPos(#tmp_Fields);
+          if getfirst tmp_Fields<>tsok Fill_tmp_Fields;
+          _loop tmp_Fields
+          { if tmp_Fields.Name=_Parameter
+            { if boLoadInterFace
+              { _Res:=string(pGP_KPI_DOC.GetFieldVal(3,word(tmp_Fields.Npp)));
+              }
+              break;
+            }//if tmp_Fields_D.Name=_Parameter
+          } //_loop tmp_Fields_D
+          PopPos(#tmp_Fields);
+        } //'%EM_LIST(':
+        //10,размер фактической суммы из привязки премии к расстановке ШР
+        '%EM_FACT_SUM%':
+        { _Res:='0';
+          _summa:=0;
+          _Res:=string(CalcRaiseProcent(GP_KPI_DOC_SP.cAppointments,GP_KPI_RAISe.cDoplata,0,_summa),0,2);
+          _Res:=string(_summa,0,2);
+        }
+        //11,' - размер фактического процента из привязки премии к расстановке ШР');
+        '%EM_FACT_PERC%':
+        { _summa:=0;
+          _Res:=string(CalcRaiseProcent(GP_KPI_DOC_SP.cAppointments,GP_KPI_RAISe.cDoplata,0,_summa),0,2);
+        }
+        //12 ,'','начисления с учетом цеха отнесения затрат по системному ВО ');
+        '%EM_NACHO(':
+        { _Summa:=EM_NACHO(GP_KPI_DOC_SP.cLschet,year(PeriodBegin),month(PeriodBegin)
+                   ,GP_KPI_DOC_SP.cKatpodr
+                   ,if(GP_KPI_DOC.wType=101,GP_KPI_DOC_SP.cPost,0)
+                   ,word(Remove39(_Parameter)));
+          _Res:=string(_summa,0,2);
+
+        }
+        '%EM_VIDNACH(':
+        {
+          //logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'EM_VIDNACH'+string(GP_KPI_DOC_SP.cLschet,0,0)+', tabn='+string(GP_KPI_DOC_SP.strtabn) ) ;
+          _Summa:=EM_VIDNACH(GP_KPI_DOC_SP.cLschet
+                            ,word(Remove39(ParseWord(_Parameter,1,',')))
+                            ,word(Remove39(ParseWord(_Parameter,2,',')))
+                            ,word(Remove39(ParseWord(_Parameter,3,',')))
+                            ,double(Remove39(ParseWord(_Parameter,4,',')))
+                            );
+          _Res:=string(_summa,0,2);
+
+        }
+          '%EM_VIDNACHV(':
+        {
+          //logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'EM_VIDNACH'+string(GP_KPI_DOC_SP.cLschet,0,0)+', tabn='+string(GP_KPI_DOC_SP.strtabn) ) ;
+          _Summa:=EM_VIDNACH(GP_KPI_DOC_SP.cLschet
+                            ,word(Remove39(ParseWord(_Parameter,1,',')))
+                            ,word(Remove39(ParseWord(_Parameter,2,',')))
+                            ,word(Remove39(ParseWord(_Parameter,3,',')))
+                            ,double(Remove39(ParseWord(_Parameter,4,',')))
+                            );
+          _Res:=string(_summa,0,2);
+
+        }
+          '%EM_VIDNACHS(':
+        {
+          //logstrtofile('result3.txt',cur_date+' '+cur_time+' '+'EM_VIDNACH'+string(GP_KPI_DOC_SP.cLschet,0,0)+', tabn='+string(GP_KPI_DOC_SP.strtabn) ) ;
+          _Summa:=EM_VIDNACH(GP_KPI_DOC_SP.cLschet
+                            ,word(Remove39(ParseWord(_Parameter,1,',')))
+                            ,word(Remove39(ParseWord(_Parameter,2,',')))
+                            ,word(Remove39(ParseWord(_Parameter,3,',')))
+                            ,double(Remove39(ParseWord(_Parameter,4,',')))
+                            );
+          _Res:=string(_summa,0,2);
+
+        }
+        '%EM_NACHBYMF('://NachByMF(O,M,Y,L)
+        {
+           if timelog_Status>2
+            {
+             timelog('  start  %EM_NACHBYMF( ' + _Parameter);
+            }
+
+          _Summa:=EM_NACHBYMF(GP_KPI_DOC_SP.cLschet,GP_KPI_DOC_SP.cKatpodr
+                   ,if(GP_KPI_DOC.wType=101,GP_KPI_DOC_SP.cPost,0)
+                   ,word(Remove39(ParseWord(_Parameter,1,',')))
+                   ,word(Remove39(ParseWord(_Parameter,2,',')))
+                   ,word(Remove39(ParseWord(_Parameter,3,',')))
+                   ,word(Remove39(ParseWord(_Parameter,4,',')))
+                    );
+          _Res:=string(_summa,0,2);
+
+        }
+        //15 '%EM_KV_WT_GHBD(M,S)%','','Начисления за указанный месяц квартала с учетом подразделения (М=номер месяца в квартале,S=1 -факт,-1 план');
+        '%EM_KV_WT_GHBD(':
+        { //2019-02-13 - изменили на алгоритм с учетом отклонений
+          _Summa:=EM_KV_WT_GHBD_2(GP_KPI_DOC_SP.cLschet
+                   ,GP_KPI_DOC_SP.cKatpodr
+                   ,if(GP_KPI_DOC.wType=101,GP_KPI_DOC_SP.cPost,0)
+                   ,word(Remove39(ParseWord(_Parameter,1,',')))
+                   ,integer(Remove39(ParseWord(_Parameter,2,',')))
+                 );
+          _Res:=string(_summa,0,2);
+        }
+        //16 Дни за период по положению
+        '%EM_YEAR_WT_GDBD(' :
+        { _Summa:=EM_YEAR_WT_GDBD(GP_KPI_DOC_SP.cLschet
+                   ,GP_KPI_DOC_SP.cKatpodr
+                   ,if(GP_KPI_DOC.wType=101,GP_KPI_DOC_SP.cPost,0)
+                   ,integer(Remove39(ParseWord(_Parameter,1,',')))
+                   ,integer(Remove39(ParseWord(_Parameter,2,',')))
+                   ,GP_KPI_RAISe.cDoplata
+                 );
+          _Res:=string(_summa,0,2);
+        }
+        //17
+        '%EM_GHBDEX%' :
+        {  /*
+           var _pLschet            :comp=GP_KPI_DOC_SP.cLschet;
+           var _HourKind           :word   =ParseWord(_Parameter,1,',');;
+           var _BeginningHour      :double =ParseWord(_Parameter,2,',');
+           var _MaxDailyHoursAmount:double =ParseWord(_Parameter,3,',');
+           var _ScheduleType       :integer=ParseWord(_Parameter,4,',');
+           var _DateRangeStart     :date   =ParseWord(_Parameter,5,',');
+           var _DateRangeEnd       :Date   =ParseWord(_Parameter,6,',');;
+           var _Flags              :longint=ParseWord(_Parameter,7,',');;
+           var _pPodr              :comp   =GP_KPI_DOC_SP.cKatpodr ;
+           var _pPost              :comp   =0 ;
+
+          _Summa:=pGP_WorkTable.GetHoursBwDatesEx(_pLschet
+              ,_HourKind
+              ,_BeginningHour
+              ,_MaxDailyHoursAmount
+              ,_ScheduleType
+              ,_DateRangeStart
+              ,_DateRangeEnd
+              ,_Flags
+              ,_pPodr
+              ,_pPost
+           ) ;
+          _Res:=string(_summa,0,2);
+          */
+        }
+        //18 премия за классность
+        '%EM_FACT_PERC_CLASS%':
+        { _summa:=0;
+          _Res:=string(CalcRaiseProcentClass(GP_KPI_DOC_SP.cAppointments,GP_KPI_RAISe.cDoplata,0,_summa),0,2);
+        }
+        //19 Средний оклад с учетом подразделения ,S=1 -факт,-1 план,T-1 Высш.зв.,2 - ср.звено
+        '%EM_SR_OKL(':
+        { _Summa:=EM_SR_OKL(GP_KPI_DOC_SP.cLschet
+                   ,GP_KPI_DOC_SP.cKatpodr
+                   ,if(GP_KPI_DOC.wType=101,GP_KPI_DOC_SP.cPost,0)
+                   ,integer(Remove39(ParseWord(_Parameter,1,',')))
+                   ,integer(Remove39(ParseWord(_Parameter,2,',')))
+                   ,GP_KPI_RAISe.cDoplata
+                 );
+          _Res:=string(_Summa,0,2);
+        }
+        //20  Часы за период по положению
+        '%EM_YEAR_WT_GHBD(' :
+        { _Summa:=EM_YEAR_WT_GHBD(GP_KPI_DOC_SP.cLschet
+                   ,GP_KPI_DOC_SP.cKatpodr
+                   ,if(GP_KPI_DOC.wType=101,GP_KPI_DOC_SP.cPost,0)
+                   ,integer(Remove39(ParseWord(_Parameter,1,',')))
+                   ,integer(Remove39(ParseWord(_Parameter,2,',')))
+                   ,GP_KPI_RAISe.cDoplata
+                 );
+          _Res:=string(_summa,0,2);
+        }
+        //21 Средний оклад(в часах) с учетом подразделения ,S=1 -факт,-1 план,T-1 Высш.зв.,2 - ср.звено
+        '%EM_SR_OKL_H(':
+        { _Summa:=EM_SR_OKL_H(GP_KPI_DOC_SP.cLschet
+                   ,GP_KPI_DOC_SP.cKatpodr
+                   ,if(GP_KPI_DOC.wType=101,GP_KPI_DOC_SP.cPost,0)
+                   ,integer(Remove39(ParseWord(_Parameter,1,',')))
+                   ,integer(Remove39(ParseWord(_Parameter,2,',')))
+                   ,GP_KPI_RAISe.cDoplata
+                 );
+          _Res:=string(_Summa,0,2);
+        }
+
+        //30 загрузить и рассчитать интерфейс. Загрузки подкэшируем
+        '%EM_INTERFACE(':
+        { var _par2:string;
+          _par2:=ParseWord(_Parameter,2,',');
+          _Parameter:=ParseWord(_Parameter,1,',');
+
+          var ww_num:word=0;
+          if Getfirst tmp_Interface where (( _Parameter == tmp_Interface.Name ))<>tsok
+          { Insert into tmp_Interface set tmp_Interface.Name:=_Parameter;
+
+          }
+          else ww_num:=tmp_Interface.num;
+          do
+          { if ww_num=0
+            { ww_num:=count(DM_ALG)+1;
+              SetLimit(DM_ALG,ww_num);
+              if LoadvipRef(DM_ALG[ww_num], 'GP_STAFF::GP_KPI_ALG_USER_'+_Parameter)
+              { update current tmp_interface set tmp_interface.Num:=ww_num;
+              }
+              else break;
+            }
+            _Res:=DM_ALG[ww_num].Calc(Spec.cStatement,Spec.Nrec,_Par2);
+            Break;
+          } while True;
+        }
+        '%EM_KOEFF_IND_NZ(':  // для совместимости со старыми формулами, где без параметров было
+        {
+        var _maxKoef : double = 0;
+
+          if (_Parameter <> '') // в параметре передаем максимальный возможный коэффициент
+           then
+            {
+             _maxKoef := double(_Parameter);
+            }
+           if _maxKoef = 0 then _maxKoef := 1;
+
+          _Summa := getEM_KOEFF_IND_NZ(GP_KPI_DOC_SP.cLschet,GP_KPI_DOC.wMonth,GP_KPI_DOC.wYear,_maxKoef);
+          _Res:=string(_Summa,0,2);
+        }
+    '%EM_KOEFF_IND_NZ_NEW(':  // для совместимости со старыми формулами, где без параметров было
+        {
+        var _maxKoef : double = 0;
+
+          if (_Parameter <> '') // в параметре передаем максимальный возможный коэффициент
+           then
+            {
+             _maxKoef := double(_Parameter);
+            }
+           if _maxKoef = 0 then _maxKoef := 1;
+
+          _Summa := getEM_KOEFF_IND_NZ_NEW(GP_KPI_DOC_SP.cLschet,GP_KPI_DOC.wMonth,GP_KPI_DOC.wYear,_maxKoef);
+          _Res:=string(_Summa,0,2);
+        }
+        '%EM_PROCDOPLPERIOD(':
+        {
+          /*
+          пытаемся получить процент доплаты за период с учетом назначения текущего по людям
+          */
+          Summa := get_EM_PROCDOPLPERIOD(_Parameter);
+         if timelog_status>2 then timelog('  %EM_PROCDOPLPERIOD( Summa = ' + String(Summa));
+          _res := string(Summa,0,2);
+         if timelog_status>2 then timelog('  %EM_PROCDOPLPERIOD( Summa = ' + String(Summa)+ ' _res = '+ String(_res) );
+        }
+        '%EM_KOEFF_ERS%':
+         {
+           _Summa := getEM_KOEFF_ERS(GP_KPI_DOC_SP.cLschet,0);
+           _Res:=string(_Summa,0,2);
+         }
+        '%EM_KOEFFBTK%':
+         {
+           _Summa := GetEm_KoeffBTK(GP_KPI_DOC_SP.cAppointments,GP_KPI_DOC.wMonth,GP_KPI_DOC.wYear);
+           _Res:=string(_Summa,0,2);
+         }
+        '%EM_KOEFKACHESTTRUDA%':
+         {
+           _Summa := Get_KOEFKACHESTTRUDA(GP_KPI_DOC_SP.cKatPodr,GP_KPI_DOC.wMonth,GP_KPI_DOC.wYear);
+           _Res:=string(_Summa,0,2);
+         }
+
+        end;
+        //Timelog('_Res='+_Res);
+        Result:=Substr(Result,1,ii_first-1)
+               +_Res
+               +Substr(Result,ii_first+Length(_Key)+if(_len=0,0,_Len+2),255);
+        //Timelog('Result='+Result);
+        //подстрахуемся, если что то пойдет не так
+        _stop++;
+        if _stop>30 break;
+        //Break;
+      } while True;
+    } //else if tmp_KPI_Alg.KeyR<>''
+  } //_Loop tmp_KPI_Alg ordered by Imdex tmp_KPI_Alg02
+} //function ReplaceByValues(Formula:string):string;
+
+
+//----------------------------------------
+// освободить пользовательские алгоритмы
+//----------------------------------------
+Procedure Free_Dm_Alg;
+{
+  if timelog_Status>0
+    Timelog('GP_KPI_ALG->Free_Dm_Alg');
+  var ww_num,kk:word=0;
+  ww_num:=count(DM_ALG);
+  if ww_num=0 then exit;
+
+
+  delete all tmp_interface;
+  for(kk:=1;kk<=ww_num;kk:= kk+1)
+  { if not NullVipRef(DM_ALG[kk])
+    { FreeVipInterface(DM_ALG[kk]);
+    }
+  } //for(kk:=1;kk<count(RPD_A);kk:= kk+1)
+  SetLimit(DM_ALG,0)
+
+} //Procedure Free_Dm_Alg;
+
+#doc
+  Заполнить справочник алгоритмов
+#end
+Procedure Fill_Tmp_alg_One(_Npp:word; _Key:string; _KeyR:string; _Prim:string='');
+{  Insert into Tmp_Kpi_Alg
+   set
+     Tmp_Kpi_Alg.Npp :=_Npp
+    ,Tmp_Kpi_Alg.Key :=_Key
+    ,Tmp_Kpi_Alg.KeyR:=_KeyR
+    ,Tmp_Kpi_Alg.Prim:=_Prim
+    ,Tmp_Kpi_Alg.wType:=wType_Alg
+   ;
+}
+#doc
+  Заполнить справочник алгоритмов
+#end
+Function Fill_Tmp_alg(_wType_Alg:word):boolean;
+{ Result:=True;
+  //if wType_Alg=_wType_Alg
+  // if (getfirst Tmp_Kpi_Alg)=tsok      Exit;
+  // delete Tmp_Kpi_Alg;
+  wType_Alg:=_wType_Alg;
+  if (getfirst Tmp_Kpi_Alg)=tsok
+     Exit;
+  case wType_Alg of
+  0:
+  {  Fill_Tmp_alg_One(1,'GP_KPI_STATEMENTSPEC.','Spec.');
+     Fill_Tmp_alg_One(2,'ФАКТ','Spec.Fact');
+     Fill_Tmp_alg_One(3,'ПЛАН','Spec.Plan');
+     Fill_Tmp_alg_One(4,'ВЕС','Spec.UdVes');
+     Fill_Tmp_alg_One(5,'НИЖНЯЯ ГРАНИЦА','Spec.LowLimit');
+     Fill_Tmp_alg_One(6,'ВЕРХНЯЯ ГРАНИЦА','Spec.HighLimit');
+     Fill_Tmp_alg_One(10,'Spec.'        ,'Spec.'     ,'Поле из таблицы GP_KPI_StatementSpec');
+
+
+  }
+  1:
+  {
+    Fill_Tmp_alg_One(01,'%EM_FieldDocbyPers(,,)%',''
+                       ,'%EM_FieldDocbyPers(wtype,Filedname,param)%. Получает знач поля вед-ти по типу док-та и наим поля: в тек.мес нах-ся док-нт типа, в нем ищется строка по человеку и в берется значение поля FieldName. Param-доп параметр');
+    Fill_Tmp_alg_One(02,'%EM_TotalWeightKoef(wType, param)%',''
+                       ,'%EM_TotalWeightKoef(wType, param)% wTtype= word. За месяц собираются все документы с типом wType по подразделению строки и по ним суммируются значения полей с типом <результат> = <+> (итоговое поле). Param - доп параметр');
+    Fill_Tmp_alg_One(03,'%EM_Col(i)%'        ,'',', I = word. Получает значение i-ой колонки текущей строки');
+    Fill_Tmp_alg_One(04,'%EM_SumBase%'       ,'',' - размер базовой суммы для расчет премии из шапки премии');
+    Fill_Tmp_alg_One(05,'%EM_CRP%'           ,'',' - размер целевого значения премии из шапки премии');
+    Fill_Tmp_alg_One(06,'%EM_KoefKorr%'      ,'',' - размер корр. Коэфф. Из шапки премии');
+    Fill_Tmp_alg_One(07,'%EM_NORM_SUM%'      ,'',' - размер нормативной суммы из привязки премии к расстановке ШР');
+    Fill_Tmp_alg_One(08,'%EM_NORM_Perc%'     ,'',' - размер нормативного процента из привязки премии к расстановке ШР');
+    Fill_Tmp_alg_One(09,'%EM_List(nameList)%','',' - данное поле будет выпадающим списком, список идентифицируется по имени.');
+    Fill_Tmp_alg_One(10,'%EM_FACT_SUM%'      ,'',' - размер фактической суммы из привязки премии к назначению');
+    Fill_Tmp_alg_One(11,'%EM_FACT_Perc%'     ,'',' - размер фактического процента из привязки премии к назначению');
+    Fill_Tmp_alg_One(12,'%EM_NACHO(O)%'      ,'','начисления с учетом цеха отнесения затрат по системному ВО ');
+    //этот ключ ничего не делаем
+    Fill_Tmp_alg_One(13,'%EM_GHBDEx%'        ,'%EM_GHBDEX%','=Lschet.Nrec, WT_GHBDEx(c_ExFunc.chm),Katpodr.nrec.Lschet.cAppoint ');
+    Fill_Tmp_alg_One(14,'%EM_NACHBYMF(O,M,Y,L)%','','Начисления за указанный месяц с учетом подразделения (O - системный код вида оплаты)');
+    Fill_Tmp_alg_One(15,'%EM_KV_WT_GHBD(M,S)%','','Часы за указанный месяц квартала с учетом подразделения (М=номер месяца в квартале,S=1 -факт,-1 план');
+    Fill_Tmp_alg_One(16,'%EM_YEAR_WT_GDBD(S,T)%','','Дни за период с учетом подразделения=план -отпуска ОЖ,УП и т.п. ,S=1 -факт,-1 план,T-1 Высш.зв.,2,3 - ср.звено');
+    //17  пока нет      '%EM_GHBDEX%' :
+    Fill_Tmp_alg_One(18,'%EM_FACT_Perc_Class%','',' - размер фактического процента за классность(для 236 доплаты)');
+    Fill_Tmp_alg_One(19,'%EM_SR_OKL(S,T)%','','Средний оклад с учетом подразделения ,S=1 -факт,-1 план,T-1 Высш.зв.,2 - ср.звено');
+    Fill_Tmp_alg_One(20,'%EM_YEAR_WT_GHBD(S,T)%','','Часы за период с учетом подразделения=план -отпуска ОЖ,УП и т.п. ,S=1 -факт,-1 план,T-1 Высш.зв.,2,3 - ср.звено');
+    Fill_Tmp_alg_One(21,'%EM_SR_OKL_H(S,T)%','','Средний оклад с учетом подразделения ,S=1 -факт,-1 план,T-1 Высш.зв.,2 - ср.звено');
+    //-----------------------
+    Fill_Tmp_alg_One(31,'PeriodBegin'        ,'PeriodBegin'     ,'Период расчета премии - начало');
+    Fill_Tmp_alg_One(32,'PeriodEnd'          ,'PeriodEnd'       ,'Период расчета премии - конец');
+    Fill_Tmp_alg_One(34,'ValuePrev'          ,'ValuePrev'       ,'Текущее значение');
+    Fill_Tmp_alg_One(40,'%EM_Interface(, )%' ,'','%EM_Interface(NameInterface, parameter)%  - данное поле является полем выбора, запускающим NameInterface. Логику обработки данного поля оставляю на вас.');
+    Fill_Tmp_alg_One(41,'GP_KPI_Doc_SP.'     ,'GP_KPI_Doc_SP.'  ,'Поле из таблицы GP_KPI_Doc_SP.');
+    Fill_Tmp_alg_One(42,'GP_KPI_Doc.'        ,'GP_KPI_Doc.'     ,'Поле из таблицы GP_KPI_Doc.');
+    Fill_Tmp_alg_One(43,'%EM_KOEFF_IND_NZ(1)%'     ,'',' - коэффициент индивидуальной нормы выработки (часы нарядов/часы табеля по факту), параметр - максимальный коэффициент');
+    Fill_Tmp_alg_One(44,'%EM_KOEFF_IND_NZ_NEW(1)%'     ,'',' - коэффициент индивидуальной нормы выработки (часы нарядов/(часы факту + выхи(РО) - отгулы), параметр - максимальный коэффициент');
+    Fill_Tmp_alg_One(45,'%EM_KOEFF_ERS%'        ,'',' - коэффициент из листов оценки сотрудника');
+    Fill_Tmp_alg_One(46,'%EM_KOEFFBTK%'         ,'',' - коэффициент оценки БТК');
+    Fill_Tmp_alg_One(47,'%EM_KOEFKACHESTTRUDA%'         ,'',' - коэффициент качества труда из выполнения показателей премирования по подразделению 3-х значному');
+    Fill_Tmp_alg_One(48,'%EM_PROCDOPLPERIOD(0)%'         ,'',' - процент по виду оплаты (сист.) по периоды: смотрится текущий период расчета и границы текущего назначения (если перевели ранее , чем конец месяца, то периодж будет не весь месяц)');
+    Fill_Tmp_alg_One(51,'%EM_VIDNACH(V,O,D)%'         ,'','Начисление по виду оплат с учетом счета(основной/неосновной) V- сист. код оплаты, O-основной 1/неосновной 0, D- вредность ');
+     Fill_Tmp_alg_One(51,'%EM_VIDNACHV(V,O,D)%'         ,'','Начисление по виду оплат с учетом счета(основной/неосновной) V- сист. код оплаты, O-основной 1/неосновной 0, D- вредность ');
+      Fill_Tmp_alg_One(51,'%EM_VIDNACHS(V,O,D)%'         ,'','Начисление по виду оплат с учетом счета(основной/неосновной) V- сист. код оплаты, O-основной 1/неосновной 0, D- вредность ');
+
+  }
+  end;
+} //Function Fill_Tmp_alg(_wType_Alg:word):boolean;
+
+Window wnGetInterface 'Выберите интерфейс расчета' ('',,Sci1Esc) CYAN, DoAccept;
+show(20,5,80,25);
+Browse brGetInterface;
+Table Tmp_Interface;
+Fields
+  Tmp_Interface.Name 'Наименование' :[25],Protect,NoDel;
+  Tmp_Interface.description 'Описание' :[50],Protect,NoDel;
+end;//Browse brGetInterface
+end;//Window wnGetInterface
+
+#doc
+  Выбрать интерфейс
+#end
+Function ChooseInterface(_wType_Alg:word):string;
+{ #__UNUSED__(_wType_Alg)
+  Result:='';
+  Free_Dm_Alg;
+  delete all tmp_Interface;
+  if (LoadImplementationList('GP_STAFF::IGP_KPI_ALG_USER', 'GP_KPI_ALG_USER_'))
+  {
+    StartNewVisual(vtNumericVisual, vfTimer + vfBreak, 'Загрузка списка отчетов...', 1);
+    _try
+    {
+      var I: integer;
+
+      for (I := 0; I < GetImplementationCount; I := I + 1)
+      {
+        var A : IGP_KPI_ALG_USER;
+
+        if LoadvipRef(A, GetImplementationName(I))
+        { var ww_str:string;
+          ww_Str:=Replace(GetImplementationName(I), 'GP_STAFF::GP_KPI_ALG_USER_', '');
+          tmp_Interface.name := ww_str;
+          tmp_Interface.description := A.GetDescription;
+          insert current tmp_Interface;
+          FreeVipInterface(A);
+        }
+        NextVisual;
+      }
+    }
+    _except
+      on ExUserBreak : {};
+    _finally
+      StopVisual('', 0);
+  }
+  UnLoadImplementationList;
+  if RunWindowModal(wnGetInterface)=cmDefault
+  { Result:=tmp_Interface.name;
+  }
+} //Function ChooseInterface(_wType_Alg:word):string;
+
+//-----------------------------------------------------------------------------
+// Получить последнюю ошибку
+//-----------------------------------------------------------------------------
+Public Function GetLastError : string;
+{ Result := sLastError;
+}
+
+
+//-----------------------------------------------------------------------------
+// Загрузить табель
+//-----------------------------------------------------------------------------
+Procedure Load_Wt(_pPodr:comp;_pPost:comp=0);
+{ //без этого табельные функции не пашут.
+  Loadworkingtable(vLschet.pLschet,Month(PeriodBegin),year(PeriodBegin));
+  if timelog_status>0
+  { timelog('Load_Wt vLschet.pLschet='+string(vLschet.pLschet,0,0)
+     +' _pPodr='+string(_PPodr,0,0)+', _pPost='+string(_pPost,0,0) );
+  }
+  // старый вариант  WT_AddDepartmentFilter(_PPodr)
+  if WT_PPodr_filter<>_PPodr
+  or WT_PPost_filter<>_pPost
+  { WT_ResetFilter; // или WT_DeleteFilter(hf); - сняли фильтр
+    if WT_Hanler_Filtr_Depart<>0
+    { DestroyDF(WT_Hanler_Filtr_Depart);
+    }
+    if WT_Hanler_Filtr_Post<>0
+    { DestroyDF(WT_Hanler_Filtr_Post);
+    }
+    WT_Hanler_Filtr_Depart := CreateDepartmentDF(_PPodr); // создали фильтр
+    WT_AddFilter(WT_Hanler_Filtr_Depart); // наложили фильтр
+    if _pPost<>0
+    { WT_Hanler_Filtr_Post   := CreateAppointmentDF(_PPost); // создали фильтр
+      if WT_Hanler_Filtr_Post<>0
+        WT_AddFilter(WT_Hanler_Filtr_Post); // наложили фильтр
+    }
+    WT_PPodr_filter:=_PPodr;
+    WT_PPost_filter:=_PPost;
+  }
+} //Procedure Load_Wt(_pPodr:comp);
+
+//-----------------------------------------------------------------------------
+// Рассчитать алгоритм
+//-----------------------------------------------------------------------------
+Function Calc_Alg(_pAlg:comp; boMes:boolean=false):string;
+var tmpRes, sError, sFormula:string;
+{ Result:='';
+  if timelog_Status>1
+    Timelog('GP_KPI_ALG->Calc_Alg');
+
+  sLastError:='';
+  sFormula:='';
+  if (getfirst fastfirstrow GP_KPI_Alg where((_pAlg==GP_KPI_Alg.NRec))<>tsok)
+  { sLastError:='Не найден алгоритм KPI с NRec='+string(_pAlg,0,0);
+    if boMes
+    { message(sLastError,error);
+    }
+    else
+    { displ(sLastError)
+    }
+    exit;
+  }
+  if boLog
+     displ('Рассчитываем алгоритм '+GP_KPI_Alg.Name+',  '+GetStrTabn(vLschet.Lschet.Tabn,vLschet.Lschet.strTabn) );
+  var _PPodr:comp=0;
+  var _PPost:comp=0;
+  if wTypeDoc=0
+  { _PPodr:=Spec.cPodr;
+    _pPost:=0;
+  }
+  else
+  { _PPodr:=GP_KPI_DOC_SP.cKatpodr;
+    _pPost:=GP_KPI_DOC_SP.cPost;
+  }
+
+  if isBitCTW(GP_KPI_ALG.Option,1)
+  { Init_Zar;
+
+    if vLschet.pLschet<>vLschet.pLschet_Prev  or _PPodr <>WT_PPodr_filter  or PeriodBegin<>RunDate_Prev
+    or _pPost <>WT_PPost_filter
+    or boNotLoadZarLschet
+    { vLschet.pLschet_Prev:=vLschet.pLschet;
+      WT_PPodr_filter:=0; //иначе фильтр не подымается в табельных функциях
+      WT_PPost_filter:=0; //иначе фильтр не подымается в табельных функциях
+      RunDate_Prev:=PeriodBegin;
+      boNotLoadZarLschet:=false;
+
+      vLschet.delete All NacTmp;
+        //для расчета зп
+      var _Rejim :word  = vLschet.Lschet.Rejim   ; //Режим работы
+      var _SisOpl:word  = vLschet.Lschet.SisOpl  ; //Система оплаты
+      var _Vidopl:word  = 7              ; //Вид оплаты
+      var _Razr  :word  = vLschet.Lschet.Razr    ; //Разряд
+      var _Tarif :double= vLschet.Lschet.Tarif   ; //Тариф
+      var _CodTar:comp  = vLschet.Lschet.CodTar  ; //Код тарифа
+      var _cPost :comp  = vLschet.Lschet.cAppoint; //Ссылка на должность
+      var _su    :double=0;
+      //а эта сохраняет   LSCHSUMALGNO(pLschet,2);
+      //не сохраняет позицию
+      _su:=SETSUMRAISEALL (
+        0,
+        0,
+        vLschet.pLschet,               //Nrec л/с
+        PeriodBegin,               //Дата проведения расчета
+        _Rejim,                //Режим работы
+        _SisOpl,             //Система оплаты
+        _VidOpl, //Вид оплаты
+        0, //Процент доплаты
+        0   , //Сумма доплаты
+        _Razr,                 //Разряд
+        _Tarif,              //Тариф
+        _CodTar,               //Код тарифа
+        vLschet.Lschet.tPerson,              //Ссылка на сотрудника
+        _cPost,                 //Ссылка на должность
+        0, //ссылка на классификатор валют
+        0,//сумма валюты
+        0,          //сумма по предыдущим доплатам
+        1    //признак использования алгоритма расчета
+      );
+      Load_Wt(_pPodr,_pPost);
+      if timelog_Status>1
+        TimeLog('GP_KPI_ALG->Calc_Alg:SETSUMRAISEALL='+string(_su,0,5));
+    } //if pLschet<>pLschet_Prev  or _PPodr <>WT_PPodr_filter  or PeriodBegin<>RunDate_Prev
+
+  } //  if isBitCTW(GP_KPI_ALG.Option,1)
+  else
+  if isBitCTW(GP_KPI_ALG.Option,2)
+  { Init_Wt;
+    if vLschet.pLschet<>vLschet.pLschet_Prev
+    or _PPodr <>WT_PPodr_filter
+    or _PPost <>WT_PPost_filter
+    or PeriodBegin<>RunDate_Prev
+    { vLschet.pLschet_Prev:=vLschet.pLschet;
+      WT_PPodr_filter:=0; //иначе фильтр не подымается в табельных функциях
+      WT_PPost_filter:=0; //иначе фильтр не подымается в табельных функциях
+      RunDate_Prev:=PeriodBegin;
+      boNotLoadZarLschet:=true;
+      Load_Wt(_pPodr,_pPost);
+    }
+  }
+  //рассчитаем сначала ключи по спецификации
+  delete all tmp_Alg_Spec;
+  _Loop GP_KPI_ALG_SPEC
+  { if length(trim(GP_KPI_ALG_SPEC.Formula))=0 continue;
+    tmpRes:='';
+    sError:='';
+if timelog_Status>2     timelog('ReplaceByValues(GP_KPI_ALG_SPEC.Formula);' + GP_KPI_ALG_SPEC.Formula);
+    sFormula:=ReplaceByValues(GP_KPI_ALG_SPEC.Formula);
+    if boLog
+    { Displ('Расчет ключа '+GP_KPI_ALG_SPEC.Key+', Формула='+GP_KPI_ALG_SPEC.Formula);
+      Displ('После замены выражений='+sFormula);
+    }
+    if timelog_Status>2
+      {
+        timelog('Расчет ключа '+GP_KPI_ALG_SPEC.Key+', Формула='+GP_KPI_ALG_SPEC.Formula+', '+'После замены выражений='+sFormula);
+//        timelog('      PERIODBEGIN = ' +PERIODBEGIN  + ', PERIODEND = '+PERIODEND);
+//        timelog('      vApp.Appointments.AppointDate = ' +vApp.Appointments.AppointDate  + ', vApp.Appointments.DISMISSDATE='+vApp.Appointments.DISMISSDATE);
+      }
+
+    if length(sFormula)<>0
+    { tmpRes := LotExpressionFunc(sFormula, sError);
+      if timelog_Status>2
+        timelog('Результат='+tmpRes+', ошибка='+sError);
+      if length(sError) = 0
+      { insert into tmp_alg_spec
+        set
+          tmp_alg_spec.Key   :=UpCase(GP_KPI_ALG_SPEC.Key)
+         ,tmp_alg_spec.Number:=GP_KPI_ALG_SPEC.Number
+         ,tmp_alg_spec.Value :=tmpRes
+        ;
+        if boLog
+         displ('Результат='+tmpRes) ;
+      }
+      else
+      {
+        sLastError:='Ошибка вычисления в алгоритме KPI "'+GP_KPI_Alg.Name
+         +', ключ ='+GP_KPI_ALG_SPEC.Key
+         +'" ('+sError+')';
+        if boMes
+          message(sLastError,error);
+        else
+          displ(sLastError);
+        exit;
+      }
+    } //if length(sFormula)<>0
+    else
+    { insert into tmp_alg_spec
+        set
+          tmp_alg_spec.Key   :=UpCase(GP_KPI_ALG_SPEC.Key)
+         ,tmp_alg_spec.Number:=GP_KPI_ALG_SPEC.Number
+         ,tmp_alg_spec.Value :=''
+        ;
+    }  //else if length(sFormula)<>0
+  } //_Loop GP_KPI_ALG_SPEC
+  sFormula:=Trim(GP_KPI_Alg.Formula);
+  if Length(sFormula)=0 {
+    sLastError:='Не задана формула расчета в алгоритме KPI "'+GP_KPI_Alg.Name+'"';
+    if boMes
+      message(sLastError,error);
+    else
+      displ(sLastError);
+    exit;
+  }
+  tmpRes:='';
+  sError:='';
+  sFormula:=ReplaceByValues(sFormula);
+  if boLog
+  { Displ('Расчет формулы='+GP_KPI_ALG.Formula);
+    Displ('После замены выражений='+sFormula);
+  }
+  if timelog_Status>2
+    timelog('Расчет формулы='+GP_KPI_ALG.Formula+',После замены выражений='+sFormula);
+  if Length(sFormula)<>0
+  { tmpRes := LotExpressionFunc(sFormula, sError);
+    if length(sError) = 0
+    {  result := tmpRes;
+       if boLog
+        displ('Результат='+tmpRes) ;
+    }
+    else
+    { sLastError:='Ошибка вычисления в алгоритме KPI "'+GP_KPI_Alg.Name+'" ('+sError+')';
+      if boMes
+        message(sLastError,error);
+      else
+        displ(sLastError);
+      timelog(sLastError);
+      exit;
+    }
+  }
+  else
+  { Result:='';
+  }
+}//Function Calc_Alg( boMes:boolean=false):double;
+
+
+function Calc(buf:type$GP_KPI_StatementSpec;boMes:boolean=false):double;
+//var tmpRes, sError:string;
+{ wTypeDoc:=1;
+  vLschet.pLschet:=0;
+  result:=0;
+  Fill_Tmp_alg(0);
+  if (getfirst fastfirstrow GP_KPI where((buf.cKPI==GP_KPI.NRec))<>tsok)
+  {
+    sLastError:='Не найден показатель премирования с NRec='+string(buf.cKPI,0,0);
+    if boMes
+      message(sLastError,error);
+    else
+      displ(sLastError);
+    exit;
+  }
+
+  if (GP_KPI.cKPI_Alg=0)
+  {
+    sLastError:='Не указан алгоритм KPI для показатель премирования "'+GP_KPI.Name+'"';
+    if boMes
+      message(sLastError,error);
+    else
+      displ(sLastError);
+    exit;
+  }
+  Spec.buffer:=buf;
+  Result:=Double(Calc_Alg(GP_KPI.cKPI_Alg,boMes));
+} //function Calc(buf:type$GP_KPI_StatementSpec;boMes:boolean=false):double;
+
+//-----------------------------------------
+// Загрузить интерфейс расчета
+//-----------------------------------------
+Function LoadInterfaceCalc(_wTypeDoc:word; var _pGP_KPI_Doc:oGP_KPI_Doc):boolean;
+var _Interface:string;
+{ Result:=True;
+  if timelog_Status>0
+    Timelog('GP_KPI_ALG->LoadInterfaceCalc:_wTypeDoc='+string(_wTypeDoc));
+  _Interface:='';
+  if wTypeDoc<>_wTypeDoc
+  { set wTypeDoc:=_wTypeDoc;
+    if timelog_Status>0
+      Timelog('GP_KPI_ALG->LoadInterfaceCalc:загружаем интерфейс');
+    if not NullVipRef(_pGP_KPI_Doc)
+    { _Try
+      { FreeVipInterface(_pGP_KPI_Doc);
+      }
+      _except
+      else
+      {  displ('Возникло исключение при освобождении интерфейса расчета '+ExploreException);
+      }
+      _Finally
+      {
+      }
+    } //if not NullVipRef(_pGP_KPI_Doc)
+    _Try
+    { case wTypeDoc of
+      1: //показатели премирования
+      { _Interface:='GP_STAFF::GP_KPI_Statements';
+      }
+      2: //фондовые ведомости
+      { _Interface:='GP_STAFF::GP_KPI_DOC_FondEdit';
+      }
+      3: //Ведомости исполнительской дисциплины
+      { _Interface:='GP_STAFF::GP_KPI_DOC_DisEdit';
+      }
+      100..110: //Премии
+      { _Interface:='GP_STAFF::GP_KPI_DOC_RaiseEdit';
+      }
+      end;
+      if timelog_Status>0
+        Timelog('GP_KPI_ALG->LoadInterfaceCalc:загружаем интерфейс '+_Interface);
+      if _Interface<>''
+      { //LoadVipRef(_pGP_KPI_DOC,_Interface)
+        LoadVipRef(_pGP_KPI_DOC,_Interface);
+        _pGP_KPI_DOC.SetUpdateMode(true);
+      }
+      else _Raise ExObjIfcNoInit;
+    }
+    _except
+    on ExRef:
+    { displ('Не определен интерфейс для типа документа '+String(wTypeDoc)+' '+ExploreException);
+      Result:=False;
+
+    }
+    else
+    { displ('Возникло исключение при загрузке интерфейса '+_Interface+' '+ExploreException);
+      Result:=False;
+    }
+    _Finally
+    {
+    }
+  } //if wTypeDoc<>_wTypeDoc
+  Result:=(not NullVipRef(_pGP_KPI_Doc));
+#IFDEF KPI_ALG_DEBUG
+  if timelog_Status>0
+    Timelog('GP_KPI_ALG->LoadInterfaceCalc:finish');
+#ENDIF
+} //Function LoadInterfaceCalc(_wTypeDoc:word):boolean_;
+
+//---------------------------------
+//получить период расчета премии
+Function SetPeriod(_TypePeriod:integer=-1;_wYear:word=0;_wKvartal:word=0;_wMonth:word=0) :boolean;
+{ //-----------------------------------
+  if _TypePeriod=-1 // берем по умолчанию
+  { if GP_KPI_Doc.wType>100
+    { if getfirst GP_KPI_RAISe=tsok
+        _TypePeriod:=GP_KPI_Raise.TypePeriod;
+    }
+    _wYear   :=GP_KPI_DOC.wYear;
+    _wKvartal:=GP_KPI_Doc.wKvartal;
+    _wMonth  :=GP_KPI_DOC.wMonth;
+    case _TypePeriod of
+    2:  _wYear:=GP_KPI_Doc.WYEARKVARTAL;
+    3,4:  _wYear:=GP_KPI_Doc.wYearPrem;
+    end;
+  } //if _TypePeriod=-1
+  wTypePeriod:=_TypePeriod;
+  //-----------------------------------
+  PeriodBegin:=date(1,_wMonth,_wYear);
+  PeriodEnd  :=date(Last_day(PeriodBegin),_wMonth,_wYear);
+  //-----------------------------------
+  if GP_KPI_Doc.wType>100
+  {
+    if true //getfirst GP_KPI_RAISe=tsok
+    { case _TypePeriod of //GP_KPI_Raise.TypePeriod of//[List
+      0:{}// '-',
+      1:{}// 'месяц',
+      2:{
+       PeriodBegin:=date(1,1+(_wKvartal-1)*3,_WYEAR);
+       PeriodEnd  :=date(1,_wKvartal*3,_WYEAR);
+       PeriodEnd  :=date(Last_Day(PeriodEnd),month(PeriodEnd),year(PeriodEnd));
+      }// 'квартал'
+      3:{
+       PeriodBegin:=date( 1, 1,_wYear); //WYEARKVARTAL
+       PeriodEnd  :=date(31,12,_wYear);
+      }// 'год',
+      4:{
+       if GP_KPI_Doc.WYEARKVARTAL<3
+       { PeriodBegin:=date(01,01,_wYear);
+         PeriodEnd  :=date(30,06,_wYear);
+       }
+       else
+       { PeriodBegin:=date(01,07,_wYear);
+         PeriodEnd  :=date(31,12,_wYear);
+       }               }//  'полугодие',
+      5:{}// 'Разовая']
+      end;
+    }
+  }//if GP_KPI_Doc.wType>100
+  timelog('SetPeriod '+DateToStr(PeriodBegin,'')+'-'+DateToStr(PeriodEnd,'')
+   +' _TypePeriod='+string(_TypePeriod)+', _wYear='+string(_wYear)+', _wKvartal='+string(_wKvartal)
+    ) ;
+  Result:=true;
+  vApp.PeriodBegin:=PeriodBegin;
+  vApp.PeriodEnd  :=PeriodEnd;
+} //Function SetPeriod:boolean;
+
+//---------------------------------------------------------------
+//
+//---------------------------------------------------------------
+function CalcSpec(_wTypeDoc:word
+                ; _cDoc:comp
+                ; _cDocSp:comp
+                ; _pAlg:comp
+                ; boMes:boolean=false
+                ; _ValuePrev:string='ZZZ'
+                ; boRezerv:boolean=false
+                ):string;
+{ #__UNUSED__(boRezerv)
+  result:='';
+  ValuePrev:=IF(_ValuePrev='ZZZ','',_ValuePrev);
+  if timelog_Status>1
+    Timelog('GP_KPI_ALG->CalcSpec '+string(_wTypeDoc)+', _cDocSp='+string(_cDocSp,0,0)+', ValuePrev='+ValuePrev);
+  if (_pAlg=0)
+  {
+    sLastError:='Не указан алгоритм KPI для показатель премирования "'+GP_KPI.Name+'"';
+    if boMes
+      message(sLastError,error);
+    else
+      displ(sLastError);
+    exit;
+  }
+  // запуск снаружи
+  if _cDoc<>0
+  {
+    if  _wTypeDoc<>wTypeDoc
+    //если это премии то не нужно обновлять!
+    and not (_wTypeDoc>=100 and wTypeDoc>=100 )
+    { Fill_Tmp_alg(1);
+      boLoadInterFace:=LoadInterfaceCalc(_wTypeDoc,pGP_KPI_Doc);
+      if not boLoadInterFace
+      { exit;
+      }
+      pDocSp:=0;
+      pDoc:=0
+    }
+    if pDoc<>_cDoc
+    { pDoc:=_cDoc;
+      case _wTypeDoc of
+      1:
+      { if Getfirst GP_KPI_Statements<>tsok exit;
+      }
+      else
+      { if getfirst GP_KPI_Doc<>tsok exit;
+      }
+      end;
+
+      pDocSp:=0;
+    }
+    if pDocSp<>_cDocSp
+    { pDocSp:=_cDocSp;
+
+      SetPeriod;
+    }
+    //надо перечитать
+    case _wTypeDoc of
+    100: //для итоговой закладки вызовем со 100
+    { if getfirst tmp_KPI_Doc_Val where (( pDocSp== tmp_KPI_Doc_Val.Nrec))  <>tsok exit;
+    }
+    else
+    { if getfirst GP_KPI_Doc_SP where (( pDocSp == GP_KPI_Doc_SP.Nrec ))<>tsok then exit;
+    }
+    end;
+    vLschet.pLschet :=GP_KPI_Doc_SP.cLschet;
+    if vLschet.getfirst Lschet=tsok {}
+    if timelog_Status>1
+      Timelog('GP_KPI_ALG->CalcSpec before SetDocPosition');
+    if not pGP_KPI_DOC.SetDocPosition(_wTypeDoc,_cDoc,pDocSp)
+    { displ(' ошибка позиционирование на спец.документа '+GP_KPI_DOC.DocNumber );
+      exit;
+    }
+
+  } //if _cDoc<>0
+  Result:=Calc_Alg(_pAlg,boMes);
+  if timelog_Status>1
+    Timelog('GP_KPI_ALG->CalcSpec Finish');
+} //function CalcSpec(buf:type$GP_KPI_StatementSpec;_pAlg:comp;boMes:boolean=false):double;
+
+
+SQL QUERY SqlTmp_VAL =
+  select
+    t.cGP_KPI_FOND as cGP_KPI_FOND
+   ,t.Summa
+   ,t.Rasp
+  from(
+    SELECT DISTINCT GP_KPI_DOC.cGP_KPI_FOND
+  , Sum(Cast(
+    //(CASE WHEN tmp_Fields.Option=2 or tmp_Fields.Option=3 or tmp_Fields.Option=6  THEN '0.00'
+    (CASE WHEN BITAND(GP_KPI_Fields.Option,1)=0 THEN '0.00'
+     ELSE CASE  GP_KPI_Fields.Npp
+       WHEN 01 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[01]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[01] END
+       WHEN 02 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[02]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[02] END
+       WHEN 03 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[03]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[03] END
+       WHEN 04 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[04]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[04] END
+       WHEN 05 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[05]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[05] END
+       WHEN 06 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[06]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[06] END
+       WHEN 07 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[07]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[07] END
+       WHEN 08 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[08]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[08] END
+       WHEN 09 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[09]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[09] END
+       WHEN 10 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[10]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[10] END
+       WHEN 11 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[11]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[11] END
+       WHEN 12 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[12]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[12] END
+       WHEN 13 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[13]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[13] END
+       WHEN 14 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[14]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[14] END
+       WHEN 15 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[15]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[15] END
+       WHEN 16 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[16]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[16] END
+       WHEN 17 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[17]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[17] END
+       WHEN 18 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[18]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[18] END
+       WHEN 19 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[19]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[19] END
+       WHEN 20 THEN CASE WHEN GP_KPI_Doc_SP.FARRVALUE[20]='' THEN '0.00' ELSE GP_KPI_Doc_SP.FARRVALUE[20] END
+       END
+     END)    as double)) as Summa
+   , 0.00 as Rasp
+  From  GP_KPI_DOC
+  Inner join GP_KPI_DOC_SP on GP_KPI_DOC_SP.cGp_KPI_Doc = GP_KPI_DOC.Nrec
+     and ( :PKatpodr = GP_KPI_DOC_SP.cKatPodr)
+  inner join GP_KPI_Fields on 1 = GP_KPI_Fields.wType and GP_KPI_Fields.cDoc = GP_KPI_DOC.cGP_KPI_FOND
+  inner join GP_Status on GP_Status.Nrec = GP_KPI_DOC.cStatus and (GP_Status.CODE<>'01')
+  where (2 = GP_KPI_DOC.wType) and (:wMonth =GP_KPI_DOC.wMonth)  and (:wYear =GP_KPI_DOC.wYear)
+  Group by GP_KPI_DOC.cGP_KPI_FOND
+    ) t where t.Summa >= 0
+;
+
+//----------------------------------------
+//  Рассчитать остальные ведомости
+//----------------------------------------
+function CalcDoc(_wTypeDoc:word         //тип документа
+                ; _cDoc   :comp         //ссылка на документ
+                ; boRecalc:boolean=true //нужен пересчет
+                ; boMes   :boolean=false//выводить сообщения
+                ; boRezerv:boolean=false//пересчет резерва
+                ):boolean;
+var
+    _Value:string;
+    _ValuePrev:String;
+    _ItSumma  :double;
+    _SumRasp  :double;
+// -  сумма вычитаемая из базы
+    _SumFond  :double;
+    _SumFond_It  :double;
+// -  сумма входит в сумму фонда для доп.распределения,
+//    сумма в фонде равна - сумма по фондам + сумма по алгоритму для каждой строки
+//    в GP_KPI_Raise.cAlg_Summa
+    isAllOk   :boolean;
+    iError    :longint;
+    stmt:tptr;
+    ExecuteErrorCode : longint;
+    _PKatpodr :comp;
+    _wMonth,_wYear:word;
+{ ClearFuncCache; // очистим кэш функций
+  vKPI_KOEF.delete all tmp_kpi_podr;
+  //только для премии среднего и высшего звена
+  if _wTypeDoc<>102 and _wTypeDoc<>103
+  { boRezerv:=false;
+  }
+  result:=false;
+  BoLog:=boMes;
+  isAllOk:=true;
+  _Value:=0;
+  _ValuePrev:=0;
+  //-----------------
+  boAll:=true;
+  //-----------------
+  Timelog('GP_KPI_ALG->CalcDoc:_wTypeDoc='+string(_wTypeDoc));
+  Fill_Tmp_alg(1);
+  boLoadInterFace:=LoadInterfaceCalc(_wTypeDoc,pGP_KPI_Doc);
+  if not boLoadInterFace
+  { exit;
+
+  }
+  //---------------------------
+  delete all tmp_fond;
+  delete all tmp_fond;
+  //---------------------------
+  _ItSumma:=0;
+  set pDoc:=_cDoc;
+  Timelog('GP_KPI_ALG->CalcDoc:ищем документ');
+  sLastError:='';
+  vLschet.pLschet:=0;
+  vLschet.pLschet_Prev:=0;
+  RunDate_Prev:=ZeroDate;
+
+  case wTypeDoc of
+  1:
+  { if (Getfirst GP_KPI_Statements)<>tsok Exit;
+  }
+  else
+  {
+
+    if (Getfirst GP_KPI_Doc<>tsok) Exit;
+    if boLog
+    { displ('======================================');
+      displ(' Ведомость тип '+String(wTypeDoc)+' Номер '+GP_KPI_DOC.DocNumber+' от '+DateTostr(GP_KPI_DOC.DocDate,'DD.MM.YYYY'));
+      displ('======================================');
+    }
+    SetPeriod;
+    pGP_KPI_DOC.SetUpdateMode(false);
+
+    Timelog('GP_KPI_ALG->CalcDoc:Ведомость тип '+String(wTypeDoc)+' Номер '+GP_KPI_DOC.DocNumber+' от '+DateTostr(GP_KPI_DOC.DocDate,'DD.MM.YYYY'));
+    vLschet.pLschet:=0;
+    _SumFond_It:=0;
+    //---------- отберем сумму фондов
+    if wTypeDoc=101
+    {   _PKatpodr :=GP_KPI_DOC.cKatPodr;
+        _wMonth:=GP_KPI_DOC.wMonth;
+        _wYear :=GP_KPI_DOC.wYear;
+        //Status_Init(2);
+
+        _Try
+        { stmt :=0;
+          stmt := sqlAllocStmt;
+          ExecuteErrorCode:=sqlPrepare(stmt,SqlTmp_Val);
+          if timelog_Status>1
+            Timelog('GP_KPI_ALG->FillTmp_Val:ExecuteErrorCode 001='+string(ExecuteErrorCode));
+          NextVisual;
+          if ExecuteErrorCode=0
+          { sqlBindParamByName(stmt,'PKatPodr', comp(_pKatPodr));
+            sqlBindParamByName(stmt,'wMonth'  , _wMonth);
+            sqlBindParamByName(stmt,'wYear'   , _wYear);
+            ExecuteErrorCode:=SqlExecute(stmt);
+            if timelog_Status>1
+              Timelog('GP_KPI_ALG->Fill_FOND 004='+string(ExecuteErrorCode));
+            if ExecuteErrorCode=0
+            { ExecuteErrorCode:=SqlFetchInto(stmt,#TMP_Fond);
+              if timelog_status>0
+              {  Timelog('GP_KPI_ALG->Fill_FOND 005:ExecuteErrorCode 005='+string(ExecuteErrorCode)
+                  +', отобрано '+String(RecordsInTable(#TMP_Fond)));
+                 ReReadRecord(#Tmp_Fond);
+                 _Loop Tmp_Fond
+                 { Timelog('GP_KPI_ALG->Tmp_Fond.cFond='+string(Tmp_Fond.cFond,0,0)
+                  +', summa='+string(Tmp_Fond.Summa,0,2));
+
+                 }
+              } //if timelog_status>0
+            }
+          } //if ExecuteErrorCode=0
+          //ExecuteErrorCode := q.Execute.ErrorCode;
+        } // try
+        _finally
+        {
+           if (ExecuteErrorCode <> 0)
+             displ ('Ошибка при выполнении SQL-сценария (Вставка записей в суммы по фондам): код = ' + String(ExecuteErrorCode));
+        } // _finally
+    }
+    //--------------------------------------
+    case wTypeDoc of
+    2: wFldType:=1;
+    3: wFldType:=3;
+    101,102,103:
+       wFldType:=if(boRezerv,wTypeDoc,0);
+    end;
+    Fill_tmp_Fields;
+    //--------------------------------------
+    _Loop GP_KPI_Doc_SP
+    { if not NextVisual break;
+      case GP_KPI_Doc.wType of
+      101,102,103:
+      { if boRezerv
+        { if GP_KPI_DOC_SP.cGP_KPI_RAISE<>0 then continue;
+        }
+        else
+        { if GP_KPI_DOC_SP.cGP_KPI_RAISE=0 then continue;
+          if getfirst GP_KPI_RAISe=tsok {}
+          if getfirst GP_KPI_RAISe=tsok {}
+          if timelog_Status>2
+          timelog('===  '+GP_KPI_RAISe.Name);
+        }
+      }
+      end;
+      pDocSp:=GP_KPI_Doc_SP.Nrec;
+      SetPeriod;
+      _SumRasp:=0;
+      _SumFond:=0;
+      case wTypeDoc of
+      2:
+      { pFldDoc :=GP_KPI_Doc.cGp_KPI_Fond;
+      }
+      3:
+      { pFldDoc :=GP_KPI_Doc.cGp_KPI_TypeVed;
+        if vLschet.pLschet<>GP_KPI_Doc_SP.cLschet
+        { vLschet.pLschet :=GP_KPI_Doc_SP.cLschet;
+
+          if vLschet.getfirst Lschet=tsok
+          { timelog('Нашли лиц.счет');
+          }
+          else
+          { displ('Ошибка поиска лиц.счета Таб.№ '+GetStrTabn(GP_KPI_Doc_SP.Tabn,GP_KPI_Doc_SP.StrTabn)
+             +', Nrec='+string(vLschet.pLschet,0,0));
+            vLschet.pLschet:=0;
+          }
+        }
+        if boLog
+          displ('Таб.№ '+GetStrTabn(GP_KPI_Doc_SP.Tabn,GP_KPI_Doc_SP.StrTabn));
+        timelog('Расчет для '+GetStrTabn(GP_KPI_Doc_SP.Tabn,GP_KPI_Doc_SP.StrTabn)
+               +','+string(vLschet.pLschet,0,0));
+      }
+      100..110:
+      { if boRezerv
+        {  pFldDoc :=GP_TypeDocs.Nrec;
+        }
+        else
+        {  pFldDoc :=GP_KPI_Doc_SP.cGP_KPI_RAISE;
+        }
+        if vLschet.pLschet<>GP_KPI_Doc_SP.cLschet
+        { set vLschet.pLschet :=GP_KPI_Doc_SP.cLschet;
+          if vLschet.getfirst Lschet=tsok
+          { timelog('Нашли лиц.счет');
+          }
+          else
+          { displ('Ошибка поиска лиц.счета Таб.№ '+GetStrTabn(GP_KPI_Doc_SP.Tabn,GP_KPI_Doc_SP.StrTabn)
+           +', Nrec='+string(vLschet.pLschet,0,0));
+            vLschet.pLschet:=0;
+          }
+        } //if pLschet<>GP_KPI_Doc_SP.cLschet
+        if boLog
+          displ('Таб.№ '+GetStrTabn(GP_KPI_Doc_SP.Tabn,GP_KPI_Doc_SP.StrTabn));
+        if timelog_status>0
+          timelog('Расчет для '+GetStrTabn(GP_KPI_Doc_SP.Tabn,GP_KPI_Doc_SP.StrTabn)
+               +','+string(vLschet.pLschet,0,0));
+      }
+      end;
+      if not pGP_KPI_DOC.SetDocPosition(_wTypeDoc,_cDoc,GP_KPI_Doc_SP.Nrec)
+      { displ(' ошибка позиционирование на спец.документа '+GP_KPI_DOC.DocNumber );
+        break;
+      }
+
+      //рассчитаем поля
+      _Loop fullcache tmp_FIELDS
+      { if tmp_FIELDS.cGP_KPI_Alg>0
+        {
+          if boRezerv // Резерв может считаться отдельно для каждого поля
+          { case tmp_FIELDS.NPP_IT of
+            0,1: SetPeriod(tmp_FIELDS.NPP_IT,GP_KPI_DOC.wYear,GP_KPI_Doc.wKvartal,GP_KPI_DOC.wMonth);
+            2  : SetPeriod(tmp_FIELDS.NPP_IT,GP_KPI_Doc.HARRCOMP[2],GP_KPI_Doc.HARRCOMP[1],GP_KPI_DOC.wMonth);
+            3,4: SetPeriod(tmp_FIELDS.NPP_IT,GP_KPI_Doc.HARRCOMP[3],GP_KPI_Doc.HARRCOMP[1],GP_KPI_DOC.wMonth);
+            end;
+            if getfirst GP_KPI_RAISe=tsok {}
+          }
+          _ValuePrev:=string(pGP_KPI_DOC.GetFieldValS(3,tmp_Fields.NPP));
+          _Value:=CalcSpec(wTypeDoc,0,0,tmp_Fields.cGP_KPI_Alg,false,_ValuePrev);
+          if sLastError<>''
+          { Message(sLastError);
+            isAllOk:=False;
+            break
+          }
+
+          if _ValuePrev<>_Value
+          { if IsBitCTW(GP_KPI_Doc_SP.Option[tmp_Fields.NPP],3)//ручной ввод не корректируем
+                        //   - красные поля в интерфейсе ввода премий.
+            { //обновим, но нужно считать дальше
+              if boRecalc
+              { pGP_KPI_DOC.SetFieldVal(3,tmp_Fields.NPP,_Value,boRecalc);
+              }
+            }
+            else
+            { pGP_KPI_DOC.SetFieldVal(3,tmp_Fields.NPP,_Value,boRecalc);
+            }
+          } //if ABs(_ValuePrev)-_Value)>0.005
+        }
+        else
+        { _Value:=pGP_KPI_DOC.GetFieldVal(3,tmp_Fields.NPP);
+        }
+        if IsBitCTW(tmp_Fields.Option,2)
+        { // надо перечитать - возможно сработает округление
+          var _SumSpec:double;
+          _SumSpec:=Double(pGP_KPI_DOC.GetFieldVal(3,tmp_Fields.NPP));
+          _ItSumma:=_ItSumma+_SumSpec;
+        } //if IsBitCTW(tmp_Fields.Option,2)
+        // входит в распределенную сумму
+        if IsBitCTW(tmp_Fields.Option,5)
+        { _SumRasp:=_SumRasp+Double(pGP_KPI_DOC.GetFieldVal(3,tmp_Fields.NPP));
+          if timelog_status>2
+          { timelog(' Поле '+string(tmp_Fields.NPP)+', сумма распределения='+String(_SumRasp,0,2))
+          }
+        }
+      } //_Loop tmp_Fields
+      if not isAllOk break;
+      //----------------------------
+      pGP_KPI_DOC.Update_SP;
+      //----------------------------
+      if wTypeDoc=101
+      {
+       _SumFond:=0;
+       // -  сумма входит в сумму фонда для доп.распределения,
+       //    сумма в фонде равна - сумма по фондам + сумма по алгоритму для каждой строки
+       //    в GP_KPI_Raise.cAlg_Summa
+        if GP_KPI_Raise.cAlg_Summa>0
+        { _SumFond:=0;
+          //_SumFond:=double(Calc_Alg(GP_KPI_Raise.cAlg_Summa,boMes)+'0');
+          _SumFond:=double(Calc_Alg(GP_KPI_Raise.cAlg_Summa,boMes));
+          _SumFond_It:=_SumFond_It+_SumFond;
+        }
+        _Loop GP_KPI_GroupPers_SP
+        { if GetFirst GP_KPI_Fond=tsok
+          { if getfirst Tmp_Fond where (( GP_KPI_Fond.Nrec == Tmp_Fond.cFond )) <>tsok
+                { insert into tmp_Fond set
+                       Tmp_Fond.cFond:=GP_KPI_Fond.Nrec
+                      ,Tmp_Fond.Summa:=_SumFond
+                      ,Tmp_Fond.Rasp :=_SumRasp
+                }
+                else
+                { update current tmp_Fond set
+                   tmp_Fond.Summa:=tmp_Fond.Summa+_SumFond
+                  ,tmp_Fond.Rasp:=tmp_Fond.Rasp+_SumRasp
+                   ;
+                }
+          } //if GetFirst GP_KPI_Fond=tsok
+        } //_Loop GP_KPI_GroupPers_SP
+      }//if wTypeDoc=101
+
+    } //_Loop GP_KPI_Doc_SP
+
+    //--  надо перевести в режим полного обновления
+    pGP_KPI_DOC.SetUpdateMode(true);
+
+    // надо перечитать, но не для резерва
+    if isAllOk and (not boRezerv)
+    { ReReadRecord(#GP_KPI_Doc);
+      if getfirst GP_KPI_Doc=tsok
+      { _Try
+        { iError:=update current GP_KPI_Doc set GP_KPI_Doc.Summa:=_ItSumma;
+        }
+        _Except
+        else
+        { displ('Ошибка обновления ведомости '+string(iError));
+        }
+      }
+      if wTypeDoc=101
+      { if getfirst tmp_fond=tsok
+        _Loop Tmp_Fond
+        { if getfirst GP_KPI_DocSumFond<>tsok
+          { insert into GP_KPI_DOCSUMFOND set
+              GP_KPI_DOCSUMFOND.wType:=GP_KPI_Doc.wType
+             ,GP_KPI_DOCSUMFOND.CDOC :=GP_KPI_Doc.Nrec
+             ,GP_KPI_DOCSUMFOND.CGP_KPI_FOND:=Tmp_Fond.cFond
+             ,GP_KPI_DOCSUMFOND.SUMMA  :=Round(Tmp_Fond.Summa,2)
+             ,GP_KPI_DOCSUMFOND.Rasp   :=Tmp_Fond.Rasp
+            ;
+          } else
+          { update current GP_KPI_DOCSUMFOND
+              set GP_KPI_DOCSUMFOND.Summa:=Round(Tmp_Fond.Summa,2)
+                 ,GP_KPI_DOCSUMFOND.Rasp:=Tmp_Fond.Rasp
+                 ;
+          }
+        } //_Loop Tmp_Fond
+        //var smtp
+        //cFond : Comp
+        // ,Rasp:tSumma
+
+      } //if wTypeDoc=101
+    } //if isAllOk
+
+  } //
+  end;//case wTypeDoc of
+  Result:=isAllOk;
+  //-----------------
+  boAll:=false;
+  //-----------------
+
+} //function CalcDoc(buf:type$GP_KPI_StatementSpec;_pAlg:comp;boMes:boolean=false):double;
+
+
+//*****************************************************
+//
+//*****************************************************
+HandleEvent
+//------------------------
+cmOnVipLoad:
+{  TimeLog_Init;
+   Timelog('GP_KPI_ALG->cmOnVipLoad');
+   boLoadZar:=false;
+   vKPI_KOEF.delete all tmp_kpi_podr;
+   pCatClass  :=coGetTune('NPOEM_OWN.Raise.Raise_Class');
+   RunDate:=dGetTune('Up.DatOtch');
+   RunDate:=date(Last_day(RunDate),month(RunDate),Year(RunDate));
+}
+//------------------------
+cmOnVipUnLoad:
+{ Free_Dm_Alg;
+  if boLoadZar
+  { if WT_Hanler_Filtr_Depart<>0
+    { DestroyDF(WT_Hanler_Filtr_Depart);
+    }
+    if WT_Hanler_Filtr_Post<>0
+    { DestroyDF(WT_Hanler_Filtr_Post);
+    }
+    DoneVx(100);
+    //ExitProc;
+  }
+  if not NullVipRef(pGP_KPI_Doc)
+  { _Try
+    { FreeVipInterface(pGP_KPI_Doc);
+    }
+    _except
+    else
+    {  displ('Возникло исключение при освобождении интерфейса расчета '+ExploreException);
+    }
+    _Finally
+    {
+    }
+  } //if not NullVipRef(_pGP_KPI_Doc)
+}
+end;
+
+end.

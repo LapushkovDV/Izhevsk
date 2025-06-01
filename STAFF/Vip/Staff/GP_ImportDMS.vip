@@ -1,0 +1,853 @@
+/*************************************************************************************************\
+* Наименование: Импорт характеристик в ставки ШР                         *
+* Контур/Модуль: Управление персоналом                                                            *
+* Пункт меню: Отчеты / Отчеты пользователя / Компенсации и льготы / Импорт доступных вариантов    *
+* ДМС в характеристики ставок ШР                                                                  *
+* Примечания:                                                                                     *
+* Так как при вводе характеристик пользователь указывает тип данных вручную и имеет возможность   *
+* выбрать любую запись из любого каталога, при импорте есть сложности с тем, с каким типом и      *
+* в какой каталог импортировать.                                                                  *
+* При реализации импорта предполагается, что каждое наименование характеристики уникально и       *
+* что тип и каталог у каждой характеристики с одним именем одинаковы.                             *
+* Если у СЕ ШР уже есть характеристика с указанным именем, она будет импортироваться с тем же     *
+* типом данных и в тот же каталог, если тип данных = Каталог.                                     *
+* Если у СЕ ШР нет характеристика с указанным именем, она будет создана. Тип данных и каталог,    *
+* если тип данных = Каталог, будет взят из первой попавшейся характеристики с таким же именем     *
+* (независимо от того, к какой СЕ ШР она привязана) с заполненным значением.                      *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#236          |19/07/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+
+#include GP_Log.vih // Объектный интерфейс для вывода протокола
+#include CatFunc.vih // Функции работы с каталогом
+
+#define GPInt GP_ImportDMS // #(GPInt)
+#define GPNam Импорт характеристик в ставки ШР // #(GPNam)
+
+interface GP_ImportDMS '#(GPNam)' EscClose;
+
+  const
+    REP_NAME = 'GP_ImportDMS'; // Название отчёта
+    ST_FULL_LOG = 1; // показывать подробный лог импорта
+    DATA_SHEET_NAME = 'Лист1'; // Имя страницы с данными в Excel-файле
+    FIRST_HEAD_ROW = 4; // Номер первой строки шапки в Excel-файле с данными для импорта
+    FIRST_DATA_ROW = 5; // Номер первой строки данных в  Excel-файле с данными для импорта
+    FIND_BY_CODE = 0; // Поиск по коду
+    FIND_BY_NAME = 1; // Поиск по наименованию
+    TYPE_OP_REPLACE_VALUE = 1; // Замена значения характеристики
+    TYPE_OP_ADD_CHAR = 2; // Добавление характеристики
+    CAT_DEP_SYS_CODE = -11; // Код каталога "Структурные единицы штатного расписания"
+    CAT_CHAR_SYS_CODE = 83; // Код каталога "Характеристики рабочих мест"
+    VAL_TYPE_LONG = 2; // Тип значения - Целое число
+    VAL_TYPE_DOUBLE = 4; // Тип значения - Дробное число
+    VAL_TYPE_DATE = 5; // Тип значения - Дата
+    VAL_TYPE_CLASS = 6; // Тип значения - Каталог
+    VAL_TYPE_STRING = 7; // Тип значения - Строка
+    // CAT_CHAR_SYS_CODE = 83; // Код каталога "Характеристики рабочих мест"
+    // Константы ошибок при работе с Excel
+    XE_BAD_OP           =  0; // не удалось выполнить операцию с Excel-файлом
+    XE_CREATE_FILE      =  1; // не удалось создать файл
+    XE_OPEN_FILE        =  2; // не удалось открыть файл
+    XE_INIT_FILE        =  3; // не удалось инициализировать Excel
+    XE_CREATE_MATRIX    =  4; // не удалось создать матрицу
+    XE_FREE_MATRIX      =  5; // не удалось освободить матрицу
+    XE_OUT_MATRIX       =  6; // не удалось вывести матрицу в отчёт
+    XE_WRITE_TO_MATRIX  =  7; // не удалось записать значение в матрицу
+    XE_FORMAT_CELL      =  8; // не удалось отформатировать ячейку
+    XE_SET_CELL_VALUE   =  9; // не удалось записать значение в ячейку
+    XE_SET_CELL_FORMULA = 10; // не удалось записать формулу
+    XE_RUN_MACRO        = 11; // не удалось запустить макрос
+    XE_ADD_SHEET        = 12; // не удалось добавить вкладку
+    XE_DEL_SHEET        = 13; // не удалось удалить вкладку
+    XE_RENAME_SHEET     = 14; // не удалось переименовать вкладку
+    XE_WRONG_TEMPLATE   = 15; // в xlt шаблоне не найден лист с именем
+    XE_GET_CELL_VALUE   = 16; // не удалось считать значение ячейки
+  end;
+
+  // Выполнять импорт нужно только если все данные во входном файле корректны
+  // Поэтому сначала считываем все данные в таблицу SData и проверяем их,
+  // затем выполняем проход по этой таблице и импортируем
+  table struct SData
+  (
+    XlsRecNum: LongInt, // Номер строки во входном файле
+    cStaffStruct: tNRec, // Ссылка на СЕ ШР
+    TypeOp: Byte, // Тип операции (константы TYPE_OP_...)
+    cAdvFeatures: tNRec, // Ссылка на AdvFeatures
+    cCharName: tNRec, // Ссылка на Catalogs - наименование характеристики
+    ValType: Integer, // Тип значения
+    cCharValue: tNRec, // Ссылка на Catalogs - значение характеристики
+    CharValue: String[255] // Значение характеристики
+  )
+  With index
+  (
+    SData01 = XlsRecNum
+  );
+
+  // Соответствия между наименованиями характеристики и их типами
+  table struct SCharTypes
+  (
+    cCharName: tNRec, // Ссылка на Catalogs - наименование характеристики
+    CharName: String[255], // наименование характеристики
+    ValType: Integer, // Тип значения
+    SysCode: Integer // Системный код каталога для ValType = VAL_TYPE_CLASS
+  )
+  With index
+  (
+    SCharTypes01 = cCharName,
+    SCharTypes02 = CharName
+  );
+
+  // Таблица для кеширования записей таблицы AdvFeatures
+  // (В AdvFeatures нет нужных индексов)
+  table struct SAdvFeatures
+  (
+    cAdvFeatures: tNRec, // Ссылка на AdvFeatures
+    cStaffStruct: tNRec, // Ссылка на StaffStruct
+    cCharName: tNRec, // Ссылка на Catalogs - наименование характеристики
+    CharName: String[255], // наименование характеристики
+    ValType: Integer, // Тип значения
+    cCharValue: tNRec, // Ссылка на Catalogs - значение характеристики
+    CharValue: String[255] // Значение характеристики
+  )
+  With index
+  (
+    SAdvFeatures01 = cStaffStruct + CharName + CharValue
+  );
+
+  create view
+    var
+      pDate: Date; // Отчётная дата
+      pFileName: String; // Имя файла для импорта
+      pSettings: Word; // Дополнительные параметры
+    from
+      SData (SData01),
+      SAdvFeatures (SAdvFeatures01),
+      SCharTypes (SCharTypes02),
+      Catalogs,
+      AdvFeatures (ByParent),
+      StaffStruct,
+      TarStav
+  ;
+
+  var
+    ICatFunc: CatalogsFunctions;
+    IsAborted: Boolean;
+    BadRecCnt: LongInt; // Кол-во некорректных записей во входном файле
+    ImpRecCnt: LongInt; // Кол-во импортированных записей
+    CatDepRoot: tNRec; // Ссылка на корневую запись каталога СЕ ШР
+    CatCharRoot: tNREc; // Ссылка на корневую запись каталога дожностей
+
+  #include GP_Log.var
+
+  window winParam '#(GPNam)' DoAccept, EscClose, Gray;
+    show at (,, 74, 9);
+
+    screen scrParam ('',, sci1EnEsc);
+    fields
+      pDate ('Импорт выполняется в ШЕ ШР, дествующие по состоянию на эту дату'): noProtect;
+      pFileName ('Имя файла для экспорта и импорта',, sci13EnEsc): noProtect;
+      pSettings ('Дополнительные параметры'): noProtect;
+    buttons
+      cmOk,,, 'Ввод - принять выбор',,sci1Esc;
+      cmCancel,,, 'Отмена',,sci1Esc;
+    <<
+
+`Отчётная дата`.@@@@@@@@@@@@
+`Имя файла для экспорта и импорта`
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Дополнительные параметры`
+  [.] показывать подробный лог импорта`
+
+                        <.  ~O~K  .> <.О~т~мена.>
+    >>
+    end;
+
+    handleEvent
+      cmOk:
+        PutCommand(cmDefault);
+      cmDefault:
+        if Trim(pFileName) = '' then
+        begin
+          Message('Введите имя файла для импорта');
+          abort;
+        end;
+      cmPick:
+        case CurField of
+          #pFileName:
+            begin
+              var S: String = GetFileName('*.xls;*.xlsx', 'Выберите файл для импорта');
+              if S <> '' then
+                set pFileName := S;
+            end;
+        end;
+    end;
+  end;
+
+  // инициализация параметров отчета
+  function InitParam: Boolean;
+  begin
+    // Видимо, сохранять дату нет смысла, так как почти всегда нужно импортировать в действующее ШР
+    // if not ReadMyDsk(pDate, '#(GPInt)_pDate', false) then
+    pDate := Cur_Date;
+    if not ReadMyDsk(pFileName, '#(GPInt)_pFileName', false) then
+      pFileName := '';
+    if not ReadMyDsk(pSettings, '#(GPInt)_pSettings', false) then
+      pSettings := 0;
+    result := true;
+  end;
+
+  // сохранение параметров отчета
+  procedure SaveParam;
+  begin
+    // SaveMyDsk(pDate, '#(GPInt)_pDate');
+    SaveMyDsk(pFileName, '#(GPInt)_pFileName');
+    SaveMyDsk(pSettings, '#(GPInt)_pSettings');
+  end;
+
+  // установка параметров отчета
+  function AskParam: Boolean;
+  begin
+    result := false;
+    if not InitParam then
+      Exit;
+    if RunWindowModal(winParam) = cmDefault then
+    begin
+      SaveParam;
+      result := true;
+    end;
+  end;
+
+  //------------------------------------------------------------------------------------------------------------------------------
+
+  // Исключение для генерации ошибок, связанных с выводом в Excel файл
+  exception ExOnExecelError;
+
+  // Генерирует ошибку, связанную с выводом в Excel файл
+  procedure ExcelError(ErrCode: Word; AddInfo: String);
+  var
+    ErrText: String;
+  begin
+    case ErrCode of
+      XE_BAD_OP:
+        ErrText := 'не удалось выполнить операцию с Excel-файлом';
+      XE_CREATE_FILE:
+        ErrText := 'не удалось создать файл';
+      XE_OPEN_FILE:
+        ErrText := 'не удалось открыть файл';
+      XE_INIT_FILE:
+        ErrText := 'не удалось инициализировать Excel';
+      XE_CREATE_MATRIX:
+        ErrText := 'не удалось создать матрицу';
+      XE_OUT_MATRIX:
+        ErrText := 'не удалось вывести матрицу в отчёт';
+      XE_WRITE_TO_MATRIX:
+        ErrText := 'не удалось записать значение в матрицу';
+      XE_WRONG_TEMPLATE:
+        ErrText := 'в xlt шаблоне не найден лист с именем';
+      XE_FORMAT_CELL:
+        ErrText := 'не удалось отформатировать ячейку';
+      XE_SET_CELL_VALUE:
+        ErrText := 'не удалось записать значение в ячейку';
+      XE_RUN_MACRO:
+        ErrText := 'не удалось запустить макрос';
+      XE_ADD_SHEET:
+        ErrText := 'не удалось добавить вкладку';
+      XE_DEL_SHEET:
+        ErrText := 'не удалось удалить вкладку';
+      XE_RENAME_SHEET:
+        ErrText := 'не удалось переименовать вкладку';
+      XE_FREE_MATRIX:
+        ErrText := 'не удалось освободить матрицу';
+      XE_SET_CELL_FORMULA:
+        ErrText := 'не удалось записать формулу';
+      XE_GET_CELL_VALUE:
+        ErrText := 'не удалось считать значение ячейки';
+    else
+      ErrText := '';
+    end;
+    oGP_Log.Error(ErrText + ' ' + AddInfo);
+    _raise ExOnExecelError;
+  end;
+
+  // Эта Функция делает более удобной проверку результата операции с Excel
+  // Первым параметром передаем функцию, которая работает с Excel, а вторым и третьим - информацию об ошибке,
+  // которая будет выведена, если эта функция вернёт false (т.е. выполнится с ошибкой)
+  procedure xlOp(IsCorrect: Boolean; ErrCode: Word; AddInfo: String);
+  begin
+    if not IsCorrect then
+      ExcelError(ErrCode, AddInfo);
+  end;
+
+  // Проверяет корректность формата файла по заголовкам ячеек
+  function CheckFileFormat: Boolean;
+  var
+    R: LongInt;
+    S: String;
+  begin
+    result := false;
+    R := FIRST_HEAD_ROW;
+    S := '';
+    xlOp(xlGetCellValue(R, 1, S), XE_GET_CELL_VALUE, 'Подразделение');
+    if S != 'Подраз-деление' then
+      exit;
+    xlOp(xlGetCellValue(R, 2, S), XE_GET_CELL_VALUE, 'Номер ставки');
+    if S != 'Номер ставки' then
+      exit;
+    xlOp(xlGetCellValue(R, 3, S), XE_GET_CELL_VALUE, 'Должность');
+    if S != 'Должность' then
+      exit;
+    xlOp(xlGetCellValue(R, 4, S), XE_GET_CELL_VALUE, 'Код тар. ставки');
+    if S != 'Код тар. ставки' then
+      exit;
+    xlOp(xlGetCellValue(R, 5, S), XE_GET_CELL_VALUE, 'Наименование характеристики');
+    if S != 'Наименование характеристики' then
+      exit;
+    xlOp(xlGetCellValue(R, 6, S), XE_GET_CELL_VALUE, 'Значение характеристики');
+    if S != 'Значение характеристики' then
+      exit;
+    result := true;
+    result := true;
+  end;
+
+  // Ищет подразделение по коду
+  function LocateDep(_DepCode: String): tNRec;
+  begin
+    if getFirst Catalogs where ((
+          CatDepRoot == Catalogs.MainLink
+      and 0          == Catalogs.lPr
+      and _DepCode   == Catalogs.Code
+    )) = tsOk then
+      result := Catalogs.NRec
+    else
+    begin
+      result := 0;
+      oGP_Log.Error('В каталоге не найдено подразделение с кодом "' + _DepCode + '"');
+    end;
+  end;
+
+  // Ищет характеристику по наименованию
+  function LocateChar(_CharName: String): tNRec;
+  begin
+    if getFirst Catalogs where ((
+          CatCharRoot == Catalogs.MainLink
+      and 0           == Catalogs.lPr
+      and _CharName   == Catalogs.Name
+    )) = tsOk then
+      result := Catalogs.NRec
+    else
+    begin
+      result := 0;
+      oGP_Log.Error('В каталоге не найдена характеристика с наименованием "' + _CharName + '"');
+    end;
+  end;
+
+  // Ищет запись по наименованию в каталоге с указанным системным кодом
+  function LocateCatValue(_SysCode: Integer; _CharValue: String): tNRec;
+  var
+    _cCatRoot: tNRec;
+  begin
+    _cCatRoot := ICatFunc.GetCatalogsNRec(_SysCode);
+    if getFirst Catalogs where ((
+          _cCatRoot  == Catalogs.MainLink
+      and 0          == Catalogs.lPr
+      and _CharValue == Catalogs.Name
+    )) = tsOk then
+      result := Catalogs.NRec
+    else
+    begin
+      result := 0;
+      oGP_Log.Error('В каталоге с системным кодом ' + To_Char(_SysCode) + ' не найдено значение с наименованием "' + _CharValue + '"');
+    end;
+  end;
+
+  // Определяет значение характеристики
+  function DefineValue(_ValType: Integer; _SysCode: Integer; var _cCharValue: tNRec; var _CharValue: String): Boolean;
+  begin
+    result := false;
+    case _ValType of
+      VAL_TYPE_LONG:
+        _CharValue := String(LongInt(_CharValue), 20);
+      VAL_TYPE_DOUBLE:
+        _CharValue := String(Double(_CharValue), 20, 3);
+      VAL_TYPE_DATE:
+        _CharValue := DateToStr(StrToDate(_CharValue, 'DD.MM.YYYY'), 'DD/MM/YYYY');
+      VAL_TYPE_CLASS:
+        begin
+          _cCharValue := LocateCatValue(_SysCode, _CharValue);
+          if _cCharValue = 0 then
+            exit;
+        end;
+      VAL_TYPE_STRING:
+        begin
+        end;
+    else
+      exit;
+    end;
+    result := true;
+  end;
+
+  // Проверяет корректность кода тарифной ставки (должно быть числовое значение)
+  function ConvStCode(_StCode: String): Word;
+  begin
+    result := Word(_StCode);
+    if result = 0 then
+      oGP_Log.Error('Некорректный код тарифной ставки');
+  end;
+
+  // Определяет системный код записи в Catalogs с указанным NRec
+  function GetSysCodeFromCatRec(_cCatalogs: tNRec): Integer;
+  var
+    _cMainLink: tNRec;
+  begin
+    result := 0;
+    if getFirst Catalogs where ((_cCatalogs == Catalogs.NRec)) = tsOk then
+    begin
+      _cMainLink := Catalogs.MainLink;
+      if getFirst Catalogs where ((_cMainLink == Catalogs.NRec)) = tsOk then
+        result := Catalogs.SysCode;
+    end;
+  end;
+
+  // Обрабатывает одну запись в файле с данными для импорта
+  function ProcessInFileRec(R: LongInt; _DepCode: String; _Position: String; _StCode: String;
+   _CharName: String; _CharValue: String): Boolean;
+  var
+    _cDep: tNRec;
+    _CodTar: Word=0;
+    _TypeOp: Byte;
+    _cAdvFeatures: tNRec;
+    _cCharName: tNRec;
+    _ValType: Integer;
+    _cCharValue: tNRec;
+    _SysCode: Integer;
+  begin
+    result := false;
+    _cDep := LocateDep(_DepCode); // Ссылка на подразделение
+    if _StCode != '' then
+      _CodTar := ConvStCode(_StCode); // Код тарифной ставки
+    else
+      _CodTar := 0;
+    // Если не удалось найти подразделение в каталоге или неверно задан код тарифной ставки
+    if _cDep = 0 or (_StCode != '' and _CodTar = 0) then
+      exit;
+    // Обрабатываем все СЕ ШР с указанным подразделением и должностью, существующие на дату, заданную в параметрах импорта
+    _loop StaffStruct
+    where ((
+          _cDep  == StaffStruct.Department
+      and pDate >>= StaffStruct.dInput and (StaffStruct.dClose = 0 or StaffStruct.dClose > pDate)
+    ))
+    begin
+      // Записи в каталоге должностей почему-то дублируются (Например, есть две записи с наименованием "Кладовщик")
+      // Так что приходится сравнивать по наименованию без предварительного поиска в каталоге
+      if _Position != ICatFunc.GetCatalogsName(StaffStruct.Post) then
+        continue;
+      // Если в строке входного файла задан код тарифной ставки, обрабатываем только СЕ ШР с этим кодом
+      if _StCode != '' then
+        if getFirst TarStav where ((StaffStruct.Tariff == TarStav.NRec)) = tsOk then
+          if _CodTar != TarStav.CodTar then
+            continue;
+            // oGP_Log.Write('Код тарифной ставки: ' + To_Char(TarStav.CodTar));
+      oGP_Log.SetShift(3);
+      oGP_Log.Write('Порядковый номер СЕ ШР: ' + To_Char(StaffStruct.SeqNmb, 0, 2));
+
+      _TypeOp := 0;
+      _cAdvFeatures := 0;
+      _cCharName := '';
+      _ValType := 0;
+      _cCharValue := 0;
+      _SysCode := 0;
+
+      // Проверяем, есть ли у текущей ШЕ характеристика с таким наименованием
+      if getFirst SAdvFeatures where ((
+            StaffStruct.NRec == SAdvFeatures.cStaffStruct
+        and _CharName        == SAdvFeatures.CharName
+      )) = tsOk then
+      begin
+        // Характеристика с таким наименованием уже есть
+        // Если значение не совпадает
+        if _CharValue != SAdvFeatures.CharValue then
+        begin
+          oGP_Log.Write('Характеристика уже есть (значение: ' + SAdvFeatures.CharValue + '), нужно заменить значение');
+          _TypeOp := TYPE_OP_REPLACE_VALUE;
+          _cAdvFeatures := SAdvFeatures.cAdvFeatures;
+          _cCharName := SAdvFeatures.cCharName;
+          _ValType := SAdvFeatures.ValType;
+          if _ValType = VAL_TYPE_CLASS then
+            _SysCode := GetSysCodeFromCatRec(SAdvFeatures.cCharValue);
+        end else
+          oGP_Log.Write('Характеристика с таким значением уже есть');
+      end else
+      begin
+        // Характеристики с таким наименованием нет
+        oGP_Log.Write('Характеристики нет, нужно добавить');
+        _TypeOp := TYPE_OP_ADD_CHAR;
+        _cCharName := LocateChar(_CharName);
+        if _cCharName != 0 then
+          // Определяем тип значения
+          if getFirst SCharTypes where ((_CharName == SCharTypes.CharName)) = tsOk then
+          begin
+            _ValType := SCharTypes.ValType;
+            _SysCode := SCharTypes.SysCode;
+          end else
+          begin
+            oGP_Log.Error('Не удалось определить тип значениея');
+            exit;
+          end;
+      end;
+
+      // Если есть необходимость в обновлении
+      if _TypeOp = TYPE_OP_REPLACE_VALUE or _TypeOp = TYPE_OP_ADD_CHAR then
+      begin
+        if _cCharName = 0 then
+          exit;
+        _cCharValue := 0;
+        if not DefineValue(_ValType, _SysCode, _cCharValue, _CharValue) then
+        begin
+          oGP_Log.Error('Не удалось определить значение');
+          exit;
+        end;
+
+        // Добавляем запись в таблицу SData с информацией об операции, которую нужно выполнить
+        // ClearBuffer(#SData); // Вызывать нет нужды - все поля присваиваются
+        SData.XlsRecNum := R;
+        SData.cStaffStruct := StaffStruct.NRec;
+        SData.TypeOp := _TypeOp;
+        SData.cAdvFeatures := _cAdvFeatures;
+        SData.cCharName := _cCharName;
+        SData.ValType := _ValType;
+        SData.cCharValue := _cCharValue;
+        SData.CharValue := _CharValue;
+        if insert current SData != tsOk then
+        begin
+          oGP_Log.Error('Не удалось добавить запись в таблицу SData (стр. ' + To_Char(R) + ')');
+          exit;
+        end;
+      end;
+    end;
+    result := true;
+  end;
+
+  // Обрабатывет одну строку входного файла
+  // Возвращает false, если значение в первой ячейке строки пустое
+  function ProcessRow(R: LongInt): Boolean;
+  var
+    _DepCode: String;
+    _StNum: String;
+    _Position: String;
+    _StCode: String;
+    _CharName: String;
+    _CharValue: String;
+    IsRecCorrect: Boolean;
+  begin
+    result := false;
+
+    // Если не инициализировать переменные Атланитс выдаёт предупреждение
+    // не обращая внимание на то, что эти переменные передаются по ссылке в другие функции
+    _DepCode := '';
+    _StNum := '';
+    _Position := '';
+    _StCode := '';
+    _CharName := '';
+    _CharValue := '';
+
+    xlOp(xlGetCellValue(R, 1, _DepCode), XE_GET_CELL_VALUE, 'Подразделение');
+    _DepCode := Trim(_DepCode);
+    if _DepCode = '' then
+      exit;
+    xlOp(xlGetCellValue(R, 2, _StNum), XE_GET_CELL_VALUE, 'Номер ставки');
+    _StNum := Trim(_StNum);
+    xlOp(xlGetCellValue(R, 3, _Position), XE_GET_CELL_VALUE, 'Должность');
+    _Position := Trim(_Position);
+    xlOp(xlGetCellValue(R, 4, _StCode), XE_GET_CELL_VALUE, 'Код тар. ставки');
+    _StCode  := Trim(_StCode );
+    xlOp(xlGetCellValue(R, 5, _CharName), XE_GET_CELL_VALUE, 'Наименование характеристики');
+    _CharName := Trim(_CharName);
+    xlOp(xlGetCellValue(R, 6, _CharValue), XE_GET_CELL_VALUE, 'Значение характеристики');
+    _CharValue := Trim(_CharValue);
+
+    oGP_Log.SetShift(1);
+    oGP_Log.StartOutToBuf;
+    oGP_Log.Write('');
+    oGP_Log.Write('Строка № ' + To_Char(R));
+    oGP_Log.IncShift;
+    oGP_Log.Write('Подразделение: ' + _DepCode);
+    oGP_Log.Write('Номер ставки: ' + _StNum);
+    oGP_Log.Write('Должность: ' + _Position);
+    oGP_Log.Write('Код тар. ставки: ' + _StCode);
+    oGP_Log.Write('Наименование характеристики: ' + _CharName);
+    oGP_Log.Write('Значение характеристики: ' + _CharValue);
+
+    IsRecCorrect := ProcessInFileRec(R, _DepCode, _Position, _StCode, _CharName, _CharValue);
+    if not IsRecCorrect then
+      BadRecCnt++;
+
+    // Если запись корректна и не включен вывод подробного лога
+    if IsRecCorrect and (pSettings and ST_FULL_LOG) = 0 then
+      // не выводим в лог ничего
+      oGP_Log.ClearBuf
+    else
+      // выводим информацию о записи и ошибках в лог
+      oGP_Log.WriteBuf;
+
+    result := true;
+  end;
+
+  // Ищет в Excel-файле страницу с данными и делает ее активной
+  function LocateDataSheet: Boolean;
+  var
+    I: LongInt;
+    C: Word;
+    SheetTitle: String;
+  begin
+    result := false;
+    C := 0;
+    xlOp(xlGetSheetsCount(C), XE_INIT_FILE, '');
+    for (I := 1; I <= C; I++)
+    begin
+      SheetTitle := '';
+      xlOp(xlGetSheetName(I, SheetTitle), XE_INIT_FILE, 'Страница ' + To_Char(I));
+      if SheetTitle = DATA_SHEET_NAME then
+      begin
+        xlOp(xlSetActiveSheet(I), XE_INIT_FILE, 'Страница ' + To_Char(I));
+        result := true;
+        exit;
+      end;
+    end;
+  end;
+
+  // Записывает данные из таблицы SData в БД
+  function ImportOneRec: Boolean;
+  var
+    _LastSeqNmb: Integer;
+  begin
+    result := false;
+    if getFirst StaffStruct where ((SData.cStaffStruct == StaffStruct.NRec)) != tsOk then
+      exit;
+
+    oGP_Log.SetShift(1);
+    oGP_Log.Write('');
+    oGP_Log.Write('Строка № ' + To_Char(SData.XlsRecNum));
+    oGP_Log.IncShift;
+    oGP_Log.Write('Подразделение: ' + ICatFunc.GetCatalogsCode(StaffStruct.Department));
+    oGP_Log.Write('Должность: ' + ICatFunc.GetCatalogsName(StaffStruct.Post));
+    oGP_Log.Write('Наименование характеристики: ' + ICatFunc.GetCatalogsName(SData.cCharName));
+    oGP_Log.Write('Значение характеристики: ' + if(SData.ValType = VAL_TYPE_CLASS, 
+     ICatFunc.GetCatalogsName(SData.cCharValue), SData.CharValue));
+    case SData.TypeOp of
+      TYPE_OP_REPLACE_VALUE: // Замена значения характеристики
+        begin
+          if getFirst AdvFeatures where ((SData.cAdvFeatures == AdvFeatures.NRec)) != tsOk then
+            exit;
+          AdvFeatures.ValType := SData.ValType;
+          if SData.ValType = VAL_TYPE_CLASS then
+            AdvFeatures.ValString := To_Char(SData.cCharValue, 20, 0)
+          else
+            AdvFeatures.ValString := Trim(AdvFeatures.ValString);
+          if update current AdvFeatures != tsOk then
+          begin
+            oGP_Log.Error('Не удалось обновить запись в таблице AdvFeatures');
+            exit;
+          end else
+            oGP_Log.Write('Значение характеристики изменено');
+        end;
+      TYPE_OP_ADD_CHAR: // Добавление характеристики
+        begin
+          _LastSeqNmb := 0;
+          if getLast AdvFeatures where ((2 == AdvFeatures.ObjType and StaffStruct.NRec == AdvFeatures.ObjNRec)) = tsOk then
+            _LastSeqNmb := AdvFeatures.SeqNmb;
+          else
+            _LastSeqNmb := 0;
+          ClearBuffer(#AdvFeatures);
+          AdvFeatures.ObjType := 2;
+          AdvFeatures.ObjNRec := StaffStruct.NRec;
+          AdvFeatures.SeqNmb := _LastSeqNmb + 1;
+          AdvFeatures.Position := SData.cCharName;
+          AdvFeatures.ValType := SData.ValType;
+          if SData.ValType = VAL_TYPE_CLASS then
+            AdvFeatures.ValString := To_Char(SData.cCharValue, 20, 0)
+          else
+            AdvFeatures.ValString := Trim(AdvFeatures.ValString);
+          if insert current AdvFeatures != tsOk then
+          begin
+            oGP_Log.Error('Не удалось добавить запись в таблицу AdvFeatures');
+            exit;
+          end else
+            oGP_Log.Write('Характеристика добавлена');
+        end;
+    end;
+    result := true;
+  end;
+
+  // Выполняем импорт данных
+  procedure DoImport;
+  var
+    R: LongInt;
+  begin
+    IsAborted := false;
+    BadRecCnt := 0;
+    ImpRecCnt := 0;
+
+    oGP_Log.Write('#(GPNam)');
+    oGP_Log.Write('Импорт из файла: ' + pFileName);
+    if not ExistFile(pFileName) then
+    begin
+      oGP_Log.Error('Не найден файл с именем "' + pFileName + '"');
+      exit;
+    end;
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Импорт данных...', 1);
+    _try
+    begin
+      oGP_Log.Write('');
+      oGP_Log.Write('Этап 1. Проверка корректности данных в файле');
+      // Считываем данные из xls-файла и проверяем их
+      xlOp(xlCreateExcelWithTemplate(pFileName, false), XE_OPEN_FILE, pFileName);
+      xlOp(xlIsExcelValid, XE_INIT_FILE, '');
+      if LocateDataSheet then
+      begin
+        if CheckFileFormat then
+        begin
+          R := FIRST_DATA_ROW;
+          while ProcessRow(R) do
+          begin
+            NextVisual;
+            R++;
+          end;
+        end else
+          oGP_Log.Error('Неверный формат файла');
+      end else
+        oGP_Log.Error('Не найдена страница с именем "' + DATA_SHEET_NAME + '"');
+      // Если ошибочных записей нет, записываем данные в БД
+      oGP_Log.SetShift(1);
+      oGP_Log.Write('');
+      if BadRecCnt = 0 then
+      begin
+        oGP_Log.SetShift(0);
+        oGP_Log.Write('');
+        oGP_Log.Write('Этап 2. Импорт данных');
+        _loop SData
+        begin
+          NextVisual;
+          if ImportOneRec then
+            ImpRecCnt++;
+        end;
+        if RecordsInTable(#SData) > 0 then
+          oGP_Log.Write('');
+        oGP_Log.Write('Импортировано записей: ' + To_Char(ImpRecCnt));
+        if RecordsInTable(#SData) > ImpRecCnt then
+          oGP_Log.Write('Не удалось импортировать: ' + To_Char(RecordsInTable(#SData) - ImpRecCnt));
+      end else
+      begin
+        oGP_Log.Write('Количество ошибочных записей во входном файле: ' + To_Char(BadRecCnt));
+        oGP_Log.Write('Импорт не выполнялся');
+      end;
+    end
+    _except on ExOnExecelError, ExUserBreak:
+      IsAborted := true;
+    _finally
+    begin
+      StopVisual('',0);
+      xlKillExcel;
+    end;
+  end;
+
+  // Кэширует таблицу AdvFeatures
+  procedure CacheAdvFeatures;
+  begin
+    _loop AdvFeatures where ((2 == AdvFeatures.ObjType))
+    begin
+      NextVisual;
+      ClearBuffer(#SAdvFeatures);
+      SAdvFeatures.cAdvFeatures := AdvFeatures.NRec;
+      SAdvFeatures.cStaffStruct := AdvFeatures.ObjNRec;
+      SAdvFeatures.cCharName := AdvFeatures.Position;
+      SAdvFeatures.CharName := ICatFunc.GetCatalogsName(AdvFeatures.Position);
+      SAdvFeatures.ValType := AdvFeatures.ValType;
+      if SAdvFeatures.ValType = VAL_TYPE_CLASS then
+      begin
+        SAdvFeatures.cCharValue := Comp(AdvFeatures.ValString);
+        SAdvFeatures.CharValue := ICatFunc.GetCatalogsName(SAdvFeatures.cCharValue);
+      end else
+        SAdvFeatures.CharValue := Trim(AdvFeatures.ValString);
+      if insert current SAdvFeatures != tsOk then
+      begin
+        oGP_Log.Error('Не удалось добавить запись в таблицу SAdvFeatures (AdvFeatures.NRec = ' + To_Char(AdvFeatures.NRec, 0, 0) + ')');
+        exit;
+      end;
+      if SAdvFeatures.cCharName != 0 and SAdvFeatures.CharValue != '' then
+        if getFirst SCharTypes where ((SAdvFeatures.cCharName == SCharTypes.cCharName)) != tsOk then
+        begin
+          ClearBuffer(#SCharTypes);
+          SCharTypes.cCharName := SAdvFeatures.cCharName;
+          SCharTypes.CharName := SAdvFeatures.CharName;
+          SCharTypes.ValType := SAdvFeatures.ValType;
+          if SCharTypes.ValType = VAL_TYPE_CLASS then
+            SCharTypes.SysCode := GetSysCodeFromCatRec(SAdvFeatures.cCharValue);
+          if insert current SCharTypes != tsOk then
+            oGP_Log.Error('Не удалось добавить запись в таблицу SCharTypes (AdvFeatures.NRec = ' + To_Char(AdvFeatures.NRec, 0, 0) + ')');
+        end;
+    end;
+  end;
+
+  HandleEvent
+    cmInit:
+      begin
+        if AskParam then
+        begin
+          oGP_Log.Init('#(GPInt).log', true, true, true);
+          oGP_Log.SetVerboseMode((pSettings and ST_FULL_LOG) != 0);
+          StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Кэширование каталогов...', 1);
+          CatDepRoot := ICatFunc.GetCatalogsNRec(CAT_DEP_SYS_CODE);
+          CatCharRoot := ICatFunc.GetCatalogsNRec(CAT_CHAR_SYS_CODE);
+          CacheAdvFeatures;
+          StopVisual('',0);
+          DoImport;
+          oGP_Log.Done(true);
+        end;
+        abort;
+      end;
+  end;
+
+end.
+
+//=[ Функции для подключения отчета ]=================================
+
+#include UserReport.vih
+
+vipinterface UserReport_GP_ImportDMS implements IUserReport;
+
+interface UserReport_GP_ImportDMS;
+
+  procedure Run;
+  begin
+    RunInterface('GP_ImportDMS');
+  end;
+
+  function GetReportName: String;
+  begin
+    result := '#(GPNam)';
+  end;
+
+  function GetGroupName(Level: Word): String;
+  begin
+    result := '';
+    case Level of
+      1: result := 'Компенсации и льготы';
+    end;
+  end;
+
+  function GetPriority: Integer;
+  begin
+    result := 0;
+  end;
+
+  function VisibleInModule(Ind: Byte): String;
+  begin
+    result := '';
+    case Ind of
+      1: result := 'STAFFMAINMENU';
+    end;
+  end;
+
+end.

@@ -1,0 +1,252 @@
+/*************************************************************************************************\
+* Наименование: Разработать интерфейс ввода нарядов                                               *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:  Перенос сумм аванса с расчета в лицевой счет                                  *
+\*************************************************************************************************/
+#include Query.vih
+
+
+interface GP_Avans_SetSumToLschet 'Установка суммы аванса в лицевой счет' escclose, cyan;
+  show at(0,0, 100,50);
+table struct tAvans
+(
+    cLsch     : comp
+  , avPlan    : double
+  , AvFact    : double
+  , Summa13   : double
+  , KollGotta : double
+  , Ndfl13    : double
+  , Ndfl15    : double
+) with index (
+   i01 = cLsch
+);
+
+var nDate : date;
+
+Create view
+var
+  _dateOtchPer  : date;
+  _log          :string;
+  _wMoveAvans   : word;
+as select
+  Persons.Fio
+from
+    tAvans
+  , Lschet
+  , Persons
+  , katpodr
+where
+ ((          root == Lschet.nrec
+  and Lschet.tperson == Persons.nrec
+  and Lschet.CEX  /== katpodr.nrec
+ ))
+ and   (Lschet.datuv=0
+    or  Lschet.datuv >= dgettune('UP.DATOTCH')
+       )
+ and not ( katpodr.kod  = '446'
+       or  katpodr.kod  = 'Вет'
+       or  katpodr.kod  = '_Профком'
+       or  katpodr.kod  = '_Студенты'
+       or  katpodr.kod  = '_ФИЗ ЛИЦ'
+       or  katpodr.kod  = ''
+         )
+;
+Procedure MyLog(_str: string);
+{
+//   If Upcase(UserName) = 'LAPUSHKOV_DV'
+//    {
+      LogStrToFile(_log,_str);
+//    }
+}
+Procedure MysqlAddStr(var query_handle: longInt; add_query_str: string);
+{
+   sqlAddStr(query_handle, add_query_str);
+   MyLog('sql: ' + add_query_str);
+} //Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
+
+function GetSumTruncate(_sum : double) : double;
+{
+  case wgettune('NPOEM_OWN.ZP.TRUNCATE_AVANS') of
+   0 : result := _sum // не обрезать
+   1 : result := Trunc(_sum, 0) // 1
+   2 : result := Trunc(_sum,-1) // 10
+   3 : result := Trunc(_sum,-2) // 100
+  end;
+}
+
+function CheckToMove(_datuv : date) : boolean;
+{
+  result := true;
+  if (_wMoveAvans = 1) then
+  {
+    if ((Month(_datuv) = Month(_dateOtchPer)) and (Year(_datuv) = Year(_dateOtchPer))) then
+    {
+      result := false;
+    }
+  }
+  //MyLog('_datuv = ' + _datuv + '_dateOtchPer = ' + _dateOtchPer + ' result = ' + result);
+}
+
+procedure SetAvans;
+{
+  _log := 'GP_Avans_SetSumToLschet_'+DateToSTr(cur_date,'YYYYMMDD') + '_' +TimeToStr(Cur_Time,'HHMMSS')+'.log';
+
+  StartNewVisual(vtRotateVisual, vfTimer, 'Он сказал поехали и махнул рукой', 0);
+  delete all tAvans;
+  set _dateOtchPer := dgettune('UP.DATOTCH');
+  set _wMoveAvans  := wGetTune('NPOEM_OWN.ZP.MOVE_FAKT_AVANS_TO_LSCHET');
+  //MyLog('_wMoveAvans = ' + _wMoveAvans);
+  setvisualheader('Запрос SQL');
+    var hstr : longint = 0;
+
+    MysqlAddStr(hstr, 'select                                               ');
+    MysqlAddStr(hstr, '    Lschet.nrec as cLsch                             ');
+    MysqlAddStr(hstr, '  , coalesce(tNdfl13.sumnach13,0) + coalesce(tNdfl15.sumnach15, 0) as avplan                           ');
+    MysqlAddStr(hstr, '  , coaLESCE(avan.sumav,0)+coaLESCE(avankassa.sumavkassa,0) as avfact        ');
+    MysqlAddStr(hstr, '  , coalesce(tNdfl13.sumnach13,0) + coalesce(tNdfl15.sumnach15, 0) as summa13                          ');
+    MysqlAddStr(hstr, '  , alim.sumalim as KollGotta                        ');
+    MysqlAddStr(hstr, '  , tNdfl13.Ndfl13                                   ');
+    MysqlAddStr(hstr, '  , tNdfl15.Ndfl15                                   ');
+    MysqlAddStr(hstr, 'from lschet                                          ');
+    MysqlAddStr(hstr, 'join katpodr on lschet.cex=katpodr.nrec              ');
+    MysqlAddStr(hstr, '                                                     ');
+    MysqlAddStr(hstr, 'left join (select clsch,sum(nachisl.summa) sumnach1 from nachisl, KlVidOpl where');
+    MysqlAddStr(hstr, ' (KlVidOpl.VidOpl = nachisl.VidOpls) and (KlVidOpl.VHVO[24] = ''+'') and ');
+    MysqlAddStr(hstr, 'mesn='+string(Month(_dateOtchPer))+' and yearn='+string(year(_dateOtchPer))+' group by clsch) nach on nach.clsch=lschet.nrec ');
+    MysqlAddStr(hstr, '                                                                     ');
+    MysqlAddStr(hstr, 'left join (select clsch,sum(uder.sumud) sumALIM from uder where      ');
+    MysqlAddStr(hstr, 'mesn='+string(Month(_dateOtchPer))+' and yearn='+string(year(_dateOtchPer))+'  and vidud in (232,234,432) group by clsch) alim on alim.clsch=lschet.nrec ');
+    MysqlAddStr(hstr, '                                                                                            ');
+    MysqlAddStr(hstr, 'left join (select clsch,sum(uder.sumud) sumAV from uder where                               ');
+    MysqlAddStr(hstr, 'mesn='+string(Month(_dateOtchPer))+' and yearn='+string(year(_dateOtchPer))+'  and vidud=226 group by clsch) AVAN on AVAN.clsch=lschet.nrec          ');
+    MysqlAddStr(hstr, '                                                                                            ');
+    MysqlAddStr(hstr, 'left join (select clsch,sum(curmonth.nozar) sumAVkassa from curmonth               ');
+! where mesn='+string(Month(_dateOtchPer))+' and yearn='+string(year(_dateOtchPer))+'
+    MysqlAddStr(hstr, ' group by clsch) AVANkassa on AVANkassa.clsch=lschet.nrec              ');
+    MysqlAddStr(hstr, '                                                                     ');
+    MysqlAddStr(hstr, 'left join (select clsch,sum(uder.sumud) Ndfl13, sum(uder.oblags) sumnach13 from uder, KlVidOpl where      ');
+    MysqlAddStr(hstr, 'mesn='+string(Month(_dateOtchPer))+' and yearn='+string(year(_dateOtchPer)));
+    MysqlAddStr(hstr, '  and (KlVidOpl.VidOpl = uder.VidOplUD) and (KlVidOpl.VHVO[24] = ''+'')');
+    MysqlAddStr(hstr, '  and (#comp(0) = uder.link2ud)');
+    MysqlAddStr(hstr, '  and vidud in (213,262) group by clsch) tNdfl13 on tNdfl13.clsch=lschet.nrec ');
+    MysqlAddStr(hstr, '                                                                     ');
+    MysqlAddStr(hstr, 'left join (select clsch,sum(uder.sumud) Ndfl15, sum(uder.oblags) sumnach15 from uder, KlVidOpl where      ');
+    MysqlAddStr(hstr, 'mesn='+string(Month(_dateOtchPer))+' and yearn='+string(year(_dateOtchPer)));
+    MysqlAddStr(hstr, '  and (KlVidOpl.VidOpl = uder.VidOplUD) and (KlVidOpl.VHVO[24] = ''+'')');
+    MysqlAddStr(hstr, '  and (#comp(0) = uder.link2ud)');
+    MysqlAddStr(hstr, '  and vidud = 221 group by clsch) tNdfl15 on tNdfl15.clsch=lschet.nrec ');
+    MysqlAddStr(hstr, '                                                                                            ');
+    MysqlAddStr(hstr, 'where (datuv=0 or  datuv >= #date('+datetostr(_dateOtchPer,'DD,MM,YYYY')+') )   and katpodr.kod  not in (''446'',''Вет'',''_Профком'',''_Студенты'',''_ФИЗ ЛИЦ'','''' )');
+
+  var objQuery: iQuery;
+    objQuery := queryManager.createQuery(hstr);
+  if objQuery.execute.errorCode != tsOk
+   then {
+      logstrtofile(_log,'Ошибка выполнения запроса '+ objQuery.errorCode);
+      }
+  else
+  {
+    sqlCopyInto(objQuery, tntAvans, true);
+  }
+   StopVisual;
+   StartNewVisual(vtIndicatorVisual, vfTimer, '', recordsintable(tntAvans));
+  _loop tAvans
+   {
+     SetVisualHeader('Установка сумм аванса');
+     nextvisual;
+     //MyLog('=============================================================================================');
+     // MyLog('tAvans.avPlan = ' + tAvans.avPlan + ' tAvans.AvFact = ' + tAvans.AvFact + ' tAvans.Summa13 = ' + tAvans.Summa13 + ' tAvans.KollGotta = ' + tAvans.KollGotta);
+     // MyLog('Lschet.avPlan = ' + Lschet.avPlan + ' Lschet.AvFakt = ' + Lschet.AvFakt + ' Lschet.Summa13 = ' + Lschet.Summa13 + ' Lschet.KOLLGOTA = ' + Lschet.KOLLGOTA);
+     If Getfirst Lschet where ((tAvans.cLsch == Lschet.nrec)) = tsOK
+      {
+        if ( CheckToMove(Lschet.datuv)) then {
+          //Mylog('CheckToMove(Lschet.datuv) = true');
+        if(   Lschet.avPlan <> tAvans.avPlan
+         or   Lschet.AvFakt <> tAvans.AvFact
+         or Lschet.Summa13 <> tAvans.Summa13
+         or Lschet.KOLLGOTA <> tAvans.KollGotta
+         or Lschet.Podnal   <> tAvans.Ndfl13
+         or Lschet.Summa48  <> tAvans.Ndfl15
+         )
+         then
+          {
+            //Mylog('Lschet.avPlan <> tAvans.avPlan  or   Lschet.AvFakt <> tAvans.AvFact or Lschet.Summa13 <> tAvans.Summa13 or Lschet.KOLLGOTA <> tAvans.KollGotta = true');
+
+              set Lschet.avPlan    := tAvans.avPlan;
+              set Lschet.AvFakt    := GetSumTruncate(tAvans.AvFact);
+              set Lschet.Summa13   := GetSumTruncate(tAvans.Summa13);
+              set Lschet.KOLLGOTA  := tAvans.KollGotta;
+              if(GetSumTruncate(tAvans.AvFact) > 0)
+              {
+                set Lschet.Podnal    := tAvans.Ndfl13;
+                set Lschet.Summa48   := tAvans.Ndfl15;
+                set Lschet.char8     := '+';
+                //set Lschet.DVIPAV    := date(27, month(dGetTune('UP.DATOTCH')), year(dGetTune('UP.DATOTCH')) ) ;
+
+                set Lschet.DVIPAV    := nDate;
+              }
+
+              Update current Lschet;
+          }
+      }
+      }
+   }
+   StopVisual;
+  rereadrecord;
+}
+
+screen sctAvans;
+  show at(1,1, 99,3);
+Fields
+  nDate (' Дата выплаты аванса')  : noProtect;
+<<
+  Дата выплаты аванса: .@@@@@@@@@@@@
+>>
+end;
+
+browse brtAvans;
+  show at(1,4, 99,49);
+table Lschet;
+ fields
+   Lschet.StrTabn   'Таб. номер': [10], Protect, nopickbutton ;
+   Persons.fio      'ФИО': [20], Protect, nopickbutton ;
+   katpodr.kod      'Подр': [20], Protect, nopickbutton;
+   Lschet.datuv     'Дата увольнения'     : Protect, nopickbutton;
+   Lschet.avPlan    'Аванс','плановый'    : [5.2,'\2p[|-]3666`666`666.88'], Protect, nopickbutton;
+   Lschet.AvFakt    'Аванс','фактический' : [5.2,'\2p[|-]3666`666`666.88'], Protect, nopickbutton;
+   Lschet.KollGota  'Аванс','Алименты'    : [5.2,'\2p[|-]3666`666`666.88'], Protect, nopickbutton;
+   Lschet.Podnal + Lschet.Summa48 'НДФЛ'  : [5.2,'\2p[|-]3666`666`666.88'], Protect, nopickbutton;
+  end;
+handleevent
+cminit:
+{
+  //set nDate := dGetTune('UP.DATOTCH');
+  set nDate := date(27, month(dGetTune('UP.DATOTCH')), year(dGetTune('UP.DATOTCH')) );
+  /*set nDate := if(Day_Of_Week(Date(Day(nDate), Month(nDate), Year(nDate))) = 7,
+                                                    Date(Day(nDate)-2, Month(nDate), Year(nDate)),
+                                                    if(Day_Of_Week(Date(Day(nDate), Month(nDate), Year(nDate))) = 6,
+                                                        Date(Day(nDate)-1, Month(nDate), Year(nDate)),
+                                                        Date(Day(nDate), Month(nDate), Year(nDate)))
+                                        );*/
+}
+cmValue1:
+{
+ SetAvans;
+}
+cmHotKeys:
+{
+ case CurTable of
+  #Lschet:
+   {
+    PutHotCommand(RunMenu('GP_Avans_SetSumToLschetPopup'));
+   }
+  end;
+}
+end;
+end.
+
+
+GP_Avans_SetSumToLschetPopup menu
+{
+  - 'Установить аванс на основе расчета', cmValue1, 'Установить аванс на основе расчета' ,hcNoContext, '', , sci1Esc;
+}
