@@ -12,7 +12,7 @@ del Atlantis*.res
 
 @set exedir=C:\Galaktika\AVAZ\avaz_ptz\Exe_support
 
-@%exedir%\vip.EXE Vip.prj /r:STAFF.res /c:vip.cfg /u:supervisor /def:Atl60
+@%exedir%\vip.EXE STAFF.prj /r:STAFF.res /c:vip.cfg /u:supervisor /def:Atl60
 @%exedir%\FRRES.EXE /to /r:STAFF.res /source:fr3
 
 rem /c:support_res.cfg

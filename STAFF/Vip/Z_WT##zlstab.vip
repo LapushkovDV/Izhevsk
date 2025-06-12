@@ -1,0 +1,879 @@
+/*************************************************************************************************\
+* Наименование:  Ведение заказов/проектов - Распределение ФОТ работников по заказам               *
+* Контур/Модуль: Заработная плата                                                                 *
+* Примечание:    Доработка табеля учета рабочего времени                                          *
+*                Контейнер для данных табеля учета рабочего времени                               *
+* #178 При задании даты закрытия/обработки табеля необходимо проверять наличие необработанных     *
+*      нарушений в СКУД. При наличии таковых запрещать устанавливать дату                         *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+* Разработка  |#767          |10/09/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#1138         |06/11/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+* Разработка  |#1236         |10/11/17|Тищенко Р.Н.             |НПО Энергомаш                    *
+* Разработка  |#178          |03/12/17|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#3574         |31/10/18|Кириллов Э.П.            |НПО Энергомаш                    *
+* Разработка  |#87938        |16/01/25|Семичев П.В.             |НПО Энергомаш                    *
+\*************************************************************************************************/
+//'Z_WT::ZLSTAB.WORKINGTABLEWINDOW.WTCONTAINEREMBEDDED.Z_WT##WTCONTAINER.PAGE4.Z_WT::WTHANDCORRECTIONMASK.HANDCORRECTIONBROWSE.MASKWORKINGHOURSSTR'
+//VII. Доработка табеля учета рабочего времени
+/*
+SD-87938
+Изменение логики сохранения исходных табелей - теперь табель сохраняется при проставлении поля "Дата проверки"
+Если месяц табеля больше или равен месяцу из настройки с текущим периодом - происходит сохранение, в противном
+случае - копия табеля не перезатирается.
+Данная доработка потребовалась, так как между проверкой табеля и созданием копии по старой технологии (через
+пункт меню "Просмотр исходного табеля") могло пройти некоторое время, за которое бухгалтерия успевала провести
+несколько приказов по изменению табеля, по этим приказам не формировались корректировочные начисления.
+  Изменение принципа отображение признака корректировки в табеле. Раньше признак отображался, если была
+сохраненная копия, теперь такая копия есть всегда. Признак появляется если в сохраненной копии и рабочем табеле
+есть расхождение в отработанных часах или если буквенное обозначение графика изменилось с "НН" на "Б"
+
+Upd_18.02.2025 Теперь признак "Корр" ставится не только при изменении с "НН" на "Б" а и просто если было "НН",
+а стало что-то другое. Пока так, но чувствую будут еще изменения...
+Upd_21.03.2025 Добавление к проставлению признака корректировки - если было что-то, а стало "Б" - тоже ставим "корр"
+*/
+
+#doc
+ Доработка табеля учета рабочего времени
+#end
+#include GetKau.Vih
+#include GP_SCUD_EventsEdit.Vih
+#include GP_SCUD_MisConDuctEdit.Vih
+#include Z_WT##WTCOSTSHARING.vih
+#include Z_WT##WTSCUD_Events.vih
+#include Z_WT##WTSCUD_MisConDuct.vih
+#include GP_FormT12.vih
+
+#component "Z_WT"
+
+function LikeATableTime(var s: string): boolean; external 'G_WORKTABLE.DLL';
+
+//=======================================
+Alter Interface zlstab;//Wt_tabel.Vip
+//=======================================
+
+  OverLoad
+    Procedure ReReadWorkingTable;
+    procedure ReFreshAdjacentInfo;
+    procedure HotKeys;
+//------------------------------------------------------------------------------
+    procedure SetCheckDate(Value: date); //закрываем полностью
+    procedure UpdateCheckDate;
+  end;
+
+  //------------------------------------------------------------------------------
+  #include GetKau.Var
+  #include GP_Func_ZP.Var
+  #include GP_FormT12.var
+
+  var WTCOSTSHARING    :  IWTCOSTSHARING;
+  var WTSCUD_Events    :  IWTSCUD_Events;
+  var WTSCUD_MisConDuct:  IWTSCUD_MisConDuct;
+  //------------------------------------------------------------------------------
+  var wKodAnalitik :word;//код "избранная аналитика"
+  var pTmp         :comp;
+  //---------------------------------------
+  var iGP_SCUD_EventsEdit    :GP_SCUD_EventsEdit;
+  var iGP_SCUD_MisConDuctEdit:GP_SCUD_MisConDuctEdit;
+  //----------------- настройки
+  var Tabel_Check_SCUD_on_Close:word;//'Контролировать нарушения по СКУД при установки даты проверки'
+  var Tabel_SCUD_PANEL         :word;//отображать события СКУД в табеле
+  var Tabel_SCUD_MisConduct    :word;//Отображать нарушения СКУД в табеле
+  //------------------------------------------------------------------------------
+
+  function DayInfoBr(D: Word): String[5]; forward;
+  function DayColorBr(I: Integer): Integer; forward;
+  function DayBoldBr(I: Word): Boolean; forward;
+  function GetDaysBr: Double; forward;
+  function GetHoursBr: String; forward;
+  function IsKorr : boolean; forward;
+
+  create view
+    as select
+      (GetDaysBr) (FieldName = DaysBr),
+      (GetHoursBr) (FieldName = HoursBr),
+      DayInfoBr(1) (FieldName = DayInfoBr1),
+      DayInfoBr(2) (FieldName = DayInfoBr2),
+      DayInfoBr(3) (FieldName = DayInfoBr3),
+      DayInfoBr(4) (FieldName = DayInfoBr4),
+      DayInfoBr(5) (FieldName = DayInfoBr5),
+      DayInfoBr(6) (FieldName = DayInfoBr6),
+      DayInfoBr(7) (FieldName = DayInfoBr7),
+      DayInfoBr(8) (FieldName = DayInfoBr8),
+      DayInfoBr(9) (FieldName = DayInfoBr9),
+      DayInfoBr(10) (FieldName = DayInfoBr10),
+      DayInfoBr(11) (FieldName = DayInfoBr11),
+      DayInfoBr(12) (FieldName = DayInfoBr12),
+      DayInfoBr(13) (FieldName = DayInfoBr13),
+      DayInfoBr(14) (FieldName = DayInfoBr14),
+      DayInfoBr(15) (FieldName = DayInfoBr15),
+      DayInfoBr(16) (FieldName = DayInfoBr16),
+      DayInfoBr(17) (FieldName = DayInfoBr17),
+      DayInfoBr(18) (FieldName = DayInfoBr18),
+      DayInfoBr(19) (FieldName = DayInfoBr19),
+      DayInfoBr(20) (FieldName = DayInfoBr20),
+      DayInfoBr(21) (FieldName = DayInfoBr21),
+      DayInfoBr(22) (FieldName = DayInfoBr22),
+      DayInfoBr(23) (FieldName = DayInfoBr23),
+      DayInfoBr(24) (FieldName = DayInfoBr24),
+      DayInfoBr(25) (FieldName = DayInfoBr25),
+      DayInfoBr(26) (FieldName = DayInfoBr26),
+      DayInfoBr(27) (FieldName = DayInfoBr27),
+      DayInfoBr(28) (FieldName = DayInfoBr28),
+      DayInfoBr(29) (FieldName = DayInfoBr29),
+      DayInfoBr(30) (FieldName = DayInfoBr30),
+      DayInfoBr(31) (FieldName = DayInfoBr31),
+      //if(IsValidAll(tnGP_TimeTable), 'К', '') (FieldName = TabHasCopy)
+      if(IsKorr(), 'К', '') (FieldName = TabHasCopy)
+    from 
+      GP_TimeTable
+    where ((
+          LSTab.cLSchet == GP_TimeTable.cLSchet
+      and LSTab.YearN   == GP_TimeTable.YearN
+      and LSTab.MesN    == GP_TimeTable.MonthN
+    ))
+  ;
+
+
+  //--------------------------
+  create view vScud
+  var
+    pPersons:comp;
+    wYearRas, wMonthRas:word;
+  as select GP_SCUD_Pers.Nrec
+  From GP_SCUD_Pers, Tmp_Scud_MisConDuct
+  where ((
+        pPersons == GP_SCUD_Pers.cPersons
+    and GP_SCUD_Pers.Nrec == Tmp_Scud_MisConDuct.cGP_SCUD_PERS
+    and wYearRas          == Tmp_Scud_MisConDuct.YearN
+    and wMonthRas         == Tmp_Scud_MisConDuct.MesN
+  ))  ;
+
+
+  //-------------------------------------------------------
+//  overloadFormats WorkingTableBrowse, PersonalTableBrowse;
+  extendFormats WorkingTableBrowse, PersonalTableBrowse;
+  //-------------------------------------------------------
+
+function IsKorr : boolean;
+var i : byte;
+    ChasfDay : double;
+    dDate, dDatePer : date;
+{
+  Result := false;
+
+  dDate := date(1,LSTab.MesN, LSTab.YearN);
+  dDatePer := date(1, month(dGetTune('UP.DATOTCH')), year(dGetTune('UP.DATOTCH')));
+
+  if (dDatePer <= dDate)//если табель не за прошедший отчетный период - не выводим признак корректировки
+    exit;
+
+  if not IsValidAll(tnGP_TimeTable)
+    exit;
+
+  _loop GP_TimeTable
+	{
+    i := Day(gp_TimeTable.DBeg);
+		do
+    {
+      if lstab.DAYCHF[i]>100
+        ChasfDay:=0;
+      else
+        ChasfDay:=lstab.daychf[i];
+
+			if (ChasfDay<>gp_timeTable.DHOURS[i]) or
+         (LoCase(trim(lstab.DAYS[i])) <> LoCase(trim(gp_timeTable.dMark[i])) and
+          (LoCase(trim(gp_timeTable.dMark[i])) = 'нн' or LoCase(trim(lstab.DAYS[i])) = 'б'))
+			{
+        Result := true;
+        exit;
+			}
+			i++;
+		}
+		while (i<day(gp_TimeTable.DEnd)+1)
+	}
+
+}
+
+  #define DayInfoFieldBr(N) DayInfoBr#N '#N' ('День месяца'): [5], protect, noAutoSize, centered, {Font={Color=DayColorBr(#N); Bold = DayBoldBr(#N)}};
+
+  #declare DayInfoFields
+    DaysBr 'Дней' ('Итого рабочих дней'): [5], protect, noAutoSize, centered;
+    HoursBr  'Часов' ('Итого рабочих часов'): [6], protect, noAutoSize, centered;
+    #DayInfoFieldBr(1)
+    #DayInfoFieldBr(2)
+    #DayInfoFieldBr(3)
+    #DayInfoFieldBr(4)
+    #DayInfoFieldBr(5)
+    #DayInfoFieldBr(6)
+    #DayInfoFieldBr(7)
+    #DayInfoFieldBr(8)
+    #DayInfoFieldBr(9)
+    #DayInfoFieldBr(10)
+    #DayInfoFieldBr(11)
+    #DayInfoFieldBr(12)
+    #DayInfoFieldBr(13)
+    #DayInfoFieldBr(14)
+    #DayInfoFieldBr(15)
+    #DayInfoFieldBr(16)
+    #DayInfoFieldBr(17)
+    #DayInfoFieldBr(18)
+    #DayInfoFieldBr(19)
+    #DayInfoFieldBr(20)
+    #DayInfoFieldBr(21)
+    #DayInfoFieldBr(22)
+    #DayInfoFieldBr(23)
+    #DayInfoFieldBr(24)
+    #DayInfoFieldBr(25)
+    #DayInfoFieldBr(26)
+    #DayInfoFieldBr(27)
+    #DayInfoFieldBr(28)
+    #DayInfoFieldBr(29)
+    #DayInfoFieldBr(30)
+    #DayInfoFieldBr(31)
+  #end
+
+tree WorkingTableBrowse (,hcWT_TABEL,sci1478EscInsC8CC);
+  show at (,,,19);
+  QSearchPosChanged;
+  table SWRKTABLE;
+  fields
+/*     {Font={Color=if(LSTAB_MarkerStr <> '', ColorMark, 0)}};
+      LSTab_MarkerStr: [1], skip, noAutoSize;
+      SWrkTable.TabN 'Таб.№' ('Табельный номер'): [10], protect, noAutoSize;
+      SWrkTable.StrTabN 'Таб.№' ('Табельный номер'): [10], protect, noAutoSize;
+      Persons.FIO 'Работник' ('Работник'): [30], protect, noAutoSize, noDel;
+      TableDepartment.KOD  'Код подр.' ('Код подразделения отнесения затрат', hcperexod): [7], protect;
+      TableDepartment.Name 'Подразделение' ('Подразделение отнесения затрат', hcperexod): [20], protect;
+      TabHasCopy 'Корр.' ('Признак корректировки табеля'): [6], protect, noAutoSize, centered;
+      LSTab.LastDate 'Проверен'('Дата последней проверки табеля'): [10], protect, noAutoSize, centered, noDel;
+*/
+    TableDepartment.KOD  'Код подр.' ('Код подразделения отнесения затрат', hcperexod): [7], protect;
+    TabHasCopy 'Корр.' ('Признак корректировки табеля'): [6], protect, noAutoSize, centered;
+!      LSTab.LastDate 'Проверен'('Дата последней проверки табеля'): [10], protect, noAutoSize, centered, noDel;
+
+    #DayInfoFields
+end;
+
+tree PersonalTableBrowse  (,hcWT_TABEL,sci1478EscInsC8CC);
+  show at (,,,19);
+  table SWRKTABLE;
+  fields
+/*
+    {Font={Color=if(LSTAB_MarkerStr <> '', ColorMark, 0)}};
+      LSTab_MarkerStr: [1], skip, noAutoSize;
+      SWrkTable.Year 'Год' ('Год'): [4], protect, noAutoSize;
+      MonthName 'Месяц' ('Месяц',,): [8], protect, noAutoSize;
+      TableDepartment.KOD  'Код подр.' ('Код подразделения отнесения затрат', hcperexod): [7], protect;
+      TableDepartment.Name 'Подразделение' ('Подразделение отнесения затрат', hcperexod): [20], protect;
+      TabHasCopy 'Корр.' ('Признак корректировки табеля'): [6], protect, noAutoSize, centered;
+      LSTab.LastDate 'Проверен'('Дата последней проверки табеля'): [10], protect, noAutoSize, centered, noDel;
+*/
+    TableDepartment.KOD  'Код подр.' ('Код подразделения отнесения затрат', hcperexod): [7], protect;
+    TabHasCopy 'Корр.' ('Признак корректировки табеля'): [6], protect, noAutoSize, centered;
+!      LSTab.LastDate 'Проверен'('Дата последней проверки табеля'): [10], protect, noAutoSize, centered, noDel;
+
+    #DayInfoFields
+end;
+
+  var
+    DayInfoBrVisible: Boolean = true;
+
+  procedure SwitchDayInfoBr(_Visible: Boolean);
+  {
+    if (DayInfoBrVisible = _Visible)
+      exit;
+    ToggleFieldVisible(#DaysBr, _Visible);
+    ToggleFieldVisible(#HoursBr, _Visible);
+    ToggleFieldVisible(#DayInfoBr1, _Visible);
+    ToggleFieldVisible(#DayInfoBr2, _Visible);
+    ToggleFieldVisible(#DayInfoBr3, _Visible);
+    ToggleFieldVisible(#DayInfoBr4, _Visible);
+    ToggleFieldVisible(#DayInfoBr5, _Visible);
+    ToggleFieldVisible(#DayInfoBr6, _Visible);
+    ToggleFieldVisible(#DayInfoBr7, _Visible);
+    ToggleFieldVisible(#DayInfoBr8, _Visible);
+    ToggleFieldVisible(#DayInfoBr9, _Visible);
+    ToggleFieldVisible(#DayInfoBr10, _Visible);
+    ToggleFieldVisible(#DayInfoBr11, _Visible);
+    ToggleFieldVisible(#DayInfoBr12, _Visible);
+    ToggleFieldVisible(#DayInfoBr13, _Visible);
+    ToggleFieldVisible(#DayInfoBr14, _Visible);
+    ToggleFieldVisible(#DayInfoBr15, _Visible);
+    ToggleFieldVisible(#DayInfoBr16, _Visible);
+    ToggleFieldVisible(#DayInfoBr17, _Visible);
+    ToggleFieldVisible(#DayInfoBr18, _Visible);
+    ToggleFieldVisible(#DayInfoBr19, _Visible);
+    ToggleFieldVisible(#DayInfoBr20, _Visible);
+    ToggleFieldVisible(#DayInfoBr21, _Visible);
+    ToggleFieldVisible(#DayInfoBr22, _Visible);
+    ToggleFieldVisible(#DayInfoBr23, _Visible);
+    ToggleFieldVisible(#DayInfoBr24, _Visible);
+    ToggleFieldVisible(#DayInfoBr25, _Visible);
+    ToggleFieldVisible(#DayInfoBr26, _Visible);
+    ToggleFieldVisible(#DayInfoBr27, _Visible);
+    ToggleFieldVisible(#DayInfoBr28, _Visible);
+    ToggleFieldVisible(#DayInfoBr29, _Visible);
+    ToggleFieldVisible(#DayInfoBr30, _Visible);
+    ToggleFieldVisible(#DayInfoBr31, _Visible);
+    DayInfoBrVisible := _Visible;
+  }
+
+  var
+    LoadedTabcLSchet: Comp = 0;
+    LoadedTabMesN: Word = 0;
+    LoadedTabYearN: Word = 0;
+
+  // При необходимости загружает табель
+  function LoadTab: Boolean;
+  {
+    result := true;
+    if (not (LoadedTabcLSchet = LSTab.cLSchet and LoadedTabMesN = LSTab.MesN and LoadedTabYearN = LSTab.YearN))
+      if (LoadWorkingTable(LSTab.cLSchet, LSTab.MesN, LSTab.YearN) = 0)
+      {
+        LoadedTabcLSchet := LSTab.cLSchet;
+        LoadedTabMesN := LSTab.MesN;
+        LoadedTabYearN := LSTab.YearN;
+      } else
+        result := false;
+  }
+
+  // Информация о дне для отображения в браузере
+  // Копия функции DayInfoBr но без сдвига в зависимости от дня недели
+  function DayInfoBr(D: Word): String[5];
+  {
+    if (not DayInfoBrVisible)
+      exit;
+    // Если такой день не существует, выводим "-"
+    if (D > Last_Day(To_Date(1, LSTab.MesN, LSTab.YearN)))
+    {
+      result := '-';
+      exit;
+    }
+    // введенные вручную значения должны отображаться "как есть"
+    if (IsFieldModified(FieldNum(LSTab.DAYCHF[D])))
+    {
+      result := if (LSTab.DAYCHF[D] <> 0, Time2StrDef(LSTab.DAYCHF[D]), Mrg.MirageDays(LSTab.Days[D]));
+      exit;
+    }
+    // 102.133561
+    // Если строка пометки дня содержит часы, представить их в правильном формате.
+    // К сожалению, не можем запрашивать состояние вещей с помощью функций, так как
+    // табель может быть недопереформирован (протухший), и нужно светить не актуальное,
+    // а именно из протухшего табеля.
+    // Ясен пень, делается допущение, что никто не будет заводить в классификаторе УО
+    // обозначение, похожее на часы. Ситуацию улучшает тот факт, что часы в поле LSTab.Days
+    // пишутся в одном и том же формате, независимо от настроек.
+    if (LikeATableTime(LSTab.Days[D]))
+    {
+      // LikeATableTime гарантирует, что это как минимум будет корректный double, с точностью до обрамляющих пробелов.
+      var dTime: double=0;
+      /*
+      Увы, в LSTab.Days всего 5 символов, из-за чего сильно страдает точность.
+      Но мы то знаем, что в LSTab.Days значение попадает из LSTab.DayChF и можем брать его, как более точное
+      (если ничего не разошлось...)
+      */
+      if (LSTab.Days[D] = To_Char(LSTab.DayChF[D]))
+        dTime := LSTab.DAYCHF[D];
+      else
+        dTime := Double(Trim(LSTab.Days[D]));
+      result := Time2StrDef(dTime);
+      exit;
+    }
+    result := Mrg.MirageDays(LSTab.Days[D]);
+  }
+
+  // Возвращает цвет, которым нужно выводить информацию по дню
+  function DayColorBr(I: Integer): Integer;
+  {
+    result := 0;
+    if (not DayInfoBrVisible)
+      exit;
+    if (not LoadTab)
+      exit;
+
+    if (HighlightDays and WT_IsFilterSet and (not WT_IsDayValid(I, false) or not WT_IsDayEnabled(I)))
+    {
+      result := ColorGray;
+      exit;
+    }
+
+    if (WT_GetHoursInDayEx(I, hkWholeWeekendHoliday, stActual, 0) > 0)
+    {
+      result := ColorSysFuchsia;
+      exit;
+    }
+
+    if (WT_TestDay(I, dkHoliday, stActual))
+    {
+      result := ColorNotOk;
+      exit;
+    }
+
+    if (WT_GetHoursInDayEx(I, hkWholeWeekend, stActual, 0) > 0)
+    {
+      result := ColorMark;
+      exit;
+    }
+  }
+
+  // Возвращает true, если нужно вывести информацию по дню жирным шрифтом
+  function DayBoldBr(I: Word): Boolean;
+  {
+    result := false;
+    if (not DayInfoBrVisible)
+      exit;
+    if (LoadTab)
+      result := WT_IsDayValid(I, false) and WT_IsDayEnabled(I);
+  }
+
+  // Итого рабочих дней
+  function GetDaysBr: Double;
+  {
+    result := 0;
+    if (not DayInfoBrVisible)
+      exit;
+    if (LoadTab)
+      result := WT_GetDays(dkWorking, stActual);
+  }
+
+  // Итого рабочих часов
+  function GetHoursBr: String;
+  {
+    result := 0;
+    if (not DayInfoBrVisible)
+      exit;
+    if (LoadTab)
+      result := Time2StrDef(WT_GetHours(hkWorking, stActual));
+  }
+
+  procedure ShowTimeTotals;
+  {
+    PushPos(#SWrkTable);
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Анализ данных...', 1);
+    var IsAborted: Boolean = false;
+    var TotalDays: Double = 0;
+    var TotalHours: Double = 0;
+    _try
+    {
+      _loop SWrkTable
+      {
+        NextVisual;
+        if (LoadTab)
+        {
+          TotalDays += WT_GetDays(dkWorking, stActual);
+          TotalHours += WT_GetHours(hkWorking, stActual);
+        }
+      }
+    }
+    _except
+      on ExUserBreak:
+        IsAborted := true;
+    _finally
+    {
+      StopVisual('', 0);
+      PopPos(#SWrkTable);
+    }
+    if (not IsAborted)
+      Message('Итого дней: ' + To_Char(TotalDays, 0, 0) + 
+       ''#13'Итого часов: ' + Time2StrDef(TotalHours));
+  }
+
+  // Вызов контекстного меню
+  procedure HotKeys;
+  {
+    case CurTable of
+      #LSTab, #SWrkTable, tnNoTable:
+        if (CurWindow = wnMainWindow or CurField <> #LSTab.SovProc)
+          PutHotCommand(RunDynMenu('Z_WT::WorkingTablePopUp;SEPARATOR;Z_WT::mnuLSTabCopies'));
+        else
+          PutHotCommand(RunDynMenu('z_wt::WorkingTablePopUp;SEPARATOR;z_wt::PayRollAvgFactorPopup'));
+    end;
+  }
+
+  //------------------------------------------------------------------------------
+  //178 Контролировать по СКУДУ наличие нарушения
+  //
+  //------------------------------------------------------------------------------
+  Function Chk_Scud_MisConDuct(_boMes:boolean=false):boolean;
+  var _sMes:string;
+  {
+     Result:=true;
+     vScud.pPersons:=LsTab.tPerson;
+     if vScud.getfirst GP_Scud_Pers<>tsok
+     { _sMes:='Для '+GetStrTabn(LsTab.Tabn,LsTab.StrTabn)+ ' '+PERSONS.FIO
+        +' нет записи в справочнике СКУД';
+       if _boMes
+       { message(_sMes);
+       }
+       else
+       { displ(_sMes);
+       }
+     } //if vScud.getfirst GP_Scud_Pers<>tsok
+     _sMes:='';
+     //пересчитаем сальдо
+     iGP_SCUD_EventsEdit.CalcAll(vScud.GP_Scud_Pers.Nrec,LsTab.YearN,LsTab.MesN,2,false);
+     vScud.wYearRas :=LsTab.YearN;
+     set vScud.wMonthRas:=LsTab.MesN;
+
+     if vScud.getfirst Tmp_Scud_MisConDuct=tsok
+     vScud._loop Tmp_Scud_MisConDuct
+     { if vScud.Tmp_Scud_MisConDuct.DT_Ev=ZeroDate continue;
+       // есть ссылка на заявление - пропускаем
+       if vScud.Tmp_Scud_MisConDuct.cMisConDuct>0 then continue;
+       //Невыявленная неявка - не обрабатываем.
+       if vScud.Tmp_Scud_MisConDuct.wMisConDuct=6
+       { if (LsTab.Days[Day(vScud.Tmp_Scud_MisConDuct.DT_Ev)]='НН'
+          or LSTAB.DAYCHF[Day(vScud.Tmp_Scud_MisConDuct.DT_Ev)]=0)
+           continue;
+       }
+       if Result
+       { _smes:=GetStrTabn(LsTab.Tabn,LsTab.StrTabn)+ ' '+PERSONS.FIO;
+         if not _boMes
+         { displ(_sMes);
+         }
+       }
+       Result:=false;
+       if not _boMes _sMes:=''
+       else
+       { _sMes:=_sMes+if(_sMes<>'',chr(13),'') ;
+       }
+       _sMes:=_sMes+DateToStr(vScud.Tmp_Scud_MisConDuct.DT_Ev,'DD.MM.YYYY ')
+            + TimeToStr(vScud.Tmp_Scud_MisConDuct.TM_Ev,' HH:MM' )
+            + ', Нарушено на '+String(iGP_SCUD_EventsEdit.GetDoubleFromTime(vScud.Tmp_Scud_MisConDuct.tDiff),0,2)
+            + ', '+iGP_SCUD_MisConDuctEdit.GetMisConDuctTypeName(vScud.Tmp_Scud_MisConDuct.wMisConDuct)
+            ;
+       if Length(_SMes)>200 break;
+     } //vScud._loop Tmp_Scud_MisConDuct
+     if not Result
+     if _boMes
+     { message(_sMes);
+     }
+     else
+     { displ(_sMes);
+     }
+  }  //Function Chk_Scud_MisConDuct(_boMes:boolean_:boolean;
+
+  //------------------------------------------------------------------------------
+  procedure UpdateCheckDate;
+  {
+    if boGetTune('UP.ZAR.WT.UpdateCheckDate') and not IsFieldModified(#LSTAB.LASTDATE)
+    //GP
+    { if Tabel_Check_SCUD_on_Close>0
+        if not Chk_Scud_MisConDuct
+        { if Tabel_Check_SCUD_on_Close=1
+            exit;
+        }
+      //GP
+        SET LSTAB.LASTDATE := Cur_Date;
+
+    }
+  }
+
+  procedure CreateCopyTabel(bufLSTab : Type$LSTab);
+  {
+    oGP_FormT12.CreateCopy(Cur_Date, bufLSTab.cLSchet, bufLSTab.MesN, bufLSTab.YearN, true, false);
+  }
+  //------------------------------------------------------------------------------
+  //178 Контролировать по СКУДУ наличие нарушения
+  // забираем целиком установку даты закрытия.
+  //------------------------------------------------------------------------------
+  procedure SetCheckDate(Value: date);
+  {
+    //GP
+    //'Z_WT::ZLSTAB.WORKINGTABLEWINDOW.WORKINGTABLESCREEN.LSTAB.LASTDATE'
+    Tabel_Check_SCUD_on_Close:=0;//'Контролировать нарушения по СКУД при установки даты проверки'
+    if ExistTune('NPOEM_OWN.Tabel.Check_SCUD_on_Close')
+      Tabel_Check_SCUD_on_Close:=wGetTune('NPOEM_OWN.Tabel.Check_SCUD_on_Close');
+    //-------------------------------
+    var Marked: boolean;
+
+    var dDatePer : date = date(1, month(dGetTune('UP.DATOTCH')), year(dGetTune('UP.DATOTCH')));
+#ifnDef _After_2021_10_20_
+    Marked := GetMarkerCount(LSTAB_Markers) > 0;
+    if (not Marked)
+      InvertMarker(LSTAB_Markers, LSTAB.NREC);
+#else
+    Marked := PMarker.Count > 0;
+    if (not Marked)
+      PMarker.MarkUnMarkRec(LSTAB.NREC);
+#end
+
+#ifnDef _After_2021_10_20_
+    if (GetMarkerCount(LSTAB_Markers) > 0)
+#else
+ if PMarker.Count > 0
+#end
+    {
+      var Broken: boolean;
+
+      Broken := false;
+      PushPos(#LSTAB);
+
+      StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak, 'Установка даты проверки',
+#ifnDef _After_2021_10_20_
+      GetMarkerCount(LSTAB_Markers)
+#else
+      PMarker.Count
+#end
+      );
+
+      _try
+      {
+#ifnDef _After_2021_10_20_
+        var I: longint;
+        var Marker: comp;
+        for (I := 0; I < GetMarkerCount(LSTAB_Markers); I := I + 1)
+          if (GetMarker(LSTAB_Markers, I, Marker))
+          {
+            //GP
+            if Tabel_Check_SCUD_on_Close>0
+            { if getfirst LSTAB where ((Marker == LSTAB.NREC))=tsok {}
+              if not Chk_Scud_MisConDuct
+                if Tabel_Check_SCUD_on_Close=1
+                { displ('Дата проверки табеля не установлена');
+                  Continue;
+                }
+            } //if Tabel_Check_SCUD_on_Close>0
+            //END GP
+            if not boGetTune('UP.ZAR.WT.MakeCheckedReadOnly')
+              update LSTAB where ((Marker == LSTAB.NREC)) set LSTAB.LASTDATE := Value
+            else if (boGetTune('UP.ZAR.WT.MakeCheckedReadOnly') and (day(Value) <> 0) )
+              update LSTAB where ((Marker      == LSTAB.NREC and
+                                   Date(0,0,0) == LSTAB.LASTDATE(noindex) )) set LSTAB.LASTDATE := Value;
+
+            if getfirst LSTAB where ((Marker == LSTAB.NREC)) = tsOK
+              if (LSTAB.LASTDATE != ZeroDate) and (dDatePer <= date(1, LSTab.MesN, LSTab.YearN))
+                CreateCopyTabel(LSTAB.buffer);
+          }
+#else
+          _loop PMarker where (( 0 << PMarker.pNrec ))
+            {
+                if Tabel_Check_SCUD_on_Close>0
+                { if getfirst LSTAB where ((PMarker.pNrec == LSTAB.NREC))=tsok {}
+                  if not Chk_Scud_MisConDuct
+                    if Tabel_Check_SCUD_on_Close=1
+                    { displ('Дата проверки табеля не установлена');
+                      Continue;
+                    }
+                } //if Tabel_Check_SCUD_on_Close>0
+              if not boGetTune('UP.ZAR.WT.MakeCheckedReadOnly')
+                update LSTAB where ((PMarker.pNrec == LSTAB.NREC)) set LSTAB.LASTDATE := Value
+              else
+                if (boGetTune('UP.ZAR.WT.MakeCheckedReadOnly') and (day(Value) <> 0) )
+                  update LSTAB where ((PMarker.pNrec      == LSTAB.NREC and
+                                       Date(0,0,0) == LSTAB.LASTDATE(noindex) )) set LSTAB.LASTDATE := Value;
+
+              if getfirst LSTAB where ((PMarker.pNrec == LSTAB.NREC)) = tsOK
+                if (LSTAB.LASTDATE != ZeroDate) and (dDatePer <= date(1, LSTab.MesN, LSTab.YearN))
+                  CreateCopyTabel(LSTAB.buffer);
+            }
+#end
+
+      }
+      _except
+        on ExUserBreak:
+          Broken := true;
+      _finally
+      {
+        StopVisual('', 0);
+        PopPos(#LSTAB);
+        if (not Marked)
+#ifnDef _After_2021_10_20_
+          ClearMarker(LSTAB_Markers);
+#else
+          PMarker.MarkUnMarkRec(LSTAB.NREC);
+#end
+      }
+      //GP
+      ShowErrors;
+      //end GP
+      RereadRecord(#SWRKTABLE);
+      Message('Установка даты проверки ' + if(Broken, 'прервана', 'завершена'), Information + OkButton);
+    }
+
+  }
+
+
+
+  //------------------------------------
+  // Установить параметры по плану
+  //------------------------------------
+  Function SetFieldsByMnPlan(_pMnPlan:comp):boolean;
+  { Result:=false;
+    #FUNC_ZP_Fill_To_SchKauParam(Lstab,cSchetD,cSubSchD,cKaud,Tbld)
+    if pGP_Func_ZP.SetFieldsByMnPlan(_pMnPlan,PSchKauParam)
+    { #FUNC_ZP_Fill_From_SchKauParam(Lstab,cSchetD,cSubSchD,cKaud,Tbld)
+    }
+    Result:=true;
+    SetModified(true);
+    UpdateTable;
+  } //Function SetFieldsByMnPlan(_pMnPlan:comp);
+
+  //-------------------------------
+  //проверим субсчет по заказу, если не совпадает поменяем
+  Procedure Check_Analitic_MnPlan;
+  { #FUNC_ZP_Fill_To_SchKauParam(Lstab,cSchetD,cSubSchD,cKaud,Tbld)
+    if pGP_Func_ZP.Check_Analitic_MnPlan(PSchKauParam)
+    { #FUNC_ZP_Fill_From_SchKauParam(Lstab,cSchetD,cSubSchD,cKaud,Tbld)
+      SetModified(true);
+      UpdateTable;
+    }
+  } //Procedure Check_Analitic_MnPlan;
+
+  //------------------------------------------------------------------------------
+  // cmPositionChange по Srange
+
+  procedure ReFreshAdjacentInfo;
+  { Inherited::ReFreshAdjacentInfo;
+    WTCOSTSHARING.LinkTo(LsTab.Nrec,SelectedRange,SRANGE.CHANGE, SRANGE.BEGINNING,SRANGE.ENDING);
+    if Tabel_SCUD_Panel>0
+    { WTSCUD_Events.LinkTo(LsTab.Nrec,SelectedRange,SRANGE.CHANGE, SRANGE.BEGINNING,SRANGE.ENDING);
+    }
+    if Tabel_SCUD_MisConduct>0
+    { WTSCUD_MisConduct.LinkTo(LsTab.Nrec,SelectedRange,SRANGE.CHANGE, SRANGE.BEGINNING,SRANGE.ENDING);
+    }
+  } //procedure ReFreshAdjacentInfo;
+
+  Procedure ReReadWorkingTable;
+  { //WTCOSTSHARING.LinkTo(LsTab.Nrec,0);
+    WTCOSTSHARING.LinkTo(LsTab.Nrec,SelectedRange,SRANGE.CHANGE, SRANGE.BEGINNING,SRANGE.ENDING);
+    if Tabel_SCUD_Panel>0
+    { WTSCUD_Events.LinkTo(LsTab.Nrec,SelectedRange,SRANGE.CHANGE, SRANGE.BEGINNING,SRANGE.ENDING);
+    }
+    if Tabel_SCUD_MisConduct>0
+    { WTSCUD_MisConduct.LinkTo(LsTab.Nrec,SelectedRange,SRANGE.CHANGE, SRANGE.BEGINNING,SRANGE.ENDING);
+    }
+    Inherited::ReReadWorkingTable;
+  } //Procedure ReReadWorkingTable;
+
+  WindowEvent WorkingTableWindow;
+    cmInit:
+    {
+      EditMode := true;
+
+      if NullvipRef(WTContainer)
+        LoadVipRef(WTContainer, 'WTcontainer');
+      WTContainer.Embed(10, 'Распределение затрат', IWTContainerItem(WTCOSTSHARING), '');
+      if Tabel_SCUD_Panel>0
+      { if NullvipRef(WTSCUD_Events)
+         LoadVipRef(WTSCUD_Events, 'WTSCUD_Events');
+
+        WTContainer.Embed(9, 'СКУД', IWTContainerItem(WTSCUD_Events), '');
+      }
+      if Tabel_SCUD_MisConduct>0
+      { if NullvipRef(WTSCUD_MisConduct)
+          LoadVipRef(WTSCUD_MisConduct, 'WTSCUD_MisConduct');
+        WTContainer.Embed(8, 'Нарушение', IWTContainerItem(WTSCUD_MisConduct), '');
+      }
+
+      Inherited::HandleEvent(cmInit);
+
+    }
+  end;//WindowEvent WorkingTableWindow;
+
+
+  //------------------------------------------------------------------------------
+  tableevent table SWRKTABLE;
+    cmCheckField:
+    { case curfield of
+      #LSTAB.LASTDATE:
+      {
+        if Tabel_Check_SCUD_on_Close>0
+          if LSTAB.LASTDATE<>ZeroDate
+            if not Chk_Scud_MisConDuct(true)
+            {
+              if Tabel_Check_SCUD_on_Close=1
+                set LSTAB.LASTDATE:=ZeroDate;
+              exit;
+            }
+
+        var dDatePer : date = date(1, month(dGetTune('UP.DATOTCH')), year(dGetTune('UP.DATOTCH')));
+        if (LSTAB.LASTDATE != ZeroDate) and (dDatePer <= date(1, LSTab.MesN, LSTab.YearN))
+          CreateCopyTabel(LSTAB.buffer);
+
+      }
+      end;
+      if Inherited::HandleEvent(cmCheckField)=heAbort Abort;
+    }
+  end;
+
+  //------------------------------------------------------------------------------
+  HandleEvent
+    cmInit:
+      { 
+        if NullvipRef(WTCOSTSHARING)
+         LoadVipRef(WTCOSTSHARING, 'WTCOSTSHARING');
+        //'Контролировать нарушения по СКУД при установки даты проверки'
+        Tabel_Check_SCUD_on_Close:=wGetTune('NPOEM_OWN.Tabel.Check_SCUD_on_Close');
+        ////Отображать события скуд в табеле
+        Tabel_SCUD_Panel:=wGetTune('NPOEM_OWN.Tabel.SCUD_PANEL');
+        if Tabel_SCUD_Panel>0
+        { if NullvipRef(WTSCUD_Events)
+            LoadVipRef(WTSCUD_Events, 'WTSCUD_Events');
+        }
+        ////Отображать нарушения СКУД в табеле
+        Tabel_SCUD_MisConduct:=wGetTune('NPOEM_OWN.Tabel.SCUD_MisConduct');
+        if Tabel_SCUD_MisConduct>0
+        { if NullvipRef(WTSCUD_MisConduct)
+            LoadVipRef(WTSCUD_MisConduct, 'WTSCUD_MisConduct');
+        }
+
+        // По умолчанию поля с информацией по дням спрячем - так как их показ очень затратен
+        // даже не будем сохранять выбранный режим - изначально всегда выключено
+        SwitchDayInfoBr(false);
+        if Inherited::HandleEvent(cmInit)=heAbort Abort;
+      }
+      //------------------------
+    cmPick:
+      {
+        var need_Pick:boolean=true;
+        case curField of
+        #AccountStr, #ControlAccountStr, #AnalyticsStr:
+        { if curField=#AnalyticsStr
+          { if (QuickChoiceName <> '')  QuickChoiceName := 'qcKau_Needed'
+          }
+          if AccountStr='' or (QuickChoiceName<>'' and curField=#AnalyticsStr)
+          { pTmp:=0;
+            if iGetKau.GetCodeKau(cgiPick, cgKau_Zakaz, pTmp)<>0 //cmCancel
+            { if  SetFieldsByMnPlan(pTmp)
+              { case curField of
+                #AccountStr, #ControlAccountStr: need_Pick:=false;
+                end;
+              }
+            }
+            else
+            { message('Задайте счет');
+              SelectField(#AccountStr);
+            }
+          } //if Schetdeb=''
+        } //#AccountStr, #ControlAccountStr
+        end; //case curField of
+        //----------------------
+        if need_Pick
+        { if (inherited::handleEvent (cmPick) = heAbort)
+            Abort;
+          if (curField = #AnalyticsStr) //and QuickChoiceName=''
+          { Check_Analitic_MnPlan;
+          }
+        }
+        //----------------------
+      }
+    cmValue37:
+      {
+        RunInterface('GP_TblCopies', LSTab.cLSchet, LSTab.MesN, LSTab.YearN);
+        RescanPanel(CurTable);
+      }
+    cmValue38:
+      ShowTimeTotals;
+    cmAccording:
+      SwitchDayInfoBr(not DayInfoBrVisible);
+  end;
+end.
+
+mnuLSTabCopies Menu
+{
+- 'Исходные табели', cmValue37, 'Исходные табели',,,, sci1Esc;
+- 'Режим представления: с/без данных по дням', cmAccording, 'Переключение представления (показать/скрыть данные по дням)',,,, sci1Esc;
+- 'Показать итоги', cmValue38, 'Показать итоги по дням / часам',,,, sci1Esc;
+}
