@@ -12,6 +12,7 @@
 #include odecl.vih             // Функции склонения ФИО
 #include QUE_BASE.vih
 #include QUE_View_QUE_OUT.vih
+#include WorkWithDoplata.vih
 
 #component "EM_IIKO"
 #doc
@@ -101,20 +102,27 @@ as select
  , GetStatusName(zayavka.Status) (Fieldname=StatusName, FieldTitle='Статус заявки на питание')
 // ,if(isValid(tneMail), eMail.eMail,' -у сотрудника нет почты- ')  (fieldname = PERSEMAIL)
 From
-  GP_ZAYAVKA_PITANIE zayavka
-, catalogs Podr
-, x$users UserInput
-, x$users UserApprove
-, Persons Pers
-, KatOrg
-, QUE_OUT
+      GP_ZAYAVKA_PITANIE zayavka
+    , catalogs Podr
+    , x$users UserInput
+    , x$users UserApprove
+    , Persons Pers
+    , KatOrg
+    , QUE_OUT
+    , SHTRAF
+    , Doplata
 
-, COMMUNICATIONS eMail
-, spkau KauSystem
-, spkau Limitpitanie
-//, ZAR_USER ZU
-//, tPodr
-, tTmp
+    , KLVIDOPL KLVIDOPL_OPL
+    , KLVIDUD KLVIDUD_NORM
+    , KLVIDUD KLVIDUD_NORMUPPER
+    , COMMUNICATIONS eMail
+    , spkau KauSystem
+    , spkau Limitpitanie
+    , Appointments
+    , LSCHET
+    //, ZAR_USER ZU
+    //, tPodr
+    , tTmp
 where
 ((
    _datetime(0,0,0,0,0,0,0) <<= zayavka.INPUT_DATE (noindex)
@@ -123,6 +131,10 @@ and       zayavka.cSystem == KauSystem.nrec
 and  zayavka.cPodr        == podr.nrec
 and  zayavka.CUSERINPUT   == Userinput.Atl_nrec
 and  zayavka.CUSERAPPROVE == UserApprove.atl_nrec
+and        Pers.AppointCur == Appointments.Nrec
+and Appointments.CAddNrec2 == LSCHET.nrec
+
+
 and Zayavka.CLIMITCATEGORY == Limitpitanie.nrec
      and zayavka.cQUE_OUT  == QUE_OUT.nrec
 and             Pers.nrec == eMail.PERSON
@@ -556,7 +568,7 @@ Function generateFileToemefsi : string; {
         _outStr := _outStr + ';' + SubStr(pers.fio,1,1) + ' ' + SubStr(extractdelimitedword(pers.fio,2,' '),1,1)  +  ' ' + SubStr(extractdelimitedword(pers.fio,3,' '),1,1);
         _outStr := _outStr + ';' +'***';
         _outStr := shortstrtowin(_outStr);
-        logstrtofile(_outFile,_outStr)
+        logstrtofile(_outFile,_outStr);
         insert tTmp set cRec := Zayavka.nrec;
       }
    result := _outFile;
@@ -582,6 +594,128 @@ procedure AgreeZayavka; {
          Message('Не указан e-Mail',error);
          exit;
        }
+
+        var _KLVIDUD_NORM : word = wgettune('GP_OWN.GP_OWN.PITANIE.PITANIE_UDER') ;
+        if _KLVIDUD_NORM = 0 {
+           Message('В настройке ' + GetTuneName('GP_OWN.GP_OWN.PITANIE.PITANIE_UDER')
+           +''#13'' + 'не указано удержание',error);
+           exit;
+         }
+
+       set _KLVIDUD_NORM := _KLVIDUD_NORM;
+       if getfirst KlVidUd_NORM where ((_KLVIDUD_NORM == KlVidUd_NORM.VIDUD))<> tsOK {
+           Message('В настройке указано удержание '+string(_KLVIDUD_NORM)+ ' но его нет в системе',error);
+           exit;
+       }
+
+        var _KLVIDUD_NORMUPPER : word = wgettune('GP_OWN.GP_OWN.PITANIE.PITANIE_UDER_UPPERNORM') ;
+        if _KLVIDUD_NORMUPPER = 0 {
+           Message('В настройке ' + GetTuneName('GP_OWN.GP_OWN.PITANIE.PITANIE_UDER')
+           +''#13'' + 'не указано удержание',error);
+           exit;
+         }
+
+       set _KLVIDUD_NORMUPPER := _KLVIDUD_NORMUPPER;
+       if getfirst KlVidUd_NORMUPPER where ((_KLVIDUD_NORMUPPER == KlVidUd_NORMUPPER.VIDUD))<> tsOK {
+           Message('В настройке указано удержание '+string(_KLVIDUD_NORMUPPER)+ ' но его нет в системе',error);
+           exit;
+       }
+
+        var _KLVIDOPL : word = wgettune('GP_OWN.GP_OWN.PITANIE.PITANIE_VIDOP_NENACH') ;
+        if _KLVIDOPL = 0 {
+           Message('В настройке ' + GetTuneName('GP_OWN.GP_OWN.PITANIE.PITANIE_VIDOP_NENACH')
+           +''#13'' + 'не указана оплата',error);
+           exit;
+         }
+
+      if getfirst KLVIDOPL_OPL where ((_KLVIDOPL == KLVIDOPL_OPL.VIDOPL))<> tsOK {
+           Message('В настройке указана оплата '+string(_KLVIDOPL)+ ' но её нет в системе',error);
+           exit;
+       }
+
+      if getfirst Appointments <> tsOK {
+          Message('У сотрудника не найдено текущее назначение Pers.AppointCur = ' + string(Pers.AppointCur),error);
+          exit;
+      }
+
+      if getfirst LSCHET <> tsOK {
+          Message('Не найден лицевой счет по текущему назначению сотрудника Appointments.CAddNrec2 = '+string(Appointments.CAddNrec2),error);
+          exit;
+      }
+
+
+
+#declare insertshtraf(tblname)
+  if getfirst SHTRAF where (( LSCHET.NREC == SHTRAF.CLSCH
+                     and #tblname.VIDUD == SHTRAF.VIDUD
+                                  and '+' == SHTRAF.POMETKA (noindex) )) <> tsOK
+  {
+     clearbuffer(tnSHTRAF);
+      SHTRAF.POMETKA := '+';
+      SHTRAF.CLSCH   := LSCHET.NREC;
+      SHTRAF.STRTABN := LSCHET.StrTABN;
+      SHTRAF.TABN    := LSCHET.TABN;
+      SHTRAF.CEX     := LSCHET.CEX;
+      if Day(LSchet.DATUV) <> 0
+        then SHTRAF.DATOK := AD_LastDate(LSchet.DATUV);
+      SHTRAF.TPERSON := LSCHET.TPERSON;
+
+      if (#tblname.VHVO2 <> 'К') and (#tblname.VHVO2 <> '+') // ERP-5573
+        set SHTRAF.FLAG3 := '-';
+      else
+        set SHTRAF.FLAG3 := '+';
+
+        set SHTRAF.CPOL := 0;
+        set SHTRAF.CBANKPOL := 0;
+
+
+      SHTRAF.VIDUD := #tblname.VIDUD;
+
+      SHTRAF.NAMEPL1 := #tblname.NVIDUD;
+
+      if ((SHTRAF.VIDUD >= 206) and (SHTRAF.VIDUD <= 210))
+          or ((SHTRAF.VIDUD >= 220) and (SHTRAF.VIDUD <= 230))
+          or (SHTRAF.VIDUD = 219)
+      {
+        SHTRAF.PRPER := 2
+      }
+      else
+      {
+        SHTRAF.PRPER := 1;
+      }
+        if #tblname.VHVOW2 = 5 //ИЛ
+        {
+          SHTRAF.comp1 := 50;
+          SHTRAF.NOMDOK := '2'; //пока так, НО вообще должно быть 4
+        }
+        SHTRAF.DATAN   := zayavka.DOCDATE;
+        SHTRAF.DATANSK := zayavka.DOCDATE;
+     insert current SHTRAF;
+  }
+#end
+
+
+      #insertshtraf(KlVidUd_NORM)
+      #insertshtraf(KlVidUd_NORMUPPER)
+
+
+     if getfirst DOPLATA where (( LSCHET.NREC == DOPLATA.CLSCH
+                      and KLVIDOPL_OPL.VIDOPL == DOPLATA.VIDOPL
+                                      and '+' == DOPLATA.POMETKA (noindex) )) <> tsOK {
+        var WWD : WorkWithDoplata new;
+        ClearBuffer(#DOPLATA);
+        DOPLATA.NRec := GetNextNRec(tnDoplata, 0); //чтобы привязывать внешние атрибуты
+        DOPLATA.CLSCH  := LSCHET.NREC;
+        DOPLATA.VIDOPL := KLVIDOPL_OPL.VIDOPL;
+        // Обработка cmSetDefault для доплаты - в объекте WWD
+        WWD.SetDefault(DOPLATA.BUFFER, LSCHET.BUFFER, KLVIDOPL_OPL.BUFFER, IsValid(#LSCHET), IsValid(#KLVIDOPL_OPL));
+        insert current doplata;
+          // Общая обработка после вставки доплаты
+        WWD.AfterInsertDoplata(DOPLATA.BUFFER, LSCHET.BUFFER);
+        DOPLATA.DATANN := zayavka.DOCDATE;
+        DOPLATA.DATAN  := zayavka.DOCDATE;
+        update current DOPLATA;
+     }
 
       set zayavka.STATUS       := 1;
       set zayavka.CUSERAPPROVE := userID;

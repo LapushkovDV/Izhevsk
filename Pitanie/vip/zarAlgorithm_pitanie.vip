@@ -1,0 +1,358 @@
+/**************************************************************************************************\
+* Наименование:                                                                                    *
+* Контур/Модуль: Заработная плата                                                                  *
+* Пункт меню:                                                                                      *
+* Примечание:                                                                                      *
+*                                                                                                  *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                            *
+* -------------------------------------------------------------------------------------------------*
+* Разработка  |              |        |                         | АВТОВАЗ                          *
+\**************************************************************************************************/
+
+#include Contexts.vih // прикладные контексты
+#include ZarAlg.vih
+
+#component "z_Zar"
+
+VipInterface ZarAlgorithm_pitanie implements IzarAlgorithm;
+const
+ coVA_SummaDay  = 'Питание. Льготируемая сумма в день';
+ coVA_PercLgota = 'Питание. Процент льготы';
+end;
+interface ZarAlgorithm_pitanie cacheable;
+// посомтреть  Z_zar##ZarAlgorithm_58vo.Vip
+table struct tPeriodPitanie (
+   begdate      : date
+ , enddate      : date
+ , VA_SummaDay  : double
+ , VA_PercLgota : double
+ , sumPitanie   : double
+ , countMealDays  : byte
+ , countNightDays : byte
+ )
+with index (
+   ind0 = begdate
+ , ind1 = enddate
+)
+;
+  create view
+   var _log_OUT : string;
+    _isLogging : boolean = true;
+    pLschet
+  , _cPersons : comp;
+    wMes
+  , wYear  : word;
+  CS: IContextSession;
+  from
+   GP_Cancel_Pitanie  ZayavPitanieCancel
+ , GP_ZAYAVKA_PITANIE ZayavPitanie
+ , Lschet LS_PITANIE
+ , Persons Pers_PITANIE
+ , GP_Pitanie_sp Pitanie_sp
+
+ , tPeriodPitanie
+ , tPeriodPitanie tPeriodPitanie_copy
+;
+ var
+  AlgNumberInner : word = 0;
+
+Function GenerateNewFile: string; {
+ result := GetStringParameter('Files','OutputFilesDirectory',0)+ 'zarAlgorithm_pitanie_'+DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS-SSS');
+}
+function GetLogFile : string; {
+  if _log_OUT = '' then _log_OUT := GenerateNewFile+'.log';
+  result := _log_OUT;
+}
+
+Procedure MyLog(_str: string); {
+  if not _isLogging then exit;
+
+  LogStrToFile(GetLogFile,DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS') + ': ' + ShortStrToWin(_str));
+}
+
+procedure ParseAlgParams(ParamStr: String); {
+  var I: Word;
+  var P: Byte;
+  var Value: String;
+    _isLogging := false;
+    I := 0;
+    do
+    {
+      I++;
+      P := InStr(',', ParamStr);
+      if P > 0 then {
+        Value := SubStr(ParamStr, 1, P - 1);
+        ParamStr := SubStr(ParamStr, P + 1, Length(ParamStr) - P);
+      } else {
+        Value := ParamStr;
+       }
+      Value := LoCase(Trim(Value));
+      if Value != '' then
+        case I of
+          1: AlgNumberInner := Word(Value);
+          2: _isLogging := (Value = 'on' or Value = 'true');
+        end;
+    } while P > 0;
+
+    //_isLogging := true; //debug
+}
+procedure filltPeriodPitanie; {
+  //  соберем все заявления на питание раньше конца месяца расчета
+  delete all tPeriodPitanie;
+  _loop ZayavPitanie where ((_cPersons == ZayavPitanie.CPERSONS ))
+                        and ZayavPitanie.DOCDATE <=  to_date(last_day(to_date(01, wMes, wYear)), wMes, wYear)
+                        and ZayavPitanie.Status <> 0
+                                {
+     mylog('нашли ZayavPitanie ' + datetostr(ZayavPitanie.DOCDATE,'DD/MM/YYYY'));
+      if ZayavPitanie.DOCDATE < to_date(01, wMes, wYear) then {
+        if getfirst tPeriodPitanie where ((to_date(01, wMes, wYear) >> tPeriodPitanie.begdate )) <> tsOK {
+          insert tPeriodPitanie set
+             tPeriodPitanie.begdate      := ZayavPitanie.DOCDATE
+           , tPeriodPitanie.enddate      := to_date(0,0,0)
+           , tPeriodPitanie.VA_SummaDay  := dogetattr(coSpKau, ZayavPitanie.CLIMITCATEGORY,coVA_SummaDay)
+           , tPeriodPitanie.VA_PercLgota := dogetattr(coSpKau, ZayavPitanie.CLIMITCATEGORY,coVA_PercLgota)
+           , tPeriodPitanie.sumPitanie := 0
+          ;
+          mylog('вставили tPeriodPitanie с заявлением от '  +  datetostr(tPeriodPitanie.begdate,'DD/MM/YYYY'));
+        }
+        // ищем последнее заявление до начала месяца расчета
+        if tPeriodPitanie.begdate < ZayavPitanie.DOCDATE then {
+           update current tPeriodPitanie set
+              tPeriodPitanie.begdate      := ZayavPitanie.DOCDATE
+            , tPeriodPitanie.VA_SummaDay  := dogetattr(coSpKau, ZayavPitanie.CLIMITCATEGORY,coVA_SummaDay)
+            , tPeriodPitanie.VA_PercLgota := dogetattr(coSpKau, ZayavPitanie.CLIMITCATEGORY,coVA_PercLgota)
+           ;
+         }
+      } else {
+        // заполянем заявления в текущем месяце
+        if getfirst tPeriodPitanie where ((ZayavPitanie.DOCDATE == tPeriodPitanie.begdate)) <> tsok   // вдруг дубли
+         then  {
+          insert tPeriodPitanie set
+             tPeriodPitanie.begdate      := ZayavPitanie.DOCDATE
+           , tPeriodPitanie.enddate      := to_date(0,0,0)
+           , tPeriodPitanie.VA_SummaDay  := dogetattr(coSpKau, ZayavPitanie.CLIMITCATEGORY,coVA_SummaDay)
+           , tPeriodPitanie.VA_PercLgota := dogetattr(coSpKau, ZayavPitanie.CLIMITCATEGORY,coVA_PercLgota)
+           , tPeriodPitanie.sumPitanie := 0
+          ;
+        }
+      }
+   }
+
+  _loop ZayavPitanieCancel where ((_cPersons == ZayavPitanieCancel.CPERSONS ))
+                        and ZayavPitanieCancel.DOCDATE <=  to_date(last_day(to_date(01, wMes, wYear)), wMes, wYear)
+                        and ZayavPitanieCancel.Status <> 0  {
+       // находим последнее заявление на питание и устанавливаем дату окончания действия
+      if getlast tPeriodPitanie where ((ZayavPitanieCancel.DOCDATE >> tPeriodPitanie.begdate )) = tsOK {
+        if tPeriodPitanie.enddate = to_date(0,0,0) or  tPeriodPitanie.enddate > ZayavPitanieCancel.DOCDATE then // пустое или если почему то 2 заявления на отмену есть, то берем первое
+          update current tPeriodPitanie set tPeriodPitanie.enddate := ZayavPitanieCancel.DOCDATE ;
+      }
+   }
+
+   // теперь установим все даты окончания периодов
+   _loop tPeriodPitanie {
+     if tPeriodPitanie.enddate <> to_date(0,0,0) then {
+       if getfirst tPeriodPitanie_copy where ((tPeriodPitanie.begdate << tPeriodPitanie_copy.begdate)) = tsOK { // нашли соедующее заявление, и при этом не было отмены питания
+         update current tPeriodPitanie set tPeriodPitanie.enddate := sub_day(tPeriodPitanie_copy.begdate,1);
+       }
+     }
+   }
+
+  if getfirst tPeriodPitanie where ((to_date(0,0,0)  == tPeriodPitanie.enddate)) = tsOK
+         then update current tPeriodPitanie
+               set tPeriodPitanie.enddate := to_date(last_day(to_date(01, wMes, wYear)), wMes, wYear); // ставим дату окончания периода = последнему дню месяца
+  if getfirst tPeriodPitanie where (( to_date(01, wMes, wYear) >>= tPeriodPitanie.begdate)) = tsOK
+         then update current tPeriodPitanie
+               set tPeriodPitanie.begdate := to_date(01, wMes, wYear); // то, что раньше месяца было, ставим дату = началу месяца
+
+  _loop tPeriodPitanie {
+    // если по неведомой причине остались периоды вне границ месяца, то удаляем
+    if  tPeriodPitanie.begdate < to_date(01, wMes, wYear) or tPeriodPitanie.enddate < to_date(01, wMes, wYear)
+    or tPeriodPitanie.begdate > to_date(last_day(to_date(01, wMes, wYear)), wMes, wYear) or tPeriodPitanie.enddate > to_date(last_day(to_date(01, wMes, wYear)), wMes, wYear)
+    then  {
+      mylog('удаляем непонятные записи tPeriodPitanie.begdate = ' + datetostr(tPeriodPitanie.begdate,'DD/MM/YYYY') + ' tPeriodPitanie.enddate = ' + datetostr(tPeriodPitanie.enddate,'DD/MM/YYYY'));
+      delete current tPeriodPitanie;
+    }
+  }
+
+#declare setsumpitanieonday(daypitanie)
+   if(getfirst tPeriodPitanie where day(tPeriodPitanie.begdate) <= #daypitanie
+                                and day(tPeriodPitanie.enddate) >= #daypitanie ) = tsOK {
+          if Pitanie_sp.DAY_SUM[#daypitanie] <> 0 {
+            update current tPeriodPitanie set
+               tPeriodPitanie.sumPitanie    := tPeriodPitanie.sumPitanie + Pitanie_sp.DAY_SUM[#daypitanie]
+              ,tPeriodPitanie.countmealdays := tPeriodPitanie.countMealDays + 1
+             ;
+          }
+     }
+#end
+  _loop Pitanie_sp where ((_cPersons == Pitanie_sp.Cpersons
+                           and wMes == Pitanie_sp.MESN  (noindex)
+                           and wYear == Pitanie_sp.YEARN (noindex) )) {
+     #setsumpitanieonday( 1)
+     #setsumpitanieonday( 2)
+     #setsumpitanieonday( 3)
+     #setsumpitanieonday( 4)
+     #setsumpitanieonday( 5)
+     #setsumpitanieonday( 6)
+     #setsumpitanieonday( 7)
+     #setsumpitanieonday( 8)
+     #setsumpitanieonday( 9)
+     #setsumpitanieonday(10)
+     #setsumpitanieonday(11)
+     #setsumpitanieonday(12)
+     #setsumpitanieonday(13)
+     #setsumpitanieonday(14)
+     #setsumpitanieonday(15)
+     #setsumpitanieonday(16)
+     #setsumpitanieonday(17)
+     #setsumpitanieonday(18)
+     #setsumpitanieonday(19)
+     #setsumpitanieonday(20)
+     #setsumpitanieonday(21)
+     #setsumpitanieonday(22)
+     #setsumpitanieonday(23)
+     #setsumpitanieonday(24)
+     #setsumpitanieonday(25)
+     #setsumpitanieonday(26)
+     #setsumpitanieonday(27)
+     #setsumpitanieonday(28)
+     #setsumpitanieonday(29)
+     #setsumpitanieonday(30)
+     #setsumpitanieonday(31)
+   }
+
+  mylog('содержимое таблицы tPeriodPitanie:');
+  mylog('begdate | enddate | VA_SummaDay | VA_PercLgota | sumPitanie | countMealDays | countNightDays');
+
+  _loop tPeriodPitanie {
+    update current tPeriodPitanie set tPeriodPitanie.countNightDays := WT_GetDaysBwDaysEx (8, 1, day(tPeriodPitanie.begdate), day(tPeriodPitanie.enddate), 0); // dkNight = 8,  stActual = 1  фактические данные (табель)
+
+
+    mylog( datetostr(tPeriodPitanie.begdate,'DD/MM/YYYY') + ' | ' + datetostr(tPeriodPitanie.enddate,'DD/MM/YYYY') + ' | ' + string(tPeriodPitanie.VA_SummaDay) + ' | '+ string(tPeriodPitanie.VA_PercLgota) +
+     + '|' +string(tPeriodPitanie.sumPitanie) + ' | '+ string(tPeriodPitanie.countMealDays)+' | ' + string(tPeriodPitanie.countNightDays));
+  }
+  mylog(' ');
+}
+
+function CalcSum(Parameter: String): Double; {
+    result := 0;
+    ParseAlgParams(Parameter);
+    MyLog('--------------------------------------------');
+    MyLog('zarAlgorithm_pitanie. Parameter = ' + Parameter);
+    pLschet := uch_lsch;
+    wMes    := month(uch_datan);
+    wYear   := year(uch_datan);
+    mylog('pLschet = '+ string(pLschet));
+    mylog('wMes    = '+ string(wMes));
+    mylog('wYear   = '+ string(wYear));
+
+    if getfirst LS_PITANIE where ((pLschet == LS_PITANIE.nrec)) <> tsOK then {
+      mylog('ОШИБКА. не найден ЛС uch_lsch = ' + string(pLschet , 0, 0));
+      exit;
+     }
+    _cPersons := LS_PITANIE.TPERSON;
+    if getfirst Pers_PITANIE where ((_cPersons == Pers_PITANIE.nrec)) <> tsOK then {
+      mylog('ОШИБКА. не найден сотрудник по ЛС. LSCHET.TPERSON = ' + string(_cPersons, 0, 0));
+      exit;
+     }
+    MyLog('Сотрудник ' + Pers_PITANIE.FIO + ' ' + if(wgettune('FORMATCLOCKNUMBER') = 1,Pers_PITANIE.strtabn,string(Pers_PITANIE.tabnmb)) + ' _cPersons = ' + _cPersons);
+/*
+   var CL: ContextList;
+   if ((not CL.Add(CS, 'WorkingTable'))
+       or (not CL.Add(CS, 'PADetailsUtils')))
+     {
+       mylog('ОШИБКА. Инициализация табеля учета рабочего времени'  );;
+       exit;
+     }
+
+*/
+    if LoadWorkingTable(pLschet, wMes, wYear) <> 0 then {
+      mylog('ОШИБКА. не удалось загрузить табель сотрудника');
+      exit;
+    }
+    filltPeriodPitanie;
+
+    case AlgNumberInner of
+      0: MyLog('режим работы: сумма по норме');
+      1: MyLog('режим работы: сумма сверх нормы');
+      2: MyLog('режим работы: сумма неначисляемый доход');
+    else {
+        MyLog('Первый аргумент находится за границами 0-2');
+        exit;
+      }
+    end;
+   MyLog('Определение сумм:');
+
+   _loop tPeriodPitanie {
+
+     var _result : double  = 0;
+      case AlgNumberInner of
+        0: {
+           case tPeriodPitanie.VA_PercLgota of
+             100  : {
+               _result := 0;
+             }
+             else {
+               if tPeriodPitanie.sumPitanie <= tPeriodPitanie.VA_SummaDay * tPeriodPitanie.countMealDays  then {
+                 // тут по сути считаем пропорцию ночных смен относит ельно количества дней питания и по этой пропорции сумму по норме берем с учетом процента льготы
+                 _result := tPeriodPitanie.sumPitanie*if(tPeriodPitanie.countMealDays >= tPeriodPitanie.countNightDays
+                                                               , tPeriodPitanie.countMealDays -tPeriodPitanie.countNightDays
+                                                               ,0)*(1 - tPeriodPitanie.VA_PercLgota/100)/tPeriodPitanie.countMealDays;
+               } else {
+                 // много ел чувак.. потому считаем нормы
+                 _result :=  tPeriodPitanie.VA_SummaDay*if(tPeriodPitanie.countMealDays >= tPeriodPitanie.countNightDays
+                                                                , tPeriodPitanie.countMealDays -tPeriodPitanie.countNightDays
+                                                                ,0)*(1 - tPeriodPitanie.VA_PercLgota/100);
+               }
+             }
+           end;
+        }
+        1: {
+            // тут одинаково считается в обоих случаях
+           case tPeriodPitanie.VA_PercLgota of
+             100  : {
+               if tPeriodPitanie.sumPitanie > tPeriodPitanie.VA_SummaDay * tPeriodPitanie.countMealDays  then {
+                 _result := tPeriodPitanie.sumPitanie - tPeriodPitanie.VA_SummaDay * tPeriodPitanie.countMealDays;
+               }
+             }
+             else {
+               if tPeriodPitanie.sumPitanie > tPeriodPitanie.VA_SummaDay * tPeriodPitanie.countMealDays  then {
+                 _result := tPeriodPitanie.sumPitanie - tPeriodPitanie.VA_SummaDay * tPeriodPitanie.countMealDays;
+               }
+             }
+           end;
+        }
+        2: {
+           // тут одинаково считается в обоих случаях
+           case tPeriodPitanie.VA_PercLgota of
+             100  : {
+               if tPeriodPitanie.sumPitanie <= tPeriodPitanie.VA_SummaDay * tPeriodPitanie.countMealDays  then {
+                 _result := tPeriodPitanie.sumPitanie;
+               } else {
+                 _result := tPeriodPitanie.VA_SummaDay * tPeriodPitanie.countMealDays;
+               }
+             }
+             else {
+               if tPeriodPitanie.sumPitanie <= tPeriodPitanie.VA_SummaDay * tPeriodPitanie.countMealDays  then {
+                 _result := tPeriodPitanie.sumPitanie*if(tPeriodPitanie.countMealDays >= tPeriodPitanie.countNightDays
+                                                               , tPeriodPitanie.countMealDays -tPeriodPitanie.countNightDays
+                                                               ,0)*(tPeriodPitanie.VA_PercLgota/100)/tPeriodPitanie.countMealDays
+               } else {
+                 _result := tPeriodPitanie.VA_SummaDay*if(tPeriodPitanie.countMealDays >= tPeriodPitanie.countNightDays
+                                                                , tPeriodPitanie.countMealDays -tPeriodPitanie.countNightDays
+                                                                , 0)*(tPeriodPitanie.VA_PercLgota/100);
+               }
+             }
+           end;
+        }
+      end;
+     MyLog('период: ' + datetostr(tPeriodPitanie.begdate,'DD/MM/YYYY') +' - '+ datetostr(tPeriodPitanie.enddate,'DD/MM/YYYY') + ' сумма = ' + string(_result));
+     result := result + _result
+   }
+}
+
+function GetDescription: String; {
+    GetDescription := 'Питание за месяц Первый параметр:0-сумма по норме,1- сумма сверхнормы,2-неначисляемый доход, второй параметр: true - логировать';
+}
+
+end.

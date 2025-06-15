@@ -12,8 +12,8 @@ del Atlantis*.res
 
 @set exedir=C:\Galaktika\AVAZ\avaz_ptz\Exe_support
 
-@%exedir%\vip.EXE pitanie.prj /r:pitanie.res /c:vip.cfg /u:supervisor /def:Atl60
-@%exedir%\FRRES.EXE /to /r:pitanie.res /source:fr3
+@%exedir%\vip.EXE pitanie.prj /r:Pitanie_06.res /c:vip.cfg /u:supervisor /def:Atl60
+@%exedir%\FRRES.EXE /to /r:Pitanie_06.res /source:fr3
 
 rem /c:support_res.cfg
 @echo Компиляция завершена
