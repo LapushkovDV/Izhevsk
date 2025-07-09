@@ -52,12 +52,14 @@ Table Struct tRows (
   , cMVZ         : comp
   , cPeredel     : comp
   , cTmpltSp     : comp
+  , cInstanceSp  : comp
 )
 with index (
    Index1 = nrow
 )
 ;
 
+procedure getcustomvalues; forward;
 
 create view
  var
@@ -71,7 +73,8 @@ create view
   , _logFile   : string= '';
   typeTable  : word = 0;
     _cTemplate
-  , _cInstance : comp;
+  , _cInstance
+  , _cPeredelCorrTo : comp;
       _wSTATYA
     , _wCATEGORY
     , _wSHPZ
@@ -79,13 +82,18 @@ create view
     , _wCEX
     , _wMVZ
     , _wPEREDEL : word;
-
+ as select
+    PeredelCorrTo.code (fieldname = PeredelCorrTocode)
 from
     Budg_Tmplt_sp
   , Budg_Instance_sp
   , spkau spkau_check
+  , spKau PeredelCorrTo
   , tRows
   , tRows tRows_BR
+ where ((
+   _cPeredelCorrTo == PeredelCorrTo.nrec
+ ))
 ;
 
 PROCEdURE ClearAll; {
@@ -394,11 +402,19 @@ Procedure CheckErrors_tRows;
              tRows.sum7 = 0 and tRows.sum8 = 0 and tRows.sum9 = 0 and tRows.sum10 = 0 and tRows.sum11 = 0 and tRows.sum12 = 0 {
               #setwarning('|все суммы нулевые')
              }
+
+
+         if typeTable = cotblInstnBudgetSHPZCorr or typeTable = cotblInstnBudgetVidCorr {
+           if _cPeredelCorrTo = 0h {
+            #seterror('|в шапке файла не указана принимающая сторона')
+           }
+         }
+
       }
      end;
     update current tRows;
 
-    if _cTemplate <> 0h and tRows.FlagErr < 2 { // проверим наличие в шаблоне разреза если по строке нет ошибки
+    if _cInstance <> 0h and tRows.FlagErr < 2 { // проверим наличие в шаблоне разреза если по строке нет ошибки
       case typeTable of
          cotblInstnBudgetSHPZ
         ,cotblInstnBudgetSHPZCorr : {
@@ -421,14 +437,30 @@ Procedure CheckErrors_tRows;
       if tRows.cTmpltSp = 0h {
        #seterror('|в шаблоне нет строки с такой аналитикой (статья, категория, ШПЗ)')
       } else {
+        var _cPeredel : comp = tRows.cPeredel;
+        if typeTable = cotblInstnBudgetSHPZCorr or typeTable = cotblInstnBudgetVidCorr then {
+          _cPeredel := _cPeredelCorrTo;
+        }
        if getfirst Budg_Instance_sp where (( 1 == Budg_Instance_sp.planfact
                             and tRows.cTmpltSp == Budg_Instance_sp.cTmpltSp
                                and tRows.cPodr == Budg_Instance_sp.cPodr
                                 and tRows.cCex == Budg_Instance_sp.cCex
                                 and tRows.cMVZ == Budg_Instance_sp.cMVZ
-                            and tRows.cPeredel == Budg_Instance_sp.cPeredel)) = tsOK {
+                                 and _cPeredel == Budg_Instance_sp.cPeredel)) = tsOK {
             #seterror('|в в бюджете уже есть строка с такой аналитикой (статья, категория, ШПЗ, подразделение, цех. мвз, передел)')
          }
+       if typeTable = cotblInstnBudgetSHPZCorr or typeTable = cotblInstnBudgetVidCorr then {
+       if getfirst Budg_Instance_sp where (( 1 == Budg_Instance_sp.planfact
+                            and tRows.cTmpltSp == Budg_Instance_sp.cTmpltSp
+                               and tRows.cPodr == Budg_Instance_sp.cPodr
+                                and tRows.cCex == Budg_Instance_sp.cCex
+                                and tRows.cMVZ == Budg_Instance_sp.cMVZ
+                             and tRows.cPeredel == Budg_Instance_sp.cPeredel)) <> tsOK {
+            #seterror('|в в бюджете НЕТ! строки с такой аналитикой (статья, категория, ШПЗ, подразделение, цех. мвз, передел)')
+         } else {
+           update current tRows set tRows.cInstanceSp := Budg_Instance_sp.nrec;
+         }
+       }
       }
      }
    }
@@ -436,7 +468,27 @@ Procedure CheckErrors_tRows;
 }
 
 
+
 #include OpenFileExcelSearchCells.vpp
+procedure getcustomvalues;{
+  var _Nrow, _column, _iCol : longint = 0;
+  for(_Nrow := 1; _Nrow <= 15; _Nrow++) {
+          setvisualHeader('Поиск кастомных значений, лист ' + ListName
+          + ''#13'' +'Строка ' + string(_Nrow));
+        _column := SearchCellsByName('Принимающая сторона',  _Nrow);
+        if _column <> 0 {
+          for(_iCol := _column + 1; _iCol <= _column + 10; _iCol++) {
+            var _iCellStr : string = '';
+             xlGetCellValue(_nrow, _iCol, _iCellStr);
+           if _iCellStr <> '' then {
+             set _cPeredelCorrTo := getspkaubycodename( _wPEREDEL, _iCellStr, '');
+           }
+          }
+          break;
+        }
+    if _column <> 0 then break;
+  }
+}
 
 
 procedure MyLog(_log : string); {
@@ -482,9 +534,7 @@ procedure Insert_budget; {
                                 }
       }
       cotblInstnBudgetVid
-     ,cotblInstnBudgetVidCorr
-     ,cotblInstnBudgetSHPZ
-     ,cotblInstnBudgetSHPZCorr : {
+     ,cotblInstnBudgetSHPZ : {
              insert Budg_Instance_sp set
                 Budg_Instance_sp.cTemplate := _cTemplate
               , Budg_Instance_sp.cInstance := _cInstance
@@ -508,6 +558,12 @@ procedure Insert_budget; {
               , Budg_Instance_sp.summa[12] := tRows.sum12
              ;
       }
+     cotblInstnBudgetSHPZCorr
+    ,cotblInstnBudgetVidCorr  : {
+       if getfirst Budg_Instance_sp where ((tRows.cInstanceSp == Budg_Instance_sp.nrec)) = tsOK {
+        update current Budg_Instance_sp  set Budg_Instance_sp.cPeredel := _cPeredelCorrTo;
+       }
+    }
     end;
 
 
@@ -534,7 +590,19 @@ Screen scrImportBudget;
 >>
 end;
 windowevent winImportBudget;
-cmOK: {
+cmInit : {
+  var  _winTitle : string = '';
+  case typeTable of
+   cotblTmpltBudgetVid      : _winTitle := 'Импорт шаблона бюджета по видам';
+   cotblTmpltBudgetSHPZ     : _winTitle := 'Импорт шаблона бюджета по ШПЗ';
+   cotblInstnBudgetVid      : _winTitle := 'Импорт варианта бюджета по видам';
+   cotblInstnBudgetSHPZ     : _winTitle := 'Импорт варианта бюджета по ШПЗ';
+   cotblInstnBudgetVidCorr  : _winTitle := 'Импорт корректировки бюджета по видам';
+   cotblInstnBudgetSHPZCorr : _winTitle := 'Импорт корректировки бюджета по ШПЗ';
+  end;
+ setwindowtitle(winImportBudget, _winTitle);
+}
+cmOK : {
     if File_input = '' {
      message('не выбран файл шаблона', error) ;
      stop;abort;exit;
@@ -577,6 +645,7 @@ cmOK: {
 
  if visualizationactive  StopVisual('The End',vfTimer);
  if visualizationactive  StopVisual('The End',vfTimer);
+  if getfirst tRows_BR = tsOK {}
   rereadrecord(tntRows_br);
 } // cmOK
 cmCreateDocs: {
@@ -610,6 +679,7 @@ end;
   tRows_br.MVZ_kod        'Код','МВЗ'               headerAlign = centered:protect,[4];
   tRows_br.MVZ_name       'Наименование','МВЗ'      headerAlign = centered:protect,[4];
   tRows_br.peredel_kod    'Код','передела'          headerAlign = centered:protect,[4];
+  PeredelCorrTocode       'НА КОТОРЫЙ','передел переносим'          headerAlign = centered:protect,[4];
   tRows_br.peredel_name   'Наименование','передела' headerAlign = centered:protect,[4];
   tRows_br.statya_kod     '№'                       headerAlign = centered:protect,[4];
   tRows_br.statya_name    'Статья','бюджета'        headerAlign = centered:protect,[4];
@@ -760,6 +830,9 @@ procedure importbudget(__cTemplate, __cInstance : comp; __typeTable : word); {
      }
   end;
 
+ if typeTable = cotblInstnBudgetSHPZCorr or typeTable = cotblInstnBudgetVidCorr
+   then SetFieldState(#PeredelCorrTocode  , sfVisible)
+   else ClearFieldState(#PeredelCorrTocode, sfVisible);
 
   if _wSTATYA = 0 or _wCATEGORY = 0 or _wSHPZ = 0 or _wPODR = 0 or _wCEX = 0 or _wMVZ = 0 or _wPEREDEL = 0 {
     stop;abort;exit;
