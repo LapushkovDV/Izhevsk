@@ -1,0 +1,1471 @@
+
+
+/*
+ ╔═══════════════════════════════════════════════════════════════════════════╗
+ ║                     (c) 1987,98 корпорация ГАЛАКТИКА                      ║
+ ║ Проект        : ГАЛАКТИКА              (c)Th корпорация Галактика         ║
+ ╚═══════════════════════════════════════════════════════════════════════════╝
+*/
+
+#include ProveDoc.vih
+#include LinkGrPL.vih         // iGrPl            привязка к группе плат.средств
+#include SDfuns.vih
+#include KontrBal.vih         // iKB              оперативный расчет сальдо контрагентов
+#include SoprDocb.vih
+#include ChkSchem.vih        // oChkSchem        Функции работы со схемами связей
+#include UKSfuns.vih          // oUKSfuns         привязка к объектам строительства
+#include MakeOrder.vih
+#include SchFactFunctions.vih
+#include TxoBind.vih          // iTxoBind         сложная привязка ТХО, и запуск сложной разноски
+#include SHManager.vih        // oSHManager       описание интерфейса для работы с SoprHoz
+#include DocTune.vih
+#include StatLog.vih
+#include ViewSchF.vih
+#include TotalLog_v1.vih  // Объектный интерфейс общего лога
+#include TotalLog.vih  // Объектный интерфейс общего лога
+#include Notes.vih         // Описание объекта для работы с полем Пояснение по статусу
+! #include IsprDoc.vih
+#include CorrDocFun.vih
+Interface ProveDoc ''  DoAccept,cyan;
+#include SFConst.inc
+#include CorrDocFun.var
+#include LinkGrPL.var         // iGrPl            привязка к группе плат.средств
+#include SDfuns.var
+#include ChkSchem.var         // oChkSchem        Функции работы со схемами связей
+#include UKSfuns.var          // oUKSfuns         привязка к объектам строительства
+#include KontrBal.var         // iKB              оперативный расчет сальдо контрагентов
+#include TxoBind.var          // iTxoBind         сложная привязка ТХО, и запуск сложной разноски
+!#include TotalLog_v1.var // Переменная-объект для общих логов
+#include TotalLog.var // Переменная-объект для общих логов
+
+var
+  iMakeOrder: MakeOrder;
+  iDocTune: DocTune noauto;
+  iSF: viSchFunc noauto;
+  iViewSchF : ViewSchF noauto;
+  MyVisualCount: word;
+  wCurTuneModify : word;
+  oNotes    : iNotes;
+  SfPar: TParamsSF;
+!  pIsprDoc : IsprDoc;
+Table struct tSpSch
+(
+   cMcUsl    : Comp
+ , cParty    : Comp
+ , dCur      : Double
+ , dOst      : Double
+ , cSchfact  : Comp
+)
+With Index
+(
+   tIdx00 = cMcUsl+cParty
+);
+
+Table Struct tSpAkt
+(
+   Nrec      : Comp
+ , cMcUsl    : Comp
+ , cParty    : Comp
+ , cSpSopr   : Comp
+ , Sum       : Double
+ , Kol       : Double
+)
+With Index
+(
+   tIdx00 = Nrec
+);
+
+Table struct mt_SpSopr
+(
+   cSpSopr    : Comp
+ , doPrice    : Double
+ , doRPrice   : Double
+ , doKol      : Double
+)
+With Index
+(
+   tIdx00 = cSpSopr
+);
+
+Table struct mt_SpNal
+(
+   cSpDoc    : Comp
+ , doSumma      : Double
+
+)
+With Index
+(
+   tIdx00 = cSpDoc
+);
+
+Create view vView
+var
+  par_KatSopr : tNRec;
+  dPrice: date;
+  OprDate
+/*, SfDate
+, SfRegDate*/  : date;
+/*  SfNum : string;*/
+
+  wSP, wMode: word;
+
+  IsRecModif
+  ,NeedProtokol
+  ,NeedAskDate: boolean;
+  LogHandle : longint;
+
+
+As Select
+  oCorrDocFun.GetKDKolOld(SpSopr.cADocSp, SpSopr.cSopr)
+         (FieldName = KDKolOld)
+
+, KDKolOld + if (SpSopr.Kol <> 0, SpSopr.KolOpl, 0)
+         (FieldName = KDKolNew)
+
+,  oCorrDocFun.GetKDSummaOld(SpSopr.cADocSp, SpSopr.cSopr, KatSopr.cVal)  (FieldName = KDSummaOld)
+//-----------------------------------------------------------------------------
+, if (KatSopr.cVal = 0, SpSopr.Price, SpSopr.VPrice) * SpSopr.KolOpl
+  + oCorrDocFun.GetKDSummaOld(SpSopr.cADocSp, SpSopr.cSopr, KatSopr.cVal) (FieldName = KDSummaNew)
+
+, KDSummaNew / KDKolNew     (FieldName = KDPriceNew)
+//-------
+, *
+From
+  BookPrZk
+, Dogovor
+, KatMc
+, KatParty
+, HozOper
+, KatNotes
+, KatPayment
+, KatSopr
+, KatSopr  KSopr
+, SklOrder
+, SoprHoz
+, SpSopr
+, SpSopr SpSoprSrc
+, SpecZatr SpecZatr2
+
+, StepDoc StepDoc1
+, BaseDoc BaseDoc1
+, SpDocNal SpDocNalSrc
+, tSpSch
+, tSpAkt
+, SpSopr SpSopr1
+Where
+((
+    par_KatSopr      == KatSopr.NRec
+AND KatSopr.NRec     == SpSopr.cSopr
+AND SpSopr.cMcUsl    == KatMc.Nrec
+
+AND KatSopr.cStepDoc == StepDoc.NRec
+AND StepDoc.cBaseDoc == BaseDoc.NRec
+AND KatSopr.cSchFact == SchFact.NRec
+AND KatSopr.cPayment == KatPayment.NRec
+//AND SoprHoz.cHozOper == HozOper.NRec
+
+!AND SchFact.cBaseDoc == BaseDoc1.Nrec;
+!AND SchFact.cStepDoc == StepDoc1.Nrec;
+))
+;
+Form errr2('protprov.out', 'errr2')with novisual;
+exception ExDocTune;
+  exception ExDocTuneNotLoad(ExDocTune);
+  exception ExDocTuneNotAccepted(ExDocTune);
+  exception ExStatusNotAccepted(ExDocTune);
+exception ExMakeProve;
+  exception ExMakeNoKatSopr;
+  exception ExMakeDataNotValid;
+  exception ExMakeSklOrder;
+
+  exception ExMakeSchFact;
+    exception ExSchFactDoError(ExMakeSchFact);
+    exception ExSchFactNotInited(ExMakeSchFact);
+    exception ExSchFactNotCreated(ExMakeSchFact);
+    exception ExSchFactNotRegistred(ExMakeSchFact);
+    exception ExSchFactNotFound(ExMakeSchFact);
+  exception ExMakeHozOper;
+
+#include DirectSQL.Vpp
+
+!-------------------------------------------------------------------------------------------------------------
+!
+!-------------------------------------------------------------------------------------------------------------
+window wnParams 'Формирование сопроводительных документов' gray, EscClose, doAccept ;
+Show At(,,45,8)
+screen scParams;
+Fields
+  OprDate      ('Введите дату')         : [, 'DD/MM/YYYY'],NoProtect;
+  [NDSNAME]    'Документ для учета НДС' : Skip;
+  SfPar.dDate  ('Введите дату')         : [, 'DD/MM/YYYY'],NoProtect;
+  SfPar.dRegDate  ('Введите дату')      : [, 'DD/MM/YYYY'],NoProtect;
+  SfPar.sNum                            : NoProtect;
+
+Buttons
+  cmOk,Default,, 'Ввод',   , scGalDial;
+  cmCancel,,,    'Отмена', , scGalDial;
+
+<<
+`Дата оприходования:`&.@@@@@@@@@@@
+ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+`Дата:            `&.@@@@@@@@@@@
+`Дата регистрации:`&.@@@@@@@@@@@
+`Номер:            `.@@@@@@@@@@@@@@@@@@@@@@@@
+  <.~П~родолжить.>       <. ~О~тмена .>
+>>
+end;
+
+HandleEvent
+cmInit:
+{
+  if iDocTune.NeedMake(cgOper_SchFact)
+  {
+    SetFieldVisible(#SfPar.dDate, true);
+    ShowLabel4Field(#SfPar.dDate);
+    SetFieldVisible(#SfPar.dRegDate, true);
+    ShowLabel4Field(#SfPar.dRegDate);
+    SetFieldVisible(#SfPar.sNum, true);
+    ShowLabel4Field(#SfPar.sNum);
+    SetFieldVisible(#NDSNAME, true);
+  }
+  else
+  {
+    SetFieldVisible(#SfPar.dDate, false);
+    HideLabel4Field(#SfPar.dDate);
+    SetFieldVisible(#SfPar.dRegDate, false);
+    HideLabel4Field(#SfPar.dRegDate);
+    SetFieldVisible(#SfPar.sNum, false);
+    HideLabel4Field(#SfPar.sNum);
+    SetFieldVisible(#NDSNAME, false);
+  }
+
+}
+cmOk:
+{
+  if(SfPar.dDate > SfPar.dRegDate)
+  {
+    Message('Дата регистрации не может быть меньше даты формирования СФ.');
+    Exit;
+  }
+  if(SfPar.dDate > SfPar.dRegDate)
+  {
+    Message('Дата регистрации не может быть меньше даты формирования СФ.');
+    Exit;
+  }
+  PutCommand(cmDefault);
+}
+ // CloseWindow(wnParams);
+end;
+
+end;
+/*procedure ParseExeption( );
+{}
+*/
+function NeedMakeSF: boolean;
+{
+  Result :=  if(GetFirst KatPayment = tsOk, LoCase(KatPayment.Name) != 'без сф', true);
+
+}
+!-------------------------------------------------------------------------------------------------------------
+!Записать сообщение в протокол
+!lev - количество отступов
+!-------------------------------------------------------------------------------------------------------------
+procedure WriteProtokol(strMes: string; lev: word = 2);
+{
+  If NeedProtokol
+    Form_Write(LPadCh('', ' ', lev) + strMes, '', LogHandle);
+}
+!-------------------------------------------------------------------------------------------------------------
+!
+!-------------------------------------------------------------------------------------------------------------
+procedure MyBeginVisual(sMess: string);
+{
+  if (MyVisualCount = 0)
+  {
+    StartNewVisual(vtRotateVisual, vfTimer, 'Отмена проведение документа...', 3);
+    SetVisualTitle(sMess);
+
+  }
+  SetVisualHeader(sMess);
+  MyVisualCount ++;
+}
+!-------------------------------------------------------------------------------------------------------------
+!
+!-------------------------------------------------------------------------------------------------------------
+procedure MyStopVisual;
+{
+  MyVisualCount --;
+  if MyVisualCount = 0
+    StopVisual('', 0);
+}
+!-------------------------------------------------------------------------------------------------------------
+!Получение направления счета фактуры
+!-------------------------------------------------------------------------------------------------------------
+function GetDirectShFact : word;
+{
+  Result := 0;
+  case KatSopr.VidSopr of
+    552,553,554:     Result := 2;
+    504,513,551,557: Result := 1;
+    // накладные и акты из KatSopr
+    101..111, 114, 151, 201..211, 251, 1411, 1421:
+    {
+      case KatSopr.VidSopr of
+       102,106,203,206,114: Result := KatSopr.TipSopr; // возвраты
+      else
+        case KatSopr.TipSopr of
+          1: Result := 2;
+          2: Result := 1;
+        end;
+      end;
+    }
+  end;
+  if ( Result = 0)
+    Message('Неизвестный тип документа, по которому формируется документ по учету НДС',Information);
+};
+#include KatSoprToBaseDoc.vpp
+!-------------------------------------------------------------------------------------------------------------
+! Апдейт накладных перед и после операций проведения
+!-------------------------------------------------------------------------------------------------------------
+Function Update_Current_KatSopr: word;
+{
+  Result := Update Current KatSopr;
+  if  Result != tsOk
+  {
+    Message('Ошибка обновления статуса: ' + Result + 'Обратитесь к разработчикам.');
+  }
+
+
+   iKB.SaveInfoforBal(KatSopr.VidSopr,KatSopr.NRec);
+
+
+  if ( Result = tsOk )
+    oSDfuns.UpdateSoprHoz(KatSopr.Buffer);
+
+  iKB.ModiKontrBal(KatSopr.VidSopr,KatSopr.NRec);
+}
+!-------------------------------------------------------------------------------------------------------------
+!Вставка накладной если новая, теоретически не должно попасть сюда
+!-------------------------------------------------------------------------------------------------------------
+Procedure MakeNotNewKatSopr;
+{
+  if (IsNew)
+  {
+    insert current KatSopr;
+    SetNew(FALSE);
+    // тип документа системный,ссылка на документ,ссылка на контрагента
+    iGrPl.InsSpGrPlD_Default( KatSopr.VidSopr, KatSopr.NRec, KatSopr.cOrg);
+    Update_Current_KatSopr;
+  }
+}
+!-------------------------------------------------------------------------------------------------------------
+!
+!-------------------------------------------------------------------------------------------------------------
+function DeleteHozOperBySh(TipDoc: word; cSoprDoc: tNrec): boolean;
+var
+  iSHoz : ObjSHmanager;
+{
+  Result := false;
+
+
+  If (GetFirst SoprHoz where ((TipDoc  == SoprHoz.TipDoc AND cSoprDoc == SoprHoz.cSoprDoc)) != tsOk)
+    Exit;
+
+  iTxoBind.ResetServer;
+  if ( NullVipRef(iSHoz) )
+    GetVipRef(iSHoz, 'SHmanager');
+
+  iShoz.CheckMagOper(#TSoprHozX(SoprHoz.bufferp), integer(1));
+  iTxoBind.BuildTree(SoprHoz.bufferp);
+  Result := iTxoBind.UnBind(SoprHoz.bufferp);
+  iTxoBind.ProcessProtokol;
+
+
+}
+!-------------------------------------------------------------------------------------------------------------
+!Удаление хоз операции
+!-------------------------------------------------------------------------------------------------------------
+function DeleteHozOper: boolean;
+{
+  /*if not iDocTune.NeedDel(cgOper_HozOper)
+  {
+    Result := true;
+    Exit;
+  }       */
+  Result := false;
+  WriteProtokol('Удаление ХозОпераций по документу.');
+  if (not DeleteHozOperBySh(KatSopr.VidSopr, KatSopr.Nrec)      )
+     WriteProtokol('Ошибка удаления ХозОпераций по документу.', 3);
+  else
+  {
+    update current SoprHoz;
+    if GetFirst KatSopr = tsOk
+    {
+      KatSopr.cHozOper    := SoprHoz.cHozOper;
+      set KatSopr.SoprHoz := 1;
+      Update_Current_KatSopr;
+    }
+  }
+  Result := true;
+
+}
+!-------------------------------------------------------------------------------------------------------------
+!Привязка Хоз. операции
+!-------------------------------------------------------------------------------------------------------------
+function MakeHozOperBySh(TipDoc: word; cSoprDoc: tNrec; wOperFlag: word; wRecType: word = 0): word;
+var
+  iSHoz : ObjSHmanager;
+  TxoIsGood : boolean;
+  logMes: string;
+{
+  Result := 0;
+  TxoIsGood := false;
+
+  If (GetFirst SoprHoz where ((TipDoc  == SoprHoz.TipDoc AND cSoprDoc == SoprHoz.cSoprDoc)) != tsOk)
+    Exit;
+
+  iTxoBind.ResetServer;
+  if ( NullVipRef(iSHoz) )
+    GetVipRef(iSHoz, 'SHmanager');
+
+  //передаем тип книги для проведения
+  SoprHoz.cHozOper := iDocTune.GetHozOper(wOperFlag, wRecType);
+  SoprHoz.SysOper  := wRecType;//получаем тип операции для всего
+  //Message(TipDoc+' '+wRecType+' '+SoprHoz.cHozOper);
+  if (SoprHoz.cHozOper = 0) and (wRecType != 0) // значит нет записи для книги покупок в настройке
+  {
+    Result := 2;
+    Exit;
+  }
+
+  if GetFirst HozOper where ((SoprHoz.cHozOper == HozOper.Nrec)) != tsOk
+    Exit;
+  iShoz.CheckMagOper(#TSoprHozX(SoprHoz.bufferp), integer(1));
+  iTxoBind.BuildTree(SoprHoz.bufferp);
+  iTxoBind.SetOperation(0, wOper_ReObor, 0, 0);
+  TxoIsGood := iTxoBind.RealizeAndApplyOperations(SoprHoz.bufferp);
+
+  iTxoBind.ProcessProtokol;
+
+  if ( TxoIsGood )
+  {
+    update current SoprHoz;
+    WriteProtokol('Привязана хозоперация "' + HozOper.Name1 +'"', 3);
+  }
+
+  Result := 1;
+}
+!-------------------------------------------------------------------------------------------------------------
+!Привязка Хоз. операции
+!-------------------------------------------------------------------------------------------------------------
+function MakeHozOper: boolean;
+
+{
+  Result := false;
+  if not iDocTune.NeedMake(cgOper_HozOper)
+  {
+    Result := true;
+    Exit;
+  }
+  if (GetFirst KatSopr != tsOk)
+    Exit;
+  WriteProtokol('Привязка ХозОперации:') ;
+  if (MakeHozOperBySh(KatSopr.VidSopr, KatSopr.Nrec, cgOper_HozOper) = 0)
+  {
+    WriteProtokol(' Не найдена хозоперация для типа: ' + KatSopr.VidSopr, 3);
+    Exit;
+  }
+  Result := true;
+}
+
+!-------------------------------------------------------------------------------------------------------------
+!Привязка Хоз. операции
+!-------------------------------------------------------------------------------------------------------------
+function MakeBookHozOper: boolean;
+var
+  wBookType
+  ,wDirect: word;
+  cSchFact: tNrec;
+  isBookRec: boolean;
+  wSh: word;
+{
+  Result := false;
+  if not iDocTune.NeedMake(cgOper_HozOperBook)
+  {
+    Result := true;
+    Exit;
+  }
+  if (GetFirst KatSopr != tsOk)
+    Exit;
+  if ( GetFirst SchFact != tsOk )
+    Exit;
+
+  WriteProtokol('Привязка ХозОперации к записям в книге покупок/продаж:') ;
+  /*wBookType := iDocTune.GetBookType;
+  if (wBookType = 0)
+  {
+    WriteProtokol(' Не найдена хозоперация к записям в книге покупок/продаж', 3);
+    Exit;
+  }                                 */
+  cSchFact := SchFact.Nrec;
+  isBookRec := false;
+  _loop BookPrZk where ((cSchFact == BookPrZk.cSchFact))
+  {
+    /*if (BookPrZk.TipUser != wBookType)
+      continue;           */
+
+    wDirect := word(SubStr(BookPrZk.TipUser, 1, 2));
+    isBookRec := true;
+    wSh := MakeHozOperBySh(wDirect, BookPrZk.Nrec, cgOper_HozOperBook, BookPrZk.TipUser);
+    if (wSh = 0)
+    {
+      WriteProtokol(' Не найдена хозоперация к записям в книге покупок/продаж', 3);
+      Exit;
+    }
+  }
+
+  if not isBookRec
+    WriteProtokol(' Нет записей в книге покупок/продаж', 3);
+  else
+   if wSh = 2
+    WriteProtokol(' Нет записи для книги покупок/продаж в настройке.', 3);
+  Result := true;
+}
+
+#include ProveDoc204.Vpp
+
+
+!-------------------------------------------------------------------------------------------------------------
+!Окно настройки параметров операций
+!-------------------------------------------------------------------------------------------------------------
+function GetMakeParams: boolean;
+{
+  Result := false;
+  SfPar.dDate := SfPar.dRegDate := OprDate := if (longint(KatSopr.dOpr) = 0, KatSopr.dSopr, KatSopr.dOpr);
+  if (not iDocTune.NeedMake(cgOper_SchFact))  or (not NeedMakeSF)
+  {
+    result := true;
+    Exit;
+  }
+  iViewSchF.GetNumDate(SfPar, KaTSopr.Nrec);
+
+  if(( KatSopr.VidSopr != 201) and ( KatSopr.VidSopr != 211))
+  {
+    if (SfPar.dDate = date(0,0,0))
+      SfPar.dDate := KatSopr.dSopr;
+    if (SfPar.dRegDate = date(0,0,0))
+      SfPar.dRegDate := SfPar.dDate;
+
+
+    if (trim(SfPar.sNum) = '')
+      SfPar.sNum := KatSopr.NSopr;
+  }
+  if NeedAskDate
+    if (RunWindowmodal(wnParams) != cmDefault)
+      Exit;
+
+   Result := true;
+}
+
+!-------------------------------------------------------------------------------------------------------------
+! проверка данных перед формированием ордеров
+!-------------------------------------------------------------------------------------------------------------
+function CheckData: boolean;
+var
+  bBoxNeedAuto: boolean;
+{
+  Result := false;
+  If (wGetTune('Doc.Buy.MakeOrder')=1 and KatSopr.status != 1)
+  {
+    message('Включена настройка "Формирование ордеров по накладным только в статусе "исполняемый"".');
+    exit;
+  }
+  bBoxNeedAuto := false ;
+  if (ExistTune('Oper.BoxAutoNew'))
+  {
+    if (boGetTune('Oper.UseBoxes') and (wGetTune('Oper.BoxAutoNew') = 2))
+      if (message('Выполнить автоматическое распределение по ячейкам?', YesNo) = cmYes)
+        bBoxNeedAuto := true;
+  }
+
+  PushPos(#SpSopr);
+
+  _LOOP SpSopr
+    _LOOP SpecZatr2 where ((SpSopr.NRec == SpecZatr2.cAddSumTune))
+      if (SpecZatr2.coTable = 0)
+      {
+        Message('Накладная связана с актом о приемке материалов.');
+        PopPos(#SpSopr);
+        Exit;
+      }
+  if (boGetTune('Oper.UseBoxes') and (wGetTune('Oper.BoxAutoNew') = 2))
+    _LOOP SpSopr
+    {
+      PushPos(#SpSopr);
+      if not bBoxNeedAuto
+        RunInterface('InBoxPlan', SpSopr.NRec);
+      PopPos(#SpSopr);
+    }
+
+  PopPos(#SpSopr);
+  if (wGetTune('Oper.Buy.Nakl.PrihParty') = 1) and (not boGetTune('MCUsl.AvtoParty')) and (KatSopr.VidSopr = 101)
+  {
+    PushPos(#SpSopr);
+    _Loop SpSopr where ((KatSopr.nRec == SpSopr.cSopr and  word(1) == SpSopr.prMC and (SpSopr.cParty = 0) ))
+      if (KatMC.kGroupMC <> sGetTune('Tara.KodGrMcTara'))
+      {
+        ShowTune('Для формирования ордера требуется наличие партии у всех позиций спецификации!',
+                 'Oper.Buy.Nakl.PrihParty');
+        PopPos(#SpSopr);
+        Abort;
+        Exit;
+      }
+    PopPos(#SpSopr);
+  }
+
+  MakeNotNewKatSopr;
+  Result := true;
+}
+!-------------------------------------------------------------------------------------------------------------
+!Возвращает дату для ордера объекту
+!-------------------------------------------------------------------------------------------------------------
+Function CanMakeOrder: Date;
+{
+  Result := to_Days(0);
+
+  if (NOT iMakeOrder.IsDelOrder(KatSopr.NRec))
+    Exit;
+
+  /*if (KatSopr.dSopr > OprDate)
+    if (Message('Дата формирования ордеров меньше даты документа!'#13 +
+                'Продолжить формирование?', Confirmation + YesNo + mfSwapButtons) <> cmYes)
+      Exit;                   */
+
+
+  Result := OprDate;
+}
+!-------------------------------------------------------------------------------------------------------------
+!Удаление ордеров
+!-------------------------------------------------------------------------------------------------------------
+function DeleteOrders: boolean;
+{
+ /* if not iDocTune.NeedDel(cgOper_SklOrder)
+  {
+    Result := true;
+    Exit;
+  }
+ */
+  WriteProtokol('Удаление ордеров по документу.');
+  Result := iMakeOrder.DeleteOrders(KatSopr.NRec, false, true, true, 0, 0);
+  if not Result
+    WriteProtokol('Ошибка удаления ордеров.', 3);
+}
+function MakePrihOrder: boolean;
+var
+  firstRozn,
+  prRozn: boolean;
+{
+  Result := iMakeOrder.MakePrihOrder(KatSopr.Nrec, false, firstRozn, prRozn,wSP,wMode,0);
+
+  if (KatSopr.VidSopr = 101)
+  {
+    _Loop KSopr where ((KatSopr.Nrec == KSopr.cKatSopr))
+      if (KSopr.VidSopr = 111)
+        {
+          if (KSopr.wcIzd <> cgCustomAkt)
+          {
+            KSopr.wcIzd := cgPrihOrdAkt;
+            Update current KSopr;
+          }
+        }
+  }
+  if ( KatSopr.VidSopr = 101 )
+    // Если есть модуль "Управление строительством" в лицензионном файле
+    if (GetFirst SklOrder where ((KatSopr.NRec == SklOrder.cSopr)) = tsOk)
+    {
+      oChkSchem.CheckSchem(KatSopr.Nrec, KatSopr.VidSopr, SklOrder.Nrec,
+                           if(SklOrder.VidOrder = 0, word(150), word(250)), true);
+
+      if UpdateTable
+        oUKSfuns.JoinSO(SklOrder.nRec);
+    }
+
+  if (prRozn)
+  {
+    Update_Current_KatSopr;
+    RunInterface(KUTOper);
+  }
+}
+!-------------------------------------------------------------------------------------------------------------
+!Формирование складских ордеров
+!-------------------------------------------------------------------------------------------------------------
+function MakeSkladOrder: boolean;
+var
+  firstRozn,
+  prRozn: boolean;
+{
+  Result := false;
+  wMode := 0;
+
+  if not iDocTune.NeedMake(cgOper_SklOrder)
+  {
+    Result := true;
+    Exit;
+  }
+  WriteProtokol('Формирование складских ордеров ... ');
+  if not DeleteOrders
+    Exit;
+  BindEvent(CanMakeOrder, iMakeOrder.CanMakeOrder);
+
+
+  case KatSopr.VidSopr of
+    101, 111: Result :=  MakePrihOrder;
+    201, 204, 211: Result :=  iMakeOrder.MakeRashOrd (KatSopr.NRec, False, OprDate, 0, 0, 2, LogHandle);
+  end;
+  UnBindEvent(CanMakeOrder, iMakeOrder.CanMakeOrder);
+
+  if Result
+    WriteProtokol('Формирование завершено.', 3);
+  Result := true;
+}
+
+!-------------------------------------------------------------------------------------------------------------
+! Установка заданного номера и даты для СФ
+!-------------------------------------------------------------------------------------------------------------
+function UpdateSchFact: boolean;
+{
+  Result := true;
+  /*if (SfNum = '')
+    Exit;        */
+  if not iDocTune.NeedMake(cgOper_SchFact) or not NeedMakeSF
+    Exit;
+  if (GetFirst KatSopr != tsOk)
+    Exit;
+  if ( GetFirst SchFact = tsOk )
+  {
+
+    //ели одинаковые то и нечего апдейтить
+    if ( (SchFact.Num = SfPar.sNum) and (SchFact.DFACT = SfPar.dDate)
+       and (SchFact.DReg = SfPar.dRegDate) and (SchFact.cRecs[3] = SfPar.cStatusBuh)  )
+      Exit;
+    // если не задано то пропишем в аттрибуты накладной из счета фактуры
+    SfPar.sNum       := if(SfPar.sNum = ''     , SchFact.Num      , SfPar.sNum);
+    SfPar.dDate      := if(SfPar.dDate = 0     , SchFact.DFACT    , SfPar.dDate);
+    SfPar.dRegDate   := if(SfPar.dRegDate = 0  , SchFact.DReg     , SfPar.dRegDate);
+    SfPar.cStatusBuh := if(SfPar.cStatusBuh = 0, SchFact.cRecs[3], SfPar.cStatusBuh);
+
+    iViewSchF.SetNumDate(SfPar, KatSopr.Nrec);
+    if ( (update current SchFact set SchFact.Num      := SfPar.sNum
+                                  , SchFact.DFACT     := SfPar.dDate
+                                  , SchFact.DReg      := SfPar.dRegDate
+                                  , SchFact.cRecs[3] := SfPar.cStatusBuh
+         ) != tsOk )
+    {
+      WriteProtokol('Ошибка обновления документа для учета НДС.' );
+      Result := false;
+      Exit;
+    }
+
+  }
+  else
+  {
+    Result := false;
+    WriteProtokol('Ошибка изменения параметров документа для учета НДС.');
+    _raise ExSchFactNotFound;
+  }
+  Result := true;
+}
+
+!-------------------------------------------------------------------------------------------------------------
+!Удаление Хоз. операции
+!-------------------------------------------------------------------------------------------------------------
+function DeleteBookHozOper: boolean;
+var
+  wBookType
+  ,wDirect: word;
+  cSchFactD : tNRec;
+{
+  Result := false;
+  WriteProtokol('Удаление ХозОперации к записям в книге покупок/продаж:') ;
+  wBookType := iDocTune.GetBookType;
+
+  if(KatSopr.VidSopr != Word(204))
+  {
+/*    if (wBookType = 0)
+    {
+      WriteProtokol(' Не найдена хозоперация к записям в книге покупок/продаж', 3);
+      Exit;
+    }
+        */
+  cSchFactD := SchFact.Nrec;
+
+  _loop BookPrZk where ((cSchFactD == BookPrZk.cSchFact))
+  {
+/*    if (BookPrZk.TipUser != wBookType)
+      continue; */
+
+    wDirect := word(SubStr(BookPrZk.TipUser, 1, 2));
+    if (not DeleteHozOperBySh(wDirect, BookPrZk.Nrec)      )
+    {
+      WriteProtokol('Ошибка удаления ХозОпераций к записям в книге покупок/продаж.', 3);
+      Exit;
+    }
+   }
+  } // if(KatSopr.VidSopr != Word(204))
+  else
+   DeleteBookHozOper204;
+
+  Result := true;
+}
+
+!-------------------------------------------------------------------------------------------------------------
+!Удаление счетов фактур
+!-------------------------------------------------------------------------------------------------------------
+function DeleteSchFact: boolean;
+var
+  MarkerSchF: longint;
+  cSF: tNrec;
+{
+  Result := false;
+  _try
+  {
+/*    if not iDocTune.NeedMake(cgOper_SchFact) or not NeedMakeSF
+    {
+      Result := true;
+      Exit;
+    } */
+    if (KatSopr.cSchFact = Comp(0))
+    {
+      Result := true;
+      Exit;
+    }
+
+    if (GetFirst FastFirstRow SchFact where((KatSopr.cSchFact == SchFact.NRec)) != tsOk)
+    {
+      WriteProtokol('Удаление документа для учета НДС. Некорректная ссылка NREC: ' +  KatSopr.cSchFact);
+      Exit;
+    }
+    DeleteBookHozOper;
+    WriteProtokol('Удаление документа СФ № ' + SchFact.Num + ' от ' + string(SchFact.DFACT));
+    SfPar.sNum       := SchFact.Num  ;
+    SfPar.dDate      := SchFact.DFACT;
+    SfPar.dRegDate   := SchFact.DReg ;
+    SfPar.cStatusBuh := SchFact.cRecs[3];
+
+    iViewSchF.SetNumDate(SfPar, KatSopr.Nrec);
+
+    if ( not iSF.DoInit(GetDirectShFact) )
+      _raise ExSchFactNotInited;
+    iSF.SetMsgState(true);
+    //viTotalLogV1.vip убить мсг тама
+    Result := iSf.DeleteSchFact(KatSopr.cSchFact);
+
+
+    if (GetFirst FastFirstRow SchFact where((KatSopr.cSchFact == SchFact.NRec)) = tsOk)
+    {
+      Result := false;
+      WriteProtokol('Документ не удален.', 3);
+    }
+    else
+    {
+       If GetFirst KatSopr != tsOk
+         Exit;
+       /*if(pIsprDoc.IsIspr(KatSopr.NRec))
+       {
+         pIsprDoc.DeleteIsprRecs(KatSopr.cAdoc);
+       }*/
+    }
+  }
+}
+!-------------------------------------------------------------------------------------------------------------
+!Регистрация СФ
+!-------------------------------------------------------------------------------------------------------------
+function RegisterSchFact:boolean;
+var
+  tmpSchDate
+, tmpDateOpr: date;
+{
+  Result := false;
+  _try
+  {
+    if not iDocTune.NeedMake(cgOper_SchFactReg) or not NeedMakeSF
+    {
+      Result := true;
+      Exit;
+    }
+    if ( not iSF.DoInit(GetDirectShFact) )
+      _raise ExSchFactNotInited;
+
+    iSF.SetMsgState(true);
+    if (GetFirst KatSopr != tsOk)
+      Exit;
+    tmpDateOpr := KatSopr.dOpr;
+    if ( GetFirst SchFact = tsOk )
+    {
+
+     WriteProtokol('Регистрация документа для учета НДС № ' + if(SfPar.sNum != '', SfPar.sNum, SchFact.Num) +
+                   ' от ' + if(SfPar.dDate != 0, string(SfPar.dDate), string(SchFact.DFACT)));
+     if(SfPar.dRegDate != SchFact.dPost) and (SfPar.dRegDate != 0)
+      {
+       // SfRegDate  := if(SfRegDate = 0, SchFact.DReg , SfRegDate);
+        tmpSchDate := SchFact.DPost;
+
+        if ((update current SchFact set SchFact.DPost := SfPar.dRegDate) != tsOk){}
+
+
+      }
+      if iSF.Register(SchFact.Nrec)
+      {
+        if (SchFact.DPost = 0)
+          if ((update current SchFact set SchFact.DPost := SchFact.DReg ) != tsOk){}
+        WriteProtokol('Документ зарегистрирован.', 3);
+
+//        pIsprDoc.CheckSFRegister(SchFact.Nrec, KatSopr.wAdoc);
+        /*if(pIsprDoc.IsIspr(KatSopr.NRec))
+        {
+          pIsprDoc.CreateRecords(SchFact.Nrec, KatSopr.VidSopr);
+
+        }*/
+      }
+      else
+        _raise ExSchFactNotRegistred;
+    }
+    else
+      _raise ExSchFactNotFound;
+
+    Result := true;
+  }
+  _finally
+  {
+    if(tmpDateOpr != KatSopr.dOpr)
+      if ((update current KatSopr set KatSopr.dOpr := tmpDateOpr) != tsOk){}
+  }
+
+}
+
+!-------------------------------------------------------------------------------------------------------------
+! Установка договора из накладной
+!-------------------------------------------------------------------------------------------------------------
+Function MakeBaseDocToSF: boolean;
+{
+   Result := false;
+
+   if(GetFirst BaseDoc1 Where ((SchFact.cBaseDoc == BaseDoc1.Nrec)) =tsOk)
+    {
+      Result := True;
+      Exit;
+    }
+
+    if(GetFirst Dogovor Where ((KatSopr.cDogovor == Dogovor.Nrec)) != tsOK)
+      Exit;
+
+
+    if(GetFirst BaseDoc1 Where ((Dogovor.Nrec ==  BaseDoc1.cDogovor AND Word(211) == BaseDoc1.VidDoc)) !=tsOk)
+    { // Создаем
+      ClearBuffer(#BaseDoc1);
+        BaseDoc1.VidDoc   := 211;
+        BaseDoc1.NoDoc    := Dogovor.NoDoc;
+        BaseDoc1.dForm    := Dogovor.dDoc;
+        BaseDoc1.dDoc     := Dogovor.dDoc;
+        BaseDoc1.YearDoc  := Year(BaseDoc1.dDoc);
+        BaseDoc1.cDogovor := Dogovor.Nrec;
+        BaseDoc1.Name     := 'по договору';
+        BaseDOC1.FilialNo := lGetTune('Konsolid.FilialNo');
+        BaseDOC1.KolDn    := wGetTune('Oper.SrokSch'); //word "количество дней действия счета",
+        BaseDOC1.Descr    := sGetTune('User.Descr');
+        BaseDOC1.DesGr    := sGetTune('User.DesGr');
+        BaseDOC1.cOrg     := Dogovor.cPlat;
+        BaseDOC1.Status   := Word(2);
+        BaseDOC1.cNote    := oNotes.GetFirstNote(Word(40), BaseDOC1.Status);
+      Insert Current BaseDoc1;
+    }
+
+    if(GetFirst StepDoc1 Where ((BaseDoc1.Nrec ==  StepDoc1.cBaseDoc)) !=tsOk)
+    { // Создаем
+       ClearBuffer(#StepDoc1);
+        StepDoc1.cBaseDoc := BaseDoc1.Nrec;
+        StepDoc1.Name     := BaseDoc1.Name;
+        StepDoc1.nStep    := Word(1);
+        StepDoc1.dStart   := BaseDoc.dDoc;
+        StepDoc1.dEnd     := BaseDoc.dDoc;
+        StepDoc1.Status   := Word(2);
+       Insert Current StepDoc1;
+    }
+
+    SchFact.cBaseDoc := StepDoc1.cBaseDoc;
+    SchFact.cStepDoc := StepDoc1.Nrec;
+    Update Current SchFact;
+
+   Result := True;
+} // function MakeBaseDocToSF
+
+!-------------------------------------------------------------------------------------------------------------
+!Создание СФ
+!-------------------------------------------------------------------------------------------------------------
+function MakeMySchFact: boolean;
+var
+  ValidKatSopr, bIsExistSchFact : Boolean;
+  StrTmp                        : String;
+  KS   : type$KatSopr;
+{
+  Result := false;
+  if not iDocTune.NeedMake(cgOper_SchFact) or not NeedMakeSF
+  {
+    Result := true;
+    Exit;
+  }
+  // Необходима такая проверка, т.к. в KatSopr.cSchFact м.б. ссылка на несуществующий документ
+  bIsExistSchFact := False;
+
+  _try
+  {
+    WriteProtokol('Формирование документа для учета НДС ... ');
+    if ( not iSF.DoInit(GetDirectShFact) )
+      _raise ExSchFactNotInited;
+
+    DeleteSchFact;
+    if (not bIsExistSchFact)
+    {
+      if IsValid(#BaseDoc)
+      {
+        if (NOT ((KatSopr.VidSopr = 111) AND (BaseDoc.VidDoc = 520)) AND
+            NOT ((KatSopr.VidSopr = 211) AND (BaseDoc.VidDoc = 102)))
+          if (not (KatSoprToBaseDoc = BaseDoc.VidDoc))
+            _raise ExSchFactDoError;
+      }
+
+/*      if(pIsprDoc.IsIspr(KatSopr.NRec))
+      {
+        If GetFirst KatSopr != tsOk
+          Exit;*/
+/*        KS := KatSopr.Buffer;
+        if (GetFirst KSopr where ((KatSopr.cADoc == KSopr.NRec)) = tsOk)
+        {
+          KatSopr.wAdoc := adSoprDocKN;
+          KatSopr.Summa += KSopr.Summa;
+          update current KatSopr ;
+          delete all mt_SpSopr;
+          delete all mt_SpNal;
+          _loop SpSopr where ((KatSopr.Nrec == SpSopr.cSopr))
+          {
+            ClearBuffer(#mt_SpSopr);
+            mt_SpSopr.cSpSopr := SpSopr.Nrec;
+            mt_SpSopr.doPrice := SpSopr.Price;
+            mt_SpSopr.doRPrice := SpSopr.RPrice;
+            mt_SpSopr.doKol := SpSopr.KolOpl;
+            insert current mt_SpSopr;
+            if GetFirst SpDocNal where ((SpSopr.NRec == SpDocNal.cSpDoc)) = tsok
+            {
+              mt_SpNal.cSpDoc := SpDocNal.Nrec;
+              mt_SpNal.doSumma := SpDocNal.Summa;
+              insert current mt_SpNal;
+            }
+
+            if (GetFirst SpSoprSrc where ((SPSOPR.CADOCSP == SpSoprSrc.Nrec )) = tsOk)
+            {
+              if GetFirst SpDocNalSrc where ((SpSoprSrc.NRec == SpDocNalSrc.cSpDoc)) = tsOk
+              {
+                 SpDocNal.Summa +=SpDocNalSrc.Summa;
+                 update current SpDocNal;
+              }
+
+              SpSopr.Price := KDPriceNew;
+              SpSopr.RPrice := KDPriceNew;
+              SpSopr.KolOpl   := KDKolNew;
+              update current SpSopr;
+            }
+
+          }
+
+        }  */
+!        Message('ok');
+
+      //}
+      if ( NOT iSF.CreateSFbyKatSopr(KatSopr.NRec) )
+        _raise ExSchFactNotCreated;
+
+      If GetFirst KatSopr != tsOk
+          Exit;
+      /*if(pIsprDoc.IsIspr(KatSopr.NRec))
+      {
+        KatSopr.wAdoc := KS.wAdoc;
+        KatSopr.Summa := KS.Summa;
+        update current KatSopr ;
+        _loop SpSopr where ((KatSopr.Nrec == SpSopr.cSopr))
+        {
+          if (GetFirst mt_SpSopr where ((SPSOPR.NRec == mt_SpSopr.cSpSopr )) = tsOk)
+          {
+
+            SpSopr.Price := mt_SpSopr.doPrice;
+            SpSopr.RPrice := mt_SpSopr.doRPrice;
+            SpSopr.KolOpl:= mt_SpSopr.doKol;
+            update current SpSopr;
+          }
+          _loop SpDocNal   where ((SpSopr.NRec == SpDocNal.cSpDoc))
+          {
+            if (GetFirst mt_SpNal where ((SpDocNal.NRec == mt_SpNal.cSpDoc  )) = tsOk)
+            {
+              SpDocNal.Summa := mt_SpNal.doSumma;
+              update  current SpDocNal;
+            }
+          }
+
+        }
+
+      }                         */
+
+
+
+      ReReadRecord(tnKatSopr);
+       if(GetFirst SchFact =tsOK)
+       {
+         SchFact.dPost := SchFact.dFact;
+         Update Current SchFact;
+         MakeBaseDocToSF;
+       }
+
+      WriteProtokol('Документ успешно сформирован', 3);
+      Result := true;
+    }
+  }
+} // Procedure MakeSchFact
+
+!-------------------------------------------------------------------------------------------------------------
+!Установка статуса документа, статус берется из DocTune
+!-------------------------------------------------------------------------------------------------------------
+procedure SetGalStatus(wNum: word);
+var
+  iStatlog      : vipStatlog;
+  cNewStat : tNRec;
+  wNewStat : word;
+{
+  cNewStat := iDocTune.GetDocStatus(wNum);
+  if GetFirst KatNotes where ((cNewStat == KatNotes.NRec)) = tsOk
+    wNewStat := KatNotes.Status;
+  if GetFirst KatSopr != tsOk
+    Exit;
+
+  if KatSopr.Status = wNewStat
+    Exit;                    // KatSopr.VidSopr
+//                                  , word(1024+1)
+  iStatlog.StatLog_InsNewStat(word(100), KatSopr.Nrec, KatSopr.Status, KatSopr.cNote,
+                                wNewStat, cNewStat,
+                                if(wNum = 4, 'проведение документа', 'отмена проведение документа')
+                              );
+  KatSopr.Status := wNewStat;
+  KatSopr.cNote  := cNewStat;
+  //KatSopr.cZakaz := iDocTune.GetDocStatus(cgStatus_ControlProve);
+  Update_Current_KatSopr;
+}
+!-------------------------------------------------------------------------------------------------------------
+!
+!-------------------------------------------------------------------------------------------------------------
+function CheckStatus(wStatus: word): boolean;
+{
+  Result := (wStatus != 4);
+}
+!-------------------------------------------------------------------------------------------------------------
+!Инициализация настроек документа
+!-------------------------------------------------------------------------------------------------------------
+function InitDocTune: boolean;
+{
+  Result := false;
+  _try
+  {
+    iDocTune := new(DocTune, InitDoc(KatSopr.VidSopr));
+    if not iDocTune.SetTune(KatSopr.cIzd, KatSopr.wcIzd)
+      _raise  ExDocTuneNotLoad;
+    if (not iDocTune.isAvaliableCommand(1) )
+      _raise  ExDocTuneNotAccepted;
+    if (not CheckStatus(KatSopr.Status) )
+      _raise  ExStatusNotAccepted;
+
+    iViewSchF.SetSchFact(KatSopr.cSchFact, KatSopr.Nrec, false);
+
+    Result := true;
+  }
+  _except
+    on ExRef: Message('Ошибка загрузки объекта настроек для документа.'#13 + 'Обратитесь к разработчикам!');
+    on ExDocTuneNotLoad: Message('Ошибка загрузки настроек для документа.');
+    on ExDocTuneNotAccepted: Message('Вам запрещено модифицировать документ с данным видом операции.', Error);
+    on ExStatusNotAccepted:  Message('Статус документа запрещает его модификацию .', Error);
+}
+
+!-------------------------------------------------------------------------------------------------------------
+! Закрытый период бух. контура
+!-------------------------------------------------------------------------------------------------------------
+Function boClosePeriod:boolean;
+Var
+  dtECBUH : Date;
+  ModAfterClose : Word;
+{
+    Result := True;
+    dtECBUH := dGetTune('FIN.USER.DTECBUH');
+    ModAfterClose:= wGetTune('FIN.USER.MODAFTERCLOSE');
+
+    if(KatSopr.dSopr < dtECBUH)
+    {
+       Case ModAfterClose of
+        0 : {}
+        1 : {
+               if(Message('Документ находится в закрытом отчетном периоде. Продолжить проведение?',YesNo)<>cmYes)
+                exit;
+            }
+        2 : {
+               Message('Документ находится в закрытом отчетном периоде. Модификация запрещена!');
+               exit;
+            }
+       End; //case
+    }
+
+    Result := false;
+} // function boClosePeriod
+
+!-------------------------------------------------------------------------------------------------------------
+!Отмена проведения документа
+!-------------------------------------------------------------------------------------------------------------
+function DeleteProve(cKatSopr: tNRec): boolean;
+{
+  Result := true;
+  _try
+  {
+    par_KatSopr := cKatSopr;
+    MyBeginVisual('Отмена проведение документа...');
+    if (GetFirst KatSopr != tsOk)
+      Exit;
+
+
+    if(boClosePeriod)
+      exit;
+
+    if not InitDocTune
+      Exit;
+    Result := Result and DeleteHozOper;
+    Result := Result and DeleteOrders;
+    if Result
+    {
+      if GetFirst KatSopr != tsOk
+        Exit;
+      case KatSopr.VidSopr of
+        111:
+        {
+          KatSopr.cPodrTo := 0;
+          KatSopr.cMolTo  := 0;
+          Update current KatSopr;
+        }
+      end;
+    }
+
+    Result := Result and if(KatSopr.VidSopr !=Word(204),DeleteSchFact,DeleteBookHozOper);
+
+    SetGalStatus(cgStatus_GalUnProved);
+    //если отменяем из создания и отмена прошла не полностью, то статус ставим проведен
+  }
+  _finally
+  {
+    MyStopVisual;
+    ShowProtokol;
+    iDocTune := NullRef;
+  }
+}
+
+!-------------------------------------------------------------------------------------------------------------
+!
+!-------------------------------------------------------------------------------------------------------------
+function CheckDataAll: boolean;
+{
+  Result := false;
+  If KatSopr.cOrgBase = 0
+  {
+    WriteProtokol('Необходимо заполнить поле "Организация-контрагент".');
+    exit;
+  }
+
+  if (not IsValid(#SpSopr))
+  {
+    WriteProtokol('Нет спецификации по документу.');
+    Exit;
+  }
+
+   if(iDocTune.wGetParamTune('wParSFB') = Word(0))
+    If ( (KatSopr.dSopr > SfPar.dDate) and (SfPar.dDate != 0) )
+      or ( (KatSopr.dSopr > SfPar.dRegDate) and (SfPar.dRegDate != 0) )
+    {
+      Message('Дата СФ не может быть меньше даты накладной.');
+      WriteProtokol('Дата СФ не может быть меньше даты накладной.');
+      Exit;
+    }
+  Result := true;
+}
+
+
+!-------------------------------------------------------------------------------------------------------------
+! проведение документа
+!-------------------------------------------------------------------------------------------------------------
+Function RunMake: boolean;
+{
+  Result := false;
+  _try
+  {
+
+    if not MakeSkladOrder
+      _raise ExMakeSklOrder;
+
+    if(KatSopr.VidSopr !=Word(204))
+     MakeMySchFact;// эксепшн генерится внутри и сюда упадет
+
+    if not MakeHozOper
+      _raise ExMakeHozOper;
+
+    if(KatSopr.VidSopr !=Word(204))
+    {
+      UpdateSchFact;
+      RegisterSchFact; //сразу не находит schfact, не критично
+      MakeBookHozOper;
+    }
+    else
+    {
+      MakeBookHozOper204;
+    }
+    Result := true;
+  }
+  _except
+    on ExUserBreak:
+    {
+      Message('Break');
+      WriteProtokol('Формирование прервано пользователем!' , 1);
+    }
+    //обработка ошибок формирования Ордеров
+    on ExMakeSklOrder:
+      WriteProtokol('Складские ордера не сформированы...');
+    //обработка ошибок формирования СФ
+    on ExSchFactNotInited:
+      WriteProtokol('Не проинициализирован модуль обработки документов для учета НДС');
+    on ExSchFactNotCreated:
+      errr2.Write('Документ для учета НДС не создан...');
+    on ExSchFactDoError:
+      WriteProtokol( 'Документ связан с ДО другого типа.'#13#3 + 'В этом случае документ для учета НДС должен формироваться'#13#3 + 'по хозоперации и рассматриваться как оплата.', 3);
+    on ExSchFactNotRegistred:
+      WriteProtokol('Документ для учета НДС не Зарегистрирован');
+    on ExSchFactNotFound:
+       WriteProtokol('Документ для учета НДС не найден.');
+   //обработка ошибок формирования TXO
+    on ExMakeHozOper:
+      WriteProtokol('Ошибка привязки TXO');
+
+}
+
+!-------------------------------------------------------------------------------------------------------------
+! проведение документа, если были ошибки, то отмена
+!-------------------------------------------------------------------------------------------------------------
+function MakeProve(cKatSopr: tNRec): boolean;
+{
+  par_KatSopr := cKatSopr;
+  _try
+  {
+    Result := false;
+    MyBeginVisual('Проведение документа...');
+//    NeedAskDate := NeedProtokol;
+    if (GetFirst KatSopr != tsOk)
+      _raise ExMakeNoKatSopr;
+    if not InitDocTune
+      Exit;
+
+    if(boClosePeriod)
+      exit;
+
+    if not GetMakeParams
+      Exit;
+
+     WriteProtokol(''#13 + GetTidkGalName(KatSopr.VidSopr) + ' № '  + KatSopr.NSopr + ' от ' + string(KatSopr.dSopr) + ':', 1);
+
+     if(KatSopr.VidSopr = Word(204))
+     {
+       if not CheckData204
+        _raise  ExMakeDataNotValid;
+     }
+     else
+     {
+      if not CheckDataAll
+        _raise  ExMakeDataNotValid;
+     }
+
+
+    //если были ошибки при формировании, отменим проведение
+    //if
+     RunMake;
+      SetGalStatus(cgStatus_GalProved);
+    /*else
+      DeleteProve(cKatSopr);*/
+    Result := true;
+  }
+  _except
+
+    on ExMakeNoKatSopr:
+      WriteProtokol('Ошибка позиционирования KatSopr.Nrec: ' + string(par_KatSopr), 1);
+    on ExMakeDataNotValid:
+      WriteProtokol('Документ оформлен неправильно!!!', 1);
+  _finally
+  {
+    MyStopVisual;
+!    ShowProtokol;
+    if not NullVipRef(iDocTune)
+      iDocTune := NullRef;
+  }
+
+}
+!-------------------------------------------------------------------------------------------------------------
+! Показать протокол
+!-------------------------------------------------------------------------------------------------------------
+procedure ShowProtokol;
+{
+  if (NeedProtokol and (LogHandle != 0))
+    Form_ShowFile('Протокол формирования', false, LogHandle);
+}
+!-------------------------------------------------------------------------------------------------------------
+! Включение/отключение протокола
+!-------------------------------------------------------------------------------------------------------------
+Procedure EnableProtokol(flag: boolean; lHandle : longint = 0);
+{
+  if (NeedProtokol and not flag)
+    Form_AbortForm(LogHandle);
+  NeedProtokol := flag;
+  LogHandle := if(flag, if(lHandle = 0, Errr2.Handle, lHandle), 0);
+}
+!-------------------------------------------------------------------------------------------------------------
+!
+!-------------------------------------------------------------------------------------------------------------
+Procedure SetDopParams(flag: word);
+{
+  NeedAskDate := ((flag and cgAskParams) > 0);
+}
+!-------------------------------------------------------------------------------------------------------------
+!
+!-------------------------------------------------------------------------------------------------------------
+constructor Init;
+{
+  Result := true;
+  NeedAskDate := NeedProtokol := false;
+
+  LogHandle := 0;
+  MyVisualCount := 0;
+  SaveMyDsk(1, 'CheckNds_DontCheckProv');
+
+  iSF := new(viSchFunc);
+  iSF.SetMsgState(true);
+  iViewSchF  := new(ViewSchF);
+  oTL.TotalLogOpen;
+
+
+
+}
+
+destructor done;
+{
+  ShowProtokol;
+  iSF       := NullRef;
+  iViewSchF := NullRef;
+  SaveMyDsk(0, 'CheckNds_DontCheckProv');
+  oTL.TotalLogClose;
+}
+end. // interface
