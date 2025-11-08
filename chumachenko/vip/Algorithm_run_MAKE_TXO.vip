@@ -9,6 +9,8 @@
 #include auto_MAKE_TXO.vih
 #include Algor.vih
 #include iz_const.vpp
+#include StatLog.vih
+
 #component "M_MnPlan"
 //***********************************
 VipInterface Algorithm_run_MAKE_TXO Implements oAlgoritm_Sys #Licensed_Free;
@@ -20,14 +22,29 @@ VipInterface Algorithm_run_MAKE_TXO Implements oAlgoritm_Sys #Licensed_Free;
 Interface Algorithm_run_MAKE_TXO; // M_MNPLAN::ALGORITHM_RUN_MAKE_TXO (chumachenko.res
 
 Create view
-  var nrecFormPl : comp;
-from formpl
+  var   nrecFormPl
+      , _cToStatus : comp;
+ iVipStatLog : VipStatLog;//интерфейс истории изменений статусов
+from
+   formpl
+ , KatNotes KatNotes_ok
+ , KatNotes KatNotes_notok
+ , KatNotes KatNotesNew
+ , katsopr
+
+ , tTxoTipDoc
+ , tTxoTipDoc tTxoTipDocIns
+
 where
  ((
     nrecFormPl == formpl.nrec
+and FormPl.RESCOMP[2] == KatNotes_ok.nrec
+and FormPl.RESCOMP[3] == KatNotes_notok.nrec
+and _cToStatus  == KatNotesNew.nrec
  ))
 ;
 //Номер системного алгоритма
+#include filltTxoTipDoc.vpp
 Function GetNum: Word; {
   Result := 6600;
 } //Function GetNum: Word;
@@ -85,6 +102,42 @@ Function ConvertMNPLAN_tipDoc_to_tidkgal(_typeCpNrec : word) : word;
   end;
 }
 
+Procedure SetKatSoprStatus; {
+   Var oldStatus   : Word;//предыдущий статус документа
+   Var oldNote     : Comp;
+   Var vidSoprLog  : Word;
+
+   oldStatus := KatSopr.status;
+   oldNote   := KatSopr.cNote;
+   If(GetFirst FastFirstRow KatNotesNew = TsOk) then {
+     KatSopr.status := KatNotesNew.status;
+     KatSopr.cNote  := KatNotesNew.nrec;
+    }
+   else  {
+    KatSopr.status := 0;
+    KatSopr.cNote  := Comp(0);
+   }
+   If(Update Current KatSopr = TsOk)
+   {
+    Case(KatSopr.vidSopr)Of
+     101 //Накладная на прием МЦ (Управление снабжением)
+    ,201 //Накладная на отпуск МЦ (Управление сбытом)
+    ,206 //Накладная на возврат по рекламации (Управление снабжением)
+    ,210://Акт передачи оборудования в монтаж (Складской учет)
+     {
+      vidSoprLog := 100;
+     }
+     Else
+     {
+      vidSoprLog := KatSopr.vidSopr;
+     }
+    End;
+    //Функция вставки записи в историю изменения статуса документа
+    iVipStatLog.StatLog_InsNewStat(vidSoprLog, KatSopr.nrec, oldStatus, oldNote
+      , KatSopr.status, KatSopr.cNote, GetNameInter+' Автоматическое изменение статуса алгоритма привязки ТХО');
+   }
+}
+
 Function RunInter(wflag: Word; Var pt: TRecAcc): Boolean;{
   #__UNUSED__(wflag,pt)
   set nrecFormPl := pt.cFormPl;
@@ -105,12 +158,21 @@ Function RunInter(wflag: Word; Var pt: TRecAcc): Boolean;{
   var _cpNrec     : comp = pt.cpNrec;
 
   _TypeCpNrec := ConvertMNPLAN_tipDoc_to_tidkgal(_TypeCpNrec);
-  if _TypeCpNrec = 0 {
+
+  filltTxoTipDoc;
+  if( getfirst tTxoTipDoc where tTxoTipDoc.tipdoc = _TypeCpNrec)  <> tsOK {
      message('Тип документа TypeCpNrec = '+string(_TypeCpNrec)+' не предусмотрен для автоматического формирования проводок в алгоритме', error);
      pt.Binding:=8;
      result := false;
      exit;
-   }
+  }
+
+  if _TypeCpNrec <> FormPl.RESWORD[4] {
+     message('Алгоритм запущен из документа с типом TypeCpNrec = '+string(_TypeCpNrec)+', а алгоритм настроен для типа ' + string(FormPl.RESWORD[4]), error);
+     pt.Binding:=8;
+     result := false;
+     exit;
+  }
 
 
   //message('_cpNrec = '+string(_cpNrec,0,0) + ' _TypeCpNrec = '+string(_TypeCpNrec));
@@ -118,9 +180,30 @@ Function RunInter(wflag: Word; Var pt: TRecAcc): Boolean;{
 
 
   if FormPl.RESWORD[1] = 1 then iauto_MAKE_TXO.enableLog;
-  iauto_MAKE_TXO.MakeHozOper(_TypeCpNrec, _cpNrec, FormPl.RESCOMP[1]);
+  var _resTxo : boolean = iauto_MAKE_TXO.MakeHozOper(_TypeCpNrec, _cpNrec, FormPl.RESCOMP[1]);
   if FormPl.RESWORD[1] = 1 then processtext(iauto_MAKE_TXO.GetLogFile,vfDefault ,'лог привязки ТХО');
- result := True;
+
+  result := True;
+
+/*
+!!!!!!!!!!!!!!!!!
+смена статуса далее только для накладных сделана, никаких проверок нет накладная ли в обработке, так что если будет что то еще кроме накладных - меняйте соответственно
+*/
+  if getfirst katsopr where ((_cpNrec == katsopr.nrec)) <> tsOK {exit;}
+  set _cToStatus := 0;
+  if _resTxo {
+    if FormPl.RESWORD[2] = 1
+    if getfirst KatNotes_ok = tsOK then set _cToStatus := KatNotes_ok.nrec;
+  }
+  else {
+    if FormPl.RESWORD[3] = 1
+    if getfirst KatNotes_notok = tsOK then set _cToStatus := KatNotes_notok.nrec;
+  }
+  if _cToStatus <> 0h {
+    SetKatSoprStatus;
+  }
+
+
 } //Function RunInter(wflag: Word; Var pt: TRecAcc): Boolean;
 
 End.
