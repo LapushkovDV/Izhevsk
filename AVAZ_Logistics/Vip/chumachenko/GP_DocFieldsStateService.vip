@@ -1,0 +1,1174 @@
+/*************************************************************************************************\
+* Наименование: Реализация класса GP_DocFieldsStateService                                        *
+*               "Сервисные функции настройки доступа к полям документов"                          *
+* Контур/Модуль: *                                                                                *
+* Примечание: взято с проекта НПО ЭНЕРГОМАШ                                                       *
+*                                                                                                 *
+\*************************************************************************************************/
+#include GP_DATFS_Base.vih
+#include GP_DocFieldsStateService.vih
+interface GP_DocFieldsStateService;
+
+var mFields      :GP_ObjDocFields;
+    mDocName     :string[127]='????????';
+    cCurUser     :comp=0;
+    cCurDocSubType:comp=-99999;
+    //---------------
+    pR_Users          :comp;// признак что роль нужна
+    //--------------- чтобы не пересчитывать
+    pDocField2         :comp=0;
+    pTuneDocFields     :comp=0;
+    pFieldsStateMatrix :comp=0;
+    //-------------------------------------
+    Rights_Razdel      :boolean; //NPOEM_OWN.Rights_Razdel, Использовать права на редактирование раздела'
+    Rights_Type        :boolean; //NPOEM_OWN.Rights_Type  , Использовать в правах на поля Protect(иначе Skip)', ftboolean,0,'','');
+    Rights_Event       :boolean; //NPOEM_OWN.Rights_Event , Использовать права на события раздела
+
+    bEmptyTitleAsFieldNameEnabled: boolean = false;
+    bCheckProtectStateEnabled: boolean = false;
+    iDatFS_base : GP_DATFS_Base;
+create view
+as select r_Users.Nrec
+from
+   mFields
+  ,r_Users
+  ,tr_WorkPlace //r_WorkPlace
+//-----------------------
+  ,tRFld_Interface
+//-----------------------
+  ,tTuneDocFields
+  ,tFieldsStateMatrix
+//------- Раздел
+  ,tDoc_Status
+  ,tTuneDocFields     tTuneDocFields_R
+  , tTuneDocFields tTuneDocFields_2
+  ,tFieldsStateMatrix tFieldsStateMatrix_R
+  ,tr_WorkPlace       tr_WorkPlace_R//Раздел
+
+//-----------------------
+  ,GP_TuneDocFields
+//  ,GP_FieldsStateMatrix
+//  ,GP_FieldsStateMatrix FieldsStateMatrix2
+where((
+       cCurUser              == r_Users.cXUsers
+  //and  r_Users.NRec          == r_WorkPlace.cUsers
+  //-----------------------------------------------
+  and  mDocName              == tTuneDocFields.DocName
+//  and  tTuneDocFields.NRec   == tFieldsStateMatrix.cDocField
+//  and  tr_WorkPlace.wSubType    == tFieldsStateMatrix.wSubType
+//  and  cCurDocSubType         == tFieldsStateMatrix.cSubType
+  //-----------------------------------------------
+  and  pTuneDocFields        == GP_TuneDocFields.DocName
+  and cCurDocSubType         == GP_TuneDocFields.cSubtip (noindex)
+//  and  pFieldsStateMatrix    == GP_FieldsStateMatrix.Nrec
+  // много записей нельзя без поддцепки
+//  and  pDocField2            == FieldsStateMatrix2.cDocField
+  //---------------- права на раздел
+  and  mDocName                  == tDoc_Status.DocName
+  and  tDoc_Status.DocName       == tTuneDocFields_R.DocName
+  and  ''                        == tTuneDocFields_R.DocFieldGroup
+  and  tDoc_Status.DocFieldGroup == tTuneDocFields_R.DocFieldName
+
+//  and  tTuneDocFields_R.NRec     == tFieldsStateMatrix_R.cDocField
+//  and  tr_WorkPlace_R.wSubType      == tFieldsStateMatrix_R.wSubType
+//  and  tDoc_Status.cSubType       == tFieldsStateMatrix_R.cSubType
+  //-----
+  and mDocName == tRFld_Interface.name
+));
+
+property pbEmptyTitleAsFieldNameEnabled: boolean absolute bEmptyTitleAsFieldNameEnabled read write;
+procedure timelog(_str : string); {
+#ifdef _DEBUG_DocFieldsStateService_
+  iDatFS_base.enablelog;
+  iDatFS_base.MyLog(_str);
+#endif
+}
+//------------------------------------
+Constructor Init;
+{ Result:=true;
+  cCurUser:=UserID;
+  pR_Users:=0;
+  if (getfirst fastfirstrow r_Users =tsok)
+     pR_Users:= r_Users.Nrec;
+  Rights_Razdel      := true; // boGetTune('NPOEM_OWN.Rights_Razdel');// 'Использовать права на редактирование раздела'
+  Rights_Type        := true; // boGetTune('NPOEM_OWN.Rights_Type'  );// 'Использовать в правах на поля Protect(иначе Skip)'
+  Rights_Event       := true; // boGetTune('NPOEM_OWN.Rights_Event');// , Использовать права на события раздела
+} //Constructor Init;
+
+//------------------------------------
+function GetDocByName(DocName:string):GP_ObjDocAbleTuneFieldsState;//Фабричный метод
+{
+  timelog('GP_DocFieldsStateService -> GetDocByName DocName = ' + DocName);
+  result:=NullRef;
+  if (DocName='') exit;
+
+  if (Pos('GP_DATFS_',DocName)=0)
+    DocName:='GP_Logistics::GP_DATFS_'+DocName;
+
+  if (not GetVipRef(result,DocName)) {
+      timelog('GP_DocFieldsStateService -> GetDocByName GetVipRef = NULL');
+    result:=NullRef;
+  }
+} //function GetDocByName(DocName:string):GP_ObjDocAbleTuneFieldsState;//Фабричный метод
+
+//=========================================
+// Наполнить времянки
+// Проверим дату время последнего выхода из интерфейса настройки прав
+// Управление материально-техническим обеспечением - Операции -
+// Настройка прав доступа к документам.
+Function LoadTableFields:boolean;
+{ Result:=true;
+ /*
+  if getfirst tRFld_Interface  =tsok
+  { var _DT_Nastr:date = dGetTune('NPOEM_OWN.Rights_Fields_Date');
+    var _TM_Nastr:time = tGetTune('NPOEM_OWN.Rights_Fields_Time');
+    //если время заполнения больше , чем дата время сохранения настройке прав,
+    //то пересчитывать не нужно
+    if tRFld_Interface.DT >_DT_Nastr exit;
+    if tRFld_Interface.DT=_DT_Nastr
+      if tRFld_Interface.TM>_TM_Nastr Exit;
+    //Надо перегружать
+    delete current tRFld_Interface;
+    delete tTuneDocFields     where (( mDocName == tTuneDocFields.DocName     ));
+    delete tFieldsStateMatrix where (( mDocName == tFieldsStateMatrix.DocName ));
+    delete tDoc_Status        where (( mDocName == tDoc_Status.DocName        ));
+  }
+  */
+  //=================================
+  //Rights_Razdel      :=boGetTune('NPOEM_OWN.Rights_Razdel');// 'Использовать права на редактирование раздела'
+  //Rights_Type        :=boGetTune('NPOEM_OWN.Rights_Type'  );// 'Использовать в правах на поля Protect(иначе Skip)'
+  //Rights_Event       :=boGetTune('NPOEM_OWN.Rights_Event');// , Использовать права на события раздела
+  //=================================
+
+  var _IsUsed:boolean=True;
+  // всегда чистим привязку к ролям
+  delete all tr_WorkPlace;
+  delete all tTuneDocFields;
+  //--- Запомним когда заливали
+  insert into tRFld_Interface set
+      tRFld_Interface.name:=mDocName
+     ,tRFld_Interface.DT :=Cur_Date
+     ,tRFld_Interface.TM :=Cur_Time
+     ;
+  //-------------------------------
+  _Try
+  { SQL Select
+        GP_TuneDocFields.NRec          NRec         // "Номер записи",  какого уя нрек всегда 0 сюда заходит
+      , GP_TuneDocFields.DocName       DocName      // "Имя документа",
+      , GP_TuneDocFields.DocFieldGroup DocFieldGroup// "Группа полей",
+      , GP_TuneDocFields.DocFieldName  DocFieldName // "Имя поля",
+      , GP_TuneDocFields.State         State
+      , GP_TuneDocFields.TitleNew      TitleNew
+      , GP_TuneDocFields.IsUsed        IsUsed       // "Поле используется в настройке"
+    From GP_TuneDocFields
+    where GP_TuneDocFields.DocName= :(mDocName)
+      and GP_TuneDocFields.cSubTip = :(cCurDocSubType)
+      and GP_TuneDocFields.IsUsed = :(_IsUsed)   // True не катит
+    into tTuneDocFields byname;
+  }
+  _Except
+  else
+  { timelog('LoadTableFields:Возникло исключение при запуске запроса 001 '+ExploreException);
+  }
+  //-------------------------------
+/*
+  _Try
+  { SQL Select
+      GP_FieldsStateMatrix.NRec      as NRec     //"Номер записи",
+     ,GP_FieldsStateMatrix.cDocField as cDocField//"Настройка поля документа",
+     ,GP_FieldsStateMatrix.wSubType     as wSubType    //"Роль",
+     ,GP_FieldsStateMatrix.cSubType   as cSubType  //"Статус",
+     ,GP_FieldsStateMatrix.State     as State    //"Состояние",
+     //------------- нету в стандарте, но нужно для индекса
+     ,:(mDocName)                    as DocName  //"Имя документа",
+    From GP_TuneDocFields
+    //inner join r_Users     on  r_Users.cXUsers   = :(cCurUser)
+  //-----------------------------------------------
+    Inner join GP_FieldsStateMatrix on
+         GP_FieldsStateMatrix.cDocField =  GP_TuneDocFields.NRec
+//    and  GP_FieldsStateMatrix.wSubType  =  r_WorkPlace.wSubType
+    where GP_TuneDocFields.DocName=:(mDocName)
+      and GP_TuneDocFields.IsUsed =:(_IsUsed)
+    into tFieldsStateMatrix byname;
+  }
+  _Except
+  else
+  { timelog('LoadTableFields:Возникло исключение при запуске запроса 002 '+ExploreException);
+  }
+*/
+  //-------------------------------
+
+#IFDEF _DEBUG_DocFieldsStateService_
+    timelog('LoadTableFields:отобрали полей  '+RecordsInTable(#tTuneDocFields)
+                                   +', прав  '+RecordsInTable(#tFieldsStateMatrix)
+
+        );
+#endif
+} //Function LoadTableFields:boolean;
+
+//=========================================
+// Найти и заполнить права доступа по разделу
+Function FindRazdelRidths(_DocName:string;_DocFieldGroup:string; _cSubType:comp;_boInit:boolean=false):boolean;
+var CurMatrixState:word;
+{ if _boInit
+  { var _cCurDocSubType_save:comp  =cCurDocSubType;
+    var _mDocName_Save     :string=mDocName;
+    cCurDocSubType:=_cSubType;
+    mDocName:= _DocName;
+    LoadTableFields;
+    cCurDocSubType :=_cCurDocSubType_save;
+    mDocName      :=_mDocName_save;
+
+  } //if _boInit
+
+  if GetFirst tDoc_Status where ((
+       _DocName        == tDoc_Status.DocName
+   and _DocFieldGroup  == tDoc_Status.DocFieldGroup
+   and _cSubType        == tDoc_Status.cSubType
+  )) =tsok then
+  { Result:=true;
+    exit;
+  }
+  //Rights_Event       :=boGetTune('NPOEM_OWN.Rights_Event');// , Использовать права на события раздела
+
+  Clearbuffer(#tDoc_Status);
+  tDoc_Status.DocName       :=_DocName;
+  tDoc_Status.DocFieldGroup :=_DocFieldGroup;
+  tDoc_Status.cSubType       :=_cSubType;
+  tDoc_Status.IsUsed        :=False;// "Поле используется в настройке"
+  tDoc_Status.IsIns         :=False; //  if((GP_FieldsStateMatrix.State and   1b)=0
+  tDoc_Status.IsEdit        :=False; //  if((GP_FieldsStateMatrix.State and  10b)=0
+  tDoc_Status.IsDel         :=False; //  if((GP_FieldsStateMatrix.State and 100b)=0
+
+  //============ определим права по ролям
+  _Loop tTuneDocFields_R
+  { if (tTuneDocFields_R.IsUsed)
+    { tDoc_Status.IsUsed:=true;
+      _loop tr_WorkPlace_R {
+        if (IsValidAll(tntFieldsStateMatrix_R))
+          CurMatrixState:=tFieldsStateMatrix_R.State
+        else
+          CurMatrixState:=0;
+        // надо найти максимальные права
+        if ((CurMatrixState and 1b)<>0)
+          tDoc_Status.IsIns:=true;
+        if ((CurMatrixState and 10b)<>0)
+          tDoc_Status.IsEdit:=true;
+        if ((CurMatrixState and 100b)<>0)
+          tDoc_Status.IsDel:=true;
+        if  tDoc_Status.IsIns
+        and tDoc_Status.IsEdit
+        and tDoc_Status.IsDel
+        { break;
+        }
+      }//_loop r_WorkPlace
+    } //if (tTuneDocFields.IsUsed)
+  } //_Loop tntTuneDocFields_R
+
+  //===============================
+  if insert current tDoc_Status=tsok {};
+  //===============================
+#IFDEF _DEBUG_DocFieldsStateService_
+  { timelog('FindRazdelRidths: tDoc_Status.DocName='+tDoc_Status.DocName
+      +', DocFieldGroup='+tDoc_Status.DocFieldGroup
+      +', cSubType='+string(tDoc_Status.cSubType,0,0)
+      +', IsUsed=' +string(tDoc_Status.IsUsed)
+      +', IsIns='  +string(tDoc_Status.IsIns)
+      +', IsEdit=' +string(tDoc_Status.IsEdit)
+      +', IsDel='  +string(tDoc_Status.IsDel)
+    );
+
+  }
+#endif
+  Result:=True;
+} //Function FindRazdelRidths(_DocName:string;_DocFieldGroup:string; _cSubType:comp):boolean;
+
+//=========================================
+
+function anotherSubTip(cSubType:comp):boolean; {
+ result := (cCurDocSubType<>cSubType);
+#IFDEF _DEBUG_DocFieldsStateService_
+   timelog('anotherSubTip = '+string(result));
+#endif
+
+}
+
+// Вычислить состояние полей
+function CalcFieldsState(oDATFS:GP_ObjDocAbleTuneFieldsState;cSubType:comp):boolean; //Рассчитать состояние полей для текущего пользователя
+var CurMatrixState:word;
+    FirstRole:boolean;
+{
+  result:=false;
+  //-----------------------
+#IFDEF _DEBUG_DocFieldsStateService_
+      timelog('GP_DocFieldsStateService -> CalcFieldsState mDocName='+mDocName
+          +',cSubType='      +string(cSubType,0,0)
+          +',cCurDocSubType='+string(cCurDocSubType,0,0)
+          );
+
+#ENDIF
+  //-------------
+  // Если только что проверяли, то зачем повторно?
+  if  cCurDocSubType=cSubType
+  and mDocName= oDATFS.Name
+  { Result:=true;
+    Exit;
+  }
+  //Rights_Type        :=boGetTune('NPOEM_OWN.Rights_Type'  );// 'Использовать в правах на поля Protect(иначе Skip)'
+  //Rights_Event       :=boGetTune('NPOEM_OWN.Rights_Event');// , Использовать права на события раздела
+
+  cCurDocSubType:=cSubType;
+  mDocName:= oDATFS.Name;
+  mFields := oDATFS.Fields;
+
+  //-----------------------
+  LoadTableFields;
+  //-----------------------
+
+  _loop mFields
+  where((
+        root          == mFields.Num
+    and mDocName      == tTuneDocFields.DocName
+    and mFields.Group == tTuneDocFields.DocFieldGroup
+    and mFields.Name  == tTuneDocFields.DocFieldName
+  ))
+  {
+    //----- ищем права на поля. На редактирование сбрасываем при первом поиске
+    mFields.State:=0;
+    mFields.IsUsed:=false;
+    if (IsValidAll(tntTuneDocFields))
+    { if (tTuneDocFields.IsUsed)
+      { mFields.IsUsed:=true;
+        mFields.State := tTuneDocFields.state;
+        if mFields.Def_ObjType = 6 then mFields.title := tTuneDocFields.titleNew;
+      }
+
+
+/*
+        FirstRole:=true;
+
+        // можно сократить поиск по этой таблице
+        // и бегать по tFieldsStateMatrix
+        _loop tr_WorkPlace
+        {
+          if (IsValidAll(tntFieldsStateMatrix))
+            CurMatrixState:=tFieldsStateMatrix.State
+          else
+            CurMatrixState:=0;
+
+          //Невидимость - если есть у всех ролей, то поле невидимо, т.е. установлен первый бит
+          if ((CurMatrixState and 1b)<>0 and FirstRole)
+            mFields.State:=mFields.State or 1b
+          else if ((CurMatrixState and 1b)=0 and (mFields.State and 1b)<>0)
+            mFields.State:=mFields.State xor 1b;
+
+          //Редактирование - если есть хоть у одной роли, то поле можно редактировать, т.е установлен второй бит
+          if ((CurMatrixState and 10b)<>0)
+            mFields.State:=mFields.State or 10b;
+          FirstRole:=false;
+          // Нет флага скрыть и есть редактирование - можно дальше не искать
+          if mFields.State=10b break;
+        } //_loop tr_WorkPlace
+      } //if (tTuneDocFields.IsUsed)
+    } //_Loop tTuneDocFields
+
+    // Ищем права на раздел
+    if (not mFields.IsUsed)
+    {
+      if Rights_Razdel // отключим пока что #3954
+      { if FindRazdelRidths(mDocName,mFields.Group,cSubType)
+        { if tDoc_Status.IsUsed
+          { mFields.IsUsed:=true;// надо закрыть, если правами на поля не определено другое
+            // если весь раздел закрыт, то смысла не проверять по полям?
+            // но пока - если раздел открыт для редактирования, то для все х полей.
+            if tDoc_Status.IsEdit
+            { mFields.State :=10b;//
+            }
+          }
+        } //if FindRazdelRidths(mDocName,mFields.Group,cSubType)
+      } //if Rights_Razdel // отключим пока что #3954
+*/
+    } //if (not mFields.IsUsed)
+
+    update current mFields;
+#IFDEF _DEBUG_DocFieldsStateService_
+    //000A00000000003Bh
+    timelog('CalcFieldsState: mFields.Name='+mFields.Name
+      +', State='+string(mFields.State)
+      +', ControlName='  +mFields.ControlName
+      +', Group='        +mFields.Group
+      +', mDocName='     +mDocName
+      +', RootContainer='+mFields.RootContainer
+      );//timelog(
+#ENDIF
+
+  }//_loop mFields
+
+  result:=true;
+} //function CalcFieldsState(oDATFS:GP_ObjDocAbleTuneFieldsState;cSubType:comp):boolean; //Рассчитать состояние полей для текущего пользователя
+
+function GetOrigContainerName(CurContainer:tptr):string;
+{
+  cfsGetProp(CurContainer,cfpName,result);
+
+  var p:byte=Pos('&',result);
+  if (p<>0)
+    result:=SubStr(result,1,p-1);
+}
+
+function boSetProp(ControlName:string;Prop:word;NewVal:boolean):boolean;
+var CurVal:boolean;
+{
+  result:=false;
+
+  var res:tptr = cfsGetProp(ControlName, Prop, CurVal);
+
+  result:=(res=cfOk and CurVal<>NewVal);
+  if (result)
+    result:=cfsSetProp(ControlName, Prop, NewVal)=cfOk;
+}
+
+function iSetProp(ControlName:string;Prop:word;NewVal:integer):boolean;
+var CurVal:integer;
+{
+  result:=false;
+
+  var res:tptr = cfsGetProp(ControlName, Prop, CurVal);
+
+  result:=(res=cfOk and CurVal<>NewVal);
+  if (result)
+    result:=cfsSetProp(ControlName, Prop, NewVal)=cfOk;
+}
+
+function wSetProp(ControlName:string;Prop:word;NewVal:word):boolean;
+var CurVal:word;
+{
+  result:=false;
+
+  var res:tptr = cfsGetProp(ControlName, Prop, CurVal);
+
+  result:=(res=cfOk and CurVal<>NewVal);
+  if (result)
+    result:=cfsSetProp(ControlName, Prop, NewVal)=cfOk;
+}
+
+procedure SetCheckProtectStateEnabled(pEnabled: boolean);
+{
+  bCheckProtectStateEnabled := pEnabled; 
+}
+
+function isButtonOverLoad(oFields:GP_ObjDocFields; CurContainer:tptr; _command : longint) : boolean; {
+
+  timelog('GP_DocFieldsStateService -> isButtonOverLoad');
+  result:=false;
+
+  mFields:=oFields;
+
+  var CurRootContainer :string;
+
+  CurRootContainer:=GetOrigContainerName(CurContainer);
+
+  timelog('GP_DocFieldsStateService -> isButtonOverLoad CurRootContainer = ' + CurRootContainer);
+  timelog('GP_DocFieldsStateService -> isButtonOverLoad _command = ' + string(_command));
+  timelog('GP_DocFieldsStateService -> isButtonOverLoad _loop mFields where((true==mFields.IsUsed and CurRootContainer==mFields.RootContainer))');
+
+  _loop mFields where((true==mFields.IsUsed and CurRootContainer==mFields.RootContainer)) {
+    timelog('mFields.Name = '+mFields.Name+ ', mFields.Def_ObjType = '  + string(mFields.Def_ObjType) + ' mFields.Def_command = ' + string(mFields.Def_command));
+    if mFields.Def_ObjType <> 6 then continue;
+     if mFields.Def_command = _command then {
+      result := true;
+      break;
+     }
+  }
+}
+
+
+function ButtonPush(oFields:GP_ObjDocFields; CurContainer:tptr; _command : longint; _TypeCpNrec : word; _cRec : comp) : boolean; { //выполнить перекрытую кнопку
+
+  timelog('GP_DocFieldsStateService -> ButtonPush');
+  result:=false;
+
+  mFields:=oFields;
+
+  var CurRootContainer :string;
+
+  CurRootContainer:=GetOrigContainerName(CurContainer);
+
+  timelog('GP_DocFieldsStateService -> ButtonPush CurRootContainer = ' + CurRootContainer);
+  timelog('GP_DocFieldsStateService -> ButtonPush _command = ' + string(_command));
+  timelog('GP_DocFieldsStateService -> ButtonPush _loop mFields where((true==mFields.IsUsed and CurRootContainer==mFields.RootContainer))');
+
+  _loop mFields where((true==mFields.IsUsed and CurRootContainer==mFields.RootContainer)) {
+    timelog('mFields.Name = '+mFields.Name+ ', mFields.Def_ObjType = '  + string(mFields.Def_ObjType) + ' mFields.Def_command = ' + string(mFields.Def_command));
+    if mFields.Def_ObjType <> 6 then continue;
+     if mFields.Def_command = _command then {
+      result := true;
+      //"""""""""""""""""вот тут и запускать все алгоритмы"""""""""""""""""""""
+/*
+Упрощённый запуск алгоритма одним интерфейсом
+Закрывается со слеующими событиями в зависимости от присвоения значений структуре pt : TRecAcc в функции RunInter алгоритма pt.Binding = 8 - cmNo, иначе pt.Binding = 1 - cmDefault, иначе pt.Error = 0 - cmOk, иначе cmCancel
+Пример вызова
+StartNewVisual(vtRotateVisual, vfScreenBottom, '', 0);
+wResultAlg := RunInterface('SimpleWayToRunAlgorithm', pAlg, word(2000 + KatSopr.VidSopr), KatSopr.NRec, KatSopr.cNote);
+StopVisual('', 0);
+if ((wResultAlg = cmNo) or (wResultAlg = cmDefault)) {
+   Message(''#3+'По результатам выполнения алгоритма'+''#13+ ''#3+'изменение статуса запрещено',Information);
+   Exit;
+   }
+ if (wResultAlg = cmCancel)
+ if (Message(''#3+'В процессе выполнения алгоритма произошли ошибки!'+''#13+ ''#3+'Изменить статус?', Confirmation + YesNo) <> cmYes)
+ Exit;
+
+Параметры
+cAlg : Comp
+ссылка на алгоритм (FormPL)
+TypeCp : Word
+тип вызова. смотри CompSrc\M\M_MnPlan\vip\Plan\TRecAcc.rec
+DocNRec : Comp
+ссылка на документ
+DocSpNRec : Comp
+ссылка на позицию документа
+
+*/
+
+         timelog('  _loop tTuneDocFields_2');
+            _loop tTuneDocFields_2 {
+             timelog('     NRec='+string(tTuneDocFields_2.NRec,0,0)+
+                         ',DocName='+tTuneDocFields_2.DocName+
+                         ',DocFieldGroup='+tTuneDocFields_2.DocFieldGroup+
+                         ',DocFieldName='+tTuneDocFields_2.DocFieldName+
+                         ',state='+string(tTuneDocFields_2.state));
+             timelog(',IsUsed='+string(tTuneDocFields_2.IsUsed)+
+                         ',TitleNew='+tTuneDocFields_2.TitleNew
+                         );
+             }
+
+           timelog(' mFields.Def_command = _command, _TypeCpNrec = ' + string(_TypeCpNrec,0,0) + ', _cRec ='+ string(_cRec,0,0));
+           timelog(' mfields.name = '+mfields.name);
+           if(getfirst tTuneDocFields_2 where tTuneDocFields_2.DocFieldName = mfields.name) = tsOK {
+
+
+
+               timelog('   if(getfirst tTuneDocFields_2 where tTuneDocFields_2.DocFieldName = mfields.name) = tsOK   tTuneDocFields_2.nrec = ' + string(tTuneDocFields_2.nrec,0,0));
+               //if getfirst GP_TuneDocFields where ((tTuneDocFields_2.cGP_TuneDocFields == GP_TuneDocFields.nrec)) = tsOK {
+
+                 if getfirst GP_TuneDocFields where ((tTuneDocFields_2.DocName == GP_TuneDocFields.DocName
+                                            and tTuneDocFields_2.DocFieldGroup == GP_TuneDocFields.DocFieldGroup
+                                             and tTuneDocFields_2.DocFieldName == GP_TuneDocFields.DocFieldName
+                                                            and cCurDocSubType == GP_TuneDocFields.cSubTip (noindex) )) = tsOK {
+
+                 timelog('  if getfirst GP_TuneDocFields where ((tTuneDocFields_2.nrec == GP_TuneDocFields.nrec)) = tsOK');
+                 if GP_TuneDocFields.cAlgorithmDo <> 0h {
+                  timelog(' GP_TuneDocFields.cAlgorithmDo = '+string(GP_TuneDocFields.cAlgorithmDo,0,0));
+                  var wResultAlg : word = RunInterface('M_MNPLAN::SimpleWayToRunAlgorithm'
+                                                       , GP_TuneDocFields.cAlgorithmDo
+                                                       , _TypeCpNrec
+                                                       , _cRec
+                                                       , comp(0)
+                                                      );
+                    if (wResultAlg <> cmOk) {
+                       if GP_TuneDocFields.cAlgorithmCancel <> 0h
+                          RunInterface('M_MNPLAN::SimpleWayToRunAlgorithm'
+                                       , GP_TuneDocFields.cAlgorithmCancel
+                                       , _TypeCpNrec
+                                       , _cRec
+                                       , comp(0)
+                                      );
+                      result := false;
+                    }
+                 }
+               } else {
+                 timelog('  NOT!!!! if getfirst GP_TuneDocFields where ((tTuneDocFields_2.nrec == GP_TuneDocFields.nrec)) = tsOK')
+               }
+          } else {
+            timelog('   NOT!!!! if(getfirst tTuneDocFields_2 where tTuneDocFields_2.DocFieldName = mfields.name) = tsOK');
+          }
+        }
+      break;
+  }
+}
+
+
+function ApplyFieldsState(oFields:GP_ObjDocFields;CurContainer:tptr;UseSkip:boolean; _returnFieldsProp : word = 0 ):boolean; //Применить состояние полей к документу
+var IsVisible,IsEditable,IsRequired,CurVal:boolean;
+    CurRootContainer,CurControlName:string;
+    _ObjType       :longint;
+    _ObjType2      :longint;
+    _StatusCtx     :longint;
+    _Protect       :boolean;
+    _Visible       : boolean;
+    _CalendarBut   :boolean;
+    _CalcButton    :boolean;
+    _PickButton    :boolean;
+    _SpinButton    :boolean;
+     vPropf         :boolean;
+     _command      : longint;
+     _title        : string;
+    DFI:GP_DocFieldInfo;
+{
+  result:=true;
+
+  mFields:=oFields;
+  CurRootContainer:=GetOrigContainerName(CurContainer);
+
+  _loop mFields where((true==mFields.IsUsed and CurRootContainer==mFields.RootContainer)) {
+    IsVisible  := (mFields.State and 001b) <> 0;
+    IsEditable := (mFields.State and 010b) <> 0;
+    IsRequired := (mFields.State and 100b) <> 0;
+    var _title : string =  mFields.Title;
+    if _returnFieldsProp = 1 {
+     IsVisible  := mFields.Def_Visible;
+     IsEditable := not mFields.Def_Protect;
+     _title     :=  mFields.Def_title
+    }
+
+
+    DFI:=mFields.GetDocFieldInfo;
+
+    if Rights_Type
+    {
+      _ObjType    :=mFields.Def_ObjType    ;
+      _StatusCtx  :=mFields.Def_StatusCtx  ;
+      _Protect    :=mFields.Def_Protect    ;
+      _Visible    :=mFields.Def_Visible    ;
+      _CalendarBut:=mFields.Def_CalendarBut;
+      _CalcButton :=mFields.Def_CalcButton ;
+      _PickButton :=mFields.Def_PickButton ;
+      _SpinButton :=mFields.Def_SpinButton ;
+
+    } //if Rights_Type
+    _ObjType2:=_ObjType mod 1000;
+    var _strFontBackColor : string= 'if(string('+mfields.Name+') = '''',17,0 )';
+#IFDEF _DEBUG_DocFieldsStateService_
+
+
+        timelog('mFields.Name='+mFields.Name+', '+string(mFields.State)
+          +', '+string(_ObjType)
+          +',_StatusCtx='  +string(_StatusCtx  )
+          +',_Protect='    +string(_Protect    )
+          +',_Visible='    +string(_Visible    )
+          +',_CalendarBut='+string(_CalendarBut)
+          +',_CalcButton=' +string(_CalcButton ) );
+          timelog(',_PickButton=' +string(_PickButton )
+          +',_SpinButton=' +string(_SpinButton )
+          +',IsEditable='+(mFields.State and 10b)
+          +',IsVisible='+ (mFields.State and 001b)
+          +',_returnFieldsProp = ' + string(_returnFieldsProp)
+          +', fontbackcololr = ' + _strFontBackColor
+          );
+          timelog(',Title = '+Title
+                 +',mFields.Def_title = '+ mFields.Def_title);
+
+#ENDIF
+    if not Rights_Type
+       if (ApplyState(IsVisible,IsEditable,mFields)) continue;
+    Result:=true;
+    //Типовая обработка
+    CurControlName:=mFields.ControlName;
+    //Далее нельзя вызывать методы и свойства, т.к. слетит CurrentContainer!
+    //timelog в том числе
+    if (cfsSetCurrentContainer(CurContainer)<>cfOk)
+      result:=false;
+
+    if (cfsGetProp(CurControlName,cfpVisible,CurVal)<>cfOk)
+      result:=false;
+    if (CurVal<>IsVisible and result)
+      if (cfsSetProp(CurControlName,cfpVisible,IsVisible)<>cfOk)
+        result:=false;
+    CurVal:=False;
+
+    if IsRequired then {
+        cfsSetProp(CurControlName, cfpFontBackColor, _strFontBackColor)
+       } else {
+         cfsSetProp(CurControlName, cfpFontBackColor, '2')
+       }
+
+    //==== устанавливаем права на поля
+    if  Rights_Type // Protect
+    and _ObjType2<>cfcClusterItem   // cfcClusterItem пусть идет по старому
+    and _ObjType2<>cfcPanelCheckBox // чеки пусть идут по старому
+    and _ObjType2<>cfcRadioButton
+    and _ObjType2<>cfcPanelRadioButton
+    { if (_ObjType div 1000)>0 //ListControls
+      { //if (cfsGetProp(CurControlName,cfpHistoryID,CurVal)<>cfOk) result:=false;
+        if true// (CurVal<>(IsEditable)) //and result)
+        { //if (cfsSetProp(CurControlName,cfpHistoryID,IsEditable)<>cfOk)
+          if (cfsSetProp(CurControlName,cfpHistoryID,if(IsEditable,256,0))<>cfOk)
+             result:=false;
+        }
+      }
+      if bCheckProtectStateEnabled or (not _Protect) //NonProtectedControls[I]
+      { //if (cfsGetProp(CurControlName,cfpProtect,CurVal)<>cfOk)  result:=false;
+        if true//if (CurVal<>(not IsEditable) ) //and result
+        { if (cfsSetProp(CurControlName,cfpProtect,not IsEditable)<>cfOk)
+             result:=false;
+        }
+      }
+      if _CalendarBut //cfpCalendarButton
+      {
+        //if (cfsGetProp(CurControlName,cfpCalendarButton,CurVal)<>cfOk)      result:=false;
+        if true//if (CurVal<>(IsEditable)) // and result
+        { if (cfsSetProp(CurControlName,cfpCalendarButton,IsEditable)<>cfOk)
+             result:=false;
+        }
+      }
+      if _CalcButton  //
+      {
+        //if (cfsGetProp(CurControlName,cfpCalcButton,CurVal)<>cfOk)    result:=false;
+        if true//if (CurVal<>(IsEditable)) // and result
+        { if (cfsSetProp(CurControlName,cfpCalcButton,IsEditable)<>cfOk)
+             result:=false;
+        }
+      }
+      if _PickButton  //
+      {
+        //if (cfsGetProp(CurControlName,'DefaultPickButton',CurVal)<>cfOk)   result:=false;
+        if true // (CurVal<>(IsEditable)) // and result
+        { // cfsSetProp(CurControlName,cfpPickButton,IsEditable);
+          cfsSetProp(CurControlName, cfpButtonType,if(IsEditable,DFI.PropButtonType,integer(0)));
+          if (cfsSetProp(CurControlName,'DefaultPickButton',IsEditable)<>cfOk) //cfpPickButton
+             result:=false;
+          if (IsEditable=False)
+           wSetProp(/*DFI.Control*/CurControlName, cfpStatusCtx, sci1Esc)
+          else
+           wSetProp(DFI.Control, cfpStatusCtx, DFI.PropStatusCtx);
+        }
+
+      }
+      if _SpinButton  //
+      {
+        //if (cfsGetProp(CurControlName,cfpSpinButton,CurVal)<>cfOk) result:=false;
+        if (CurVal<>(IsEditable)) // and result
+        { if (cfsSetProp(CurControlName,cfpSpinButton,IsEditable)<>cfOk)
+             result:=false;
+        }
+      }
+      if mFields.Def_ObjType = 6 { // кнопка
+        cfsSetProp(CurControlName, cfpTitle, _title);
+      }
+    } // if Rights_Type
+    else if (IsVisible)
+    {
+      if (UseSkip or DFI.ObjType=cfcClusterItem) {
+        if (boSetProp(DFI.Control, cfpSkip, (not IsEditable)))
+          if (not IsEditable and DFI.ObjType<>cfcClusterItem)
+            boSetProp(DFI.Control, cfpNoStatic, true);
+      } else {
+        if (IsEditable) {
+          boSetProp(DFI.Control, cfpProtect, DFI.PropProtect);
+          boSetProp(DFI.Control, cfpDefaultPickButton, DFI.PropDefPickButton);
+          iSetProp(DFI.Control, cfpButtonType, DFI.PropButtonType);
+          wSetProp(DFI.Control, cfpStatusCtx, DFI.PropStatusCtx);
+          if (not DFI.OrigFontColor)
+            wSetProp(DFI.Control, cfpFontColor, DFI.PropFontColor);
+        } else {
+          boSetProp(DFI.Control, cfpProtect, true);
+          boSetProp(DFI.Control, cfpDefaultPickButton, false);
+          iSetProp(DFI.Control, cfpButtonType, 0);
+          wSetProp(DFI.Control, cfpStatusCtx, sci1Esc);
+          if (not DFI.OrigFontColor)
+            wSetProp(DFI.Control, cfpFontColor, ColorSysGray);
+        }
+      }
+    } //else if Rights_Type
+  }//_loop mFields
+}
+
+//-------- #3954 ------------------
+//Доступно ли редактирование раздела
+function CanEditRazdel(_CurContainer:tptr;_DocName:string; ControlName:string;_Razdel:string;_cSubType:comp):boolean;
+{ #__UNUSED__(CurContainer,ControlName,Razdel)
+  Result:=true;
+  if not Rights_Event exit;
+  if not FindRazdelRidths(_DocName,_Razdel,_cSubType,true) then exit;
+
+  if tDoc_Status.IsUsed
+  { Result:=tDoc_Status.IsEdit;
+  }
+#IFDEF _DEBUG_DocFieldsStateService_
+
+   timelog('CanEditRazdel: tDoc_Status.DocName='+tDoc_Status.DocName
+        +', cSubType='+string(tDoc_Status.cSubType,0,0)
+        +', Result='+string(Result)
+        );
+
+#ENDIF
+} //function CanEditRazdel(CurContainer:longint;ControlName:string;Razdel:string):boolean;
+
+//-------- #3954 ------------------
+//Доступна ли вставка записей раздела
+function CanInsRazdel (_CurContainer:tptr;_DocName:string; ControlName:string;_Razdel:string;_cSubType:comp):boolean;
+{ #__UNUSED__(CurContainer,ControlName,Razdel)
+  Result:=true;
+  if not Rights_Event exit;
+  if not FindRazdelRidths(_DocName,_Razdel,_cSubType,true) then exit;
+  if tDoc_Status.IsUsed
+  { Result:=tDoc_Status.IsIns;
+  }
+#IFDEF _DEBUG_DocFieldsStateService_
+
+   timelog('CanInsRazdel: tDoc_Status.DocName='+tDoc_Status.DocName
+        +', cSubType='+string(tDoc_Status.cSubType,0,0)
+        +', Result='+string(Result)
+        );
+
+#ENDIF
+} //function CanInsRazdel (CurContainer:tptr;ControlName:string;Razdel:string):boolean;
+
+//-------- #3954 ------------------
+//Доступна ли удаление записей раздела
+function CanDelRazdel (_CurContainer:tptr;_DocName:string; ControlName:string;_Razdel:string;_cSubType:comp):boolean;
+{ #__UNUSED__(CurContainer,ControlName,Razdel)
+  Result:=true;
+  if not FindRazdelRidths(_DocName,_Razdel,_cSubType,true) then exit;
+  if not Rights_Event exit;
+  if tDoc_Status.IsUsed
+  { Result:=tDoc_Status.IsDel;
+  }
+#IFDEF _DEBUG_DocFieldsStateService_
+
+   timelog('CanDelRazdel: tDoc_Status.DocName='+tDoc_Status.DocName
+        +', cSubType='+string(tDoc_Status.cSubType,0,0)
+        +', Result='+string(Result)
+        );
+
+#ENDIF
+
+} //function CanDelRazdel (CurContainer:tptr;ControlName:string;Razdel:string):boolean;
+
+//=============================
+function CanEditField(oFields:GP_ObjDocFields;CurContainer:tptr;ControlName:string):boolean;
+var CurRootContainer:string;
+{
+  result:=true;
+
+  mFields:=oFields;
+  CurRootContainer:=GetOrigContainerName(CurContainer);
+#IFDEF _DEBUG_DocFieldsStateService_
+  timelog('CanEditField: Container='+CurRootContainer+', '+ControlName );
+#ENDIF
+
+  if (getfirst fastfirstrow mFields
+      where((
+        true==mFields.IsUsed and
+        CurRootContainer==mFields.RootContainer and
+        ControlName==mFields.ControlName
+      ))=tsok)
+    result:=(mFields.State and 10b)<>0;
+#IFDEF _DEBUG_DocFieldsStateService_
+  timelog('CanEditField:Result='+string(result) );
+#ENDIF
+}
+
+function DelSpecSimv(s:string):string;
+{
+  result:=Replace(s,''#3,'');
+  result:=Replace(result,''#10,' ');
+  result:=Replace(result,''#13,' ');
+}
+
+function IsContainerObjectExist(RootContainer:string):boolean;
+{
+  result:=cfsSetCurrentContainer(RootContainer)=cfOk;
+}
+
+//===============================
+var  ArDef_Control:array[1] of TDef_Control;
+//===============================
+// добавить элемент ArDef_Control
+Procedure Add_ArDef_Control(_ObjType:longint; _num_elem:longint;_ObjList:string );
+{ SetLimit(ArDef_Control,_num_elem);
+  var _bVal:boolean;
+  var _lVal:longint;
+  SetLimit(ArDef_Control,_num_elem);
+
+  ArDef_Control[_num_elem]._ObjType:=_ObjType;
+  cfsGetProp(_ObjList, cfpProtect, _bVal);
+  ArDef_Control[_num_elem]._Protect:=_bVal;
+
+  cfsGetProp(_ObjList, cfpVisible, _bVal);
+  ArDef_Control[_num_elem]._Visible:=_bVal;
+
+  // все контролы с CalendarButton
+  cfsGetProp(_ObjList, cfpCalendarButton, _bVal);
+  ArDef_Control[_num_elem]._CalendarBut:=_bVal;
+  //cfsGetProp(_ObjList, cfpPickButton, _bVal);
+  cfsGetProp(_ObjList, 'DefaultPickButton', _bVal);
+  if _bVal
+  { // все контролы с pickbutton
+    ArDef_Control[_num_elem]._PickButton:=true;
+  }
+  else
+  { cfsGetProp(_ObjList, cfpCalcButton, _bVal);
+    if _bVal
+    { // все контролы с calcbutton
+      ArDef_Control[_num_elem]._CalcButton:=true;
+    }
+    else
+    { cfsGetProp(_ObjList, cfpSpinButton, _bVal);
+      if _bVal
+      { // все контролы со spinbutton
+        ArDef_Control[_num_elem]._SpinButton:=true;
+      }
+    }
+  } ///------------------------
+  // имеет смысл только для полей с выпадающим списком
+  var EnumList: array[1] of string;
+  SetLimit(EnumList, 0);
+  cfsGetPropArray(_ObjList, cfpStrings, EnumList);
+  if Count(EnumList) > 0 // >0
+  { // ListControls[Count(ListControls) + 1] := ObjList[I];
+    ArDef_Control[_num_elem]._ObjType+=1000;
+  }
+  // оригинальная статус-строка
+  cfsGetProp(_ObjList, cfpStatusCtx, _lVal);
+  ArDef_Control[_num_elem]._StatusCtx:=_lVal;
+
+  if _ObjType = 6 { // кнопка
+     var _command : longint = 0;
+     cfsGetProp(_ObjList, cfpCommand, _command);
+     ArDef_Control[_num_elem]._command:=_command;
+     timelog('     cfpCommand = '+ string(_command));
+     var _title : string = '';
+     cfsGetProp(_ObjList, cfpTitle, _title);
+     ArDef_Control[_num_elem]._title:=_title;
+     timelog('     cfpTitle = '+ _title);
+   }
+
+} //Procedure Add_ArDef_Control(_num_elem:longint;_ObjList:string );
+
+var OrigFontColor:boolean;
+procedure FillPropVal(var DFI:GP_DocFieldInfo);
+{
+  if (DFI.Control='' or DFI.ObjType=cfcClusterItem) exit;
+
+  cfsGetProp(DFI.Control, cfpProtect, DFI.PropProtect);
+  cfsGetProp(DFI.Control, cfpDefaultPickButton, DFI.PropDefPickButton);
+  cfsGetProp(DFI.Control, cfpButtonType, DFI.PropButtonType);
+  cfsGetProp(DFI.Control, cfpStatusCtx, DFI.PropStatusCtx);
+  cfsGetProp(DFI.Control, cfpFontColor, DFI.PropFontColor);
+  if (DFI.PropFontColor=34599)
+    DFI.PropFontColor:=0;
+  if (DFI.Control=DFI.Name) //После контрола без поля нельзя менять свойство FontColor, иначе рантайм (5.5.33)
+    OrigFontColor:=true;
+
+  DFI.OrigFontColor:=OrigFontColor;
+}
+
+function GrubFieldsFromContainer(oFields:GP_ObjDocFields;RootContainer,Container:string):boolean;
+var ObjList,ClusterItemList:array[1] of string;
+    i,n,k,ObjType,j,l:longint;
+    ObjSelf : tptr;
+    ObjFullName,ObjContainerName,PrevLable:string;
+    ArDFI:array[1] of GP_DocFieldInfo;
+{
+  result:=false;
+
+  RootContainer := UpCase(Trim(RootContainer));
+  if (RootContainer='') exit;
+
+  Container := UpCase(Trim(Container));
+  if (Container='') exit;
+
+  n:=cfsSetCurrentContainer(RootContainer);
+  if (n<>cfOk) {
+    message('Ошибка выполнения cfsSetCurrentContainer ('+RootContainer+') = '+string(n),error);
+    exit;
+  }
+
+  SetLimit(ObjList, 0);
+  if (cfsEnumObjects(Container, ObjList, false)<>cfOk) exit;
+
+  SetLimit(ArDef_Control, 0);
+  SetLimit(ArDFI, 0);
+  OrigFontColor:=false;
+
+  k:=0;
+  PrevLable:='';
+  n := Count(ObjList);
+  for(i := 1; i <= n; i++) {
+    timelog('GP_DocFieldsStateService -> GrubFieldsFromContainer for(i := 1; i <= n; i++) ');
+    timelog('     i ='+ string(i));
+    if (cfsGetObjInfo(upcase(trim(ObjList[i])), ObjFullName, ObjSelf, ObjContainerName, ObjType) <> cfOk) {
+      timelog('     ERROR! cfsGetObjInfo(ObjList[i], ObjFullName, ObjSelf, ObjContainerName, ObjType) <> cfOk');
+      timelog('     ObjList['+string(i)+'] = ' + ObjList[i]);
+      timelog('     ObjFullName = ' + ObjFullName);
+      timelog('     ObjSelf = ' + string(ObjSelf));
+      timelog('     ObjContainerName = ' + ObjContainerName);
+      timelog('     ObjType = '+ string(ObjType));
+      continue;
+     }
+      timelog('     ObjList['+string(i)+'] = ' + ObjList[i]);
+      timelog('     ObjFullName = ' + ObjFullName);
+      timelog('     ObjSelf = ' + string(ObjSelf));
+      timelog('     ObjContainerName = ' + ObjContainerName);
+      timelog('     ObjType = '+ string(ObjType));
+    case ObjType of
+      cfcButton: {
+       k++;
+       cfsGetProp(ObjList[i], cfpName, ArDFI[k].Name); //  cfpTitle
+       cfsGetProp(ObjList[i], cfpTitle, ArDFI[k].Title);
+
+
+        ArDFI[k].Control:=ObjList[i];
+        ArDFI[k].ObjType:=ObjType;
+        FillPropVal(ArDFI[k]);
+
+        Add_ArDef_Control(ObjType,k,ObjList[i]);
+
+      }
+      cfcLabel:
+        PrevLable:=ObjList[i];
+      cfcPanelInputLine:{
+        k++;
+        if (PrevLable<>'') {
+          cfsGetProp(PrevLable, cfpTitle, ArDFI[k].Title);
+          PrevLable:='';
+        }
+        if (ArDFI[k].Title='')
+          cfsGetProp(ObjList[i], cfpHelpLine, ArDFI[k].Title);
+
+        cfsGetProp(ObjList[i], cfpFieldName, ArDFI[k].Name);
+        if (ArDFI[k].Name='')
+          ArDFI[k].Name:=ObjList[i];
+
+        ArDFI[k].Control:=ObjList[i];
+        ArDFI[k].ObjType:=ObjType;
+        FillPropVal(ArDFI[k]);
+
+        Add_ArDef_Control(ObjType,k,ObjList[i]);
+      }
+      cfcColumn,cfcTreeColumn:{
+        k++;
+        cfsGetProp(ObjList[i], cfpTitle, ArDFI[k].Title);
+        if (ArDFI[k].Title='')
+          cfsGetProp(ObjList[i], cfpHelpLine, ArDFI[k].Title);
+
+        cfsGetProp(ObjList[i], cfpFieldName, ArDFI[k].Name);
+        if (ArDFI[k].Name='')
+          ArDFI[k].Name:=ObjList[i];
+
+        ArDFI[k].Control:=ObjList[i];
+        ArDFI[k].ObjType:=ObjType;
+        FillPropVal(ArDFI[k]);
+
+        Add_ArDef_Control(ObjType,k,ObjList[i]);
+      }
+      cfcPanelCheckBox:{
+        var sHelpLine:string = '';
+        cfsGetProp(ObjList[i], cfpHelpLine, sHelpLine);
+
+        SetLimit(ClusterItemList, 0);
+        if (cfsEnumObjects(ObjList[i], ClusterItemList, false)=cfOk) {
+          l := Count(ClusterItemList);
+          for(j := 1; j <= l; j++) {
+            if (cfsGetObjInfo(ClusterItemList[j], ObjFullName, ObjSelf, ObjContainerName, ObjType) <> cfOk) continue;
+
+            if (ObjType=cfcClusterItem) {
+              k++;
+              ArDFI[k].Name:=ClusterItemList[j];
+
+              cfsGetProp(ClusterItemList[j], cfpTitle, ArDFI[k].Title);
+              if (ArDFI[k].Title='')
+                ArDFI[k].Title:=sHelpLine;
+
+              ArDFI[k].Control:=ClusterItemList[j];
+              ArDFI[k].ObjType:=ObjType;
+
+              Add_ArDef_Control(ObjType,k,ClusterItemList[j]);
+            }
+          }
+        }
+      }
+    end;
+  }
+
+  oFields.SetRootContainer(RootContainer);
+  oFields.SetContainer(Container);
+  for(i := 1; i <= k; i++) 
+  {
+    ArDFI[i].Title:=DelSpecSimv(ArDFI[i].Title);
+    #IFDEF _EM_14_
+    if bEmptyTitleAsFieldNameEnabled and (Trim(ArDFI[i].Title) = '')
+      ArDFI[i].Title := Trim(ArDFI[i].Name);
+    #ENDIF
+    oFields.Add(ArDFI[i], ArDef_Control[i]);
+  }
+
+  result:=true;
+}
+
+procedure RenameFieldsGroup(DocName,OldName,NewName:string);
+{
+  update GP_TuneDocFields
+  where((
+    DocName==GP_TuneDocFields.DocName and
+    OldName==GP_TuneDocFields.DocFieldGroup
+  )) set
+    GP_TuneDocFields.DocFieldGroup:=NewName;
+}
+
+procedure RenameField(DocName,FieldGroup,OldName,NewName:string);
+{
+  update GP_TuneDocFields
+  where((
+    DocName==GP_TuneDocFields.DocName and
+    FieldGroup==GP_TuneDocFields.DocFieldGroup and
+    OldName==GP_TuneDocFields.DocFieldName
+  )) set
+    GP_TuneDocFields.DocFieldName:=NewName;
+}
+/*
+function CopyFieldStateMatrix(cSrc:comp;DocName,FieldGroup,DocFieldName:string):boolean;
+{
+  result:=false;
+  if (cSrc=0) exit;
+
+  if (getfirst fastfirstrow GP_TuneDocFields
+      where((
+        DocName==GP_TuneDocFields.DocName and
+        FieldGroup==GP_TuneDocFields.DocFieldGroup and
+        DocFieldName==GP_TuneDocFields.DocFieldName
+      ))=tsok) {
+    if (not GP_TuneDocFields.IsUsed) {
+      GP_TuneDocFields.IsUsed:=true;
+      if (update current GP_TuneDocFields <> tsok) {
+        message('Ошибка модификации записи в таблице GP_TuneDocFields!',error);
+        exit;
+      }
+    }
+
+    if (delete FieldsStateMatrix2 where((GP_TuneDocFields.NRec==FieldsStateMatrix2.cDocField)) <> tsok) {
+      message('Ошибка удаления записи в таблице GP_FieldsStateMatrix!',error);
+      exit;
+    }
+  } else {
+    GP_TuneDocFields.IsUsed:=true;
+    GP_TuneDocFields.NRec:=0;
+    GP_TuneDocFields.DocName:=DocName;
+    GP_TuneDocFields.DocFieldGroup:=FieldGroup;
+    GP_TuneDocFields.DocFieldName:=DocFieldName;
+    if (insert current GP_TuneDocFields <> tsok) {
+      message('Ошибка вставки записи в таблицу GP_TuneDocFields!',error);
+      exit;
+    }
+  }
+
+  result:=true;
+  _loop FieldsStateMatrix2 where((cSrc==FieldsStateMatrix2.cDocField)) {
+    GP_FieldsStateMatrix.buffer:=FieldsStateMatrix2.buffer;
+    GP_FieldsStateMatrix.NRec:=0;
+    GP_FieldsStateMatrix.cDocField:=GP_TuneDocFields.NRec;
+    result:=insert current GP_FieldsStateMatrix = tsok;
+    if (not result) {
+      message('Ошибка вставки записи в таблицу GP_FieldsStateMatrix!',error);
+      break;
+    }
+  }//_loop FieldsStateMatrix2
+}
+*/
+
+end.
+#IFDEF _DEBUG_DocFieldsStateService_
+#UNDEF _DEBUG_DocFieldsStateService_
+#ENDIF

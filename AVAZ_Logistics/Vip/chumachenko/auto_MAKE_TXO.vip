@@ -1,0 +1,139 @@
+/*************************************************************************************************\
+* Наименование:                                                    *
+* Контур/Модуль:                                                                             *
+* Примечание:                                                                                     *
+*                                                                                                 *
+* Вид работы  |Номер         |Дата    |Исполнитель              |Проект                           *
+* ----------------------------------------------------------------------------------------------- *
+
+\*************************************************************************************************/
+
+const
+end;
+
+#include TxoBind.vih          // iTxoBind         сложная привязка ТХО, и запуск сложной разноски
+
+#include auto_MAKE_TXO.vih
+
+#component "VAZ"
+Interface auto_MAKE_TXO 'Формирование проводок к документу по ТХО';
+
+create view
+ var
+     _LongStringLog
+   , _serviceLog    : tptr;
+     _needlog : boolean;
+     iTxoBind : TxoBinder;
+from
+   soprhoz
+ , HozOper
+;
+exception ExMakeHozOper;
+
+function getlastsymbol(_str : string) : string; {
+  result := substr(_str,length(_str),1);
+}
+
+Function GenerateNewFile: string; {
+  var _outdir : string = GetStringParameter('Files','OutputFilesDirectory',0);
+ result := _outdir + if(getlastsymbol(_outdir) = '\','','\') +
+       + 'auto_make_txo_'+DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS-SSS');
+}
+
+Procedure MyLog(_str: string);{
+  if not _needlog then exit;
+  _str := DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS') + ': '+_str + ''#13'';
+  HttpConnect_AddValueToLongString(_serviceLog, _str, _LongStringLog);
+}
+
+procedure disableLog; {
+  HttpConnect_DestroyLongString(_serviceLog, _LongStringLog);
+  HttpConnect_Free(_serviceLog);
+  set _needlog := false;
+}
+
+procedure enableLog; {
+   disableLog;
+  _serviceLog    := HttpConnect_CreateEx('http://ya.ru', '', '', true);
+  _LongStringLog := HttpConnect_CreateLongString(_serviceLog);
+  set _needlog := true;
+}
+
+function GetLogFile : string; {
+  var _log_OUT : string = GenerateNewFile+'.log';
+  HttpConnect_SaveToFileEx(_serviceLog, _LongStringLog, _log_OUT, cpOEMCP, false); // cpUTF8 | cpOEMCP | cpACP | 0-CP866
+  result := _log_OUT;
+}
+
+function MakeHozOperreal (_TipDoc: word; _cSoprDoc: comp; _cHozOper : comp) : boolean; {
+  Result := false;
+
+
+  mylog('start function MakeHozOper _TipDoc = '+ string(_TipDoc) + ' _cSoprDoc = ' + string(_cSoprDoc,0,0)+' _cHozOper = ' + string(_cHozOper,0,0));
+
+  If (GetFirst fastfirstrow SoprHoz where ((_TipDoc  == SoprHoz.TipDoc AND _cSoprDoc == SoprHoz.cSoprDoc)) != tsOk) {
+    mylog('не найдена хозоперация (_TipDoc = '+ string(_TipDoc) + ' _cSoprDoc = ' + string(_cSoprDoc,0,0)+')');
+    Exit;
+   }
+
+  iTxoBind.ResetServer;
+
+  if GetFirst HozOper where ((_cHozOper == HozOper.Nrec)) != tsOk {
+    mylog('не найдена хозоперация (_cHozOper = '+ string(_cHozOper,0,0) + ')');
+    Exit;
+   }
+
+  update SoprHoz set SoprHoz.cHozOper := _cHozOper;
+
+  iTxoBind.BuildTree(SoprHoz.bufferp);
+  iTxoBind.SetOperation(0, wOper_ReObor, 0, 0);
+  Result := iTxoBind.RealizeAndApplyOperations(SoprHoz.bufferp);
+
+  iTxoBind.ProcessProtokol;
+
+  if ( Result ) then {
+    update current SoprHoz;
+    mylog('К документу (_TipDoc = '+ string(_TipDoc) + ' _cSoprDoc = ' + string(_cSoprDoc,0,0) + ') привязана хозоперация "' + HozOper.Name1 +'"');
+  }
+  else {
+      mylog('ОШИБКА. К документу (_TipDoc = '+ string(_TipDoc) + ' _cSoprDoc = ' + string(_cSoprDoc,0,0) +') НЕ привязана хозоперация "' + HozOper.Name1 +'"');
+      exit
+    }
+}
+function MakeHozOper (_TipDoc: word; _cSoprDoc: comp; _cHozOper : comp) : boolean; {
+  _try {
+    result := MakeHozOperreal(_TipDoc, _cSoprDoc, _cHozOper);
+    if not result
+     _raise  ExMakeHozOper;
+  }
+  _except
+    on ExMakeHozOper:
+      mylog('ОШИБКА ПРИВЯЗКИ ТХО. К документу (_TipDoc = '+ string(_TipDoc) + ' ' + string(_cSoprDoc,0,0)+')');
+  _finally
+      mylog('end function MakeHozOper');
+}
+
+function DeleteHozOper (_TipDoc: word; _cSoprDoc: comp) : boolean; {
+
+  If (GetFirst fastfirstrow SoprHoz where ((_TipDoc  == SoprHoz.TipDoc AND _cSoprDoc == SoprHoz.cSoprDoc)) != tsOk) {
+    mylog('не найдена хозоперация (_TipDoc = '+ string(_TipDoc) + ' _cSoprDoc = ' + string(_cSoprDoc,0,0)+')');
+    Exit;
+   }
+
+  iTxoBind.ResetServer;
+  iTxoBind.BuildTree(SoprHoz.bufferp);
+  Result := iTxoBind.UnBind(SoprHoz.bufferp);
+  iTxoBind.ProcessProtokol;
+  if ( Result ) then {
+    update current SoprHoz;
+    mylog('От документа (_TipDoc = '+ string(_TipDoc) + ' _cSoprDoc = ' + string(_cSoprDoc,0,0) + ') отвязана хозоперация "' + HozOper.Name1 +'"');
+  }
+  else {
+      mylog('ОШИБКА. От документа (_TipDoc = '+ string(_TipDoc) + ' _cSoprDoc = ' + string(_cSoprDoc,0,0) + ') НЕ отвязана хозоперация "' + HozOper.Name1 +'"');
+      exit
+    }
+
+}
+
+
+end.
