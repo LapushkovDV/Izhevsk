@@ -1,0 +1,811 @@
+//------------------------------------------------------------------------------
+//                                                      (c) корпорация Галактика
+// Галактика 9.1
+// Тиражирование объектов недвижимости
+//------------------------------------------------------------------------------
+#include RltObjReplicator.vih
+#include CustomAttr.vih
+#include RoomAttr.vih
+#include HouseAttr.vih
+#include FloorAttr.vih
+#include RltAttrHist.vih
+#include BuildingAttrSimple.vih // Не интерактивный вариант интерфейса объекта недвижимости Здание/Строение.
+#include PlaceAttrSimple.vih    // Не интерактивный вариант интерфейса объекта недвижимости "Место на благоустроенной территории"
+#include ZemComplAttrSimple.vih // Не интерактивный вариант интерфейса объекта недвижимости "Земельный участок"
+
+interface RltObjReplicator;
+
+const
+  OBJ_REF_CACHE_SIZE = roCustom div 10;
+end;
+
+var
+  oAttrs:          RltAttrHistory;
+  m_objRefCache:   array [1..OBJ_REF_CACHE_SIZE] of tRltObjCommon; // кэш ссылок на интерфейсы атрибутов
+  m_setupComplete: boolean;         // содержит true, если setup был успешно выполнен
+  m_isCopyChild:   boolean;         // нужно ли копировать дочерние объекты
+  m_srcObjTreeBuf: type$RltObjTree; // Объект недвижимости - источник (образец) репликации
+  m_strVal1:       string;          // для комнат - фактический номер комнаты, для остальных объектов - наименование представления объекта в иерархии
+  m_strVal2:       string;          // номер комнаты в БТИ, номер этажа, номер помещения, для остальных - наименование объекта
+  m_longVal:       longint;         // для этажа - уровень, для остальных - не используется
+
+create view
+from
+  rltObjTree
+, rltRooms
+, rltHouses
+, rltFloors
+, rltBuildings
+, rltBuildings rltBuildingsSrc
+, rltPlaces
+, rltPlaces    rltPlacesSrc
+, rltZemCompl
+, rltZemCompl  rltZemComplSrc
+, rltCustoms
+, rltCustoms   rltCustomsSrc
+;
+
+
+// Установить текущий контекст.
+Procedure SetContext(_srcObjTreeBuf: type$RltObjTree; _strVal1, _strVal2: string; _longVal: longint = 0);
+{
+  m_srcObjTreeBuf := _srcObjTreeBuf;
+  m_strVal1       := _strVal1;
+  m_strVal2       := _strVal2;
+  m_longVal       := _longVal;
+}
+
+// Макросы сохранения/восстановления текущего контекста методов AfterInsert*.
+// (выполнить это в виде процедуры не представляется возможным - необходима стековая структура для многократных
+// вложенных сохранений/восстановлений в следствие рекурсивных вызовов метода AfterInsertObj).
+
+// Сохранить текущий контекст.
+#declare PUSH_CONTEXT
+  {
+    var saveSrcObjTreeBuf: type$rltObjTree;
+    var saveStrVal1:       string;
+    var saveStrVal2:       string;
+    var saveLongVal:       longint;
+
+    saveSrcObjTreeBuf := m_srcObjTreeBuf;
+    saveStrVal1       := m_strVal1;
+    saveStrVal2       := m_strVal2;
+    saveLongVal       := m_longVal;
+
+    _try {
+#end
+
+// Восстановить текущий контекст.
+#declare POP_CONTEXT
+    }
+    _finally {
+      SetContext(saveSrcObjTreeBuf, saveStrVal1, saveStrVal2, saveLongVal);
+    }
+  }
+#end
+
+Function GetAttrObjRef(_vidObj: word): tRltObjCommon; forward;
+
+// Постобработка добавления нового этажа.
+// pOwner - ссылка на узел rltObjTree, которому принадлежит этаж (в наст. время это здание/сооружение).
+// pObj   -  ссылка на новую добавленную запись в rltFloors
+// Использует переменные - члены интерфейса:
+//   m_strVal1 - наименование этажа в представлении объекта в иерархии
+//   m_strVal2 - номер добавленного этажа
+//   m_longVal - уровень добавленного этажа
+//   m_srcObjTreeBuf.cObj - ссылка на этаж - источник (rltFloors.nRec)
+//   m_isCopyChild - если true, то копирует все находящиеся на этаже - источнике объекты.
+procedure AfterInsertFloor(pOwner, pObj: comp);
+{
+  if ( GetFirst rltFloors where((pObj == rltFloors.NRec)) <> tsOk )
+    Exit;
+
+  insert rltObjTree set rltObjTree.cOwner   := pOwner,
+                        rltObjTree.cObj     := pObj,
+                        rltObjTree.VidObj   := roFloor,
+                        rltObjTree.SortName := m_strVal1;
+
+  var pPos, pHouses, pRooms: comp;
+
+  pPos := rltObjTree.nRec;
+
+  insert rltObjTree set
+    rltObjTree.cOwner   := pPos,
+    rltObjTree.cObj     := pObj,
+    rltObjTree.VidObj   := roHouses,
+    rltObjTree.SortName := 'Помещения';
+
+  pHouses := rltObjTree.nRec;
+
+  insert rltObjTree set
+    rltObjTree.cOwner   := pPos,
+    rltObjTree.cObj     := pObj,
+    rltObjTree.VidObj   := roRooms,
+    rltObjTree.SortName := 'Комнаты/Площади';
+
+  pRooms := rltObjTree.nRec;
+
+  oAttrs.DestroyHistory(pObj, roFloor);
+  oAttrs.CopyAttrs(m_srcObjTreeBuf.cObj, pObj, roFloor);
+
+  ExtAttrClass_CopyAll(coRltFloors, m_srcObjTreeBuf.cObj, pObj);
+
+  update rltFloors where((pObj == rltFloors.NRec)) set
+    rltFloors.No    := m_strVal2,
+    rltFloors.Level := m_longVal;
+
+  // Необходимо ли копировать подчиненные объекты?
+  if (not m_isCopyChild)
+    exit;
+
+  // Сохранить текущий контекст.
+  #PUSH_CONTEXT
+
+  var pHousesOwner, pRoomsOwner: comp;
+  pHousesOwner := pRoomsOwner := 0;
+
+  // подчиненные объекты этажа - источника
+  _loop rltObjTree where ((m_srcObjTreeBuf.nRec == rltObjTree.cOwner))
+    case rltObjTree.VidObj of
+      roRooms : pRoomsOwner  := rltObjTree.nRec
+      roHouses: pHousesOwner := rltObjTree.nRec;
+    end;
+
+  // тиражируем помещения
+  if ( pHousesOwner <> 0 )
+    {
+      _loop rltObjTree where (( pHousesOwner == rltObjTree.cOwner ))
+        if ( GetFirst rltHouses where (( rltObjTree.cObj == rltHouses.NRec )) = tsOk )
+          {
+            // Настроить контекст для предстоящей цепочки вызовов doInsertObj -> AfterInsertObj
+            SetContext(rltObjTree.Buffer, rltObjTree.SortName,  rltHouses.No);
+            PushPos(#rltObjTree);
+
+            // Комнаты, принадлежащие помещениям будут скопированы кодом тиражирования помещений
+            GetAttrObjRef(roHouse).doInsertObj(pObj, pHouses);
+
+            PopPos(#rltObjTree);
+          }
+    }
+
+  // Тиражируем комнаты, не принадлежащие помещениям
+  if ( pRoomsOwner <> 0 )
+    {
+      _loop rltObjTree where ((pRoomsOwner == rltObjTree.cOwner))
+        if ( GetFirst rltRooms where (( rltObjTree.cObj == rltRooms.NRec )) = tsOk )
+          {
+            // Если комната принадлежит какому - либо помещению, то не копируем ее (она копируется кодом тиражирования помещений)
+            if ((rltRooms.cHouse != 0) and (pHousesOwner != 0))
+              {
+                if (RecordExists rltObjTree where((roHouse         == rltObjTree.VidObj
+                                               and rltRooms.cHouse == rltObjTree.cObj
+                                               and pHousesOwner    == rltObjTree.cOwner)) = tsOk)
+                  {
+                    continue;
+                  }
+              }
+
+            // Настроить контекст для предстоящей цепочки вызовов doInsertObj -> AfterInsertObj
+            SetContext(rltObjTree.buffer, RltRooms.NoFact, RltRooms.NoBTI);
+            PushPos(#rltObjTree);
+
+            GetAttrObjRef(roRoom).doInsertObj(pObj, pRooms);
+
+            PopPos(#rltObjTree);
+          }
+    }
+
+  // Восстановить текущий контекст.
+  #POP_CONTEXT
+}
+
+// Постобработка добавления новой комнаты.
+// pOwner - ссылка на узел rltObjTree, которому принадлежит комната.
+// pObj   -  ссылка на новую добавленную запись в rltRooms
+// Использует переменные - члены интерфейса:
+//  m_strVal1 - Фактический номер комнаты
+//  m_strVal2 - Номер комнаты по БТИ
+//  m_srcObjTreeBuf.cObj - ссылка на комнату - источник (rltRooms.nRec).
+procedure AfterInsertRoom(pOwner, pObj: comp);
+{
+  if ( GetFirst rltRooms where ((pObj == rltRooms.NRec)) <> tsOk )
+    Exit;
+
+  oAttrs.DestroyHistory(pObj, roRoom);
+  oAttrs.CopyAttrs(m_srcObjTreeBuf.cObj, pObj, roRoom);
+  ExtAttrClass_CopyAll(coRltRooms, m_srcObjTreeBuf.cObj, pObj);
+
+  update rltObjTree where((roRoom == rltObjTree.VidObj and pObj == rltObjTree.cObj)) set
+    rltObjTree.SortName := m_strVal1;
+
+  insert rltObjTree set rltObjTree.cOwner   := pOwner,
+                        rltObjTree.cObj     := pObj,
+                        rltObjTree.VidObj   := roRoom,
+                        rltObjTree.SortName := if(rltRooms.cHouse = 0, m_strVal1, m_strVal2);
+
+  // Обновить номера комнаты
+  update rltRooms where((pObj == rltRooms.NRec)) set
+    rltRooms.NoFact := m_strVal1,
+    rltRooms.NoBTI  := m_strVal2;
+}
+
+// Постобработка добавления нового помещения.
+// pOwner - ссылка на узел rltObjTree, которому принадлежит помещение.
+// pObj   -  ссылка на новую добавленную запись в rltHouses
+// Использует переменные - члены интерфейса:
+//   m_strVal1 - Наименование представления объекта в иерархии
+//   m_strVal2 - Номер помещения
+//   m_srcObjTreeBuf.cObj - ссылка на помещение - источник.
+//   m_isCopyChild - если true, то копирует все находящиеся в помещении - источнике объекты.
+procedure AfterInsertHouse(pOwner, pObj: comp);
+{
+  if ( GetFirst rltHouses where((pObj == rltHouses.NRec)) <> tsOk )
+    Exit;
+
+  oAttrs.DestroyHistory(pObj, roHouse);
+  oAttrs.CopyAttrs(m_srcObjTreeBuf.cObj, pObj, roHouse);
+  ExtAttrClass_CopyAll(coRltHouses, m_srcObjTreeBuf.cObj, pObj);
+
+  update rltHouses where((pObj == rltHouses.NRec)) set
+    rltHouses.No := m_strVal2;
+
+  insert rltObjTree set rltObjTree.cOwner   := pOwner,
+                        rltObjTree.cObj     := pObj,
+                        rltObjTree.VidObj   := roHouse,
+                        rltObjTree.SortName := m_strVal1;
+
+  // Необходимо ли копировать подчиненные объекты?
+  if (not m_isCopyChild)
+    exit;
+
+  var dstHouseTreeNode: comp;
+  dstHouseTreeNode := rltObjTree.nRec;
+
+  var dstFloor: comp;
+  dstFloor := rltHouses.cFloor;
+
+  // Запомнить ссылку на помещение-источник, т.к. в процессе обработки подчиненных объектов текущий контекст будет меняться
+  var srcHouseTreeNode: comp;
+  srcHouseTreeNode := m_srcObjTreeBuf.nRec;
+
+  // Сохранить текущий контекст.
+  #PUSH_CONTEXT
+
+  // Обход и копирование всех комнат помещения - источника
+  _loop rltObjTree where((srcHouseTreeNode == rltObjTree.cOwner))
+    if (GetFirst rltRooms where((rltObjTree.cObj == rltRooms.nRec)) = tsOk)
+    {
+      // Настроить контекст для предстоящей цепочки вызовов doInsertObj -> AfterInsertObj
+      SetContext(rltObjTree.buffer, rltRooms.NoFact, rltRooms.NoBTI);
+      PushPos(#rltObjTree);
+
+      GetAttrObjRef(roRoom).doInsertObj(dstFloor, dstHouseTreeNode);
+
+      PopPos(#rltObjTree);
+    }
+
+  // Восстановить текущий контекст.
+  #POP_CONTEXT
+}
+
+// Постобработка добавления нового здания/сооружения.
+// pOwner - ссылка на узел rltObjTree, которому принадлежит здание/сооружение.
+// pObj   -  ссылка на запись в rltBuildings
+// Использует переменные - члены интерфейса:
+//   m_srcObjTreeBuf - буфер записи исходного здания/сооружения
+//   m_strVal1 - наименование представления объекта в иерархии
+//   m_strVal2 - наименование объекта
+//   m_srcObjTreeBuf.cObj - ссылка на здание/сооружение - источник
+//   m_isCopyChild - если true, то также копирует все находящиеся в здании - источнике объекты
+procedure AfterInsertBuilding(pOwner, pObj: comp);
+{
+  if (GetFirst rltBuildings where((pObj == rltBuildings.NRec)) <> tsOk)
+    Exit;
+
+  if (GetFirst rltBuildingsSrc where((m_srcObjTreeBuf.cObj == rltBuildingsSrc.nRec)) <> tsOk)
+    Exit;
+
+  oAttrs.DestroyHistory(pObj, roBuilding);
+  oAttrs.CopyAttrs(m_srcObjTreeBuf.cObj, pObj, roBuilding);
+  ExtAttrClass_CopyAll(coRltBuildings, m_srcObjTreeBuf.cObj, pObj);
+
+  update RltBuildings where((pObj == rltBuildings.NRec)) set
+    RltBuildings.cFpCO        := RltBuildingsSrc.cFpCO,
+    RltBuildings.IsBuildings  := RltBuildingsSrc.IsBuildings,
+    RltBuildings.InvNo        := RltBuildingsSrc.InvNo,
+    RltBuildings.Name         := m_strVal2,
+    RltBuildings.Addr         := RltBuildingsSrc.Addr,
+    RltBuildings.cAddr        := RltBuildingsSrc.cAddr,
+    RltBuildings.Material     := RltBuildingsSrc.Material,
+    RltBuildings.BuildYear    := RltBuildingsSrc.BuildYear,
+    RltBuildings.GroundFloors := RltBuildingsSrc.GroundFloors,
+    RltBuildings.IsMonument   := RltBuildingsSrc.IsMonument,
+    RltBuildings.wPurposes    := RltBuildingsSrc.wPurposes,
+    RltBuildings.pPurposes    := RltBuildingsSrc.pPurposes;
+
+  insert rltObjTree set
+    rltObjTree.cOwner   := pOwner,
+    rltObjTree.cObj     := pObj,
+    rltObjTree.VidObj   := roBuilding,
+    rltObjTree.SortName := m_strVal1;
+
+  var treeNodeBuilding: comp; treeNodeBuilding := rltObjTree.nRec;
+
+  // Необходимо ли копировать подчиненные объекты?
+  if (not m_isCopyChild)
+    exit;
+
+  // Ввиду того, что копируем и подчиненные объекты, необходимо скопировать поля, описывающие эти объекты
+  update RltBuildings where((pObj == rltBuildings.NRec)) set
+    RltBuildings.Flats  := RltBuildingsSrc.Flats,
+    RltBuildings.Rooms  := RltBuildingsSrc.Rooms,
+    RltBuildings.Floors := RltBuildingsSrc.Floors;
+
+  // Запомнить ссылку на узел-источник, т.к. в процессе обработки подчиненных объектов текущий контекст будет меняться
+  var srcObjTreeNode: comp; srcObjTreeNode := m_srcObjTreeBuf.nRec;
+
+  // Сохранить текущий контекст.
+  #PUSH_CONTEXT
+
+  // Обход всех подчиненных этажей источника (а подчиненными для здания/сооружения в настоящее время могут быть только этажи).
+  _loop rltObjTree where((srcObjTreeNode == rltObjTree.cOwner))
+    {
+      if (rltObjTree.VidObj != roFloor)
+        {
+          // Появился новый тип подчиненных объектов, а мы и не знали? В любом случае надо чинить.
+          _raise ExBadDataStructure(
+            'При репликации здания/сооружения обнаружен неожиданный подчиненный объект.'#13 +
+            '(ожидался тип объекта ' + string(roFloor) + ', а обнаружен ' + string(rltObjTree.VidObj) + ').'#13 +
+            'Пожалуйста, сообщите разработчику.');
+          continue;
+        }
+
+      if (GetFirst rltFloors where((rltObjTree.cObj == rltFloors.nRec)) != tsOk)
+        {
+          // Определенно косяки в структуре дерева объектов. Надо чинить.
+          _raise ExBadDataStructure(
+            'При репликации здания/сооружения обнаружена ошибка в структуре данных дерева объектов'#13 +
+            '(нет ссылки на объект "Этажи зданий"). Пожалуйста, сообщите разработчику.');
+          continue;
+        }
+
+      // Настроить контекст для предстоящей цепочки вызовов doInsertObj -> AfterInsertObj
+      SetContext(rltObjTree.buffer, rltObjTree.SortName, rltFloors.No, rltFloors.Level);
+      PushPos(#rltObjTree);
+
+      // Выполняем копирование очередного этажа.
+      // Принадлежащие каждому этажу объекты будут скопированы постобработчиком AfterInsertFloor
+      GetAttrObjRef(roFloor).doInsertObj(pObj, treeNodeBuilding);
+
+      PopPos(#rltObjTree);
+    }
+
+  // Восстановить текущий контекст.
+  #POP_CONTEXT
+}
+
+// Постобработка добавления нового места на благоустроенной территории.
+// pOwner - ссылка на узел rltObjTree, которому принадлежит место.
+// pObj   -  ссылка на запись в rltPlaces
+// Использует переменные - члены интерфейса:
+//   m_strVal1 - наименование представления объекта в иерархии
+//   m_strVal2 - наименование объекта
+//   m_srcObjTreeBuf.cObj - ссылка на место - источник
+procedure AfterInsertPlace(pOwner, pObj: comp);
+{
+  if (GetFirst rltPlaces where((pObj == rltPlaces.NRec)) <> tsOk)
+    Exit;
+
+  if (GetFirst rltPlacesSrc where((m_srcObjTreeBuf.cObj == rltPlacesSrc.nRec)) <> tsOk)
+    Exit;
+
+  oAttrs.DestroyHistory(pObj, roPlace);
+  oAttrs.CopyAttrs(m_srcObjTreeBuf.cObj, pObj, roPlace);
+  ExtAttrClass_CopyAll(coRltPlaces, m_srcObjTreeBuf.cObj, pObj);
+
+  // связь со зданием/сооружением копируется только если источник и копия находятся на одном земельном участке.
+  var building: comp;
+  building := if(rltPlacesSrc.cZemCompl = rltPlaces.cZemCompl, rltPlacesSrc.cBuilding, 0);
+
+  update rltPlaces where((pObj == rltPlaces.NRec)) set
+    rltPlaces.cBuilding := building,
+    rltPlaces.cFpCO     := rltPlacesSrc.cFpCO,
+    rltPlaces.Name      := m_strVal2,
+    rltPlaces.Addr      := rltPlacesSrc.Addr,
+    rltPlaces.cAddr     := rltPlacesSrc.cAddr;
+
+  insert rltObjTree set
+    rltObjTree.cOwner   := pOwner,
+    rltObjTree.cObj     := pObj,
+    rltObjTree.VidObj   := roPlace,
+    rltObjTree.SortName := m_strVal1;
+}
+
+// Постобработка добавления нового земельного участка.
+// pOwner - ссылка на узел rltObjTree, которому принадлежит участок.
+// pObj   -  ссылка на запись в rltZemCompl
+// Использует переменные - члены интерфейса:
+//   m_srcObjTreeBuf - буфер записи исходного земельного участка.
+//   m_strVal1 - наименование представления объекта в иерархии
+//   m_strVal2 - наименование объекта
+//   m_srcObjTreeBuf.cObj - ссылка на участок - источник
+//   m_isCopyChild - если true, то также копирует все принадлежащие участку - источнику объекты
+procedure AfterInsertZemCompl(pOwner, pObj: comp);
+{
+  if (GetFirst rltZemCompl where((pObj == rltZemCompl.NRec)) <> tsOk)
+    Exit;
+
+  if (GetFirst rltZemComplSrc where((m_srcObjTreeBuf.cObj == rltZemComplSrc.nRec)) <> tsOk)
+    Exit;
+
+  oAttrs.DestroyHistory(pObj, roZemCompl);
+  oAttrs.CopyAttrs(m_srcObjTreeBuf.cObj, pObj, roZemCompl);
+  ExtAttrClass_CopyAll(coRltZemCompl, m_srcObjTreeBuf.cObj, pObj);
+
+  update rltZemCompl where((pObj == rltZemCompl.NRec)) set
+    rltZemCompl.Name      := m_strVal2,
+    rltZemCompl.Addr      := rltZemComplSrc.Addr,
+    rltZemCompl.cAddr     := rltZemComplSrc.cAddr,
+    rltZemCompl.wPurposes := rltZemComplSrc.wPurposes,
+    rltZemCompl.pPurposes := rltZemComplSrc.pPurposes;
+
+  insert rltObjTree set
+    rltObjTree.cOwner   := pOwner,
+    rltObjTree.cObj     := pObj,
+    rltObjTree.VidObj   := roZemCompl,
+    rltObjTree.SortName := m_strVal1;
+
+  var owner: comp; owner := rltObjTree.nRec;
+
+  insert rltObjTree set
+    rltObjTree.cOwner   := owner,
+    rltObjTree.cObj     := pObj,
+    rltObjTree.VidObj   := roPlaces,
+    rltObjTree.SortName := 'Благоустроенная территория';
+
+  var treeNodePlaces: comp; treeNodePlaces := rltObjTree.nRec;
+
+  insert rltObjTree set
+    rltObjTree.cOwner   := owner,
+    rltObjTree.cObj     := pObj,
+    rltObjTree.VidObj   := roBuildings,
+    rltObjTree.SortName := 'Здания и сооружения';
+
+  var treeNodeBuildings: comp; treeNodeBuildings := rltObjTree.nRec;
+
+  // Необходимо ли копировать подчиненные объекты?
+  if (not m_isCopyChild)
+    exit;
+
+  // Запомнить ссылку на узел-источник, т.к. в процессе обработки подчиненных объектов текущий контекст будет меняться
+  var srcObjTreeNode: comp; srcObjTreeNode := m_srcObjTreeBuf.nRec;
+
+  // Сохранить текущий контекст.
+  #PUSH_CONTEXT
+
+  // Репликация всех мест на благоустроенной территории.
+
+  // Поиск узла "Благоустроенная территория" источника.
+  if (GetFirst rltObjTree where((srcObjTreeNode == rltObjTree.cOwner and roPlaces == rltObjTree.VidObj(NoIndex))) != tsOk)
+    {
+      // Определенно косяки в структуре дерева объектов. Надо чинить.
+      _raise ExBadDataStructure(
+        'При попытке репликации узла "Благоустроенная территория" не удалось обнаружить указанный узел.'#13 +
+        'Пожалуйста, сообщите разработчику.');
+      exit;
+    }
+
+  var srcPlaces: comp; srcPlaces := rltObjTree.nRec;
+
+  // Обход всех объектов "Место на благоустроенной территории" источника и их репликация
+  _loop rltObjTree where((srcPlaces == rltObjTree.cOwner))
+    {
+      if (rltObjTree.VidObj != roPlace)
+        {
+          // Появился новый тип подчиненных объектов, а мы и не знали? В любом случае надо чинить.
+          _raise ExBadDataStructure(
+            'При репликации узла "Благоустроенная территория" обнаружен неожиданный подчиненный объект.'#13 +
+            '(ожидался тип объекта ' + string(roPlace) + ', а обнаружен ' + string(rltObjTree.VidObj) + ').'#13 +
+            'Пожалуйста, сообщите разработчику.');
+          continue;
+        }
+
+      if (GetFirst rltPlaces where((rltObjTree.cObj == rltPlaces.nRec)) != tsOk)
+        {
+          // Определенно косяки в структуре дерева объектов. Надо чинить.
+          _raise ExBadDataStructure(
+            'При репликации узла "Место на благоустроенной территории" обнаружена ошибка в структуре данных дерева объектов'#13 +
+            '(некорректная ссылка на запись таблицы rltPlaces). Пожалуйста, сообщите разработчику.');
+          continue;
+        }
+
+      // Настроить контекст для предстоящей цепочки вызовов doInsertObj -> AfterInsertObj
+      SetContext(rltObjTree.buffer, rltObjTree.SortName, rltPlaces.Name);
+      PushPos(#rltObjTree);
+
+      // Выполняем копирование очередного места на благоустроенной территории.
+      GetAttrObjRef(roPlace).doInsertObj(pObj, treeNodePlaces);
+
+      PopPos(#rltObjTree);
+    }
+
+  // Репликация всех зданий и сооружений.
+
+  // Поиск узла "Здания и сооружения" источника.
+  if (GetFirst rltObjTree where((srcObjTreeNode == rltObjTree.cOwner and roBuildings == rltObjTree.VidObj(NoIndex))) != tsOk)
+    {
+      // Определенно косяки в структуре дерева объектов. Надо чинить.
+      _raise ExBadDataStructure(
+        'При попытке репликации узла "Здания и сооружения" не удалось обнаружить указанный узел.'#13 +
+        'Пожалуйста, сообщите разработчику.');
+      exit;
+    }
+
+  var srcBuildings: comp; srcBuildings := rltObjTree.nRec;
+
+  // Обход всех объектов "Здания и сооружения" источника и их репликация
+  _loop rltObjTree where((srcBuildings == rltObjTree.cOwner))
+    {
+      if (rltObjTree.VidObj != roBuilding)
+        {
+          // Появился новый тип подчиненных объектов, а мы и не знали? В любом случае надо чинить.
+          _raise ExBadDataStructure(
+            'При репликации узла "Здания и сооружения" обнаружен неожиданный подчиненный объект.'#13 +
+            '(ожидался тип объекта ' + string(roBuilding) + ', а обнаружен ' + string(rltObjTree.VidObj) + ').'#13 +
+            'Пожалуйста, сообщите разработчику.');
+          continue;
+        }
+
+      if (GetFirst rltBuildings where((rltObjTree.cObj == rltBuildings.nRec)) != tsOk)
+        {
+          // Определенно косяки в структуре дерева объектов. Надо чинить.
+          _raise ExBadDataStructure(
+            'При репликации узла "Здание/сооружение" обнаружена ошибка в структуре данных дерева объектов'#13 +
+            '(некорректная ссылка на запись таблицы rltBuildings). Пожалуйста, сообщите разработчику.');
+          continue;
+        }
+
+      // Настроить контекст для предстоящей цепочки вызовов doInsertObj -> AfterInsertObj
+      SetContext(rltObjTree.buffer, rltObjTree.SortName, rltBuildings.Name);
+      PushPos(#rltObjTree);
+
+      // Выполняем копирование очередного здания/сооружения.
+      // Копирование подчиненных объектов выполнит метод AfterInsertBuilding.
+      GetAttrObjRef(roBuilding).doInsertObj(pObj, treeNodeBuildings);
+
+      PopPos(#rltObjTree);
+    }
+
+  // Восстановить текущий контекст.
+  #POP_CONTEXT
+}
+
+// Постобработка добавления нового нестандартного объекта.
+// pOwner - ссылка на узел rltObjTree, которому принадлежит объект.
+// pObj   -  ссылка на запись в rltCustoms
+// Использует переменные - члены интерфейса:
+//   m_strVal1 - наименование представления объекта в иерархии
+//   m_strVal2 - наименование объекта
+//   m_srcObjTreeBuf.cObj - ссылка на объект - источник
+procedure AfterInsertCustom(pOwner, pObj: comp);
+{
+  if (GetFirst rltCustoms where((pObj == rltCustoms.NRec)) <> tsOk)
+    Exit;
+
+  if (GetFirst rltCustomsSrc where((m_srcObjTreeBuf.cObj == rltCustomsSrc.nRec)) <> tsOk)
+    Exit;
+
+  oAttrs.DestroyHistory(pObj, roCustom);
+  oAttrs.CopyAttrs(m_srcObjTreeBuf.cObj, pObj, roCustom);
+  ExtAttrClass_CopyAll(coRltCustoms, m_srcObjTreeBuf.cObj, pObj);
+
+  update rltCustoms where((pObj == rltCustoms.NRec)) set
+    rltCustoms.cFpCO     := rltCustomsSrc.cFpCO,
+    rltCustoms.Name      := m_strVal2,
+    rltCustoms.Addr      := rltCustomsSrc.Addr,
+    rltCustoms.cAddr     := rltCustomsSrc.cAddr,
+    rltCustoms.wPurposes := rltCustomsSrc.wPurposes,
+    rltCustoms.pPurposes := rltCustomsSrc.pPurposes;
+
+  insert rltObjTree set
+    rltObjTree.cOwner   := pOwner,
+    rltObjTree.cObj     := pObj,
+    rltObjTree.VidObj   := roCustom,
+    rltObjTree.SortName := m_strVal1;
+}
+
+procedure AfterInsertObj(pOwner, pObj: comp; wVidObj: word; sName: string);
+{
+  #__UnUsed__(sName)
+
+  case wVidObj of
+    roFloor:    AfterInsertFloor   (pOwner, pObj);
+    roRoom:     AfterInsertRoom    (pOwner, pObj);
+    roHouse:    AfterInsertHouse   (pOwner, pObj);
+    roBuilding: AfterInsertBuilding(pOwner, pObj);
+    roPlace:    AfterInsertPlace   (pOwner, pObj);
+    roZemCompl: AfterInsertZemCompl(pOwner, pObj);
+    roCustom:   AfterInsertCustom  (pOwner, pObj);
+  end;
+}
+
+procedure InternalInit;
+{
+  var i: integer;
+  for (i := 1; i <= OBJ_REF_CACHE_SIZE; i++)
+    m_objRefCache[i] := NullRef;
+}
+
+// Реализует отложенную загрузку базового интерфейса нужного объекта по первому требованию
+Function GetAttrObjRef(_vidObj: word): tRltObjCommon;
+{
+  var idx: integer;
+  idx := _vidObj div 10;
+
+  var attrObj: tRltObjCommon;
+  attrObj := m_objRefCache[idx];
+
+  if (attrObj = NullRef)
+  {
+    case (_vidObj) of
+      roZemCompl: attrObj := tRltObjCommon(new(ZemComplAttrSimple)); // Не интерактивный вариант интерфейса объекта недвижимости "Земельный участок"
+      roPlace:    attrObj := tRltObjCommon(new(PlaceAttrSimple));    // Не интерактивный вариант интерфейса объекта недвижимости "Место на благоустроенной территории"
+      roBuilding: attrObj := tRltObjCommon(new(BuildingAttrSimple)); // Не интерактивный вариант интерфейса объекта недвижимости Здание/Строение.
+      roFloor:    attrObj := tRltObjCommon(new(FloorAttr));
+      roRoom:     attrObj := tRltObjCommon(new(RoomAttr));
+      roHouse:    attrObj := tRltObjCommon(new(HouseAttr));
+      roCustom:   attrObj := tRltObjCommon(new(CustomAttr));
+    end;
+
+    BindEvent(AfterInsertObj, attrObj.AfterInsertObj);
+    m_objRefCache[idx] := attrObj;
+  }
+
+  result := attrObj;
+}
+
+// Для объекта "Комната" ищет этаж, на котором расположена комната и соответствующий элемент дерева
+public function GetOwnersOfRoom(_objTreeBuf: type$RltObjTree; out _floor: comp; out _treeOwner: comp): boolean;
+{
+  result := false;
+  _floor := _treeOwner := 0;
+
+  if (_objTreeBuf.VidObj != roRoom)
+    exit;
+
+  if (GetFirst rltRooms where ((_objTreeBuf.cObj == rltRooms.NRec)) != tsOk)
+    exit;
+
+  if (GetFirst rltObjTree where((_objTreeBuf.cOwner == rltObjTree.nRec)) != tsOk)
+    exit;
+
+  if ((rltRooms.cHouse = 0) AND (rltObjTree.VidObj = roRooms))
+  {
+    // Объект "Комната" в дереве принадлежит ТОЛЬКО объекту "Комнаты"
+    _treeOwner := _objTreeBuf.cOwner; // ссылка на родителя в rtlObjTree, т.е. на запись rltObjOwner.VidObj = roRooms
+    _floor     := rltObjTree.cObj;   // ссылка на rltFloors ("Этаж") - этаж, на котором располагаются комнаты
+  }
+  else if (GetFirst rltObjTree where ((rltRooms.cHouse == rltObjTree.cObj AND roHouse == rltObjTree.VidObj)) = tsOK)
+  {
+    // Объект "Комната" в дереве принадлежит объекту "Помещение", либо одновременно и объекту "Комнаты", и объекту "Помещение"
+
+    _treeOwner := rltObjTree.nRec;   // ссылка на элемент rtlObjTree с типом "Помещение", которому принадлежит данная комната
+
+    var c: comp;
+    c := rltObjTree.cOwner; // ссылка на элемент rtlObjTree с типом "ПомещениЯ", в котором расположено "Помещение" с комнатой.
+
+    if (GetFirst rltObjTree where ((c == rltObjTree.nRec)) != tsOk)
+    {
+      // Нарушена структура иерархии объектов. Надо искать ошибку в коде.
+      _raise ExBadDataStructure(
+        'При при поиске помещения, в котором расположена комната №' + rltRooms.NoFact + ', обнаружена ошибка в структуре данных дерева объектов.'#13 +
+        'Пожалуйста, сообщите разработчику.');
+      exit;
+    }
+
+    _floor := rltObjTree.cObj; // ссылка на rltFloors ("Этаж"), на котором располагаются помещения с комнатами
+  }
+  else
+  {
+    // Нарушена структура иерархии объектов. Надо искать ошибку в коде.
+    _raise ExBadDataStructure(
+      'При при поиске помещения, в котором расположена комната №' + rltRooms.NoFact + ', обнаружена ошибка в структуре данных дерева объектов.'#13 +
+      'Пожалуйста, сообщите разработчику.');
+    exit;
+  }
+
+  result := true;
+}
+
+// Для указанного узла дерева ищет и возвращает объект "Этаж", либо 0, если объект не находится ни на каком этаже.
+// (на этажах могут находиться "Комната", "Комнаты", "Помещение", "Помещения")
+public function GetFloorOf(_objTreeBuf: type$RltObjTree): comp;
+{
+  result := 0;
+
+  var vo:    word; vo    := _objTreeBuf.VidObj;
+  var owner: comp; owner := _objTreeBuf.cOwner;
+  var obj:   comp; obj   := _objTreeBuf.cObj;
+
+  while (true)
+  {
+    if (vo = roFloor)
+    {
+      result := obj;
+      break;
+    }
+
+    if (GetFirst rltObjTree where((owner == rltObjTree.nRec)) != tsOk)
+      break;
+
+    vo    := rltObjTree.VidObj;
+    owner := rltObjTree.cOwner;
+    obj   := rltObjTree.cObj;
+  }
+}
+
+// Для указанного узла дерева ищет и возвращает ссылку на земельный участок, либо 0, если объект
+// найти не удалось (это возможно только в случае разрушенных структур данных в rltObjTree).
+public function GetZemComplOf(_objTreeBuf: type$RltObjTree): comp;
+{
+  result := 0;
+
+  var vo:    word; vo    := _objTreeBuf.VidObj;
+  var owner: comp; owner := _objTreeBuf.cOwner;
+  var obj:   comp; obj   := _objTreeBuf.cObj;
+
+  while (true)
+  {
+    if ((vo = roZemCompl) or (vo = roPlaces) or (vo = roBuildings))
+    {
+      result := obj;
+      break;
+    }
+
+    if (GetFirst rltObjTree where((owner == rltObjTree.nRec)) != tsOk)
+      break;
+
+    vo    := rltObjTree.VidObj;
+    owner := rltObjTree.cOwner;
+    obj   := rltObjTree.cObj;
+  }
+}
+
+// Выполнить одну репликацию объекта - источника, разместив копию в заданный узел дерева.</brief>
+// Перед вызовом данной функции интерфейс должен быть настроен вызовом метода Setup.
+// В случае ошибки возвращается false.
+// (описание параметров см. в .vih)
+public function Replicate(
+  _srcObjTreeBuf:  type$RltObjTree;
+  _dstRltOwner:    comp;
+  _dstObjTreeNode: comp;
+  _strVal1:        string;
+  _strVal2:        string;
+  _longVal:        longint;
+  _isCopyChild:    boolean
+): boolean;
+{
+  result := false;
+
+  var attrObj: tRltObjCommon;
+  attrObj := GetAttrObjRef(_srcObjTreeBuf.VidObj);
+
+  if ( attrObj = NullRef)
+    exit;
+
+  m_isCopyChild := _isCopyChild;
+
+  // Настроить контекст для предстоящей цепочки вызовов doInsertObj -> AfterInsertObj
+  SetContext(_srcObjTreeBuf, _strVal1, _strVal2, _longVal);
+
+  result := attrObj.doInsertObj(_dstRltOwner, _dstObjTreeNode);
+}
+
+handleevent
+cmOnVipLoad:
+{
+  InternalInit();
+}
+end;
+
+end.

@@ -1,0 +1,567 @@
+
+#include UserReport.vih
+#include XLReport.vih
+#include FpPeriod.vih
+#include PersInfo.vih
+#include oiPotrGt.vih
+#include InLogistRepFuncs.vih
+#include ValFunc.vih
+exception ExExcelFatalError;
+
+
+#Doc
+ Расчет потребности в закупке инструмента</Brief>
+#End
+
+Interface STO_PLAN_POTREB_REP 'Расчет потребности в закупке инструмента', escClose, blue;
+Show at (,,70,18);
+
+// № п/п	Номенклатура	Наименование номенклатуры	Обозначение номенклатуры	Цех	Цена в валюте Договора	Валюта договора	Цена, руб	Поставщик	Производитель	ГОСТ или ТУ / № чертежа	Возможен аналог	Товарная группа	Остаток	Норма инструмента	Потребность, шт	Потребность, руб
+
+table struct TmpOborot
+(
+  S         : string
+ ,sProIzv   : string[15]
+ ,sCex      : string[35]
+ ,sUch      : string[35]
+ ,sBarkod   : string[15]
+ ,sName     : string[80]
+ ,sEd       : string[15]
+ ,sObozn     : string[80]
+ ,sPost     : string[80]
+ ,sProizvOrg     : string[80]
+ ,sGOST     : string[80]
+ ,sAnalog       : string[15]
+ ,sTovGr       : string[35]
+ ,sUslNorm       : string[35]
+ ,ObProizv  : double
+ ,Ost       : double
+ ,Norm      : double
+ ,NormObPr  : double
+ ,sKE       : string[80]
+ ,sVAL       : string[15]
+ ,Cena      : double
+ ,CenaV      : double
+ ,Summa     : double
+ ,crec      : comp
+)
+with index
+(
+  TmpOborot01 = sBarkod + crec +sUch+sAnalog+sUslNorm
+)
+;
+table struct TmpKE
+(
+  S         : string
+ ,an1       : string
+ ,an2       : string
+ ,sUch      : string
+ ,kol     : double
+)
+with index
+(
+  TmpKE01 = s +sUch+an1+an2
+)
+;
+
+
+
+var
+   sErrMessage: string;
+  lErrMessageMode,lCountRow: longInt;
+  iLFuncs: AVAZ_Logistics::iInLogistRepFuncs;
+
+#include ValFunc.var
+Create View
+var 
+  DateNorm,  DatePrice,  DateCurs ,DateMesPlan,DTB,DTE : date;
+  FixCursUS,FixCursEU:double;
+  PlanName,_sAnalog,_sUslNorm,_sPodr,_sCex,_sUch,_tVal,sKE  :string;
+  TipPlan,    flagSvod  : word;
+  _cMnPlan,cRPStatus,cPS_SHAB_Instr,_cKE:comp;
+  _cWA,HDRn,_tSP:comp;
+  m_GetPotr: oiPotrGt;
+  tKol,tAllKol:double;
+  _tCena,_tCenaV,       _tCur:TSumma;
+From
+   TmpOborot
+  ,MnPlan
+  ,WayAccou
+  ,spmnplan
+  ,spmnpl
+  ,valspmnp
+  ,HDR_PS
+  ,DOCNASTR
+  ,katmc katmc_res
+  ,katotped
+  ,katpodr
+  ,spsopr
+  ,spkau
+  ,TmpKE
+  ,katorg
+  ,katsopr
+where((
+ _cMnPlan == MnPlan.nrec
+  and
+  _cWA == WayAccou.nrec
+  and
+  mnplan.nrec == spmnplan.cmnplan
+  and
+  (DTB<=spmnplan.ENDDATE and DTE>=spmnplan.ENDDATE )
+  and
+  spmnplan.nrec == spmnpl.cspmnplan
+  and
+  spmnpl.nrec == valspmnp.cspmnpl
+
+ ));
+
+
+Panel pnParam;
+NoTableNavigation;
+screen scParam 'План расхода инструмента на следующий месяц' (,,sci1Esc);
+Fields
+  Dtb   :NoProtect;
+  Dte   :NoProtect;
+  DateNorm  :NoProtect;
+  DatePrice :NoProtect;
+  DateCurs  :NoProtect;
+  WayAccou.Name :Protect,PickButton;
+  MnPlan.name  :Protect,PickButton;
+ flagSvod : NoProtect;
+Buttons
+  cmOk,,,'Сформировать отчет', , sci1Esc;
+  cmCancel,,,'Выход', , sci1Esc;
+<<
+
+    `Период с `     .@@@@@@@@@@@   ` по `    .@@@@@@@@@@@
+
+    `Дата состава норм`                      .@@@@@@@@@@@
+
+    `Дата цены`                              .@@@@@@@@@@@
+
+    `Дата курса валют`                       .@@@@@@@@@@@
+
+    `Шаблон плана`   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    `Название плана` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    [.] Сводная по всем подразделениям`
+
+    <.~С~формировать.>           <. ~О~тмена  .>
+
+>>
+
+end; //scrParam
+End; //pnParam
+
+#include sto_rep_func.vpp;
+
+function GetData:boolean;
+var _tCPROIZV:comp;
+{
+ Result:=true;
+ StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Анализ данных...',0);
+ tKol:=0; tAllKol:=0;
+ _sUch:='';_sCex:='';_sPodr:='';
+ delete all TmpPotr;
+ delete all Tmpoborot;
+ delete all TmpKE;
+ _loop  spmnplan
+ {
+   if not NextVisual then
+    {
+     Result:=false;
+     StopVisual('',0);
+     exit;
+    }
+  HDRn:=FindPS(spmnplan.cizd);
+  if HDRn=0 then continue;
+
+   tKol:=0;
+   _loop spmnpl
+    _loop valspmnp
+     tKol:=valspmnp.kol;
+
+  tAllKol:=tAllKol+tKol;
+
+
+
+/*
+ sKE:='';
+   _cKE := coGetAttr(coKatMC,spmnplan.cizd,VA_KATMC_KE);
+  if _cKE<>0 then
+   {
+     if getfirst fastfirstrow spkau where ((_cKE == spkau.nrec))=tsok
+      {
+        sKE:=spkau.name;
+      }
+   }
+*/
+
+  m_GetPotr.SetWorkDate(spmnplan.ENDDATE);
+  m_GetPotr.SetWorkFlag(011010b);
+  m_GetPotr.GetDocPotrEx(HDRn, 10,tKol,spmnplan.cOtpEd);
+  _loop tmppotr where ((cgKAU_KatMC == tmppotr.TRESOURCE))
+   {
+     GetDopAnal(_sAnalog,_sUslNorm);
+
+     if getfirst fastfirstrow katmc_res where ((tmppotr.cresource == katmc_res.nrec))<>tsok then continue;
+     if TmpPotr.Kind=1 and TmpPotr.PrMat=1 then continue;
+     sKE:=string(katmc_res.nrec);
+     if flagSvod = 0 then  GetPODRCEXUCH(tmppotr.cdep,_sUch,_sCex,_sPodr);
+
+     if tKol<>0 then
+       {
+         if getfirst TmpKE where ((sKE == TmpKE.S and  _such == TmpKE.such and _sAnalog == TmpKE.an1 and _sUslNorm == TmpKE.an2))=tsok then
+          {
+            set TmpKE.kol:=TmpKE.kol+tKOl;
+            update current TmpKE;
+          }
+          else
+          {
+           ClearBuffer(#TmpKE);
+           set TmpKE.kol:=tKOl;
+           set TmpKE.an1:=_sAnalog;
+           set TmpKE.an2:=_sUslNorm;
+           set TmpKE.sUch :=_sUch;
+           set TmpKE.s:=sKE;
+           insert current TmpKE;
+          }
+       }
+
+
+
+     if getfirst tmpoborot where ((katmc_res.barkod == tmpoborot.sBarkod
+                              and katmc_res.nrec == tmpoborot.crec
+                              and _sUch == tmpoborot.such
+                              and _sAnalog == tmpoborot.sanalog
+                              and _sUslNorm == tmpoborot.suslnorm)) = tsok then
+      {
+       set TmpOborot.Norm     :=TmpOborot.Norm + tmppotr.RASX;
+       update current TmpOborot;
+      }
+      else
+      {
+       ClearBuffer(#TmpOborot);
+       set TmpOborot.sProIzv  :=_sPodr;
+       set TmpOborot.sCex     :=_sCex;
+       set TmpOborot.sUch     :=_sUch;
+       set TmpOborot.sBarkod  :=katmc_res.barkod;
+       set TmpOborot.sName    :=katmc_res.name;
+       set TmpOborot.sObozn   :=katmc_res.obozn;
+       set TmpOborot.sgost    :=katmc_res.gost;
+       set TmpOborot.sUslNorm :=_sUslNorm;
+       set TmpOborot.sAnalog  :=_sAnalog;
+       set tmpoborot.sKE      :=sKE;
+       if getfirst fastfirstrow katotped where ((tmppotr.ced == katotped.nrec))=tsok
+       then
+           set TmpOborot.sEd      :=katotped.abbr;
+
+       set TmpOborot.Norm     :=tmppotr.RASX;
+
+       set TmpOborot.crec     :=katmc_res.nrec;
+
+
+
+        _tCPROIZV := coGetAttr(coKatMC,spmnplan.cizd,VA_KATMC_PROIZV);
+        if _tCPROIZV<>0 then
+         {
+          if getfirst fastfirstrow katorg where ((_tCPROIZV == katorg.nrec))=tsok
+             then  set tmpoborot.sProizvOrg:=katorg.name+' ИНН:'+katorg.UNN ;
+         }
+
+        set tmpoborot.ost := GetSaldoCmc(tmppotr.cresource,if(flagSvod=0,tmppotr.cdep,0));
+
+       _tSp:=iLFuncs.GetLastPrihSpSopr(katmc_res.nrec,DatePrice);
+       _tCena:=0;
+       _tCenaV:=0;
+       _tCur:=0;
+       if getfirst fastfirstrow spsopr where ((_tSP == spsopr.nrec))=tsok then
+        {
+           if getfirst fastfirstrow katsopr where ((spsopr.csopr == katsopr.nrec))=tsok
+            if getfirst fastfirstrow katorg where ((katsopr.corg == katorg.nrec))=tsok
+             then  set tmpoborot.sPost:=katorg.name+' ИНН:'+katorg.UNN ;
+
+
+
+           _tVal:=oValFunc.GetValSimv(spsopr.cVAL);
+            set tmpoborot.sVAL:= _tVal;
+           if spsopr.cVAL<>0 then
+            {
+
+              if _tCur=0 then _tCur:=oValFunc.Rate(spsopr.cVAL,DateCurs);
+              if _tCur=0 then
+                         {
+                          _tCena:=spsopr.price;
+                          _tCenaV:=spsopr.price;
+                         }
+                         else
+                         {
+                         _tCena:=spsopr.vprice*_tCur;
+                         _tCenaV:=spsopr.vprice;
+                         }
+            }
+            else
+            {
+              _tCena:=spsopr.price;
+              _tCenaV:=spsopr.price;
+            }
+          set TmpOborot.Cena     := _tCena;
+          set TmpOborot.CenaV     := _tCenaV;
+        }
+       insert current TmpOborot;
+
+      }
+   }
+
+ }
+
+
+
+
+ lCountRow := RecordsInTable(#TmpOborot);
+ if lCountRow<=0 then Result:=false;
+ StopVisual('',0);
+}
+
+#include ExFunc.vpp;
+
+procedure PrintData;
+var npp:longint;
+{
+
+ var lColLast,lBegRow,lColNo,lRowNo:longint;
+ lColLast  := 17;
+ lRowNo    := 7;
+
+ var sTemplateName: string =  TranslatePath(StartPathName+'XLS\AVAZ\sto_potr.xlsx');
+
+ StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Печать отчета',lCountRow);
+ _try
+  {
+  CreateExcelWithTemplate(sTemplateName);
+
+  _try
+   {
+
+  SetCellStringValue('[' + UserName +' '+ _DateTimeToStr(_CurDateTime,'DD.MM.YYYY HH:NN') + ']',1,1);
+  SetCellStringValue('Потребность инструмента на план с '+DateToStr(DTB,'DD.MM.YYYY')+' по '+DateToStr(DTE,'DD.MM.YYYY'),2,1);
+  if DatePrice<>ZeroDate then SetCellStringValue(DateToStr(DatePrice,'DD.MM.YYYY'),3,3);
+  if DateCurs<>ZeroDate  then SetCellStringValue(DateToStr(DateCurs,'DD.MM.YYYY'),4,3);
+  npp:=0;
+    _loop TmpOborot
+    {
+     if not NextVisual then continue;
+
+//     tKol:=0;
+//      if getfirst TmpKE where ((TmpOborot.sKE == TmpKE.S and TmpOborot.sUch == TmpKE.such and TmpOborot.sAnalog == TmpKE.an1 and TmpOborot.sUslNorm == TmpKE.an2))=tsok then
+//      {
+//        tKol:=TmpKE.kol;
+//      }
+     inc(npp);
+     lColNo:= 0;
+     inc(lColNo); SetCellNumberValue(npp                                                  ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sBarkod                                    ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sName                                      ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sObozn                                     ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sUch                                       ,lRowNo,lColNo);
+     inc(lColNo); SetCellNumberValue(TmpOborot.CenaV                                      ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sVAL                                       ,lRowNo,lColNo);
+     inc(lColNo); SetCellNumberValue(TmpOborot.Cena                                       ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sPost                                      ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sProizvOrg                                 ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sGOST                                      ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sAnalog                                    ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sTovGr                                     ,lRowNo,lColNo);
+     inc(lColNo); SetCellNumberValue(TmpOborot.ost                                        ,lRowNo,lColNo);
+     inc(lColNo); SetCellStringValue(TmpOborot.sUslNorm                                     ,lRowNo,lColNo);
+     inc(lColNo); if tAllKol<>0 then SetCellNumberValue(TmpOborot.Norm / tAllKol                                      ,lRowNo,lColNo);
+     inc(lColNo); SetCellNumberValue(TmpOborot.Norm                                ,lRowNo,lColNo);
+     inc(lColNo); SetCellNumberValue(TmpOborot.Norm*TmpOborot.Cena                 ,lRowNo,lColNo);
+ //    inc(lColNo); SetCellNumberValue(tAllKol             ,lRowNo,lColNo);
+     lBegRow:= lRowNo;
+     lRowNo++;
+
+    }
+     lColNo:= 0;
+//     xlSetFontStyle(xlBold,4,1,4,lColLast);
+     if flagSvod = 1 then  xlDeleteRange(xlShiftToLeft,1,5,lRowNo,5   );
+}
+  _finally
+   {
+    StopVisual;
+   }
+  }
+  _except
+    on ExExcelFatalError:
+     {
+      StopVisual;
+      message(sErrMessage, lErrMessageMode);
+     }
+  _finally
+    {
+
+    xlKillExcel;
+    if VisualizationActive() then StopVisual('', 0);
+    }
+
+}
+
+HandleEvent
+//----------------------
+
+cmInit:
+{
+  if (Not LoadVipRef (m_GetPotr, 'M_TPP::iPotrPS'))
+      {
+        Message('Системная ошибка !!!' + 'Не загружен интерфейс <' + 'iPotrPS'
+                + '>', Error + CancelButton);
+        Abort;
+        Exit;
+      }
+  if not ReadMyDsk(DTB, 'R__REP_DTB',true) DTB:=date(1,Month(Cur_date),Year(Cur_date));
+  if not ReadMyDsk(DTE, 'R__REP_DTE',true) DTE:=date(Last_Day(DTB),Month(DTB),Year(DTB));
+  if not ReadMyDsk(DateNorm   , 'R__REP_DateNorm',true) DateNorm:=Cur_date;
+  if not ReadMyDsk(DateCurs   , 'R__REP_DateCurs',true) DateCurs:=Cur_date;
+  if not ReadMyDsk(DatePrice  , 'R__REP_DatePrice',true) DatePrice:=Cur_date;
+ ReadMyDsk(_cMnplan   , 'R__REP_cMnPlan',true);
+ ReadMyDsk(_cWA       , 'R__REP_cWA',true);
+ if getfirst fastfirstrow Mnplan =tsok then {}
+ if getfirst fastfirstrow WayAccou =tsok then {}
+ cRPStatus:=0;
+ if getfirst katnotes where ((1200 == katnotes.viddoc and (Pos('УТВ',UPCASE(katnotes.name))>0)))=tsok then cRPStatus:=katnotes.nrec;
+ if cRPStatus=0 then {message('Не найден статус "утвержден" для плана!');exit;}
+ cPS_SHAB_Instr:=0;
+ if getfirst DOCNASTR where ((word(1) == DOCNASTR.dtype  and PS_SHAB_Instr == DOCNASTR.NAME))=tsok then cPS_SHAB_Instr:=DOCNASTR.nrec;
+ if cPS_SHAB_Instr=0 then {message('Не найден шаблон производственной спецификации "'+PS_SHAB_Instr+'"!');exit;}
+
+}
+cmOk:
+{
+  SaveMyDsk(DTB, 'R__REP_DTB');
+  SaveMyDsk(DTE, 'R__REP_DTE');
+  SaveMyDsk(DateNorm   , 'R__REP_DateNorm');
+  SaveMyDsk(DatePrice  , 'R__REP_DatePrice');
+  SaveMyDsk(DateCurs   , 'R__REP_DateCurs');
+  SaveMyDsk(DateMesPlan, 'R__REP_DateMesPlan');
+  SaveMyDsk(_cMnplan   , 'R__REP_cMnPlan');
+  SaveMyDsk(_cWA       , 'R__REP_cWA');
+
+  if getfirst fastfirstrow WayAccou <> tsok then
+    {
+      Message('Необходимо выбрать план или шаблон пана!',information);
+      Abort;Exit;
+    }
+  if _cMnPlan=0 then
+   {
+     if getfirst fastfirstrow  Mnplan where ((_cWA == mnplan.cwayaccou
+                            and
+                            (cRPStatus = mnplan.cstatus
+                             and
+                              DateMesPlan>=mnplan.startdate
+                             and
+                              DateMesPlan<=mnplan.enddate
+                            )
+
+                        )) <> tsok then
+      {
+       Message('На дату '+DateToStr(DateMesPlan,'DD.MM.YYYY')+' нет плана в утвержденном статусе!',information);
+       Abort;Exit;
+
+      }
+     _cmnplan:=mnplan.nrec;
+
+   }
+  StartNewVisual(vtRotateVisual, vfTimer, 'Формирование отчета...',0);
+  InitMCInfo(DTE);
+  If(Not GetData)
+  {
+    message('Нет данных за указанный период c '+DateToStr(DTB,'DD.MM.YYYY')+' по '+DateToStr(DTE,'DD.MM.YYYY'));
+    DoneMCInfo;
+    StopVisual('',0);
+    exit;
+  }
+  
+  DoneMCInfo;
+  PrintData;
+  if VisualizationActive() then StopVisual('', 0);
+}
+//---------------------------
+cmPick:{
+   Case CurField Of
+    #WayAccou.name :
+     {
+      RunInterface(NastrPl,0,_cWA,1);
+      if getfirst fastfirstrow wayaccou=tsok {}
+      RescanPanel(#WayAccou);
+     };
+    #MnPlan.Name :
+     {
+      if (RunInterface('M_MNPLAN::GetMnPlan', word(1), word(0), _cMnPlan,
+            _cWA, word(0), word(0), word(0), comp(0), False, '', word(0)) <> cmCancel)
+          {
+            if getfirst fastfirstrow mnplan=tsok
+              {
+                if _cWA=0 then set _cWA:=Mnplan.cwayaccou;
+              }
+          }
+      RescanPanel(#MnPlan);
+     };
+   end;
+} //cmPick:
+
+//---------------------------
+cmDelOnProtect:{
+    Case CurField Of
+    #WayAccou.name :
+     {
+      set _cWA := 0;
+     };
+    #MnPlan.Name:
+     {
+      set _cMnPlan := 0;
+     };
+
+   End;
+   RescanPanel(#MnPlan);
+}
+cmDone:
+{
+    if (not NullVipRef(m_GetPotr))
+      FreeVipInterface(m_GetPotr);
+}
+end;
+
+End.
+
+VipInterface UserReport_STO_PLAN_POTREB_REP Implements IUserReport;
+
+Interface UserReport_STO_PLAN_POTREB_REP;
+
+create view;
+
+procedure Run;
+begin
+ RunInterface(STO_PLAN_POTREB_REP);
+end;
+function GetReportName: String;
+begin
+  GetReportName := 'Расчет потребности в закупке инструмента';
+end;
+function GetGroupName (Level : Word) : String;
+begin
+  GetGroupName := 'СТО';
+  case Level of
+    1 : GetGroupName := 'СТО';
+  end;
+end;
+
+function GetPriority : Integer;
+begin
+  GetPriority := -100;
+end;
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '*';
+end;
+end.

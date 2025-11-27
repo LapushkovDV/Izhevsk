@@ -1,0 +1,593 @@
+//------------------------------------------------------------------------------
+//                                                      (c) корпорация Галактика
+// Галактика 9.1
+// Реализация механизмов копирования/вставки объектов недвижимости
+//------------------------------------------------------------------------------
+
+// Внимание! Пожалуйста, никаких "message" в коде интерфейса. Пользуйтесь SetLastErrorMessage.
+
+#include RltObjCopyPaste.vih
+#include RltObjReplicator.vih
+
+interface RltObjCopyPaste;
+
+var
+  m_srcObject: type$RltObjTree;
+  m_dstObject: type$RltObjTree;
+  m_lastErrorMessage: string;
+  m_oReplicator: RltObjReplicator;
+
+const
+  COPY_NAME_SUFFIX = ' (копия)';
+end;
+
+create view
+from
+  RltObjTree
+, rltFloors
+, rltRooms
+, rltHouses
+, rltBuildings
+, rltPlaces
+, rltZemCompl
+, rltCustoms
+;
+
+constructor Init;
+{
+  ClearAdvRecord(m_srcObject);
+  result := true;
+}
+
+procedure SetLastErrorMessage(_msg: string);
+{
+  m_lastErrorMessage := _msg;
+}
+
+function GetVidObjOf(_nrec: comp): word;
+{
+  if (GetFirst RltObjTree where ((_nrec == RltObjTree.nRec)) = tsOk)
+    result := RltObjTree.VidObj;
+  else
+    result := roNothing;
+}
+
+function Replicate(_rltOwner: comp; _owner: comp; _strVal1: string; _strVal2: string; _longVal: longint; _isCopyChild: boolean): boolean;
+{
+  result := m_oReplicator.Replicate(m_srcObject, _rltOwner, _owner, _strVal1, _strVal2, _longVal, _isCopyChild);
+
+  if (not result)
+    SetLastErrorMessage('Функция репликация выполнена с ошибкой.');
+}
+
+function GetNameOfRltObjType(_vidObj: word): string;
+{
+  case (_vidObj) of
+    roPlaces:    result := 'Благоустроенная территория';
+    roBuildings: result := 'Здания/сооружения';
+    roRooms:     result := 'Комнаты/Площади';
+    roHouses:    result := 'Помещения';
+    roZemCompl:  result := 'Земельный участок';
+    roPlace:     result := 'Место на благоустроенной территории';
+    roBuilding:  result := 'Здание/сооружение';
+    roFloor:     result := 'Этаж';
+    roRoom:      result := 'Комната';
+    roHouse:     result := 'Помещение';
+    roCustom:    result := 'Нестандартный объект';
+    else         result := 'объект с типом ' + string(_vidObj);
+  end;
+}
+
+function GetParamsOfDstFloor(
+  out _rltObj:   comp;
+  out _owner:    comp;
+  out _name:     string;
+  out _objNo:    string;
+  out _objLevel: longint
+): boolean;
+{
+  _owner    := 0;
+  _rltObj   := 0;
+  _objNo    := '';
+  _objLevel := 0;
+
+  result := false;
+
+  if (GetFirst rltFloors where((m_srcObject.cObj == rltFloors.nRec)) != tsOk)
+  {
+    SetLastErrorMessage('Указана некорректная ссылка на объект-источник "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+    exit;
+  }
+
+  // Объектом - приемником является...
+  case (m_dstObject.VidObj) of
+    roFloor: // ... объект "Этаж"
+    {
+      // Владельцем при вставке будет здание, на котором расположен объект назначения.
+      _owner :=m_dstObject.cOwner;
+    }
+
+    roBuilding: // ... объект "Здание/сооружение"
+    {
+      // Владельцем при вставку будет само здание.
+      _owner :=m_dstObject.nRec;
+    }
+
+    else
+    {
+      // Такой ситуации возникать не должно. Где-то в коде закралась ошибка?
+      SetLastErrorMessage(
+        'Не подходящий целевой объект "' + GetNameOfRltObjType(m_dstObject.VidObj) +
+        '"для вставки объекта "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+      exit;
+    }
+  end;
+
+  _rltObj   := m_srcObject.cObj;
+  _name     := m_srcObject.SortName + COPY_NAME_SUFFIX;
+  _objNo    := rltFloors.No;
+  _objLevel := rltFloors.Level;
+
+  result := true;
+}
+
+function GetParamsOfDstRoom(
+  out _rltObj:   comp;
+  out _owner:    comp;
+  out _objNo:    string;
+  out _objNoBTI: string
+): boolean;
+{
+  _owner    := 0;
+  _rltObj   := 0;
+  _objNo    := '';
+  _objNoBTI := '';
+
+  result := false;
+
+  // Если комната вставляется на один этаж с источником - то будем копировать также и ее принадлежность
+  // своему помещению. В противном случае - принадлежность помещению не копируется.
+
+  if (GetFirst rltRooms where((m_srcObject.cObj == rltRooms.nRec)) != tsOk)
+  {
+    SetLastErrorMessage('Указана некорректная ссылка на объект-источник "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+    exit;
+  }
+
+  // Получение ссылок на владельца объекта-источника и его этажа
+  var srcOwner, srcFloor: comp;
+  if (not m_oReplicator.GetOwnersOfRoom(m_srcObject, srcFloor, srcOwner)) // этаж и владелец источника
+  {
+    SetLastErrorMessage(
+      'Нарушена структура иерархии объектов (Не удалось выяснить этаж, на котором находится объект "' +
+      GetNameOfRltObjType(m_srcObject.VidObj) + '").');
+    exit;
+  }
+
+  // Получение ссылки на этаж текущего объекта, на котором вызвана функция вставки.
+  var dstFloor: comp;
+  dstFloor := m_oReplicator.GetFloorOf(m_dstObject);
+  if (dstFloor = 0)
+  {
+    SetLastErrorMessage(
+      'Объект "' + GetNameOfRltObjType(m_srcObject.VidObj) +
+      '" не может быть скопирован в узел "' + GetNameOfRltObjType(m_dstObject.VidObj) + '".');
+    exit;
+  }
+
+  if (rltRooms.cHouse = 0) or (dstFloor != srcFloor)
+  {
+    // Исходный объект - комната, НЕ входящая в состав помещения и вставка выполняется, когда текущим
+    // объектом в иерархии является объект, находящийся на одном этаже с источником, либо на другом этаже,
+    // либо исходный объект - комната ВХОДЯЩАЯ в состав помещения и вставка выполняется на другом этаже.
+
+    // Объектом-приемником является:
+    if (m_dstObject.VidObj = roRoom)
+    {
+      // комната, являющаяся подчиненной объекту "комнаты", либо объекту "помещения" (других вроде не бывает)
+     	_owner := m_dstObject.cOwner;
+    }
+    else if((m_dstObject.VidObj = roHouse) or (m_dstObject.VidObj = roRooms))
+    {
+      // объект "помещение", либо объект "комнаты"
+     	_owner := m_dstObject.nRec;
+    }
+    else
+    {
+      // Такой ситуации возникать не должно. Где-то в коде закралась ошибка?
+      SetLastErrorMessage('Не удалось выяснить узел для копирование объекта "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+      exit;
+    }
+
+    _rltObj := dstFloor;
+  }
+  else
+  {
+    // Исходный объект - комната, ВХОДЯЩАЯ в состав помещения и при этом вставка выполняется, когда текущим
+    // объектом в иерархии является объект, находящийся на одном этаже с источником.
+
+    var dstOwnerVidObj: word;
+    dstOwnerVidObj := GetVidObjOf(m_dstObject.cOwner);
+
+    // Объектом-приемником является:
+    if (((m_dstObject.VidObj = roRoom) and (dstOwnerVidObj = roRooms)) or (m_dstObject.VidObj = roRooms))
+    {
+      // комната, являющаяся подчиненной объекту "комнаты", либо объект "комнаты"
+      _owner := srcOwner;
+    }
+    else if ((m_dstObject.VidObj = roRoom) and (dstOwnerVidObj = roHouse))
+    {
+      // комната, являющаяся подчиненной объекту "помещение"
+      _owner := m_dstObject.cOwner;
+    }
+    else if (m_dstObject.VidObj = roHouse)
+    {
+      // объект "помещение"
+    	_owner := m_dstObject.nRec;
+    }
+    else
+    {
+      // Такой ситуации возникать не должно. Где-то в коде закралась ошибка?
+      SetLastErrorMessage('Не удалось выяснить узел для копирование объекта "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+      exit;
+    }
+
+    _rltObj := srcFloor; // или dstFloor - они равны
+  }
+
+  _objNo    := rltRooms.NoFact + COPY_NAME_SUFFIX;
+  _objNoBTI := rltRooms.NoBTI  + COPY_NAME_SUFFIX;
+
+  result := true;
+}
+
+function GetParamsOfDstHouse(
+  out _rltObj: comp;
+  out _owner:  comp;
+  out _name:   string;
+  out _objNo:  string
+): boolean;
+{
+  _owner   := 0;
+  _rltObj  := 0;
+  _objNo   := '';
+
+  result := false;
+
+  // При вставке помещения текущим узлом дерева в иерархии является объект "помещение", либо объект "помещения"
+  case (m_dstObject.VidObj) of
+    roHouse:
+      _owner := m_dstObject.cOwner;
+
+    roHouses:
+      _owner := m_dstObject.nRec;
+
+    else
+    {
+      // Такой ситуации возникать не должно. Где-то в коде закралась ошибка?
+      SetLastErrorMessage(
+        'Не подходящий целевой объект "' + GetNameOfRltObjType(m_dstObject.VidObj) +
+        '"для вставки объекта "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+      exit;
+    }
+  end;
+
+  // Получение ссылки на этаж текущего объекта, на котором вызвана функция вставки.
+  var dstFloor: comp;
+  dstFloor := m_oReplicator.GetFloorOf(m_dstObject);
+  if (dstFloor = 0)
+  {
+    SetLastErrorMessage(
+      'Объект "' + GetNameOfRltObjType(m_srcObject.VidObj) +
+      '" не может быть скопирован в узел "' + GetNameOfRltObjType(m_dstObject.VidObj) + '" (не удалось определить этаж).');
+    exit;
+  }
+
+  if (GetFirst rltHouses where((m_srcObject.cObj == rltHouses.nRec)) != tsOk)
+  {
+    SetLastErrorMessage('Указана некорректная ссылка на объект-источник "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+    exit;
+  }
+
+  _rltObj := dstFloor;
+  _name   := m_srcObject.SortName + COPY_NAME_SUFFIX;
+  _objNo  := rltHouses.No;
+
+  result := true;
+}
+
+function GetParamsOfDstBuilding(
+  out _rltObj:  comp;
+  out _owner:   comp;
+  out _name:    string; // Наименование представления объекта в иерархии
+  out _bldName: string  // Наименование объекта
+): boolean;
+{
+  result   := false;
+  _owner   := 0;
+  _rltObj  := 0;
+  _name    := '';
+  _bldName := '';
+
+  // При вставке помещения текущим узлом дерева в иерархии является объект "здание/сооружение", либо объект "Здания и сооружения"
+  case (m_dstObject.VidObj) of
+    roBuilding:
+      _owner := m_dstObject.cOwner;
+
+    roBuildings:
+      _owner := m_dstObject.nRec;
+
+    else
+    {
+      // Такой ситуации возникать не должно. Где-то в коде закралась ошибка?
+      SetLastErrorMessage(
+        'Не подходящий целевой объект "' + GetNameOfRltObjType(m_dstObject.VidObj) +
+        '"для вставки объекта "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+      exit;
+    }
+  end;
+
+  if (GetFirst rltBuildings where((m_srcObject.cObj == rltBuildings.nRec)) != tsOk)
+  {
+    SetLastErrorMessage('Указана некорректная ссылка на объект-источник "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+    exit;
+  }
+
+  _rltObj  := m_oReplicator.GetZemComplOf(m_dstObject); // получаем ссылку на земельный участок объекта-приемника
+
+  if (_rltObj = 0)
+    exit;
+
+  _name    := m_srcObject.SortName + COPY_NAME_SUFFIX;
+  _bldName := rltBuildings.Name;
+
+  result := true;
+}
+
+function GetParamsOfDstPlace(
+  out _rltObj:  comp;
+  out _owner:   comp;
+  out _name:    string; // Наименование представления объекта в иерархии
+  out _plcName: string  // Наименование объекта
+): boolean;
+{
+  result   := false;
+  _owner   := 0;
+  _rltObj  := 0;
+  _name    := '';
+  _plcName := '';
+
+  // При вставке помещения текущим узлом дерева в иерархии является объект "Благоустроенная территория",
+  // либо объект "Место на благоустроенной территории"
+  case (m_dstObject.VidObj) of
+    roPlace:
+      _owner := m_dstObject.cOwner;
+
+    roPlaces:
+      _owner := m_dstObject.nRec;
+
+    else
+    {
+      // Такой ситуации возникать не должно. Где-то в коде закралась ошибка?
+      SetLastErrorMessage(
+        'Не подходящий целевой объект "' + GetNameOfRltObjType(m_dstObject.VidObj) +
+        '"для вставки объекта "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+      exit;
+    }
+  end;
+
+  if (GetFirst rltPlaces where((m_srcObject.cObj == rltPlaces.nRec)) != tsOk)
+  {
+    SetLastErrorMessage('Указана некорректная ссылка на объект-источник "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+    exit;
+  }
+
+  _rltObj := m_oReplicator.GetZemComplOf(m_dstObject); // получаем ссылку на земельный участок объекта-приемника
+
+  if (_rltObj = 0)
+    exit;
+
+  _name    := m_srcObject.SortName + COPY_NAME_SUFFIX;
+  _plcName := rltPlaces.Name;
+
+  result := true;
+}
+
+function GetParamsOfDstZemCompl(out _name: string; out _zcName: string): boolean;
+{
+  result := false;
+  _name   := '';
+  _zcName := '';
+
+  if (GetFirst rltZemCompl where((m_srcObject.cObj == rltZemCompl.nRec)) != tsOk)
+  {
+    SetLastErrorMessage('Указана некорректная ссылка на объект-источник "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+    exit;
+  }
+
+  _name   := m_srcObject.SortName + COPY_NAME_SUFFIX;
+  _zcName := rltZemCompl.Name;
+
+  result := true;
+}
+
+function GetParamsOfDstCustom(out _name: string; _csName: string): boolean;
+{
+  result := false;
+  _name   := '';
+  _csName := '';
+
+  if (GetFirst rltCustoms where((m_srcObject.cObj == rltCustoms.nRec)) != tsOk)
+  {
+    SetLastErrorMessage('Указана некорректная ссылка на объект-источник "' + GetNameOfRltObjType(m_srcObject.VidObj) + '".');
+    exit;
+  }
+
+  _name   := m_srcObject.SortName + COPY_NAME_SUFFIX;
+  _csName := rltCustoms.Name;
+
+  result := true;
+}
+
+//------------------------------------------------------------------------------
+// Паблик - методы
+//------------------------------------------------------------------------------
+
+public function GetLastErrorMessage: string;
+{
+  result := m_lastErrorMessage;
+}
+
+// Внимание! Пожалуйста, никаких "message" в коде интерфейса. Метод может вызываться из cmHotKey, например.
+public function CanBeCopied(_sourceRltObj: type$RltObjTree): boolean;
+{
+  result := (_sourceRltObj.VidObj >= 10);
+}
+
+// Внимание! Пожалуйста, никаких "message" в коде интерфейса.
+public function Copy(_sourceRltObj: type$RltObjTree): boolean;
+{
+  result := CanBeCopied(_sourceRltObj);
+
+  if (not result)
+  {
+    ClearAdvRecord(m_srcObject);
+    exit;
+  }
+
+  m_srcObject := _sourceRltObj;
+}
+
+// Внимание! Пожалуйста, никаких "message" в коде интерфейса. Метод может вызываться из cmHotKey, например.
+public function HasSavedObject: boolean;
+{
+  result := (m_srcObject.nRec != 0);
+}
+
+// Возвращает true, если вставка объекта разрешена.
+// При ошибке возвращает false, причину ошибки пишет в lastErrorMessage
+// Внимание! Пожалуйста, никаких "message" в коде интерфейса. Метод может вызываться из cmHotKey, например.
+public function CanBePasted(_destination: type$RltObjTree): boolean;
+{
+  result := false;
+  m_dstObject := _destination;
+
+  if (not HasSavedObject())
+  {
+    SetLastErrorMessage('В буфере нет объекта для вставки.');
+    exit;
+  }
+
+  // 'Земельный участок' и 'Нестандартный объект' могут быть вставлены только в корень иерархии.
+  // Поэтому объект назначения здесь не важен.
+  if ((m_srcObject.VidObj = roZemCompl) or (m_srcObject.VidObj = roCustom))
+  {
+    result := true;
+    exit;
+  }
+
+  if (m_dstObject.nRec = 0)
+  {
+    SetLastErrorMessage('Указанного места для вставки нет в иерархии объектов недвижимости.');
+    exit;
+  }
+
+  case (m_srcObject.VidObj) of
+    roPlace:
+    {
+      if ((m_dstObject.VidObj = roPlace) or (m_dstObject.VidObj = roPlaces))
+        result := true;
+      else
+        SetLastErrorMessage('Объект "Место на благоустроенной территории" может находится только в составе объекта "Благоустроенная территория".');
+    }
+
+    roBuilding:
+    {
+      if ((m_dstObject.VidObj = roBuilding) or (m_dstObject.VidObj = roBuildings))
+        result := true;
+      else
+        SetLastErrorMessage('Объект "Здание/сооружение" может находится только в составе объекта "Здания/сооружения".');
+    }
+
+    roFloor:
+    {
+      if ((m_dstObject.VidObj = roFloor) or (m_dstObject.VidObj = roBuilding))
+        result := true;
+      else
+        SetLastErrorMessage('Объект "Этаж" может находится только в составе объекта "Здание/сооружение".');
+    }
+
+    roRoom:
+    {
+      if ((m_dstObject.VidObj = roRoom) or (m_dstObject.VidObj = roRooms) or (m_dstObject.VidObj = roHouse))
+        result := true;
+      else
+        SetLastErrorMessage('Объект "Комната" может находится только в составе объектов "Комнаты", либо "Помещение".');
+    }
+
+    roHouse:
+    {
+      if ((m_dstObject.VidObj = roHouse) or (m_dstObject.VidObj = roHouses))
+        result := true;
+      else
+        SetLastErrorMessage('Объект "Помещение" может находится только в составе объекта "Помещения".');
+    }
+
+    else
+    {
+      SetLastErrorMessage('В буфере неизвестный объект. Вставка невозможна.');
+    }
+  end
+}
+
+// Внимание! Пожалуйста, никаких "message" в коде интерфейса.
+public function Paste(_destination: type$RltObjTree; _confirm: IPasteConfirm): boolean;
+{
+  result := false;
+
+  // Можно ли вставить сохраненный объект у указанное место?
+  if (not CanBePasted(_destination))
+    exit;
+
+  m_dstObject := _destination;
+
+  var dstRltObj: comp;
+  var dstObjTreeNode: comp;
+  var strVal1, strVal2: string;
+  var longVal: longint;
+
+  dstRltObj := dstObjTreeNode := 0;
+  strVal1 := strVal2 := '';
+  longVal := 0;
+
+  // Получить параметры для репликации объекта - приемника.
+  case (m_srcObject.VidObj) of
+    roPlace:    result := GetParamsOfDstPlace   (dstRltObj, dstObjTreeNode, strVal1, strVal2);
+    roBuilding: result := GetParamsOfDstBuilding(dstRltObj, dstObjTreeNode, strVal1, strVal2);
+    roFloor:    result := GetParamsOfDstFloor   (dstRltObj, dstObjTreeNode, strVal1, strVal2, longVal);
+    roRoom:     result := GetParamsOfDstRoom    (dstRltObj, dstObjTreeNode, strVal1, strVal2);
+    roHouse:    result := GetParamsOfDstHouse   (dstRltObj, dstObjTreeNode, strVal1, strVal2);
+    roZemCompl: result := GetParamsOfDstZemCompl(strVal1  , strVal2);
+    roCustom:   result := GetParamsOfDstCustom  (strVal1  , strVal2);
+  else
+  {
+    SetLastErrorMessage('В буфере неизвестный объект. Вставка невозможна.');
+    exit;
+  }
+  end;
+
+  if (not result)
+    exit;
+
+  // Если есть подчиненные объекты - запросить подтверждение на их копирование
+  // и выполнить его при необходимости.
+  var isCopyChild: boolean;
+  isCopyChild := false;
+
+  if (RecordExists rltObjTree where((m_srcObject.nRec == rltObjTree.cOwner)) = tsOk)
+    isCopyChild := _confirm.RequestToCopyChildObjects(m_srcObject);
+
+  result := Replicate(dstRltObj, dstObjTreeNode, strVal1, strVal2, longVal, isCopyChild);
+}
+
+end.

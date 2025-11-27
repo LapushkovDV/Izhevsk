@@ -1,0 +1,242 @@
+#component "F_SFO"
+
+#include GetMol.vih
+
+#include Pers_MBP.vih
+#include PersInfo.vih
+#include MovePers.vih
+#include fltBlock.vih
+#include fltCntrl.vih
+#include AvailMols.vih
+#include Permission.vih
+#include PersBreak.vih
+
+#doc
+Интерфейс для синхронизация информации о работниках.<br>
+#end
+Alter Interface PrsCrdBasket;
+
+var
+  cAttr_Uch,cAttr_Brig,_cOldV,_cNewV:comp;
+  D1,D2:date;
+
+HandleEvent
+cmInit:{
+  cAttr_Uch:=ExtAttr_ID ( coPersCard,VA_SO_UCH);
+  cAttr_Brig:=ExtAttr_ID ( coPersCard,VA_SO_BRIG);
+  If inherited::handleevent ( cmInit ) = heAbort then abort;
+}
+cmValue2:{
+    if (RecordExists tblBasket where (( True == tblBasket.isPick )) <> tsOk)
+    {
+      Message('Выберете изменения, которые необходимо внести в Личные карточки!');
+      ReReadRecord(#tblBasket);
+      Exit;
+    }
+
+    if (Message('Вы уверены, что хотите внести изменения в выбранные Личные карточки?', Confirmation + YesNo) <> cmYes)
+      Exit;
+
+   if (tblBasket.wType=2) or (tblBasket.wType=3)
+   {
+    D1:=Cur_date;
+    D2:=Add_Day(D1,1);
+    if ( RunDialog('AVAZ_Logistics::AV_SFO_GetInterval', D1, D2 ) = cmCancel )
+          Exit;
+   }
+
+
+
+    StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Вносятся изменения в Личные карточки...', 1);
+    frmProtocol.Write('***************СИНХРОНИЗАЦИЯ ИНФОРМАЦИИ О РАБОТНИКЕ***************');
+    PushPos(#tblBasket);
+    pCard := 0;
+
+    _LOOP tblBasket where (( True == tblBasket.isPick ))
+    {
+      if (not NextVisual)
+      {
+        frmProtocol.Write('*******************ПРОЦЕСС ПРЕРВАН ПОЛЬЗОВАТЕЛЕМ*******************');
+        Break;
+      }
+
+      if (tblBasket.wType = 1)
+        frmProtocol.Write(Persons.FIO + ', таб.№ ' + STabN);
+      else
+        if (tblBasket.cCard <> pCard)
+        {
+          frmProtocol.Write('ЛК учета №' + PersCard.cardNom + ': ' + Persons.FIO + ', таб.№ ' + STabN);
+          pCard := tblBasket.cCard;
+        }
+
+      case (tblBasket.wType) of
+      //---------------
+        1:
+        {
+          tblBasket.cCard := iMovePers.MakeCard(tblBasket.cLSchet, tblBasket.cPerson, tblBasket.dIzmDate, tblBasket.cNewPodr, tblBasket.cNewMol, tblBasket.cNewPost, tblBasket.cNewRank);
+
+          if (tblBasket.cCard = 0)
+            frmProtocol.Write(' -> ОШИБКА при создании Личной карточки');
+          else
+          {
+            ReReadRecord(#PersCard);
+            frmProtocol.Write(' -> ПОСТУПЛЕНИЕ: ' + PersCard.CardNom);
+            delete current tblBasket;
+          }
+        }
+      //---------------
+        2:
+        {
+          if (wMoveDoc > 0)
+          {
+            if (fillPodr and ((wMoveDoc and 1) = 1) and (tblBasket.cNewPodr = 0))
+            {
+              frmProtocol.Write(' -> ОШИБКА: невозможно переместить предметы, т.к. не указано подразделение, в которое они поступают');
+              Continue;
+            }
+
+            if (fillMol and ((wMoveDoc and 2) = 2) and (tblBasket.cNewMol = 0))
+            {
+              frmProtocol.Write(' -> ОШИБКА: невозможно переместить предметы, т.к. не указан МОЛ, к которому они поступают');
+              Continue;
+            }
+
+            if (iMovePers.CanMoveSFO(tblBasket.cCard, if (Longint(tblBasket.dIzmDate) = 0, Cur_Date, tblBasket.dIzmDate)) = 1)
+            {
+              frmProtocol.Write(' -> ОШИБКА: невозможно переместить предметы, т.к. после даты перевода с некоторыми из них выполнялись (или запланированы) операции');
+              Continue;
+            }
+          }
+
+          if (iMovePers.CanMakeMove(tblBasket.cCard, if (Longint(tblBasket.dIzmDate) = 0, Cur_Date, tblBasket.dIzmDate)) = 1)
+          {
+            frmProtocol.Write(' -> ОШИБКА: дата операции меньше даты последнего перевода работника в другое подразделение');
+            Continue;
+          }
+
+          if (iMovePers.SetPodrAndStatus(tblBasket.cCard, tblBasket.cNewPodr, tblBasket.cNewMol, if (Longint(tblBasket.dIzmDate) = 0, Cur_Date, tblBasket.dIzmDate), wMoveDoc, crdNormal) = 0)
+            frmProtocol.Write(' -> ОШИБКА при изменении ПОДРАЗДЕЛЕНИЯ');
+          else
+          {
+            frmProtocol.Write(' -> ПОДРАЗДЕЛЕНИЕ: ' + chKatPodr.Name);
+            frmProtocol.Write(' -> МОЛ: ' + chKatMol.Name);
+            RunInterface('AVAZ_Logistics::SFO_UpdateNorm', tblBasket.cCard, D1, D2);
+            delete current tblBasket;
+          }
+        }
+      //---------------
+        3:
+        {
+          if (iMovePers.SetPost(tblBasket.cCard, tblBasket.cNewPost, tblBasket.dIzmDate) = 0)
+            frmProtocol.Write(' -> ОШИБКА при изменении ДОЛЖНОСТИ');
+          else
+          {
+            frmProtocol.Write(' -> ДОЛЖНОСТЬ: ' + chCatalogs.Name);
+            RunInterface('AVAZ_Logistics::SFO_UpdateNorm', tblBasket.cCard, D1, D2);
+            delete current tblBasket;
+          }
+        }
+      //---------------
+        4:
+        {
+          // Учет фурнитуры в модуле "Учет вещевого имущества"
+          if (Lic_ItemExists('Custom'))
+          {
+            if (Longint(tblBasket.dIzmDate) = 0)
+            {
+              frmProtocol.Write(' -> ОШИБКА: не найдена дата присвоения звания');
+              Continue;
+            }
+
+            if (tblBasket.dIzmDate <= PersCard.zvDate)
+            {
+              frmProtocol.Write(' -> ОШИБКА: дата присвоения нового звания должна быть больше даты присвоения предыдущего звания ' + DateToStr(PersCard.zvDate, 'DD/MM/YYYY'));
+              Continue;
+            }
+          }
+
+          if (iMovePers.SetRank(tblBasket.cCard, tblBasket.cNewRank, tblBasket.dIzmDate) = 0)
+            frmProtocol.Write(' -> ОШИБКА при изменении ЗВАНИЯ');
+          else
+          {
+            frmProtocol.Write(' -> ЗВАНИЕ: ' + chCatalogs2.Name);
+            delete current tblBasket;
+          }
+        }
+      //---------------
+        5:
+        {
+          if (not Lic_ItemExists('Sfo')) and (not Lic_ItemExists('Custom'))
+            if (RecordExists MBPIn where (( tblBasket.cCard == MBPIn.cPers and
+                                            Word(1)         == MBPIn.Status )) = tsOk)
+            {
+              frmProtocol.Write(' -> ОШИБКА: невозможно закрыть Личную карточку, т.к. на ней числятся предметы');
+              Continue;
+            }
+
+          if (iMovePers.DoClose(tblBasket.cCard, tblBasket.dIzmDate) = 0)
+            frmProtocol.Write(' -> ОШИБКА при установке ДАТЫ УВОЛЬНЕНИЯ');
+          else
+          {
+            ReReadRecord(#PersCard);
+            frmProtocol.Write(' -> УВОЛЬНЕНИЕ: ' + DateToStr(PersCard.disDate, 'DD/MM/YYYY'));
+            delete current tblBasket;
+          }
+        }
+      //---------------
+        6:
+        {
+          var wResult: word = 0;
+          wResult := vPersBreak.CanMakePeriodsByOtpusk(tblBasket.cCard, tblBasket.cOtpusk, tblBasket.cOtpOtz);
+
+          case (wResult) of
+          //---------------
+            1: frmProtocol.Write(' -> ОШИБКА: невозможно создать период приостановки сроков службы, т.к. дата окончания периода приостановки должна быть больше даты начала периода');
+            2: frmProtocol.Write(' -> ОШИБКА: невозможно создать период приостановки сроков службы, т.к. не задана дата аттестации работника');
+            3: frmProtocol.Write(' -> ОШИБКА: невозможно создать период приостановки сроков службы, т.к. дата начала периода приостановки должна быть больше даты аттестации работника');
+            4: frmProtocol.Write(' -> ОШИБКА: невозможно создать период приостановки сроков службы, т.к. в носке имеется спецодежда с датой отсчета срока службы большей, чем дата начала периода приостановки');
+            5: frmProtocol.Write(' -> ОШИБКА: невозможно создать период приостановки сроков службы, т.к. имеется спецодежда, за которую выплачена компенсация, с датой приказа о компенсации большей, чем дата начала периода приостановки');
+          100: frmProtocol.Write(' -> ОШИБКА: не требуется создание периода приостановки сроков службы');
+          //---------------
+          end;
+
+          if (wResult > 0)
+            Continue;
+
+          var cNewRec: comp = 0;
+          cNewRec := vPersBreak.MakePeriodsByOtpusk(tblBasket.cCard, tblBasket.cOtpusk, tblBasket.cOtpOtz);
+
+          if (cNewRec = 0)
+            frmProtocol.Write(' -> ОШИБКА при создании ПЕРИОДА ПРИОСТАНОВКИ СРОКОВ СЛУЖБЫ');
+          else
+          {
+            ReReadRecord(#PersCard);
+
+            if (GetFirst PersBreak where (( cNewRec == PersBreak.nRec )) <> tsOk)
+              frmProtocol.Write(' -> создан ПЕРИОД ПРИОСТАНОВКИ СРОКОВ СЛУЖБЫ (NRec=' + String(cNewRec) + ')');
+            else
+              _LOOP PersBreak where (( tblBasket.cCard     == PersBreak.cPersCard and
+                                       tblBasket.cOtpusk   == PersBreak.cOtpusk (NoIndex) ))
+                if (PersBreak.nRec = cNewRec) or (tblBasket.cOtpOtz = 0) or (PersBreak.cOtpOtz = tblBasket.cOtpOtz)
+                  frmProtocol.Write(' -> ПРИОСТАНОВКА СРОКОВ СЛУЖБЫ: c ' + DateToStr(PersBreak.frDate, 'DD/MM/YYYY') + ' по ' + DateToStr(PersBreak.toDate, 'DD/MM/YYYY') +
+                                    if (PersBreak.frDate >= tblBasket.dIzmDate, ' (создана)', ' (изменена)'));
+
+            delete current tblBasket;
+          }
+        }
+      //---------------
+      end;
+    }
+
+    PopPos(#tblBasket);
+    StopVisual('', 0);
+    ReReadRecord(#tblBasket);
+
+    if (frmProtocol.Error)
+      frmProtocol.AbortForm;
+    else
+      frmProtocol.ShowFile('Протокол внесения изменений (ChgPersInfo.OUT)');
+}
+
+end;
+END.

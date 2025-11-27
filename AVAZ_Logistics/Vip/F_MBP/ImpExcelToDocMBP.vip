@@ -1,0 +1,408 @@
+#component "AVAZ_Logistics"
+Interface ImpExcelToDocMBP '' ('', hcNoContext, sci1Esc);
+  Show at(,,80,20);
+
+table struct tmpExcel
+(
+  Nrec    : comp
+ ,BarKod  : String
+ ,EdIzm   : String
+ ,Kol     : Double
+ ,Prim    : String
+ ,cKatMBP : comp
+ ,Err     : word
+)
+with index
+(
+ tmpExcel01 = Nrec(unique,surrogate)
+)
+;
+
+table struct tmpSpDoc
+(
+  Nrec    : comp
+ ,cKatMBP : comp
+ ,cMBPIn  : comp
+ ,Kol     : Double
+)
+with index
+(
+ tmpSpDoc01 = Nrec(unique,surrogate)
+);
+
+Create View
+ var FileName : String;
+     NrecDoc  : comp;
+as select * from
+ tmpExcel
+,tmpSpDoc
+,MBPMove
+,MBPOUT
+,MBPOUT MBPOUT_Ins
+,MBPIN
+,MBPIN MBPIN_Ins
+,KatMBP
+,KatEd
+,SOPRHOZ
+
+where
+((
+    NrecDoc == MBPMove.NRec
+and KatMBP.cEd == KatEd.Nrec
+));
+
+Parameters NrecDoc;
+
+
+Screen scParam '' ('', hcNoContext, sci13Esc);
+  Show at(,,,5);
+Fields
+ FileName : NoProtect,PickButton;
+Buttons
+ cmLoadExcel;
+ cmCancel;
+ cmOpenExcel;
+ cmImportSp;
+<<
+
+ `Имя файла`.@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+ <.  Загрузить  .> <.   Отмена    .> <. Открыть шаблон .> <.  Применить  .>
+
+>>
+End;
+Browse brResult '' ('', hcNoContext, sci1Esc);
+  Show at(,6,,);
+  Table tmpExcel;
+Fields
+ tmpExcel.BarKod  'Номенклатурный','номер' : [20],Protect, {font = {backColor  = (if ((tmpExcel.Err and 1)<>0,ColorError,0))}};
+ tmpExcel.EdIzm   'Единица','измерения' : [10],Protect, {font = {backColor  = (if ((tmpExcel.Err and 2)<>0,ColorError,0))}};
+ tmpExcel.Kol     'Количество' : [10.2],Protect;
+ tmpExcel.Prim    'Примечание' : [30],Protect;
+End;
+
+
+function xlrowcount: longint;
+{
+  var l,y: longint;
+  var s1,s2: string;
+  l := 128000;
+  y := l;
+  startnewvisual(vtRotateVisual, vftimer+vfbreak, 'Определение количества строк в xls-файле', 0);
+  while true do {
+    if not nextvisual {
+      message('Расчет количества строк в xls-файле прерван.'#13'Количество строк определено как 0');
+      result := 0;
+      break;
+    }
+    xlgetcellvalue(y,1,s1);
+    xlgetcellvalue(y+1,1,s2);
+    if s1<>'' and s2='' {
+      result := y;
+      break;
+    } else {
+      l := l div 2;
+      if l=0 then l := 1;
+      y := y + l * if(s1='',-1,1);
+    }
+    if y=0 then {
+      result := 0;
+      break;
+    }
+  }
+  stopvisual('',0);
+};
+
+function MyGetValueXLS(_Num,_Col : longint):String;
+{
+ var tmp_Value:String;
+ xlReadFromMatrix(_Num,_Col,tmp_Value);
+ set result:= tmp_Value;
+};
+
+procedure RunReadExcel;
+{
+ var cntSheet, iSheet : longint;
+ var cntRow,cntCol,XLSTR: Longint;
+ delete all tmpExcel;
+ xlCreateNewExcelWithTemplate(FileName,false);
+ xlIsExcelValid;
+ xlSetAppVisibleMode(false);
+
+ cntRow := xlrowcount;
+ cntCol := 3; //Укажи количество столбцов
+ xlReadMatrixFromExcel(1,1,cntRow,cntCol);
+
+ StartNewVisual( vtIndicatorVisual , vfTimer , 'Загрузка из Excel...', xlrowcount );
+ for (XLSTR:=2;XLSTR<=cntRow;XLSTR:=XLSTR+1)
+ {
+  if not NextVisual then break;
+  ClearBuffer(#tmpExcel);
+  set tmpExcel.BarKod := MyGetValueXLS(XLSTR,1);
+  set tmpExcel.EdIzm  := MyGetValueXLS(XLSTR,2);
+  set tmpExcel.Kol    := Double(Replace(MyGetValueXLS(XLSTR,3),',','.'));
+  set tmpExcel.Err    := (1 or 2);
+  insert current tmpExcel;
+
+  if GetFirst fastfirstrow KatMBP where((tmpExcel.BarKod == KatMBP.NNumber))=tsOk then
+  {
+   set tmpExcel.cKatMBP:= KatMBP.NRec;
+   set tmpExcel.Err    := (tmpExcel.Err xor 1);
+   if KatEd.ABBR = tmpExcel.EdIzm then
+   {
+    set tmpExcel.Err    := (tmpExcel.Err xor 2);
+   }
+   else
+   {
+    set tmpExcel.Prim:= 'Ед.изм. отличается от указанной в карточке МЦ('+KatEd.ABBR+')';
+   }
+  }
+  else
+  {
+   set tmpExcel.Prim:= 'Не найдена карточка МЦ!';
+  }
+   update current tmpExcel;
+
+
+ }
+ StopVisual( '', 0 );
+
+ xlKillExcel;
+};
+
+
+function ImpSpDoc_Input:boolean;
+{
+ var tmpKol : Double;
+ result:= false;
+ case MBPMOVE.Status of
+ mbpInExDoc: {
+ _loop tmpExcel
+ {
+   if tmpExcel.Err <> 0 then continue;
+   set tmpKol:= tmpExcel.Kol;
+   //Поиск МБП количества на складе
+  _loop MBPIN where((tmpExcel.cKatMBP == MBPIN.cMBP and 0 == MBPIN.InEkspl and 1 == MBPIN.Status))
+  {
+  // message(MBPIN.nrec);
+   if tmpKol = 0 then break;
+   if MBPIN.cPodr <> MBPMove.cPodrF then continue;
+   if MBPIN.cMol <> MBPMove.cMolF then continue;
+   if tmpKol < MBPIN.KolFact then
+   {
+     ClearBuffer(#MBPOUT_Ins);
+     set MBPOUT_Ins.NOM    := MBPMOVE.NOM;
+     set MBPOUT_Ins.STATUS := 2;
+     set MBPOUT_Ins.DOUT   := MBPMOVE.dMove;
+     set MBPOUT_Ins.TKOL   := tmpKol;
+     set MBPOUT_Ins.TSUMMA := MBPOUT_Ins.TKOL * MBPIN.Price;
+     set MBPOUT_Ins.KOL    := tmpKol;
+     set MBPOUT_Ins.SUMMA  := MBPOUT_Ins.TKOL * MBPIN.Price;
+     set MBPOUT_Ins.CMOVE  := MBPMOVE.NRec;
+     set MBPOUT_Ins.CMBPIN := MBPIN.NRec;
+     insert current MBPOUT_Ins;
+
+     set MBPIN.KolFact:= MBPIN.KolFact - tmpKol;
+     set MBPIN.SumFact:= MBPIN.KolFact * MBPIN.Price;
+     update current MBPIN;
+     set tmpKol:= 0;
+   }
+   else
+   {
+     ClearBuffer(#MBPOUT_Ins);
+     set MBPOUT_Ins.NOM    := MBPMOVE.NOM;
+     set MBPOUT_Ins.STATUS := 2;
+     set MBPOUT_Ins.DOUT   := MBPMOVE.dMove;
+     set MBPOUT_Ins.TKOL   := MBPIN.KolFact;
+     set MBPOUT_Ins.TSUMMA := MBPOUT_Ins.TKOL * MBPIN.Price;
+     set MBPOUT_Ins.KOL    := MBPIN.KolFact;
+     set MBPOUT_Ins.SUMMA  := MBPOUT_Ins.TKOL * MBPIN.Price;
+     set MBPOUT_Ins.CMOVE  := MBPMOVE.NRec;
+     set MBPOUT_Ins.CMBPIN := MBPIN.NRec;
+     insert current MBPOUT_Ins;
+
+     set tmpKol:= tmpKol - MBPIN.KolFact;
+
+     set MBPIN.KolFact  := 0;
+     set MBPIN.SumFact  := 0;
+     set MBPIN.Status   := 0;   // Закрываем!
+     set MBPIN.DATESPIS := MBPMOVE.dMove;
+     set MBPIN.DATEZERO := MBPMOVE.dMove;
+     update current MBPIN;
+
+
+   }
+    ClearBuffer(#MBPIN_Ins);
+    set MBPIN_Ins.NOM       := MBPMOVE.NOM;
+    set MBPIN_Ins.DIN       := MBPMOVE.dMove;
+    set MBPIN_Ins.CPODRF    := MBPMOVE.cPodrF;
+    set MBPIN_Ins.CMOLF     := MBPMOVE.cMolF;
+    set MBPIN_Ins.PRICE     := MBPIN.Price;
+    set MBPIN_Ins.KOLDOC    := MBPOUT_Ins.KOL;
+    set MBPIN_Ins.SUMMA     := MBPIN_Ins.KOLDOC * MBPIN_Ins.PRICE;
+    set MBPIN_Ins.KOLFACT   := MBPOUT_Ins.KOL;
+    set MBPIN_Ins.SUMFACT   := MBPIN_Ins.KOLFACT * MBPIN_Ins.PRICE;
+    set MBPIN_Ins.INSTATE   := 4;
+    set MBPIN_Ins.CMBP      := MBPIN.cMBP;
+    set MBPIN_Ins.CPODR     := MBPMOVE.cPodrT;
+    set MBPIN_Ins.CMOL      := MBPMOVE.cMolT;
+    set MBPIN_Ins.CSOPR     := MBPMOVE.NRec;
+    set MBPIN_Ins.CMBPOUT   := MBPOUT_Ins.NRec;
+    set MBPIN_Ins.STATUS    := 1;
+    set MBPIN_Ins.DATEZERO  := Date(31,12,2050);
+    set MBPIN_Ins.INEKSPL   := 1;
+    set MBPIN_Ins.DATEEKSP  := MBPMOVE.dMove;
+    set MBPIN_Ins.STATAVTO  := 1;
+    set MBPIN_Ins.CKATSOPR  := MBPIN.CKATSOPR;
+    set MBPIN_Ins.CSPSOPR   := MBPIN.CSPSOPR;
+    set MBPIN_Ins.DEXPLBEG  := MBPMOVE.dMove;
+    set MBPIN_Ins.SROKBEG   := 65535;
+    set MBPIN_Ins.ORDDOC    := 1;
+    insert current MBPIN_Ins;
+
+    ClearBuffer(#SOPRHOZ);
+    set SOPRHOZ.DATOB     := MBPMOVE.dMove;
+    set SOPRHOZ.CSOPRDOC  := MBPIN_Ins.NRec;
+    set SOPRHOZ.TIPDOC    := 12;
+    set SOPRHOZ.TIDKGAL   := 12;
+    set SOPRHOZ.NODOC     := MBPIN_Ins.NOM;
+    set SOPRHOZ.SYSOPER   := 1;
+    set SOPRHOZ.NAMESHO   := 'Ввод в эксплуатацию '+ String(MBPIN_Ins.KOLFACT) +'ед. по цене' + String(MBPIN_Ins.PRICE);
+    set SOPRHOZ.SUMMA     := MBPIN_Ins.SUMFACT;
+    set SOPRHOZ.DIRECT    := 1;
+    set SOPRHOZ.VHSUMHOZ  := '+';
+    insert current SOPRHOZ;
+
+    set MBPMOVE.Summa := MBPMOVE.Summa + MBPIN_Ins.SUMFACT;
+    update current MBPMOVE;
+  }
+ };
+ };
+ mbpSpisDoc : {
+ _loop tmpExcel
+ {
+   if tmpExcel.Err <> 0 then continue;
+   set tmpKol:= tmpExcel.Kol;
+   //Поиск МБП количества на складе
+  _loop MBPIN where((tmpExcel.cKatMBP == MBPIN.cMBP and 1 == MBPIN.InEkspl and 1 == MBPIN.Status))
+  {
+  // message(MBPIN.nrec);
+   if tmpKol = 0 then break;
+   if MBPIN.cPodr <> MBPMove.cPodrF then continue;
+   if MBPIN.cMol <> MBPMove.cMolF then continue;
+   if tmpKol < MBPIN.KolFact then
+   {
+    ClearBuffer(#MBPOUT_Ins);
+    set MBPOUT_Ins.NOM     := MBPMOVE.NOM;
+    set MBPOUT_Ins.STATUS  := 4;
+    set MBPOUT_Ins.DOUT    := MBPMOVE.dMove;
+    set MBPOUT_Ins.TKOL    := tmpKol;
+    set MBPOUT_Ins.TSUMMA  := tmpKol * MBPIN.Price;
+    set MBPOUT_Ins.KOL     := tmpKol;
+    set MBPOUT_Ins.SUMMA   := tmpKol * MBPIN.Price;
+    set MBPOUT_Ins.CMOVE   := MBPMOVE.NRec;
+    set MBPOUT_Ins.CMBPIN  := MBPIN.NRec;
+    set MBPOUT_Ins.STATAVTO:= 1;
+    set MBPOUT_Ins.EXTMOD  := 1;
+    set MBPOUT_Ins.ORDDOC  := 1;
+    insert current MBPOUT_Ins;
+    set tmpKol:= 0;
+   }
+   else
+   {
+    ClearBuffer(#MBPOUT_Ins);
+    set MBPOUT_Ins.NOM     := MBPMOVE.NOM;
+    set MBPOUT_Ins.STATUS  := 4;
+    set MBPOUT_Ins.DOUT    := MBPMOVE.dMove;
+    set MBPOUT_Ins.TKOL    := MBPIN.KolFact;
+    set MBPOUT_Ins.TSUMMA  := MBPIN.KolFact * MBPIN.Price;
+    set MBPOUT_Ins.KOL     := MBPIN.KolFact;
+    set MBPOUT_Ins.SUMMA   := MBPIN.KolFact * MBPIN.Price;
+    set MBPOUT_Ins.CMOVE   := MBPMOVE.NRec;
+    set MBPOUT_Ins.CMBPIN  := MBPIN.NRec;
+    set MBPOUT_Ins.STATAVTO:= 1;
+    set MBPOUT_Ins.EXTMOD  := 1;
+    set MBPOUT_Ins.ORDDOC  := 1;
+    insert current MBPOUT_Ins;
+    set tmpKol:= tmpKol - MBPIN.KolFact;
+   }
+  }
+ }
+ };
+ end;
+};
+
+HandleEvent // Interface
+
+cmInit:
+{
+   case (MBPMove.Status) of
+    mbpInExDoc: {
+     if GetFirst fastfirstrow MBPIN where((MBPMove.NRec == MBPIN.cSopr))=tsOk then
+     {
+      Message('В документе уже есть спецификация!',Warning);
+      abort;
+      exit;
+     }
+     SetTitle('Загрузка строк спецификации ввод в эксплуатацию');
+    }
+    mbpSpisDoc: {
+     if GetFirst fastfirstrow MBPOUT where((MBPMove.NRec == MBPOUT.CMOVE))=tsOk then
+     {
+      Message('В документе уже есть спецификация!',Warning);
+      abort;
+      exit;
+     }
+      SetTitle('Загрузка строк спецификации акта на списание');
+    }
+    else {
+      Message('Реализация загрузки для данного документа отсутствует!');
+      abort;
+      exit;
+    }
+  end;
+};
+
+cmPick:
+{
+ case CurField of
+  #FileName : {set FileName:= GetFileName('*.*','Выбор файла');};
+ end;
+};
+
+cmLoadExcel:
+{
+  if not ExistFile(FileName) then
+  {
+   Message('Ошибка:'+Chr(13)+'Файл не найден', Error);
+  }
+  else
+  {
+  RunReadExcel;
+  ReReadRecord(#tmpExcel);
+  };
+};
+
+cmOpenExcel:
+{
+  if not ExistFile(FileName) then
+  {
+   Message('Ошибка:'+Chr(13)+'Файл не найден', Error);
+  }
+  else
+  {
+//   xlOpenExcel(true);
+//   xlOpenWorkBook(FileName);
+//   xlKillExcel;
+     var aErrorCode: integer;
+     ExecProgram('',FileName , 'Просмотр файла', pfKeepWindow+pfDontWait, aErrorCode);
+  };
+};
+
+cmImportSp:
+{
+ ImpSpDoc_Input;
+ CloseInterface(cmDefault);
+};
+End;
+End.

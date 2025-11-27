@@ -1,0 +1,793 @@
+#component "M_UP"
+#define OBJINT_ACCOUNT
+#include OBJINTPL.VIN
+
+#include XLReport.vih
+#include FpPeriod.vih
+#include PersInfo.vih
+#include oiPotrGt.vih
+#include InLogistRepFuncs.vih
+#include ValFunc.vih
+
+exception ExExcelFatalError;
+
+#component "AVAZ_Logistics"
+Interface STO_AnalysisToolDeviation 'Анализ отклонений расхода инструмента' ('', hcNoContext, sci1Esc);
+  Show at(,,50,10);
+
+table struct tmpXL
+(
+  Nrec    : comp
+ ,cIzd    : comp
+ ,xlCol   : Longint
+ ,xlColQ  : Longint
+)
+with index
+(
+  tmpXL01 = Nrec(unique,surrogate)
+ ,tmpXL02 = cIzd
+)
+;
+
+table struct tmpNorms
+(
+  Nrec    : comp
+ ,cPodr   : comp
+ ,cMc     : comp
+ ,KE      : comp
+ ,cIzd    : comp
+ ,Norm    : Double
+ ,NormQ   : Double
+)
+with index
+(
+  tmpNorm01 = Nrec(unique,surrogate)
+ ,tmpNorm02 = cPodr + cMc + KE + cIzd
+)
+;
+
+table struct tmpRep
+(
+  Nrec    : comp
+ ,cPodr   : comp
+ ,cMc     : comp
+ ,KE      : comp
+ ,cIzd    : comp
+ ,Norm    : Double
+ ,Cena    : Double
+ ,Kol     : Double
+ ,Summa   : Double
+)
+with index
+(
+  tmpRep01 = Nrec(unique,surrogate)
+ ,tmpRep02 = cPodr + cMc + KE + cIzd
+)
+;
+
+Var  getN     : Util_GetName;
+Var  GlDt     : GlobData;
+Var  gKau     : OiWorkWithKAU;
+Var  iLFuncs  : AVAZ_Logistics::iInLogistRepFuncs;
+Var  m_GetPotr: oiPotrGt;
+
+var MyPlansNo : comp;
+    KodPlnSCH : String[1];
+    tSchD,GetSchD,GetSubSchD : String;
+    tSchK,GetSchK,GetSubSchK : String;
+    PointOut : comp;
+    coStatCalc : comp;
+    DatePrice,DTB,DTE : date;
+    sPickMC : String;
+
+   sErrMessage: string;
+   lErrMessageMode,lCountRow: longInt;
+
+   QKol : Double;
+   _cMnPlan,cRPStatus,cPS_SHAB_Instr,_cKE:comp;
+   _cWA,HDRn,_tSP:comp;
+  _tCena, _tCur:TSumma;
+  _sUch,_sCex,_sPodr : String;
+
+
+Create View
+as select
+ *
+from
+ tmpRep
+,PLANSSCH
+,SpKau
+,BUHSCHET KATH
+,Pick PickMc
+,KatMc
+,KatMc GetKatMc
+,KatMc KatMc_Izd
+,katmc katmc_res
+,Oborot
+,KatPodr
+,KatPodr TopPodr
+,KatEd
+,KatSopr
+,spsopr
+,SklOrder
+,SpOrder
+,MnPlan
+,WayAccou
+,SpMnPlan
+,SpMnPl
+,ValSpMnp
+,TmpPotr
+,tmpXL
+,tmpNorms
+,HDR_PS
+,KATNOTES
+,DOCNASTR
+
+where
+((
+    MyPlansNo == PLANSSCH.NRec
+and PointOut == SpKau.NRec
+and  word(7) == PickMc.wList
+
+and GetSchD == Oborot.SCHETO
+and coStatCalc == Oborot.KAUOS[5]
+and DTB <<= Oborot.DatOb
+and DTE >>= Oborot.DatOb
+
+and tmpRep.cMc   == KatMc.Nrec
+and KatMc.cED    == KatEd.NRec
+
+and 1 == SpOrder.SP
+and 0 == SpOrder.VidOrder
+and DTB <<= SpOrder.dOrd
+and DTE >>= SpOrder.dOrd
+and SpOrder.cSklOrder == SklOrder.NRec
+and SklOrder.cSopr == KatSopr.Nrec
+
+and _cMnPlan == MnPlan.nrec
+and _cWA == WayAccou.nrec
+and mnplan.nrec == SpMnPlan.cmnplan
+and (DTB<=spmnplan.ENDDATE and DTE>=spmnplan.ENDDATE )
+and SpMnPlan.nrec == SpMnPl.cSpMnPlan
+and SpMnPl.nrec == ValSpMnp.cSpMnPl
+
+and tmpXL.cIzd == KatMc_Izd.Nrec
+
+));
+
+
+Screen scRep '' ('', hcNoContext, sci13Esc);
+  Table tmpRep;
+Fields
+ SpKau.Name : Protect,PickButton;
+ DatePrice  : noProtect;
+ DTB        : [,'Month YYYY'],NoProtect;
+ tSchD      : Protect,PickButton;
+ tSchK      : Protect,PickButton;
+ WayAccou.Name :Protect,PickButton;
+ MnPlan.name  :Protect,PickButton;
+Buttons
+ cmOk;
+ cmCancel;
+<<
+
+ `Точка схода автомобиля с конвейера`.@@@@@@@@@@@
+ `Дата цен`.@@@@@@@@@@@
+ `Период`  .@@@@@@@@@@@
+ `Счет ДТ` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Счет КТ` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Шаблон плана`   .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ `Название плана` .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+       <. Сформировать .>  <. Отмена .>
+
+>>
+End;
+
+#include sto_rep_func.vpp;
+
+#include ExFunc.vpp;
+
+procedure PrintData;
+{
+
+ var lColLast,lBegRow,lEndRow,lColNo,lRowNo,lColBeg,lColEnd:longint;
+ var sTemplateName: string = TranslatePath(StartPathName+'XLS\AVAZ\sto_analysistooldeviation.xltm');
+ var f11,f12,f13,f14,f15,f16,f18,f17,f19,f20,f21,f22,f24,f23,f25,f26 : Double;
+ var tKol,tKolQ : Double;
+ StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Печать отчета',lCountRow);
+ _try
+  {
+  CreateExcelWithTemplate(sTemplateName);
+  _try
+   {
+
+    SetCellStringValue('Анализ расхода инструмента',1,5);
+
+    set lBegRow:= 4;
+    set lRowNo:= lBegRow+1;
+    set lColNo:= 0;
+
+    inc(lColNo);SetCellStringValue('Пр-во',lRowNo,lColNo); lColBeg:= lColNo;
+    inc(lColNo);SetCellStringValue('Цех',lRowNo,lColNo);
+    inc(lColNo);SetCellStringValue('Участок',lRowNo,lColNo);
+    inc(lColNo);SetCellStringValue('Код номенклатуры',lRowNo,lColNo);
+    inc(lColNo);SetCellStringValue('Наименование',lRowNo,lColNo); lColEnd:= lColNo;
+    xlMergeCells(lBegRow,lColBeg,lBegRow,lColEnd);
+
+    lColLast:= 0;
+
+    lColBeg:= lColNo + 1;
+    _loop tmpXL
+    {
+     inc(lColNo);SetCellStringValue(KatMc_Izd.Obozn+chr(10)+chr(13)+KatMc_Izd.Name,lRowNo,lColNo);
+     set tmpXL.xlCol:= lColNo;
+     update current tmpXL;
+     inc(lColLast);
+    }
+    lColEnd:= lColNo;
+
+    xlMergeCells(lBegRow,lColBeg,lBegRow,lColEnd);
+    SetCellStringValue('Норма расхода на 1 а/м, натуральное выражение',lBegRow,lColBeg);
+
+    lColBeg:= lColNo + 1;
+    _loop tmpXL
+    {
+     inc(lColNo);SetCellStringValue(KatMc_Izd.Obozn+chr(10)+chr(13)+KatMc_Izd.Name,lRowNo,lColNo);
+     set tmpXL.xlColQ:= lColNo;
+     update current tmpXL;
+    }
+    inc(lColNo);SetCellStringValue('Всего в натуральном выражении',lRowNo,lColNo);
+    lColEnd:= lColNo;
+    xlMergeCells(lBegRow,lColBeg,lBegRow,lColEnd);
+    SetCellStringValue('Норматив на объем пр-ва, шт.',lBegRow,lColBeg);
+
+    inc(lColNo);SetCellStringValue('Нормативная  цена, руб.',lRowNo,lColNo); lColBeg:= lColNo;
+    inc(lColNo);SetCellStringValue('Нормативная сумма, руб.',lRowNo,lColNo); lColEnd:= lColNo;
+    xlMergeCells(lBegRow,lColBeg,lBegRow,lColEnd);
+    SetCellStringValue('Норматив на объем',lBegRow,lColBeg);
+
+    inc(lColNo);SetCellStringValue('кол-во, шт.',lRowNo,lColNo); lColBeg:= lColNo;
+    inc(lColNo);SetCellStringValue('сумма, руб.',lRowNo,lColNo); lColEnd:= lColNo;
+    xlMergeCells(lBegRow,lColBeg,lBegRow,lColEnd);
+    SetCellStringValue('Норматив на 1 а/м',lBegRow,lColBeg);
+
+    inc(lColNo);SetCellStringValue('Фактическое кол-во, шт.',lRowNo,lColNo); lColBeg:= lColNo;
+    inc(lColNo);SetCellStringValue('Фактическая цена, руб.',lRowNo,lColNo);
+    inc(lColNo);SetCellStringValue('Фактичекая сумма  списания, руб.',lRowNo,lColNo); lColEnd:= lColNo;
+    xlMergeCells(lBegRow,lColBeg,lBegRow,lColEnd);
+    SetCellStringValue('ФАКТ на объем',lBegRow,lColBeg);
+
+    inc(lColNo);SetCellStringValue('кол-во, шт.',lRowNo,lColNo); lColBeg:= lColNo;
+    inc(lColNo);SetCellStringValue('сумма, руб.',lRowNo,lColNo); lColEnd:= lColNo;
+    xlMergeCells(lBegRow,lColBeg,lBegRow,lColEnd);
+    SetCellStringValue('Факт на 1 а/м',lBegRow,lColBeg);
+
+    inc(lColNo);SetCellStringValue('отк-ие факт-норма, шт.',lRowNo,lColNo); lColBeg:= lColNo;
+    inc(lColNo);SetCellStringValue('отк-ие факт-норма, руб.',lRowNo,lColNo);
+    inc(lColNo);SetCellStringValue('из них за счет кол-ва, руб.',lRowNo,lColNo);
+    inc(lColNo);SetCellStringValue('из них за счет цены, руб.',lRowNo,lColNo); lColEnd:= lColNo;
+    xlMergeCells(lBegRow,lColBeg,lBegRow,lColEnd);
+    SetCellStringValue('Отклонения на объем',lBegRow,lColBeg);
+
+    inc(lColNo);SetCellStringValue('кол-во, шт.',lRowNo,lColNo); lColBeg:= lColNo;
+    inc(lColNo);SetCellStringValue('сумма, руб.',lRowNo,lColNo); lColEnd:= lColNo;
+    xlMergeCells(lBegRow,lColBeg,lBegRow,lColEnd);
+    SetCellStringValue('Отклонения на 1 а/м',lBegRow,lColBeg);
+
+    inc(lColNo);SetCellStringValue('Калькулируемая единица',lRowNo,lColNo);
+
+    inc(lRowNo);
+    _loop tmpRep
+    {
+     GetPODRCEXUCH(tmpRep.cPodr,_sUch,_sCex,_sPodr);
+     f11:= tmpRep.Norm;
+     f12:= tmpRep.Cena;
+     f13:= f11*f12;
+     if QKol=0 then f14:= 0 else f14:= f11/QKol;
+     if QKol=0 then f15:= 0 else f15:= f13/QKol;
+     f16:= tmpRep.Kol;
+     f18:= tmpRep.Summa;
+     f17:= f18/tmpRep.Kol;
+     if QKol=0 then f19:= 0 else f19:= f16/QKol;
+     if QKol=0 then f20:= 0 else f20:= f18/QKol;
+     f21:= f16-f11;
+     f22:= f18-f13;
+     f24:= (f17-f12)*f16;
+     f23:= f22-f24;
+     if QKol=0 then f25:= 0 else f25:= f21/QKol;
+     if QKol=0 then f26:= 0 else f26:= f22/QKol;
+
+
+     set lColNo:= 0;
+     inc(lColNo);SetCellStringValue(_sPodr,lRowNo,lColNo);       //'Пр-во'
+     inc(lColNo);SetCellStringValue(_sCex,lRowNo,lColNo);        //'Цех'
+     inc(lColNo);SetCellStringValue(_sUch,lRowNo,lColNo);        //'Участок'
+     inc(lColNo);SetCellStringValue(KatMc.BarKod,lRowNo,lColNo); //'Код номенклатуры АХАРТА'
+     inc(lColNo);SetCellStringValue(KatMc.Name,lRowNo,lColNo);   //'Наименование'
+
+
+     _loop tmpXL
+     {
+      set tKol := 0;
+      set tKolQ:= 0;
+      _loop tmpNorms where((tmpRep.cPodr == tmpNorms.cPodr and tmpRep.cMc == tmpNorms.cMc and tmpRep.KE == tmpNorms.KE and tmpXL.cIzd == tmpNorms.cIzd))
+      {
+       set tKol := tKol + tmpNorms.Norm;
+       set tKolQ:= tKolQ + tmpNorms.NormQ;
+      }
+       SetCellNumberValue(tKol,lRowNo,tmpXL.xlCol);
+       SetCellNumberValue(tKolQ,lRowNo,tmpXL.xlColQ);
+     }
+
+     set lColNo:= lColNo + lColLast*2;
+
+     inc(lColNo);SetCellNumberValue(f11,lRowNo,lColNo); //'Всего в натуральном выражении',
+     inc(lColNo);SetCellNumberValue(f12,lRowNo,lColNo); //'Нормативная  цена, руб.'
+     inc(lColNo);SetCellNumberValue(f13,lRowNo,lColNo); //'Нормативная сумма, руб.'
+     inc(lColNo);SetCellNumberValue(f14,lRowNo,lColNo); //'кол-во, шт.'
+     inc(lColNo);SetCellNumberValue(f15,lRowNo,lColNo); //'сумма, руб.'
+     inc(lColNo);SetCellNumberValue(f16,lRowNo,lColNo); //'Фактическое кол-во, шт.'
+     inc(lColNo);SetCellNumberValue(f17,lRowNo,lColNo); //'Фактическая цена, руб.'
+     inc(lColNo);SetCellNumberValue(f18,lRowNo,lColNo); //'Фактичекая сумма  списания, руб.'
+     inc(lColNo);SetCellNumberValue(f19,lRowNo,lColNo); //'кол-во, шт.'
+     inc(lColNo);SetCellNumberValue(f20,lRowNo,lColNo); //'сумма, руб.'
+     inc(lColNo);SetCellNumberValue(f21,lRowNo,lColNo); //'отк-ие факт-норма, шт.'
+     inc(lColNo);SetCellNumberValue(f22,lRowNo,lColNo); //'отк-ие факт-норма, руб.'
+     inc(lColNo);SetCellNumberValue(f23,lRowNo,lColNo); //'из них за счет кол-ва, руб.'
+     inc(lColNo);SetCellNumberValue(f24,lRowNo,lColNo); //'из них за счет цены, руб.'
+     inc(lColNo);SetCellNumberValue(f25,lRowNo,lColNo); //'кол-во, шт.'
+     inc(lColNo);SetCellNumberValue(f26,lRowNo,lColNo); //'сумма, руб.'
+     inc(lColNo);SetCellStringValue(ShowKau(cgKAU_KE, tmpRep.KE),lRowNo,lColNo); //'Калькулируемая единица'
+     set lEndRow:=lRowNo;
+     inc(lRowNo);
+    }
+    xlSetBackColor(0C0C0C0H,lBegRow,1,lBegRow+1,lColNo);
+    xlFrameCells(1 or 2 or 4 or 8 or 16 or 32, 2, 1, 1, lBegRow, 1, lEndRow ,lColNo);
+
+   }
+  _finally
+   {
+    StopVisual;
+   }
+  }
+  _except
+    on ExExcelFatalError:
+     {
+      StopVisual;
+      message(sErrMessage, lErrMessageMode);
+     }
+  _finally
+    xlKillExcel;
+
+
+};
+
+function ChkVAPodr(_cPodr : comp): Boolean;
+{
+ var tVA : comp;
+ result:= false;
+ set tVA := coGetAttr(coKatPodr,_cPodr,VA_STO_KT);
+
+ if tVA=0 then
+ {
+  if GetFirst fastfirstrow TopPodr where((_cPodr == TopPodr.Nrec))=tsOk then
+  result:= ChkVAPodr(TopPodr.cPodr);
+ }
+ else
+ {
+  if tVA = PointOut then set result:= true;
+  exit;
+ }
+
+}
+
+procedure GetQKol;
+{
+ set QKol:= 0;
+ StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Подсчет объема производства...', RecordsInTable(#SpOrder));
+ _loop SpOrder
+ {
+  if GetFirst fastfirstrow GetKatMc where((SpOrder.cMC == GetKatMc.NRec))<>tsOk then continue;
+  if GetKatMc.kGroupMC <> '2000000' then continue;
+  if GetFirst fastfirstrow SklOrder<>tsOk then continue;
+  if GetFirst fastfirstrow KatSopr<>tsOk then continue;
+  if KatSopr.VidSopr <> 502 and KatSopr.VidSopr <> 505 then continue;
+  if not ChkVAPodr(KatSopr.CPODRTO) then continue;
+  set QKol:= QKol + SpOrder.Kol;
+ }
+ StopVisual( '', 0 );
+};
+
+procedure GetOborot;
+{
+ StartNewVisual(vtIndicatorVisual, vfTimer + vfBreak + vfConfirm, 'Анализ проводок за период...', RecordsInTable(#Oborot));
+ _loop Oborot
+ {
+   if not NextVisual then break;
+   if Oborot.SchetK<>GetSchK or Oborot.SubSchK<>GetSubSchK then continue;
+   if sPickMC <> 'не установлен' then
+   {
+     if GetFirst fastfirstrow PickMC
+      where((word(7) == PickMc.wList and Oborot.KauKs[2] == PickMC.cRec))<>tsOk then continue;
+   }
+   if GetFirst fastfirstrow tmpRep
+    where((Oborot.KodSPO == tmpRep.cPodr and Oborot.KauKs[2] == tmpRep.cMc and Oborot.KauOs[4] == tmpRep.KE ))<>tsOk then
+    {
+     ClearBuffer(#tmpRep);
+     set tmpRep.cPodr:= Oborot.KodSPO;
+     set tmpRep.cMc  := Oborot.KauKs[2];
+     set tmpRep.KE   := Oborot.KauOs[4];
+     set tmpRep.Kol  := Oborot.Kol;
+     set tmpRep.Summa:= Oborot.SumOb;
+     insert current tmpRep;
+    }
+    else
+    {
+     set tmpRep.Kol  := tmpRep.Kol + Oborot.Kol;
+     set tmpRep.Summa:= tmpRep.Summa + Oborot.SumOb;
+     update current tmpRep;
+    }
+
+ }
+ StopVisual( '', 0 );
+};
+
+function GetNrecKau_Name(_KodGrKau : Word; _Name : String):comp;
+{
+ result:= 0;
+ if GetFirst fastfirstrow SpKau
+  where((_KodGrKau == SpKau.KodGrKau and _Name == SpKau.Name))=tsOk
+   then set result:= SpKau.NRec;
+};
+
+
+function GetNameSht(_SCHET,_SUBSCH : string):String;
+{
+ result:= '';
+ if GetFirst fastfirstrow KATH where((_SCHET == KATH.SCHET and _SUBSCH == KATH.SUBSCH)) = tsOk then
+     {
+      set result:= KATH.Code+' '+KATH.Name;
+     }
+};
+
+function GetData:boolean;
+{
+ Result:=true;
+ StartNewVisual(vtRotateVisual, vfTimer + vfBreak + vfConfirm, 'Анализ данных...',0);
+
+ delete all TmpPotr;
+ delete all tmpRep;
+ delete all tmpXL;
+
+ _loop  spmnplan
+ {
+   if not NextVisual then
+    {
+     Result:=false;
+     StopVisual('',0);
+     exit;
+    }
+
+
+
+  HDRn:=FindPS(spmnplan.cizd);
+  if HDRn=0 then continue;
+
+  if GetFirst fastfirstrow tmpXL where((spmnplan.cizd == tmpXL.cIzd))<>tsOk then
+  {
+   ClearBuffer(#tmpXL);
+   set tmpXL.cIzd  := spmnplan.cizd;
+   insert current tmpXL;
+  }
+
+  _cKE := coGetAttr(coKatMC,spmnplan.cizd,VA_KATMC_KE);
+
+  m_GetPotr.SetWorkDate(spmnplan.ENDDATE);
+  m_GetPotr.SetWorkFlag(011010b);
+  m_GetPotr.GetDocPotrEx(HDRn, 10,1,spmnplan.cOtpEd);
+  _loop tmppotr where ((cgKAU_KatMC == tmppotr.TRESOURCE))
+   {
+
+     if getfirst fastfirstrow katmc_res where ((tmppotr.cresource == katmc_res.nrec))<>tsok then continue;
+     if TmpPotr.Kind=1 and TmpPotr.PrMat=1 then continue;
+
+     if GetFirst tmpNorms
+      where((tmppotr.cdep == tmpNorms.cPodr and
+             katmc_res.nrec == tmpNorms.cMc and
+             _cKE == tmpNorms.KE and
+             spmnplan.cizd == tmpNorms.cIzd
+           ))=tsOk then
+      {
+       set tmpNorms.Norm:= tmpNorms.Norm + tmppotr.RASX;
+       set tmpNorms.NormQ:= tmpNorms.NormQ + tmppotr.RASX * QKol;
+       update current tmpNorms;
+      }
+      else
+      {
+       ClearBuffer(#tmpNorms);
+       set tmpNorms.cPodr := tmppotr.cdep;
+       set tmpNorms.cMc   := katmc_res.nrec;
+       set tmpNorms.KE    := _cKE;
+       set tmpNorms.cIzd  := spmnplan.cizd;
+       set tmpNorms.Norm  := tmppotr.RASX;
+       set tmpNorms.NormQ := tmppotr.RASX * QKol;
+       insert current tmpNorms;
+      };
+
+
+ //    LogStrToFile('STO_log.log',String(tmppotr.cdep)+';'+katmc_res.Name+';'+String(_cKE)+';'+String(tmppotr.RASX));
+     if getfirst tmpRep where ((tmppotr.cdep == tmpRep.cPodr and katmc_res.nrec == tmpRep.cMc and _cKE == tmpRep.KE)) = tsok then
+      {
+       set tmpRep.Norm     :=tmpRep.Norm + tmppotr.RASX * QKol;
+       update current tmpRep;
+      }
+      else
+      {
+       ClearBuffer(#tmpRep);
+       set tmpRep.cPodr     := tmppotr.cdep;
+       set tmpRep.cMc       := katmc_res.nrec;
+       set tmpRep.KE        := _cKE;
+       set tmpRep.Norm      := tmppotr.RASX * QKol;
+
+       _tSp:=iLFuncs.GetLastPrihSpSopr(katmc_res.nrec,DatePrice);
+       _tCena:=0;
+       _tCur:=0;
+       if getfirst fastfirstrow spsopr where ((_tSP == spsopr.nrec))=tsok then
+        {
+           set tmpRep.Cena     := _tCena;
+           if spsopr.cVAL<>0 then
+            {
+              if _tCur=0 then _tCur:=oValFunc.Rate(spsopr.cVAL,DatePrice);
+              if _tCur=0 then _tCena:=spsopr.price;
+                         else _tCena:=spsopr.vprice*_tCur;
+            }
+            else
+            {
+              _tCena:=spsopr.price;
+            }
+          set tmpRep.Cena     := _tCena;
+        }
+       insert current tmpRep;
+
+      }
+   }
+
+ }
+ lCountRow := RecordsInTable(#tmpRep);
+ if lCountRow<=0 then Result:=false;
+ StopVisual('',0);
+}
+
+
+HandleEvent // Interface
+
+cmInit:
+{
+ set MyPlansNo:= coGetTune('KONSOLID.CPLANSSCH');
+ set coStatCalc:= GetNrecKau_Name(cgKAU_StatCalc,sKAU_StatCalc);
+ set PointOut:= GetNrecKau_Name(cgKAU_PointOut,sKauKT45);
+ if GetFirst fastfirstrow SpKau=tsOk then {};
+
+ set DTB:= Date(1,Month(Cur_Date),Year(Cur_Date));
+ set DTE:= Date(Last_Day(Cur_Date),Month(Cur_Date),Year(Cur_Date));
+
+ set sPickMC:= 'не установлен';
+
+ set GetSchD    := '120';
+ set GetSubSchD := '';
+ set GetSchK    := '110';
+ set GetSubSchK := '111';
+
+ set tSchD:= GetNameSht(GetSchD,GetSubSchD);
+ set tSchK:= GetNameSht(GetSchK,GetSubSchK);
+
+ if not ReadMyDsk(DatePrice  , 'R_M_REP_DatePrice',true) DatePrice:=Cur_date;
+ ReadMyDsk(_cMnplan   , 'R_M_REP_cMnPlan',true);
+ ReadMyDsk(_cWA       , 'R_M_REP_cWA',true);
+ if getfirst fastfirstrow Mnplan =tsok then {}
+ if getfirst fastfirstrow WayAccou =tsok then {}
+
+ cRPStatus:=0;
+ if getfirst katnotes where ((1200 == katnotes.viddoc and (Pos('УТВ',UPCASE(katnotes.name))>0)))=tsok then cRPStatus:=katnotes.nrec;
+ if cRPStatus=0 then {message('Не найден статус "утвержден" для плана!');exit;}
+ cPS_SHAB_Instr:=0;
+ if getfirst DOCNASTR where ((word(1) == DOCNASTR.dtype  and PS_SHAB_Instr == DOCNASTR.NAME))=tsok then cPS_SHAB_Instr:=DOCNASTR.nrec;
+ if cPS_SHAB_Instr=0 then {message('Не найден шаблон производственной спецификации "'+PS_SHAB_Instr+'"!');exit;}
+
+   if (Not LoadVipRef (m_GetPotr, 'M_TPP::iPotrPS'))
+      {
+        Message('Системная ошибка !!!' + 'Не загружен интерфейс <' + 'iPotrPS'
+                + '>', Error + CancelButton);
+        Abort;
+        Exit;
+      }
+
+ if (Not GetVipRef (Gldt, 'GlobDataSource'))
+  {
+    Message(''#3'Системная ошибка !!!'#13 +
+            ''#3'Не загружен интерфейс <' + 'GlobDataSource' + '>', Error);
+    Exit;
+  }
+
+  if (nullVipRef(GetN))
+    GetN    := gldt.uGetName();
+  if (nullVipRef(gKAU))
+    gKAU    := gldt.GetoiWorkWithKAU();
+
+};
+
+cmPick:
+{
+  case CurField of
+  #SpKau.Name:
+  {
+      var vc : comp;
+      vc := PointOut;
+      gKau.KauPick2(cgKAU_PointOut,vc);
+      set PointOut := vc;
+      RescanPanel(#tmpRep);
+  }
+
+   #tSchD:{
+   set tSchD:= '';
+   if RunInterface('F_BUHSCHET::GETBUHSCHET',0,MyPlansNo,GetSchD,GetSubSchD)=cmDefault then
+   {
+    set tSchD:= GetNameSht(GetSchD,GetSubSchD);
+   }
+   };
+   #tSchK:{
+   set tSchK:= '';
+   if RunInterface('F_BUHSCHET::GETBUHSCHET',0,MyPlansNo,GetSchK,GetSubSchK)=cmDefault then
+   {
+    set tSchK:= GetNameSht(GetSchK,GetSubSchK);
+   }
+   };
+   #sPickMC : {
+     var cfMc : comp;
+     var i : longint;
+     delete all PickMc;
+     if RunInterface('L_MCU::GetSomeMC',0)<>cmCancel {
+      i:= 0; _loop PickMc {i++; cfMc:= PickMC.cRec};
+      if GetFirst fastfirstrow KatMc where((cfMc == KatMc.NRec))=tsOk then {};
+      set sPickMC := if (i = 0, 'не установлен'
+                       , if (i = 1, KatMc.Name,'множественный выбор (' + string(i) + ')'));
+     }
+   }
+    #WayAccou.name :
+     {
+      RunInterface(NastrPl,0,_cWA,1);
+      if getfirst fastfirstrow wayaccou=tsok {}
+      RescanPanel(#WayAccou);
+     };
+    #MnPlan.Name :
+     {
+      if (RunInterface('M_MNPLAN::GetMnPlan', word(1), word(0), _cMnPlan,
+            _cWA, word(0), word(0), word(0), comp(0), False, '', word(0)) <> cmCancel)
+          {
+            if getfirst fastfirstrow mnplan=tsok
+              {
+                if _cWA=0 then set _cWA:=Mnplan.cwayaccou;
+              }
+          }
+      RescanPanel(#MnPlan);
+     };
+  end;
+};
+
+cmDelOnProtect:
+{
+  case CurField of
+   #SpKau.Name: {
+    set PointOut:= 0;
+   };
+   #tSchD: {
+    set tSchD:= GetSchD:= GetSubSchD:= '';
+   };
+   #tSchK:{
+    set tSchD:= GetSchD:= GetSubSchD:= '';
+   };
+   #sPickMC : {
+    delete all PickMc;
+    set sPickMC:= 'не установлен';
+   }
+    #WayAccou.name :
+     {
+      set _cWA := 0;
+     };
+    #MnPlan.Name:
+     {
+      set _cMnPlan := 0;
+     };
+
+  end;
+};
+
+cmDone:
+{
+    if (not NullVipRef(m_GetPotr))
+      FreeVipInterface(m_GetPotr);
+}
+
+cmOk:
+{
+ SaveMyDsk(DatePrice  , 'R_M_REP_DatePrice');
+ SaveMyDsk(_cMnplan   , 'R_M_REP_cMnPlan');
+ SaveMyDsk(_cWA       , 'R_M_REP_cWA');
+
+
+ set DTB:= Date(1,Month(DTB),Year(DTB));
+ set DTE:= Date(Last_Day(DTB),Month(DTB),Year(DTB));
+
+  if _cMnPlan=0 then
+   {
+     if getfirst fastfirstrow  Mnplan where ((_cWA == mnplan.cwayaccou
+                            and
+                            (cRPStatus = mnplan.cstatus
+                             and
+                              DTB>=mnplan.startdate
+                             and
+                              DTB<=mnplan.enddate
+                            )
+
+                        )) <> tsok then
+      {
+       Message('На дату '+DateToStr(DTB,'DD.MM.YYYY')+' нет плана в утвержденном статусе!',information);
+       Abort;Exit;
+
+      }
+     _cmnplan:=mnplan.nrec;
+
+   }
+
+  if getfirst fastfirstrow WayAccou <> tsok then
+    {
+      Message('Необходимо выбрать план или шаблон пана!',information);
+      Abort;Exit;
+    }
+
+  GetQKol;
+
+  If(Not GetData)
+  {
+    message('Нет данных за указанный период c '+DateToStr(DTB,'DD.MM.YYYY')+' по '+DateToStr(DTE,'DD.MM.YYYY'));
+    exit;
+  }
+
+
+ GetOborot;
+
+ PrintData;
+};
+
+End;
+End.
+
+#include UserReport.vih;
+VipInterface UserReport_STO_AnalysisToolDeviation Implements IUserReport;
+Interface UserReport_STO_AnalysisToolDeviation;
+create view;
+procedure Run;
+begin
+ RunInterfaceNoModal(STO_AnalysisToolDeviation);
+end;
+function GetReportName: String;
+begin
+  GetReportName := 'Анализ отклонений расхода инструмента';
+end;
+function GetGroupName (Level : Word) : String;
+begin
+  GetGroupName := 'СТО';
+  case Level of
+    1 : GetGroupName := 'СТО';
+  end;
+end;
+function GetPriority : Integer;
+begin
+  GetPriority := -100;
+end;
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '*';
+end;
+end.
