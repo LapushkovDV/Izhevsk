@@ -12,7 +12,8 @@ del Atlantis*.res
 
 @set exedir=C:\Galaktika\AVAZ\chumachenko\6.0.09.0\exe
 
-@%exedir%\vip64x.exe chumachenko.prj /r:AVAZ_Logistics.res /c:vip.cfg /u:SUPERVISOR /#user:SUPERVISOR /def:Atl60
+@%exedir%\vip64x.exe chumachenko.prj /r:AVAZ_Logistics.res /c:vip.cfg /u:SUPERVISOR /#user:SUPERVISOR
+rem /def:Atl60
 
 rem /c:support_res.cfg
 @echo Компиляция завершена
