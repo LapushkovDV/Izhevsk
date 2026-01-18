@@ -1,0 +1,290 @@
+//------------------------------------------------------------------------------
+//                                                                  (c) Топ Софт
+// Система T2 ERP
+// Обработка атрибутов с вызовом интерфейсов
+//------------------------------------------------------------------------------
+
+
+#include AttrTablePick.vih
+#include GetAttrTable.vih
+#include Getkau.vih    // Обьектный интерфес выбора КАУ
+#include Contexts.vih  // Контексты
+#include ExtFpFuncStBud.Vih
+#include PickAttrLiquid.vih
+
+#doc
+Обработка атрибутов с вызовом интерфейсов для Comp типа.
+#end
+Interface AttrTablePick;
+
+create view vTablePick
+var
+  cur_wTable   : word;
+  cur_cRec     : comp;
+  cur_cAttrNam : comp;
+as select 
+  AttrNam.Nrec
+from
+  ATTRNAM,
+  ATTRVAL,
+  X$FILES(ReadOnly),
+  CalPlan
+where
+((
+  cur_cAttrNam    == AttrNam.Nrec     and
+  cur_cAttrNam    == AttrVal.cAttrNam and
+  cur_wTable      == AttrVal.wTable   and
+  cur_cRec        == AttrVal.cRec
+));
+
+
+#include GetKau.var    // Переменная типа "Интерфеса выбора КАУ"
+#include ShowKau.vpp   // Показ кау
+var pFuncStBud : ExtFpFuncStBud;
+var pPickLiquid: PickAttrLiquid;
+
+// -----------------------------------------------------------------------------
+// Для выбора таблицы привязки при создании атрибута.  Возвращает true если выбрана, иначе false.
+// Параметры возвращаемые _rType, _rObject, _coTable - соответствующие поля в AttrNam
+Public function GetRefParams(var _rType: word; var _rObject: word; var _coTable: word): boolean;
+{
+  if RunInterface(GetAttrTable,_rType,_rObject,_coTable) <> cmCancel
+    GetRefParams := true;
+  else
+    GetRefParams := false;
+}
+
+// -----------------------------------------------------------------------------
+// Запустить выбор значений аналитики
+function myRunPickKAUMean(
+    _wTable : word;  // код таблицы
+    _cTable : comp;  // NRec таблицы
+    _wKau   : word;  // код аналитики
+var _cKau   : comp   // значение аналитики
+) : boolean;
+{
+  Result := False;
+
+  var sTuneKeyBDS : string = 'UprFin.FP.STBUD.KAUSynonymBDS';
+  var sTuneKeyBDR : string = 'UprFin.FP.STBUD.KAUSynonymBDR';
+  var wKau_FpStBudBDS : word = 0;  // аналитика статей БДДС
+  var wKau_FpStBudBDR : word = 0;  // аналитика статей БДР
+  if (ExistTune(sTuneKeyBDS) )  wKau_FpStBudBDS := wGetTune(sTuneKeyBDS);  // Синоним аналитики статей для БДДС
+  if (ExistTune(sTuneKeyBDR) )  wKau_FpStBudBDR := wGetTune(sTuneKeyBDR);  // Синоним аналитики статей для БДР
+
+  if (_wKau = wKau_FpStBudBDS)
+  { // если требуется выбор "Статьи БДДС"
+    if (pFuncStBud.RunAvStBudBDSForThisTable(
+      cgiPick  // режим запуска (cgiNo, cgiPick, ...) см.GLOCONST.INC
+    , _wTable  // код таблицы
+    , _cTable  // NRec таблицы
+    , _cKau    // ссылка на статью бюджета
+    ) = 0)    // количество выбранных записей
+    { Exit; }
+  } // если требуется выбор "Статьи БДДС"
+  else if (_wKau = wKau_FpStBudBDR)
+  { // если требуется выбор "Статьи БДР"
+    if (pFuncStBud.RunAvStBudBDRForThisTable(
+      cgiPick  // режим запуска (cgiNo, cgiPick, ...) см.GLOCONST.INC
+    , _wTable  // код таблицы
+    , _cTable  // NRec таблицы
+    , _cKau    // ссылка на статью бюджета
+    ) = 0)    // количество выбранных записей
+    { Exit; }
+  } // если требуется выбор "Статьи БДР"
+
+// Отдельная обработка для ссылочного внешнего атрибута ПКП. Работает только если ПКП уже был выбран.
+// При нажатии на троеточие или F3, сразу открывает  окно с ПКП в договоре с постановкой курсора на выбранное в внешнем атрибуте ПКП.
+// Если ПКП не был выбран, сразу открывается окно выбора договора, а потом список его ПКП.
+  else if (_wKau=cgKau_CalPlan and _cKau <> 0)
+  {
+    var NewCalPlan   : comp = _cKau;
+    if (GetFirst CalPlan where ((_cKau == CalPlan.Nrec)) <> tsOk) exit; // позиционирование
+    if (RunInterface('GetCalPlan',0FFFFh,word(0),CalPlan.cDogovor,NewCalPlan) = cmDefault) _cKau :=NewCalPlan;
+    else
+    Exit;
+  }
+  else
+  { // если требуется выбор значений других аналитик
+    if (iGetKau.GetCodeKau(cgiPick, _wKau, _cKau) = 0)
+    { Exit; }
+  } // если требуется выбор значений других аналитик
+
+  Result := True;
+} // function myRunPickKAUMean
+
+// -----------------------------------------------------------------------------
+// Выбор и установка значения атрибута. Если запись в AttrVal не существует, то создается.
+// Параметры входные _wTable, _cAttrNam, _cRec - соответствующие поля в AttrVal
+// Возвращает true - если успешно
+Public Function PickValue(_wTable: word; _cAttrNam: comp; _cRec: comp): boolean;
+var
+  err : word;
+  cRecAttrVal : comp;
+{
+  result := false;
+  //OpenMessageLog('',mfDownScreenDiv2 + mfLog2Screen);
+  //WriteMessageLog(string(_wTable) +' '+ string(_cAttrNam) +' '+ string(_cRec));
+
+  cur_wTable   := _wTable;
+  cur_cRec     := _cRec;
+  cur_cAttrNam := _cAttrNam;
+
+  // в начале проверить действительно ли атрибут существует и имеет ссылочный тип
+  if (GetFirst AttrNam <> tsOk) exit;
+
+  if( AttrNam.attrType <> cgAttrType_Comp)
+  {
+    Message ('Тип атрибута должен быть ссылка.');
+    Exit;
+  }
+  //=====================================================================
+  // выбор значения для аналитики (КАУ)
+  //=====================================================================
+  if (AttrNam.rType <> cgKatKau_System)
+  {
+    // определить и запомнить старое значение
+    var wKau : word;
+    var cKau : comp;
+
+    wKau := AttrNam.rObject;
+    cKau := 0;
+    cRecAttrVal := 0;
+    if( GetFirst AttrVal = tsOk )
+    {
+      cKau := AttrVal.vComp;
+      cRecAttrVal := AttrVal.Nrec;
+    }
+#ifdef  __TPR2__
+    // Для Ярлыков нужно передать значение _wTable и _cRec
+    if (AttrNam.rType = cgKatKau_Tags)
+    {
+        var TagMarker: TPtr;
+
+        TagMarker := InitMarker('', 8, 2, 1, false);
+        // Очередность менять нельзя !!!
+        InsertMarker(TagMarker, _wTable);
+        InsertMarker(TagMarker, _cRec);
+        DoneMarker(TagMarker, 'AttrValTagsTables_' + UserName);
+    }
+#end
+    // вызвать выбор аналитики
+    var resPick: boolean;
+
+    if pPickLiquid.IsNeedRun(_wTable, _cRec, wKau, AttrNam.Name)
+      resPick := pPickLiquid.RunPickAttr(wKau, cKau);
+    else
+      resPick := myRunPickKAUMean(_wTable, _cRec, wKau, cKau);
+
+    if (not resPick)
+      exit;
+
+    // если выбрали значение аналитики
+    // чтобы записать новое выбранное значение нужно повторно перепозиционироваться
+    // т.к. вероятно, что к моменту закрытия окна выбора аналитики будет нарушена
+    // позиция (вызов sGetValue из другого окна) или атрибут окажется вставленным
+    if(cRecAttrVal <> 0)
+    {
+      err := update AttrVal
+             where ((cRecAttrVal == AttrVal.Nrec))
+             set AttrVal.vComp := cKau, AttrVal.vString := #ShowKau(wKau, cKau);
+
+      if( err <> 0 )
+      {
+        Message('Ошибка № ' + string(err) + ' обновления записи в таблице AttrVal.');
+        exit;
+      }
+    }
+    else
+    {
+      ClearBuffer(#AttrVal);
+      AttrVal.wTable   := _wTable;
+      AttrVal.cRec     := _cRec;
+      AttrVal.cAttrNam := _cAttrNam;
+      AttrVal.vComp    := cKau;
+      AttrVal.vString  := #ShowKau(wKau, cKau);
+      err := insert current AttrVal;
+
+      if( err <> 0 )
+      {
+        Message('Ошибка № ' + string(err) + ' добавления записи в таблицу AttrVal.');
+        exit;
+      }
+    }
+    result := true;
+  }
+  //=====================================================================
+  // выбор значения для других таблиц
+  //=====================================================================
+  else
+  {
+    // новое значение нужно обязательно вставить перед перед вызовом точки расширения
+    if( GetFirst AttrVal <> tsOk )
+    {
+      ClearBuffer(#AttrVal);
+      AttrVal.wTable   := _wTable;
+      AttrVal.cRec     := _cRec;
+      AttrVal.cAttrNam := _cAttrNam;
+      err := insert current AttrVal;
+
+      if( err <> 0 )
+      {
+        Message('Ошибка № ' + string(err) + ' добавления записи в таблицу AttrVal.');
+        exit;
+      }
+    }
+
+    // запомнить т.к. после точки расширения позиция может сбиться
+    var wCodeTable : word;
+    wCodeTable := AttrNam.rObject;
+
+    // если настройка типа comp создана в коде, то связи с интерфейсом выбора нет
+    if (wCodeTable = 0)
+      Exit;
+
+    // точка расширения - выбор из таблиц не аналитики
+    // если результат вызова точки расширения TRUE - означает, что в обработчиках не было
+    // найдено интерфейса выбора для таблицы с кодом wCodeTable
+    var bNotExistInterfaceChoice : boolean;
+    bNotExistInterfaceChoice := epPickTableRef (wCodeTable, AttrVal.nRec);
+    if (bNotExistInterfaceChoice)
+    {
+      // если не найдена таблица (ошибочно указана), то выдается сообщение об отсутствии таблицы
+      // иначе сообщение о отсутствии интерфейса выбора
+      if( GetFirst x$files where ((wCodeTable == x$files.xf$code)) <> tsok )
+        message ('Нет таблицы с кодом ' + string(wCodeTable) + '.');
+      else
+        message ('Для таблицы с кодом ' + string(wCodeTable) + ' нет интерфейса выбора.');
+      exit;
+    }
+
+    result := true;
+  }
+}
+
+
+// -----------------------------------------------------------------------------
+// Для показа в интерфейсе значения типа ссылка.
+// Параметры входные _wTable, _cAttrNam, _cRec - соответствующие поля в AttrVal
+// Возвращает строку - значение ссылки
+Public Function sGetValue(_wTable: word; _cAttrNam: comp; _cRec: comp): string;
+{
+  cur_wTable   := _wTable;
+  cur_cRec     := _cRec;
+  cur_cAttrNam := _cAttrNam;
+
+  if( ( GetFirst AttrNam = tsOk ) and ( GetFirst AttrVal = tsOk ) )
+  {
+    if (AttrNam.rType <> cgKatKau_System)
+      if (AttrNam.rObject=0)
+        result := string(AttrVal.vComp)
+      else
+        result := #ShowKau(AttrNam.rObject, AttrVal.vComp)
+    else
+      result := AttrVal.vString;
+  }
+  else
+    result := '';
+}
+
+end.

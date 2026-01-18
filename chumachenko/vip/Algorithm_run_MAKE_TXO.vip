@@ -31,6 +31,7 @@ from
  , KatNotes KatNotes_notok
  , KatNotes KatNotesNew
  , katsopr
+ , MbpMove
 
  , tTxoTipDoc
  , tTxoTipDoc tTxoTipDocIns
@@ -94,10 +95,14 @@ Function ConvertMNPLAN_tipDoc_to_tidkgal(_typeCpNrec : word) : word;
    tpNak532 : result := 532; // Накладная на расход сырья /по накладной на приход готовой
    tpNak600 : result := 600; // Накладная на внутреннее перемещение МЦ со склада на склад
    tpNak611 : result := 611; // Акт об излишке МЦ на складе
+       2632 : result := 632; // АПМО
        2601 : result := 601; // Накладная на передачу МЦ в ОС
        2602 : result := 602; // Накладная на передачу МЦ в спецоснастку
    tpNak626 : result := 626; // Акт на возврат оборудования и материалов
        2650 : result := 615; // Инвентаризационная опись складского учета
+       2737 : result := 19;   // Акт на списание МБП
+       2738 : result := 12;   // Ввод в эксплуатаацию МБП /спецодежды
+
     else result := 0
   end;
 }
@@ -138,10 +143,43 @@ Procedure SetKatSoprStatus; {
    }
 }
 
+Procedure SetMpbStatus; {
+   Var oldStatus   : Word;//предыдущий статус документа
+   Var oldNote     : Comp;
+   Var vidSoprLog  : Word;
+
+//   oldStatus := MpbMpve.status;
+   oldNote   := MbpMove.CRECS[5];
+   If(GetFirst FastFirstRow KatNotesNew = TsOk) then {
+//     KatSopr.status := KatNotesNew.status;
+     MbpMove.CRECS[5]  := KatNotesNew.nrec;
+    }
+   else  {
+//    KatSopr.status := 0;
+    MbpMove.CRECS[5]  := Comp(0);
+   }
+   If(Update Current MbpMove = TsOk)
+   {
+    Case(MbpMove.status)Of
+     4:{
+      vidSoprLog := 731;
+     }
+     5:
+     {
+      vidSoprLog := 733;
+     }
+    End;
+    //Функция вставки записи в историю изменения статуса документа
+    iVipStatLog.StatLog_InsNewStat(vidSoprLog, MbpMove.nrec, 0, oldNote
+      , 0, MbpMove.CRECS[5], GetNameInter+' Автоматическое изменение статуса алгоритма привязки ТХО');
+   }
+}
+
+
 Function RunInter(wflag: Word; Var pt: TRecAcc): Boolean;{
 //  logstrtofile('c:\debug\6600.log','!!!Start 6600='+TimeToStr(Cur_Time,'HH:MM:SS:SSS'));
-!  Message('strat 6600');
-!  Message('Call Algoritm_MAKE_TXO ='+pt.TypeCpNrec);
+//  Message('strat 6600');
+//  Message('Call Algoritm_MAKE_TXO ='+pt.TypeCpNrec);
   #__UNUSED__(wflag,pt)
   set nrecFormPl := pt.cFormPl;
   if getfirst FormPl <> tsOK {
@@ -159,8 +197,11 @@ Function RunInter(wflag: Word; Var pt: TRecAcc): Boolean;{
 
   var _TypeCpNrec : word = pt.TypeCpNrec;
   var _cpNrec     : comp = pt.cpNrec;
+  var _subTip     : word =0;
 
   _TypeCpNrec := ConvertMNPLAN_tipDoc_to_tidkgal(_TypeCpNrec);
+
+//  Message('Call Algoritm_MAKE_TXO step2 '+_TypeCpNrec);
 
   filltTxoTipDoc;
   if( getfirst tTxoTipDoc where tTxoTipDoc.tipdoc = _TypeCpNrec)  <> tsOK {
@@ -176,38 +217,65 @@ Function RunInter(wflag: Word; Var pt: TRecAcc): Boolean;{
      result := false;
      exit;
   }
+//  Message('Call Algoritm_MAKE_TXO step3 '+_TypeCpNrec);
 
-
+  _subTip:=0;
+  if _TypeCpNrec=12
+   _subTip:=1;
   //message('_cpNrec = '+string(_cpNrec,0,0) + ' _TypeCpNrec = '+string(_TypeCpNrec));
   var iauto_MAKE_TXO : auto_MAKE_TXO;
 //  logstrtofile('c:\debug\6600.log','_TypeCpNrec='+_TypeCpNrec+';_cpNrec='+_cpNrec+'/'+TimeToStr(Cur_Time,'HH:MM:SS:SSS'));
 
   if FormPl.RESWORD[1] = 1 then iauto_MAKE_TXO.enableLog;
-  var _resTxo : boolean = iauto_MAKE_TXO.MakeHozOper(_TypeCpNrec, _cpNrec, FormPl.RESCOMP[1]);
+  var _resTxo : boolean = iauto_MAKE_TXO.MakeHozOper(_TypeCpNrec,_subTip, _cpNrec, FormPl.RESCOMP[1]);
 //  logstrtofile('c:\debug\6600.log','end _TypeCpNrec='+_TypeCpNrec+';_cpNrec='+_cpNrec+TimeToStr(Cur_Time,'HH:MM:SS:SSS'));
   if FormPl.RESWORD[1] = 1 then processtext(iauto_MAKE_TXO.GetLogFile,vfDefault ,'лог привязки ТХО');
-
+//  logstrtofile('c:\debug\nvp.log','is restxo='+_resTxo+'|'+_TypeCpNrec);
   result := True;
 
 /*
 !!!!!!!!!!!!!!!!!
 смена статуса далее только для накладных сделана, никаких проверок нет накладная ли в обработке, так что если будет что то еще кроме накладных - меняйте соответственно
 */
-  if getfirst katsopr where ((_cpNrec == katsopr.nrec)) <> tsOK {exit;}
-  set _cToStatus := 0;
-  if _resTxo {
-    if FormPl.RESWORD[2] = 1
-    if getfirst KatNotes_ok = tsOK then set _cToStatus := KatNotes_ok.nrec;
-  }
-  else {
-    if FormPl.RESWORD[3] = 1
-    if getfirst KatNotes_notok = tsOK then set _cToStatus := KatNotes_notok.nrec;
-  }
-  if _cToStatus <> 0h {
-    SetKatSoprStatus;
-  }
+  if (_TypeCpNrec>=101 and _TypeCpNrec<=3101)
+  {
+//    logstrtofile('c:\debug\nvp.log','is 1='+FormPl.RESCOMP[2]+'|'+FormPl.RESWORD[2]);
 
+    if getfirst katsopr where ((_cpNrec == katsopr.nrec)) <> tsOK {exit;}
+    set _cToStatus := 0;
+    if _resTxo {
+      if FormPl.RESWORD[2] = 1
+      if getfirst KatNotes_ok = tsOK then set _cToStatus := KatNotes_ok.nrec;
+    }
+    else {
+      if FormPl.RESWORD[3] = 1
+      if getfirst KatNotes_notok = tsOK then set _cToStatus := KatNotes_notok.nrec;
+    }
+    if _cToStatus <> 0h {
+//      logstrtofile('c:\debug\nvp.log','is need update');
+      SetKatSoprStatus;
+    }
+  }
+  else
+   Case _TypeCpNrec of//(_TypeCpNrec>=12 and _TypeCpNrec<=20)
+     19,12:
+     {
+       if getfirst mbpmove where ((_cpNrec == mbpmove.nrec)) <> tsOK {exit;}
+       set _cToStatus := 0;
+       if _resTxo {
+         if FormPl.RESWORD[2] = 1
+         if getfirst KatNotes_ok = tsOK then set _cToStatus := KatNotes_ok.nrec;
+       }
+       else {
+        if FormPl.RESWORD[3] = 1
+        if getfirst KatNotes_notok = tsOK then set _cToStatus := KatNotes_notok.nrec;
+       }
+       if _cToStatus <> 0h {
+        SetMpbStatus;
+       }
 
+     }
+    end;
 } //Function RunInter(wflag: Word; Var pt: TRecAcc): Boolean;
 
 End.
