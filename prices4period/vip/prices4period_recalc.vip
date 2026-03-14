@@ -1,0 +1,448 @@
+#include Query.vih
+#include SaldoFuncs.vih
+#component "C_PRICES"
+
+interface Pereschet_MC 'Расчет средних цен МЦ', EscClose;
+show at (,,60,11);
+var
+FDbf:longint;
+LogFileName : string
+table struct tPrihodMC (
+   cMc : comp
+ , kol : double
+ , sum : double
+)
+with index (
+ index0 = cMc
+);
+table struct tRashodMC (
+   cMc      : comp
+ , cSpOrder : double
+ , rSrPrice : double
+)
+with index (
+ index0 = cMc
+);
+table struct tVnutrMC (
+   cMc      : comp
+ , cSpOrder : double
+ , rSrPrice : double
+)
+with index (
+ index0 = cMc
+);
+//************************ Вьюха  *************************
+create view
+ var _katmc : String
+      DatBeg
+     ,DatEnd : date
+     _file : string
+     _vibrano
+     ,_i
+     ,_izmenenoRash
+     ,_izmenenoVnutr
+     ,_izmenenoPrih
+     ,_izmenenoMontaj: longint
+     isProverka : byte
+     _tekMonth : date
+ from
+   Pick
+  ,KatMc
+  ,SpOrder SpOrder_Prih
+  ,SpOrder SpOrder_Rash
+  ,SpOrder SpOrder_Vnutr
+  ,SpOrder SpOrder_Montaj
+  ,SKLORDER SKLORDER_Vnutr
+  ,AttrNam
+  ,Attrval
+  ,SaldoMc
+  , tPrihodMC
+  , tRashodMC
+  , tVnutrMC
+ Where  ((root == tPrihodMC_loop.cmc
+
+      ))
+ ;
+Procedure MyLog(_str: string); {
+      LogStrToFile(_log,_str);
+}
+Procedure MysqlAddStr(var query_handle: longInt; add_query_str: string); {
+   sqlAddStr(query_handle, add_query_str);
+   MyLog('sql: ' + add_query_str);
+} //Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
+
+
+
+SCREEN PROJ5;
+  Fields
+   _tekMonth : ['DD/MM/YYYY'],NoProtect;
+   DatBeg : ['DD/MM/YYYY'],NOprotect;
+   DatEnd : ['DD/MM/YYYY'],NOprotect;
+   _katmc  : Protect, PickButton;
+   isProverka :NOprotect;
+
+ Buttons
+  cmNewMonth,,,'Начать обновление';
+  cmOK,,,'Начать обновление';
+  cmCancel,,,'Отмена';
+ << 'Пересчет сальдо за период по МЦ'
+
+  .@@@@@@@@@  <. Установить новый период  .>
+
+ Период с .@@@@@@@@@@ по .@@@@@@@@@@
+   МЦ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  [.] - Проверить цены `
+
+Будут пересчитаны средние цены за период по МЦ кроме:
+ - "Нормализованный инструмент"
+ - Склады "По цене прихода"
+
+ <.   Начать  .>          <.   Отмена   .>
+>>
+END;
+
+//------------------------------------------------------------------------------
+// Инициализация главного окна
+//------------------------------------------------------------------------------
+Handleevent
+cmInit:
+{
+ RunInterFace(L_SKLAD::COUNTSAL)
+ _tekMonth := dGetTuneEx  ('TEKMONTH', 1, UserId )
+// wSetTuneEx('PICK.SORTMC',1,UserID,_nastr)
+}
+cmNewMonth:
+{
+ if dGetTuneEx('TEKMONTH', 1, UserId ) > _tekMonth
+  then
+    {
+     dSetTuneEx('TEKMONTH', 1, UserId, _tekMonth)
+     Insert SaldoMc
+      set
+       dsaldo := _tekMonth
+      ;
+    }
+    else
+     {
+      Message('Новый период должен быть позже текущего')
+      _tekMonth := dGetTuneEx('TEKMONTH', 1, UserId )
+     }
+}
+cmPick:
+{
+
+  RunInterFace(L_MCU::GETSOMEMC,-12345) // -12345 : не запрашивать кол-во
+  _vibrano := 0
+   StartNewVisual(vtRotateVisual, vfTimer, 'Подсчет выбранного количества',1);
+   _loop pick
+    {
+     setVisualHeader('Подсчет выбранного количества ' + _vibrano)
+     _vibrano++
+    }
+   StopVisual('The End',vfTimer);
+   _katmc := ' выбрано ' + _vibrano
+}
+cmOK:
+{
+ StartNewVisual(vtRotateVisual, vfTimer, '',1);
+
+ LogFileName :=   'prices4period_recalc_'+DateToSTr(cur_date,'YYYYMMDD') + '_' +TimeToStr(Cur_Time,'HHMMSS')+'.log';
+_izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0
+
+ setvisualHeader()
+ delete all tPrihodMC;
+ delete all tRashodMC;
+ delete all tVnutrMC;
+ var hstr : tptr = 0;
+ mylog(hstr, '  ------------Запрос по приходным ордерам ');
+ MysqlAddStr(hstr, '  select                                                                          ');
+ MysqlAddStr(hstr, '              katmc.nrec                                                          ');
+ MysqlAddStr(hstr, '            , sum(SpOrder_Prih.KOL) as kol                                        ');
+ MysqlAddStr(hstr, '            , sum(SpOrder_Prih.RSRPRICE * SpOrder_Prih.KOL) as sum                ');
+ MysqlAddStr(hstr, '                                                                                  ');
+ MysqlAddStr(hstr, '            from katmc
+ MysqlAddStr(hstr, '            join saldtune on saldtune.nrec = #comp('+string(000100000000000Ah) + ')'); // ЦУ ЛИ
+ MysqlAddStr(hstr, '            join sporder SpOrder_Prih on SpOrder_Prih.SP = 0                       '); // склад
+ MysqlAddStr(hstr, '                                     and SpOrder_Prih.VIDORDER = 0                 '); // приходный
+ MysqlAddStr(hstr, '                                     and SpOrder_Prih.CMC = katmc.nRec             ');
+ MysqlAddStr(hstr, '                                     and SpOrder_Prih.DORD between #date(' + strtodate(datBeg,'DD,MM,YYYY')+ ') and #date(' + strtodate(DatEnd,'DD,MM,YYYY')+ ')');
+ MysqlAddStr(hstr, '                                     and SpOrder_Prih.TIPORD in (1,2)              ');  //  внешние операции и операции с производством
+ MysqlAddStr(hstr, '            join specmtr cu on cu.csaldtune = saldtune.nrec                        ');
+ MysqlAddStr(hstr, '                            and cu.COTABLE = 1110                                  ');
+ MysqlAddStr(hstr, '                            and cu.cspec = SpOrder_Prih.nrec                       ');
+ MysqlAddStr(hstr, '                            and cu.COBJ = #comp('+string(000100000000061Ch) + ')   '); // вид собственности = Собственные
+ MysqlAddStr(hstr, '            group by katmc.nrec                                                    ');
+
+  var objQuery: iQuery;
+    objQuery := queryManager.createQuery(hstr);
+  if objQuery.execute.errorCode != tsOk
+   then {
+      MyLog(_log,'Ошибка выполнения запроса '+ objQuery.errorCode);
+      }
+  else
+  {
+    sqlCopyInto(objQuery, tntPrihodMC, false);
+  }
+  hstr := 0;
+  mylog(hstr, ' ------------ Запрос по расходным ордерам          ');
+  MysqlAddStr(hstr, ' sql                                   ');
+  MysqlAddStr(hstr, ' select                                ');
+  MysqlAddStr(hstr, '   katmc.nrec  as cMc                  ');
+  MysqlAddStr(hstr, ' , SpOrder_Prih.nrec as cSpOrder       ');
+  MysqlAddStr(hstr, ' , SpOrder_Prih.RSRPRICE as rSrPrice   ');
+  MysqlAddStr(hstr, '                                       ');
+  MysqlAddStr(hstr, '                                       ');
+  MysqlAddStr(hstr, ' from katmc                            ');
+  MysqlAddStr(hstr, '            join saldtune on saldtune.nrec = #comp('+string(000100000000000Ah) + ')'); // ЦУ ЛИ
+  MysqlAddStr(hstr, ' join sporder SpOrder_Prih on SpOrder_Prih.SP = 0        ');// склад
+  MysqlAddStr(hstr, '                          and SpOrder_Prih.VIDORDER = 1  ');// расходный
+  MysqlAddStr(hstr, '                          and SpOrder_Prih.CMC = katmc.nRec ');
+  MysqlAddStr(hstr, '                          and SpOrder_Prih.DORD between #date(' + strtodate(datBeg,'DD,MM,YYYY')+ ') and #date(' + strtodate(DatEnd,'DD,MM,YYYY')+ ')');
+  MysqlAddStr(hstr, ' join specmtr cu on cu.csaldtune = saldtune.nrec            ');
+  MysqlAddStr(hstr, '                 and cu.COTABLE = 1110                      ');
+  MysqlAddStr(hstr, '                 and cu.cspec = SpOrder_Prih.nrec           ');
+  MysqlAddStr(hstr, '                            and cu.COBJ = #comp('+string(000100000000061Ch) + ')   '); // вид собственности = Собственные
+
+  var objQuery2: iQuery;
+    objQuery2 := queryManager.createQuery(hstr);
+  if objQuery2.execute.errorCode != tsOk
+   then {
+      MyLog(_log,'Ошибка выполнения запроса '+ objQuery2.errorCode);
+      }
+  else
+  {
+    sqlCopyInto(objQuery2, tRashodMC, false);
+  }
+
+
+
+  hstr := 0;
+  mylog(hstr, ' ------------ Запрос по внутренним ордерам          ');
+  MysqlAddStr(hstr, 'select                                        ');
+  MysqlAddStr(hstr, '  katmc.nrec  as cMc                          ');
+  MysqlAddStr(hstr, ', SpOrder_Vnutr.nrec as cSpOrder              ');
+  MysqlAddStr(hstr, ', SpOrder_Vnutr.RSRPRICE as rSrPrice          ');
+  MysqlAddStr(hstr, '                                              ');
+  MysqlAddStr(hstr, '                                              ');
+  MysqlAddStr(hstr, 'from katmc                                    ');
+  MysqlAddStr(hstr, '            join saldtune on saldtune.nrec = #comp('+string(000100000000000Ah) + ')'); // ЦУ ЛИ
+  MysqlAddStr(hstr, 'join sporder SpOrder_Vnutr on SpOrder_Vnutr.SP = 0           ');// склад
+  MysqlAddStr(hstr, '                         and SpOrder_Vnutr.VIDORDER = 0      ');// расходный
+  MysqlAddStr(hstr, '                         and SpOrder_Vnutr.CMC = katmc.nRec  ');
+  MysqlAddStr(hstr, '                         and SpOrder_Vnutr.DORD between #date(' + strtodate(datBeg,'DD,MM,YYYY')+ ') and #date(' + strtodate(DatEnd,'DD,MM,YYYY')+ ')');
+  MysqlAddStr(hstr, '                         and SpOrder_Vnutr.TIPORD = 3        ');// внутренние операции
+  MysqlAddStr(hstr, ' join SKLORDER SKLORDER_Vnutr on SpOrder_Vnutr.cSklOrder = SKLORDER_Vnutr.nrec');
+  MysqlAddStr(hstr, '                                                                              ');
+  MysqlAddStr(hstr, 'join specmtr cu on cu.csaldtune = saldtune.nrec                               ');
+  MysqlAddStr(hstr, '                and cu.COTABLE = 1110                                         ');
+  MysqlAddStr(hstr, '                and cu.cspec = SpOrder_Vnutr.nrec                             ');
+  MysqlAddStr(hstr, '                            and cu.COBJ = #comp('+string(000100000000061Ch) + ')   '); // вид собственности = Собственные
+  MysqlAddStr(hstr, 'where SKLORDER_Vnutr.cSopr = #comp(0h)  ');// не надо пересчитывать ручные ордера
+
+  var objQuery3 : iQuery;
+    objQuery3 := queryManager.createQuery(hstr);
+  if objQuery3.execute.errorCode != tsOk
+   then {
+      MyLog(_log,'Ошибка выполнения запроса '+ objQuery3.errorCode);
+      }
+  else
+  {
+    sqlCopyInto(objQuery3, tntVnutrMC, false);
+  }
+
+
+
+
+   InitMcInfo(Sub_Day(datBeg,1));
+ _file := GetStringParameter('Files','OutputFilesDirectory',0) + USERNAME+'_File.txt';
+deletefile( _file)
+   MyLog(_file,'Пересчет средних цен за период с ' + datBeg + ' по ' + DatEnd)
+   MyLog(_file,'  по ' + _katmc + ' МЦ')
+   MyLog(_file,'Начало ' + Cur_Time)
+
+   _i := 0
+ var _Kol , _Summa ,_Kol_pRIH , _Summa_pRIH: Double
+ var _Price : double
+ var isWas : boolean
+  _loop tPrihodMC_loop {
+     _i++
+     SetVisualHeader(SubStr(Katmc.Name,1,30)+
+                    ''#13''+ (100*_i/_vibrano) +' % выполнено')
+
+      StepMCInfo(KatMc.nRec
+              , 0h
+              , -1 //if(pPodr  = 0, -1, pPodr)
+              , -1 //if(pMOL   = 0, -1, pMOL)
+              , -1 //if(pParty = 0, -1, pParty)
+                );
+      _Kol := NalT(Sub_Day(DatBeg,1),KatMc.nRec,0h,0h,0h)
+      _Summa := AveragePrice * _Kol
+
+      _Kol_Prih   := tPrihodMC_loop.kol
+      _Summa_Prih := tPrihodMC_loop.sum
+
+      if _Kol_Prih +_Kol =0 then continue // нет остатков и прихода
+
+       _Price := (_Summa_Prih + _Summa)/ (_Kol_Prih +_Kol)
+
+/*
+       if _Price <> 0
+         then    MyLog(_file,KatMc.BarKod+', '+KatMc.Name + ' O:'+_Kol+'|'+_Summa+'|' + ' П:'+_Kol_Prih +'|'+_Summa_Prih+' Ц:' +_Price)
+*/
+      // расходные ордера
+      isWas := false
+
+      _loop SpOrder_Rash
+       {
+       if not PoCenePrihoda(SpOrder_Rash.CCPODR,AttrNam.nRec)
+          if isProverka = 1
+           {
+            if Round(_Price,2) = Round(SpOrder_rash.RSRPRICE,2)then continue
+             if not isWas
+              then
+               {
+                isWas := true
+                MyLog(_file,KatMc.Barkod +'|' +KatMc.Name+'|'+SpOrder_rash.RSRPRICE+ '|'+ _Price)
+               }
+           }
+           else
+           {
+            _izmenenoRash++
+            update Current SpOrder_rash
+             Set
+              SpOrder_rash.RSRPRICE := _Price
+             ,SpOrder_rash.SRPRICE  := Round(_Price*SpOrder_rash.kol,2)/SpOrder_rash.kol
+            ;
+           }
+       } // end _loop SpOrder_Rash Where ((  0 == SpOrder.SP
+
+       // внутреннее перемещение и транзитные
+     _loop SpOrder_Vnutr
+      {
+       if(getfirst SKLORDER_Vnutr
+         Where ((SpOrder_Vnutr.cSklOrder == SKLORDER_Vnutr.nrec))
+            and SKLORDER_Vnutr.cSopr = 0h  // не надо пересчитывать ручные ордера
+         )=tsOK then continue
+
+       if not PoCenePrihoda(SpOrder_Vnutr.CCPODR,AttrNam.nRec)
+       if isProverka = 1
+         then
+         {
+         if Round(_Price,2) = Round(SpOrder_Vnutr.RSRPRICE,2)then continue
+          if not isWas
+           then
+            {
+             isWas := true
+             MyLog(_file,KatMc.Barkod +'|' +KatMc.Name+'|'+SpOrder_Vnutr.RSRPRICE+ '|'+ _Price)
+            }
+         }
+        else
+         {
+         _izmenenoVnutr++
+          update Current SpOrder_Vnutr
+           Set
+            SpOrder_Vnutr.RSRPRICE := _Price
+           ,SpOrder_Vnutr.SRPRICE  := Round(_Price*SpOrder_Vnutr.kol,2)/SpOrder_Vnutr.kol
+          ;
+         }
+       }// end _loop SpOrder_Vnutr Where ((  0 == SpOrder.SP
+
+     _loop SpOrder_Montaj
+      {
+       if isProverka = 1
+         then
+         {
+         if Round(_Price,2) = Round(SpOrder_Montaj.RSRPRICE,2)then continue
+          if not isWas
+           then
+            {
+             isWas := true
+             MyLog(_file,KatMc.Barkod +'|' +KatMc.Name+'|'+SpOrder_Montaj.RSRPRICE+ '|'+ _Price)
+            }
+         }
+        else
+         {
+         _izmenenoMontaj++
+          update Current SpOrder_Montaj
+           Set
+            SpOrder_Montaj.RSRPRICE := _Price
+           ,SpOrder_Montaj.SRPRICE  := Round(_Price*SpOrder_Montaj.kol,2)/SpOrder_Montaj.kol
+          ;
+         }
+       }// end _loop SpOrder_Montaj Where ((  0 == SpOrder.SP
+
+     } // end _loop KatMc
+
+      DoneMcInfo;
+   MyLog(_file,'Обработано позиций ордеров: ')
+   MyLog(_file,'   - приходных по внешним операциям и операциям с производством: ' + _izmenenoPrih)
+   MyLog(_file,'   - расходных: '+_izmenenoRash)
+   MyLog(_file,'   - приходных по внутреннему перемещению: '+_izmenenoVnutr  )
+   MyLog(_file,'   - приходных по атам передачи в монтаж: '+_izmenenoMontaj  )
+   MyLog(_file,'Конец ' + Cur_Time)
+  StopVisual('The End',vfTimer);
+   ProcessText(_file,vfEscable or vfNewTitle or vfMacroSize,'Лог-файл ошибок');
+}
+
+end;
+end.
+
+//------------------------------------------------------------------------------
+// Отчеты пользователя
+//------------------------------------------------------------------------------
+
+#ifdef Gal8_5
+#Component "F_UserReport"
+#end
+ObjInterface IUserReport;
+  // Запуск отчета на вvполнение при выборе его из списка отчетов
+  procedure Run;
+  // Наименование отчета в списке
+  function GetReportName : String;
+  // Наименования групп, в которvе входит отчет
+  // +Группа n+1 делается подчиненной группе n
+  function GetGroupName (Level : Word) : String;
+  // Приоритет отчета - сортировка внутри группv вvполняется сначала
+  // по приоритету, а затем по наименовани_
+  function GetPriority : Integer;
+  // ModuleID модулей, в которvх будет виден отчет
+  // '*' - отчет будет виден в любом модуле
+  function VisibleInModule (Ind : Byte) : String;
+end;
+
+VipInterface UserReport_Pereschet_MC Implements IUserReport;
+
+Interface UserReport_Pereschet_MC
+
+create view;
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := '*';
+  end;
+end;
+function GetPriority : Integer;
+begin
+  GetPriority := 0;
+end;
+function GetGroupName (Level : Word) : String;
+begin
+  GetGroupName := '';
+  case Level of
+    1 : GetGroupName := 'Склад';
+  end;
+end;
+
+function GetReportName: String;
+begin
+  GetReportName := 'Пересчет Цен МЦ'
+end;
+!-------------------------------------------------------------------------------
+procedure Run;
+begin
+  runinterface(VOMZ::Pereschet_MC);
+end;
+!-------------------------------------------------------------------------------
+end.
