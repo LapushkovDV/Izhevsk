@@ -1,0 +1,428 @@
+/*************************************************************************************************\
+  Наименование: Заполнение позиции спецификации накладной(рекл) ЦелУчетом из позиции 
+                прих ордера первчиного прихода
+  Контур/Модуль: КОУ
+  Примечание:
+  Вид работы  |Номер           |Дата    |Исполнитель              |Проект
+  -----------------------------------------------------------------------------------------------
+  Разработка  |#5856           |16/01/20|Шунин А.Г.               |НПО Энергомаш
+\*************************************************************************************************/
+
+#include GP_DKZDateFUNS.vih
+#component "GP_Logistics"
+
+Interface GP_DKZDateFUNS;
+
+  Create view vDZ1
+  var pcKatsopr, pcCalPlan , pcPlPor: comp;
+  as select Katsopr.Dopr
+   from
+   Katsopr,
+   Katsopr KatsoprSyn,
+   CalPlan,
+   CalPlan PredPlan,
+   CalPlan CalPlan_F,
+   PlPor,
+   PaySchem,
+   BaseFin,
+   BaseFin BaseFinSyn,
+   PlanPays,
+   BaseFin BaseFinFind,
+   PlPor PlPorFind
+   Where
+   ((
+      pcKatsopr == Katsopr.nRec
+      and pcCalPlan  == CalPlan.nRec
+      and CalPlan.cPredPlan == PredPlan.nRec
+      and pcPlPor == BASEFIN.cPlPor and BASEFIN.CSOPRHOZ == SOPRHOZ.nRec
+
+      and pcCalPlan == BaseFinFind.cKatSopr
+      and BaseFinFind.cSoprDoc == PlPorFind.Nrec
+
+      //схема платежей по товарным ПКП
+      and CalPlan.Nrec       == PaySchem.cMCPlan
+      and PaySchem.cPlanPays == PlanPays.nRec
+      and PlanPays.cCalPlan  == CalPlan_F.Nrec
+
+
+   ))
+  ;
+
+
+/*
+ L_Dogovor\vip\CalPlan\CalPlan.vip
+
+, if ( CalPlan.TermDefBy = 0, DateToStr(CalPlan.dFrom, 'DD/MM/YYYY')+'...'+DateToStr(CalPlan.dTo, 'DD/MM/YYYY'),
+    'в течение '+string(CalPlan.nDays)+' дней после №'+PredPlan.NoDoc)
+    ( FieldName = period )
+
+*/
+Function GetDebDprPKP(pCalPlan: comp): date; // Дата возникновения просроченной ДЗ у ПКП
+{
+  result := ZeroDate;
+  pcCalPlan := pCalPlan;
+  _Loop CalPlan
+  {
+    if CalPlan.TermDefBy = 0 // аванс
+    { result := CalPlan.dTo
+    }
+    else
+    {
+      var wnDays: word = CalPlan.nDays;
+      var dPredPKP: date = GetDebDprPKP(CalPlan.cPredPlan);
+      if dPredPKP <> zeroDate
+       result := Add_Day(dPredPKP, wnDays);
+    }
+  }
+}// GetDebDprPKP
+Function GetDebDprPKP_ex1(pCalPlanTov, pCalPlanFin: comp): date; // Дата возникновения просроченной ДЗ у ПКП
+{
+  result := ZeroDate;
+  pcCalPlan := pCalPlanFin;
+  if GetFirst CalPlan = tsOk
+  {
+    //Если фин.операция по платежному документу связана с ФинПКП с видом платежей <авансовый>:
+    if CalPlan.TermDefBy = 0 // аванс
+    {
+      pcCalPlan := pCalPlanTov;
+      if GetFirst CalPlan = tsOk
+      {
+        if CalPlan.TermDefBy = 0 // Значение поля <в период по> Товарного ПКП связанного с ФинПКП (аванс)
+          result := CalPlan.dTo;
+        else
+        {
+          //количество N дней, заданное в ТовПКП в поле <в течение N дней после выполнения ФинПКП (аванс)>
+          var wnDays: word = CalPlan.nDays;
+
+          //Наибольшая дата в значении поля <Оплачен> платежных документов, связанных с ФинПКП (аванс)
+          var MaxOplDate : date = ZeroDate;
+
+
+          if getfirst PredPlan = tsok
+          if PredPlan.TermDefBy = 0 //
+          {
+            if PredPlan.DirectPlat > 0 // Предыдущий ПКП - финансовый
+            {
+
+              pcCalPlan := pCalPlanFin;
+              _loop BaseFinFind
+                _loop PlPorFind
+                {
+                  if MaxOplDate = ZeroDate
+                    MaxOplDate:= PlPorFind.DatOb;
+                  if PlPorFind.DatOb > MaxOplDate
+                    MaxOplDate := PlPorFind.DatOb
+                }
+            }
+            else // Предыдущий ПКП - товарный
+            {
+              _Loop Katsopr where (( pcCalPlan == Katsopr.CCALPLAN))
+              {
+                if MaxOplDate = ZeroDate
+                  MaxOplDate:= Katsopr.DOPR;
+
+                if MaxOplDate < Katsopr.DOPR
+                  MaxOplDate := Katsopr.DOPR;
+              }
+            }
+
+            if MaxOplDate <> ZeroDate
+              result := Add_Day(MaxOplDate, wnDays);
+          }
+        }
+      }
+
+    }
+  }
+}// GetDebDprPKP_ex1
+
+
+public Function GetDebDprKatsopr(pKatsopr: comp): date; // Дата возникновения просроченной ДЗ у акта/накладной по товарному ПКП и всем его связями
+{
+  result := ZeroDate;
+  pcKatsopr := pKatsopr;
+  _Loop Katsopr
+   result := GetDebDprPKP(Katsopr.cCalPlan);
+}
+
+Function GetDebD0PKP(pCalPlan: comp): date; // Дата возникновения просроченной ДЗ у ПКП
+{
+  result := ZeroDate;
+  pcCalPlan := pCalPlan;
+  _Loop CalPlan
+  {
+    if CalPlan.TermDefBy = 0 //
+    { result := CalPlan.dFrom
+    }
+    else
+    {
+      result := GetDebD0PKP(CalPlan.cPredPlan);
+    }
+  }
+}// GetDebD0PKP
+public Function GetDebD0Katsopr(pKatsopr: comp): date; // Дата возникновения просроченной ДЗ у акта/накладной по товарному ПКП и всем его связями
+{
+  result := ZeroDate;
+  pcKatsopr := pKatsopr;
+  _Loop Katsopr
+   result := GetDebD0PKP(Katsopr.cCalPlan);
+}
+public Function GetDebDprPlPor(pPlPor: comp): date; // Дата возникновения просроченной ДЗ у PlPOR по финансовому ПКП и всем его связями
+{
+  result := ZeroDate;
+  pcPlPor := pPlPor;
+  _Loop Basefin
+  _Loop SoprHOZ
+  {
+    result := GetDebDprPKP(SoprHOZ.CFINPLAN);
+    exit;
+  }
+}
+
+public Function GetDebD0PlPor(pPlPor: comp): date; // Дата возникновения ДЗ у PlPOR по финансовому ПКП и всем его связями
+{
+  result := ZeroDate;
+  pcPlPor := pPlPor;
+  _Loop Basefin
+  _Loop SoprHOZ
+  {
+    result := GetDebD0PKP(SoprHOZ.CFINPLAN);
+    exit;
+  }
+}
+
+public Function GetMCPKP(pCalPlan: comp): comp; // даёт товарный ПКП.
+{
+  result := Comp(0);
+  pcCalPlan := pCalPlan;
+  _Loop CalPlan
+  {
+    if CalPlan.DirectMC > 0
+      result := CalPlan.nrec
+    else // это не товарный ПКП
+    {
+      if CalPlan.CPREDPLAN <> 0
+        result := GetMCPKP(CalPlan.CPREDPLAN)
+      else
+        if getfirst CalPlan where (( pcCalPlan == CalPlan.CPREDPLAN)) = tsOK
+          result := GetMCPKP(CalPlan.nRec);
+    }
+    break;
+  }
+} // Function GetMCPKP
+public Function GetFinPKP(pCalPlan: comp): comp; // даёт финансовый ПКП. Eсли Аванс-поставка-оплата то по ТовПКП выдаст ФинПКП аванса
+{
+  result := Comp(0);
+  pcCalPlan := pCalPlan;
+  _Loop CalPlan
+  {
+    if CalPlan.DirectPlat > 0
+      result := CalPlan.nrec
+    else // это не финансовый ПКП
+    {
+      if CalPlan.CPREDPLAN <> 0
+        result := GetFinPKP(CalPlan.CPREDPLAN)
+      else
+        if getfirst CalPlan where (( pcCalPlan == CalPlan.CPREDPLAN)) = tsOK
+          result := GetFinPKP(CalPlan.nRec);
+    }
+    break;
+  }
+} // Function GetFinPKP
+
+public Function GetLastKsDoprByPKP(pCalPlan: comp; var pDopr:date): boolean; // наибольшая Дата проведения накладной по товарному ПКП
+{
+  result := false;
+  pcCalPlan := GetMCPKP(pCalPlan);
+  _Loop CalPlan
+  {
+      var dOprLast: Date = ZeroDate;
+      _Loop KatsoprSyn where (( pcCalPlan == KatsoprSyn.CCALPLAN))
+      {
+        if dOprLast < KatsoprSyn.DOPR
+          dOprLast := KatsoprSyn.DOPR;
+      }
+      result := dOprLast > ZeroDate;
+      /*if dOprLast = ZeroDate
+      _Loop Katsopr where (( CalPlan.cDOGOVOR == Katsopr.cDOGOVOR and CalPlan.CAPPDOGOVOR == Katsopr.CAPPDOGOVOR ))
+      {
+        if dOprLast < Katsopr.DOPR
+          dOprLast := Katsopr.DOPR;
+      }
+      */
+    break;
+  }
+}   //  Function GetLastKsDoprByPKP
+function GetLastPLPOR(pCaLPLAN, pStepDOC: comp; pDate:date):date;
+{
+  result := ZeroDate;
+  if getlast BaseFinSyn where ((0 == BaseFinSyn.TIDKBASE and pStepDOC == BaseFinSyn.cStepDOC and pDate >> BaseFinSyn.DDOC)) = tsOK
+  {
+      result := BaseFinSyn.DDOC;
+  }
+  else
+  if getlast BaseFinSyn where ((0 == BaseFinSyn.TIDKBASE and pStepDOC == BaseFinSyn.cStepDOC)) = tsOK
+  {
+      result := BaseFinSyn.DDOC;
+  }
+}// function GetLastPLPOR
+function GetLastKatsopr(pCaLPLAN, pStepDOC: comp; pDate:date):date;
+{
+  result := ZeroDate;
+  var i: longint =0;
+  _Loop KatsoprSyn where (( pStepDOC == KatsoprSyn.cStepDOC and ( pCaLPLAN = KatsoprSyn.CCALPLAN and KatsoprSyn.DOPR > ZeroDate and KatsoprSyn.DOPR < pDate) ))
+  {
+    i++;
+    if result < KatsoprSyn.DOPR result := KatsoprSyn.DOPR;
+  }
+
+  if i = 0
+  _Loop KatsoprSyn where (( pCaLPLAN == KatsoprSyn.CCALPLAN and (KatsoprSyn.DOPR > ZeroDate and KatsoprSyn.DOPR < pDate) ))
+  {
+    i++;
+    if result < KatsoprSyn.DOPR result := KatsoprSyn.DOPR;
+  }
+}// function GetLastKatsopr
+
+public Function GetDebDprKatsoprEx(pKatsopr: comp): date; // Дата возникновения просроченной ДЗ у акта/накладной по товарному ПКП и всем его связями
+{
+  var cMCPKP, cFinPKP:comp;
+  result := ZeroDate;
+  pcKatsopr := pKatsopr;
+  _Loop Katsopr
+  {
+    cMCPKP := pcCalPlan := GetMCPKP(Katsopr.cCalPlan); // в 99% это будет тот-же Katsopr.cCalPlan
+    if getfirst CalPlan = tsok
+    {
+        if CalPlan.TermDefBy = 0 //
+        { result := CalPlan.dTO
+        }
+        else
+        {
+          var wNDaystmp: word = CalPlan.nDays;
+          var dOprtmp: Date;//  = Katsopr.DOPR;
+
+          pcCalPlan := CalPlan.cPredPlan;
+          if getfirst CalPlan = tsok
+          if CalPlan.TermDefBy = 0 //
+          {
+//             dOprtmp := CalPlan.dTO; // не выводить Дату если не было авансового платежа
+
+             if CalPlan.DirectPlat > 0 // Предыдущий ПКП - финансовый
+             {
+
+               var Dtmp: Date = GetLastPLPOR(CalPlan.nRec, Katsopr.CSTEPDOC, if(Katsopr.DOPR<>ZeroDate,Katsopr.DOPR,Katsopr.DSOPR) );
+                if Dtmp <> ZeroDate
+                  dOprtmp := Dtmp;
+
+             }
+             else // Предыдущий ПКП - товарный
+             {
+               var Dtmp: Date = GetLastKatsopr(CalPlan.nRec, Katsopr.CSTEPDOC, if(Katsopr.DOPR<>ZeroDate,Katsopr.DOPR,Katsopr.DSOPR) );
+                if Dtmp <> ZeroDate
+                  dOprtmp := Dtmp;
+
+             }
+
+             if dOprtmp <> ZeroDate
+               result := Add_Day(dOprtmp, wNDaystmp);
+          }
+        }
+    }
+    break;
+  }
+} // public Function GetDebDprKatsoprEx
+public Function GetDebDprKatsoprEx_1(pKatsopr: comp): date; // Дата возникновения просроченной ДЗ у акта/накладной по товарному ПКП и всем его связями
+{
+  var cMCPKP, cFinPKP:comp;
+  var wnDays : word = 0;
+  result := ZeroDate;
+
+  pcKatsopr := pKatsopr;
+  if GetFirst Katsopr = tsOk
+  {
+    pcCalPlan := Katsopr.cCalPlan;
+
+    var bIsFactExist : boolean = false;
+    _loop CalPlan
+      _loop PaySchem
+        _loop PlanPays
+          _loop CalPlan_F
+          {
+            if CalPlan_F.TermDefBy = 1
+            {
+              bIsFactExist := true;
+              wnDays := CalPlan_F.nDays;
+              break;
+            }
+
+          }
+    if bIsFactExist
+      Result := Add_Day(Katsopr.dOpr, wnDays)
+    else
+      Result := Add_Day(Katsopr.DOPR,14);
+  }
+} // public Function GetDebDprKatsoprEx_1
+
+
+public Function GetDebDprPlPOREx(pPlPor: comp; pKatSopr : comp): date; // Дата возникновения просроченной ДЗ у Платежа по финансовому ПКП и всем его связями с документами
+{
+  var cMCPKP, cFinPKP:comp;
+  result := ZeroDate;
+  pcPlPor := pPlPor;
+
+  _Loop Basefin
+  _Loop SoprHOZ
+  {
+    cFinPKP := pcCalPlan := GetFinPKP(SoprHOZ.CFINPLAN); // в 99% это будет тот-же SoprHOZ.CFINPLAN
+    if getfirst CalPlan = tsok
+    {
+        if CalPlan.TermDefBy = 0 // аванс
+        { result := CalPlan.dTO
+        }
+        else
+        {
+          var wNDaystmp: word = CalPlan.nDays;
+          var dOprtmp: Date;//  = Katsopr.DOPR;
+
+          pcCalPlan := CalPlan.cPredPlan;
+          if getfirst CalPlan = tsok
+          if CalPlan.TermDefBy = 0 //
+          {
+//             dOprtmp := CalPlan.dTO; // не выводить Дату если не было авансового платежа
+
+             if CalPlan.DirectPlat > 0 // Предыдущий ПКП - финансовый
+             {
+
+               var Dtmp: Date = GetLastPLPOR(CalPlan.nRec, Basefin.CSTEPDOC, Basefin.DDOC);
+                if Dtmp <> ZeroDate
+                  dOprtmp := Dtmp;
+
+             }
+             else // Предыдущий ПКП - товарный
+             {
+               var Dtmp: date = ZeroDate;
+               if pKatSopr <> 0
+                 if GetFirst KatSoprSyn where ((pKatSopr == KatSoprSyn.Nrec)) = tsOk
+                 {
+                   Dtmp := KatsoprSyn.DOPR;
+                   dOprtmp := Dtmp;
+                 }
+
+               if Dtmp = ZeroDate
+                 Dtmp := GetLastKatsopr(CalPlan.nRec, Basefin.CSTEPDOC, Basefin.DDOC);
+                  if Dtmp <> ZeroDate
+                    dOprtmp := Dtmp;
+
+             }
+
+             if dOprtmp <> ZeroDate
+               result := Add_Day(dOprtmp, wNDaystmp);
+          }
+        }
+    }
+    break;
+  }
+} // public Function GetDebDprKatsoprEx
+
+end.
