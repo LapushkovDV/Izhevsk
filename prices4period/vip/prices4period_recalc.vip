@@ -84,6 +84,7 @@ as select
   , KatSopr KatSopr_br
   , tTempMC
   , tTempMC tTempMC_br
+  , tTempMC tTempMC_func
   , tMoveMC
   , tMoveMC tMoveMC_loop
  Where ((
@@ -108,6 +109,7 @@ Procedure MysqlAddStr(var query_handle : tptr; add_query_str: string); {
 } //Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
 
 function FillMCFiltrTable : boolean; {
+  result := true;
   if getfirst pick where ((cgPick_MC == Pick.wList)) <> tsok then exit;
  setvisualHeader('Заполнение таблицы-фильтра по ТМЦ');
   result := false;
@@ -132,6 +134,12 @@ function FillMCFiltrTable : boolean; {
         sqlExecDirect(_sqlstr);
         //mylog('sql :' + _sqlstr);
    }
+  }
+}
+function PricePlanRecalc(_cMc : comp) : double; cacheable;{
+  result := 0;
+  if getfirst tTempMC_func where ((_cMc == tTempMC_func.cmc)) = tsOK {
+     result := (tTempMC_func.sum_ost + tTempMC_func.sum_prihod) / (tTempMC_func.kol_ost + tTempMC_func.kol_prihod);
   }
 }
 
@@ -189,6 +197,7 @@ fields
   KatParty.Name  'Партия', 'наименование' : [15], Protect;
   SPO_BR.Kol    'Количество' (, , sci134EnEsc) : [12], [prSignsInKol, '\3p[|-]36`666`666`666`666.888'], NoAutoSize, EditButton, { Font = {Color = ColorVidOrder}};
   SPO_BR.rSrPrice 'Цена' : [17], [brForSpOrder_Price, '\2p[|-]36`666`666`666`666.88'], NoAutoSize;
+  PricePlanRecalc(MC_br.nrec) 'Цена','после пересчета' : [17], [brForSpOrder_Price, '\2p[|-]36`666`666`666`666.88'], NoAutoSize;
 end;
 end;
 
@@ -210,11 +219,13 @@ end;
 // Инициализация главного окна
 //------------------------------------------------------------------------------
 Handleevent
-cmInit:
-{
+cmInit: {
  //RunInterFace(L_SKLAD::COUNTSAL);
- _tekMonth := dGetTuneEx  ('TEKMONTH', 1, UserId )
+ _tekMonth := dGetTuneEx  ('TEKMONTH', 1, UserId );
  delete pick where ((cgPick_MC == Pick.wList));
+ _katmc := '--все МЦ--';
+  ReadMyDsk(DatBeg,'prices4period_recalc_DatBeg',false);
+  ReadMyDsk(DatEnd,'prices4period_recalc_DatEnd',false);
 // wSetTuneEx('PICK.SORTMC',1,UserID,_nastr)
 }
 cmNewMonth:
@@ -230,6 +241,14 @@ cmNewMonth:
       Message('Новый период должен быть позже текущего');
       _tekMonth := dGetTuneEx('TEKMONTH', 1, UserId )
      }
+}
+cmDelOnProtect:{
+ case curfield of
+  #_katmc : {
+      delete pick where ((cgPick_MC == Pick.wList));
+      _katmc := '--все МЦ--';
+   }
+ end;
 }
 cmPick:
 {
@@ -253,6 +272,11 @@ cmOK:
    stop; abort; exit;
  }
 */
+
+
+  SaveMyDsk(DatBeg,'prices4period_recalc_DatBeg');
+  SaveMyDsk(DatEnd,'prices4period_recalc_DatEnd');
+
 
  if DatBeg = to_date(0,0,0) {
    message('Дата начала расчета не может быть пустой', error);
@@ -306,7 +330,7 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
   if getfirst pick where ((cgPick_MC == Pick.wList)) = tsok then MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
   MysqlAddStr(hstr, ' union all                                                                             ');
   MysqlAddStr(hstr, '  select                                                                               ');
-  MysqlAddStr(hstr, '      katmc.nrec                                                               ');
+  MysqlAddStr(hstr, '      katmc.nrec  as cMc                                                       ');
   MysqlAddStr(hstr, '    , SpOrder_Prih.nrec as cSpOrder                                            ');
   MysqlAddStr(hstr, '            from katmc                                                                 ');
   MysqlAddStr(hstr, '            join saldtune on saldtune.nrec = #comp('+string(000100000000000Ah,0,0) + ')'); // ЦУ ЛИ
@@ -337,7 +361,7 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
   MysqlAddStr(hstr, '                 and cu.COTABLE = 1112                                                ');
   MysqlAddStr(hstr, '                 and cu.cspec = SpOrder_Vnutr.nrec                                    ');
   MysqlAddStr(hstr, '                             and cu.COBJ = #comp('+string(000100000000061Ch,0,0)+')'); // вид собственности = Собственные
-  MysqlAddStr(hstr, ' where SKLORDER_Vnutr.cSopr = #comp(0h)                                               ');
+  MysqlAddStr(hstr, ' where SKLORDER_Vnutr.cSopr <> #comp(0h)                                               '); //не надо ручные пересчитывать
   if getfirst pick where ((cgPick_MC == Pick.wList)) = tsok then MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
 //  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)
 
@@ -345,11 +369,22 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
     objQuery3 := queryManager.createQuery(hstr);
   if objQuery3.execute.errorCode != tsOk
    then {
-      MyLog('Ошибка выполнения запроса '+ objQuery3.errorCode);
+        MyLog('Ошибка выполнения запроса '+ objQuery3.errorCode);
       }
   else {
-    sqlCopyInto(objQuery3, tntMoveMC, false);
-  }
+    //sqlCopyInto(objQuery3, tntMoveMC, false);
+      var _resSet : IResultSet = objQuery3.getResultSet;
+      if _resSet.getFirst <> tsOK
+      MyLog('результат запроса пустой ');
+      while true {
+         insert tMoveMC set
+            tMoveMC.cMc     := _resSet.row.val('cMc')
+          , tMoveMC.cSpOrder := _resSet.row.val('cSpOrder')
+         ;
+        mylog('insert tMoveMC cMc := ' + string(tMoveMC.cMc,0,0) + ' cSpOrder =' + string(tMoveMC.cSpOrder,0,0));
+        if _resSet.getNext() <> tsOK then break;
+      }
+   }
   mylog('  выбрано записей '+ string(recordsintable(tntMoveMC)));
 
   setvisualHeader('Расчет сальдо на начало периода');
@@ -403,6 +438,9 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
      , tTempMC.cSporder := SpOrder_loop.nrec
     ;
   }
+
+
+
   stopvisual;
   StopVisual;
  runwindowmodal(winBrowseMC);
@@ -474,8 +512,9 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
    MyLog('   - расходных: '+_izmenenoRash) ;
    MyLog('   - приходных по внутреннему перемещению: '+_izmenenoVnutr  );
    MyLog('Конец ' + Cur_Time);
-*/
+
   StopVisual('The End',vfTimer);
+*/
    ProcessText(_log,vfEscable or vfNewTitle or vfMacroSize,'Лог-файл ошибок');
 }
 
