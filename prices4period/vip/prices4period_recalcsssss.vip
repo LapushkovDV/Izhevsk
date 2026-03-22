@@ -1,0 +1,460 @@
+#include Query.vih
+#include SaldoFuncs.vih
+
+#component "L_SaldoMTR"
+
+interface prices4period_recalc 'Расчет средних цен МЦ', EscClose;
+show at (,,60,11);
+
+table struct tTempMC (
+   nRec     : comp
+ , cRec     : comp
+ , cMc      : comp
+ , kol_ost  : double
+ , sum_ost  : double
+ , cSpOrder : comp
+)
+with index (
+ ind0 = Nrec
+);
+table struct ostatkigrouptmc (
+   cMc : comp
+ , kol : double
+ , sum : Double
+) with index (
+ index0 = cMc
+);
+table struct tMoveMC (
+   cMc      : comp
+ , cSpOrder : comp
+)
+with index (
+ index0 = cMc
+);
+table struct tRashodMC (
+   cMc      : comp
+ , cSpOrder : comp
+)
+with index (
+ index0 = cMc
+);
+table struct tVnutrMC (
+   cMc      : comp
+ , cSpOrder : comp
+)
+with index (
+ index0 = cMc
+);
+//************************ Вьюха  *************************
+create view
+ var
+     iSaldoFun : SaldoFuncs;
+       DatBeg
+     , DatEnd : date;
+       _katmc
+     , _log : string;
+       _vibrano
+     , _i
+     , _izmenenoRash
+     , _izmenenoVnutr
+     , _izmenenoPrih
+     , _izmenenoMontaj : longint;
+     isProverka : byte;
+     _tekMonth : date;
+ from
+   Pick
+  ,KatMc
+  ,SpOrder SpOrder_Rash
+  ,SpOrder SpOrder_Vnutr
+  , SaldoMc
+  , tmpSaldo1
+  , tPrihodMC
+  , tRashodMC
+  , tVnutrMC
+  , ostatkigrouptmc
+ Where  ((           root == tPrihodMC.cmc
+        and tPrihodMC.cMc == katmc.nrec
+        and tPrihodMC.cmc == ostatkigrouptmc.cMc
+      ))
+ ;
+Procedure MyLog(_str: string); {
+  LogStrToFile(_log,DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS')  + ':'+_str);
+}
+Procedure MysqlAddStr(var query_handle : tptr; add_query_str: string); {
+   sqlAddStr(query_handle, add_query_str);
+   MyLog('sql: ' + add_query_str);
+} //Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
+
+function FillMCFiltrTable : boolean; {
+ setvisualHeader('Заполнение таблицы-фильтра по ТМЦ');
+  result := false;
+  var strID : tptr;  strID   := 0;
+  sqlFreeStr(strID);
+  strID:=0;
+  sqlAddStr(strID, 'table tblFiltrTMC_RECACL');
+  sqlAddStr(strID, '(                  ');
+  sqlAddStr(strID, ' cMc: comp        ');
+  sqlAddStr(strID, ')                  ');
+  sqlAddStr(strID, 'with index         ');
+  sqlAddStr(strID, '(                  ');
+  sqlAddStr(strID, ' a0 = cMc         ');
+  sqlAddStr(strID, ');                 ');
+  sqlDropTmpTable('tblFiltrTMC_RECACL');
+  if sqlCreateTmpTable(strID, ctmNormal) = tsOk {
+    result := true;
+  }
+  if result {
+  _loop pick where ((cgPick_MC == Pick.wList)) {
+        var _sqlstr : string =   'INSERT INTO tblFiltrTMC_RECACL (cMc) VALUES (' + ' #comp(' + string(Pick.cRec) + '))';
+        sqlExecDirect(_sqlstr);
+        //mylog('sql :' + _sqlstr);
+   }
+  }
+}
+
+SCREEN PROJ5;
+  Fields
+   _tekMonth : ['DD/MM/YYYY'],NoProtect;
+   DatBeg : ['DD/MM/YYYY'],NOprotect;
+   DatEnd : ['DD/MM/YYYY'],NOprotect;
+   _katmc  : Protect, PickButton;
+   isProverka :NOprotect;
+
+ Buttons
+  cmNewMonth,,,'Начать обновление';
+  cmOK,,,'Начать обновление';
+  cmCancel,,,'Отмена';
+ << 'Пересчет сальдо за период по МЦ'
+
+  .@@@@@@@@@  <. Установить новый период  .>
+
+ Период с .@@@@@@@@@@ по .@@@@@@@@@@
+   МЦ .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+  [.] - Проверить цены `
+
+Будут пересчитаны средние цены за период
+
+ <.   Начать  .>          <.   Отмена   .>
+>>
+END;
+
+//------------------------------------------------------------------------------
+// Инициализация главного окна
+//------------------------------------------------------------------------------
+Handleevent
+cmInit:
+{
+ //RunInterFace(L_SKLAD::COUNTSAL);
+ _tekMonth := dGetTuneEx  ('TEKMONTH', 1, UserId )
+// wSetTuneEx('PICK.SORTMC',1,UserID,_nastr)
+}
+cmNewMonth:
+{
+ if dGetTuneEx('TEKMONTH', 1, UserId ) > _tekMonth
+  then
+    {
+     dSetTuneEx('TEKMONTH', 1, UserId, _tekMonth);
+     Insert SaldoMc set dsaldo := _tekMonth;
+    }
+    else
+     {
+      Message('Новый период должен быть позже текущего');
+      _tekMonth := dGetTuneEx('TEKMONTH', 1, UserId )
+     }
+}
+cmPick:
+{
+
+  RunInterFace(L_MCU::GETSOMEMC,-12345); // -12345 : не запрашивать кол-во
+  _vibrano := 0;
+   StartNewVisual(vtRotateVisual, vfTimer, 'Подсчет выбранного количества',1);
+   _loop pick where ((cgPick_MC == Pick.wList)){
+     setVisualHeader('Подсчет выбранного количества ' + _vibrano);
+     _vibrano++
+    }
+   StopVisual('The End',vfTimer);
+   _katmc := ' выбрано ' + _vibrano
+}
+cmOK:
+{
+ if getfirst pick where ((cgPick_MC == Pick.wList)) <> tsok {
+   message('Не выбраны ТМЦ', error);
+   stop; abort; exit;
+ }
+
+
+ if getfirst pick where ((cgPick_MC == Pick.wList)) <> tsok {
+   message('Не выбраны ТМЦ', error);
+   stop; abort; exit;
+ }
+ if DatBeg = to_date(0,0,0) {
+   message('Дата начала расчета не может быть пустой', error);
+   stop; abort; exit;
+ }
+ if DatEnd = to_date(0,0,0) {
+   message('Дата окончания расчета не может быть пустой', error);
+   stop; abort; exit;
+ }
+ if DatBeg > DatEnd {
+   message('Дата начала расчета не может быть больше даты окончания пустой', error);
+   stop; abort; exit;
+ }
+
+
+ StartNewVisual(vtRotateVisual, vfTimer, '',1);
+   MyLog('Пересчет средних цен за период с ' + datetostr(datBeg,'DD.MM.YYYY') + ' по ' + datetostr(DatEnd,'DD.MM.YYYY'));
+   MyLog('  по ' + _katmc + ' МЦ');
+   MyLog('Начало ' + Cur_Time);
+
+ _log := GetStringParameter('Files','OutputFilesDirectory',0) + '\prices4period_recalc'+'_'+DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS-SSS')+'.txt';
+
+_izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
+
+ if not FillMCFiltrTable then {
+   message('Не удалось заполнить временную таблицу-фильтр по ТМЦ', error)
+  }
+
+ setvisualHeader('Запрос по приходным ордерам');
+ delete all tPrihodMC;
+ delete all tRashodMC;
+ delete all tVnutrMC;
+  var hstr : tptr = 0;
+  setvisualHeader('Запрос по расходным ордерам');
+  hstr := 0;
+  mylog(' ------------ Запрос по расходным ордерам          ');
+  MysqlAddStr(hstr, '   select
+  MysqlAddStr(hstr, '     katmc.nrec  as cMc
+  MysqlAddStr(hstr, '   , SpOrder_Rash.nrec as cSpOrder
+  MysqlAddStr(hstr, '   , SpOrder_Rash.RSRPRICE as rSrPrice
+  MysqlAddStr(hstr, '   from katmc
+  MysqlAddStr(hstr, '              join saldtune on saldtune.nrec = #comp(000100000000000Ah) // ЦУ ЛИ
+  MysqlAddStr(hstr, '   join sporder SpOrder_Rash on SpOrder_Rash.SP = 0
+  MysqlAddStr(hstr, '                            and SpOrder_Rash.VIDORDER = 1
+  MysqlAddStr(hstr, '                            and SpOrder_Rash.CMC = katmc.nRec
+  MysqlAddStr(hstr, '                            and SpOrder_Rash.DORD between #date(01,06,2025) and #date(30,06,2025)
+  MysqlAddStr(hstr, '   join specmtr cu on cu.csaldtune = saldtune.nrec
+  MysqlAddStr(hstr, '                   and cu.COTABLE = 1112
+  MysqlAddStr(hstr, '                   and cu.cspec = SpOrder_Rash.nrec
+  MysqlAddStr(hstr, '                              and cu.COBJ = #comp(000100000000061Ch) // вид собственности = Собственные
+  MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
+  MysqlAddStr(hstr, ' union all
+  MysqlAddStr(hstr, '  select
+  MysqlAddStr(hstr, '              katmc.nrec
+  MysqlAddStr(hstr, '            , SpOrder_Prih.nrec as cSpOrder
+  MysqlAddStr(hstr, '            , SpOrder_Prih.RSRPRICE as rSrPrice
+  MysqlAddStr(hstr, '            from katmc
+  MysqlAddStr(hstr, '            join saldtune on saldtune.nrec = #comp(000100000000000Ah) // ЦУ ЛИ
+  MysqlAddStr(hstr, '            join sporder SpOrder_Prih on SpOrder_Prih.SP = 0                        // склад
+  MysqlAddStr(hstr, '                                     and SpOrder_Prih.VIDORDER = 0                  // приходный
+  MysqlAddStr(hstr, '                                     and SpOrder_Prih.CMC = katmc.nRec
+  MysqlAddStr(hstr, '                                     and SpOrder_Prih.DORD between #date(01,06,2025) and #date(30,06,2025)
+  MysqlAddStr(hstr, '                                     and SpOrder_Prih.TIPORD in (1,2)
+  MysqlAddStr(hstr, '            join specmtr cu on cu.csaldtune = saldtune.nrec
+  MysqlAddStr(hstr, '                            and cu.COTABLE = 1112
+  MysqlAddStr(hstr, '                            and cu.cspec = SpOrder_Prih.nrec
+  MysqlAddStr(hstr, '                            and cu.COBJ = #comp(000100000000061Ch)
+  MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
+  MysqlAddStr(hstr, ' union all
+  MysqlAddStr(hstr, ' select
+  MysqlAddStr(hstr, '   katmc.nrec  as cMc
+  MysqlAddStr(hstr, ' , SpOrder_Vnutr.nrec as cSpOrder
+  MysqlAddStr(hstr, ' , SpOrder_Vnutr.RSRPRICE as rSrPrice
+  MysqlAddStr(hstr, '
+  MysqlAddStr(hstr, '
+  MysqlAddStr(hstr, ' from katmc
+  MysqlAddStr(hstr, '             join saldtune on saldtune.nrec = #comp(000100000000000Ah) // ЦУ ЛИ
+  MysqlAddStr(hstr, ' join sporder SpOrder_Vnutr on SpOrder_Vnutr.SP = 0
+  MysqlAddStr(hstr, '                           and SpOrder_Vnutr.VIDORDER = 0
+  MysqlAddStr(hstr, '                          and SpOrder_Vnutr.CMC = katmc.nRec
+  MysqlAddStr(hstr, '                          and SpOrder_Vnutr.DORD between #date(01,06,2025) and #date(30,06,2025)
+  MysqlAddStr(hstr, '                          and SpOrder_Vnutr.TIPORD = 3
+  MysqlAddStr(hstr, '  join SKLORDER SKLORDER_Vnutr on SpOrder_Vnutr.cSklOrder = SKLORDER_Vnutr.nrec
+  MysqlAddStr(hstr, '
+  MysqlAddStr(hstr, ' join specmtr cu on cu.csaldtune = saldtune.nrec
+  MysqlAddStr(hstr, '                 and cu.COTABLE = 1112
+  MysqlAddStr(hstr, '                 and cu.cspec = SpOrder_Vnutr.nrec
+  MysqlAddStr(hstr, '                             and cu.COBJ = #comp(000100000000061Ch) // вид собственности = Собственные
+  MysqlAddStr(hstr, ' where SKLORDER_Vnutr.cSopr = #comp(0h)
+  MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
+//  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)
+  MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
+  var objQuery3 : iQuery;
+    objQuery3 := queryManager.createQuery(hstr);
+  if objQuery3.execute.errorCode != tsOk
+   then {
+      MyLog('Ошибка выполнения запроса '+ objQuery3.errorCode);
+      }
+  else {
+    sqlCopyInto(objQuery3, tntVnutrMC, false);
+  }
+  mylog('  выбрано записей '+ string(recordsintable(tntVnutrMC)));
+
+  setvisualHeader('Расчет сальдо на начало периода');
+  delete all tmpSaldo1;
+          iSaldoFun.Store_Run_New( // хрен зате куда пропала фнкция это .. Store_run_new_ex
+                                   Sub_Day(DatBeg, 1)
+                                 , true //складские остатки
+                                 , false //производственные
+                                 , False
+                                 , False
+                                 , -2 //МЦ - будут браться из PICK по крайней мере в Store_run_new_ex брались
+                                 , 0h //склад
+                                 , 0h //МОЛ
+                                 , 0h //группам партий и партиям
+                                 , False // выгружать остатки по МТР
+                                 , 000100000000000Ah  //фильтр по ЦУ: ЦУ ЛИ,
+                                 , 000100000000061Ch  //фильтр по ЦУ: вид собственности = Собственные
+                                 , True  // группировать по складам
+                                 , True  // группировать по МОЛ
+                                 , True  // группировать по партиям
+                                 , False  // bIncZeroKol
+                                 );
+        delete all ostatkigrouptmc;
+           StartNewVisual(vtIndicatorVisual ,vfTimer,'Просмотр и группировка остатков по ТМЦ',RecordsInTable(tnTmpSaldo1));
+            _loop TmpSaldo1 {
+              nextvisual;
+              if getfirst tPrihodMC where (( TmpSaldo1.CMC == tPrihodMC.cMc)) <> tsok then insert tPrihodMC set tPrihodMC.cMc := TmpSaldo1.CMC; // дозаполняем, чтобы потом пройтись на всякий по всем
+              if getfirst ostatkigrouptmc where (( TmpSaldo1.CMC == ostatkigrouptmc.cMc)) <> tsok then insert ostatkigrouptmc set ostatkigrouptmc.cMc := TmpSaldo1.CMC;
+              update current ostatkigrouptmc set
+                 ostatkigrouptmc.kol := ostatkigrouptmc.kol + TmpSaldo1.kol
+               , ostatkigrouptmc.sum := ostatkigrouptmc.sum + TmpSaldo1.kol*TmpSaldo1.PRICE
+              ;
+            }
+         StopVisual('The End',vfTimer);
+
+
+
+
+   _i := 0;
+ var _Kol , _Summa ,_Kol_pRIH , _Summa_pRIH: Double;
+ var _Price : double;
+
+  _loop tPrihodMC {
+    mylog('tPrihodMC.cMc = ' + string(tPrihodMC.cMc,0,0));
+     _i++;
+     SetVisualHeader(SubStr(Katmc.Name,1,30)+
+                    ''#13''+ (100*_i/_vibrano) +' % выполнено');
+
+       _Kol := _Summa := 0;
+
+       if getfirst ostatkigrouptmc where (( TmpSaldo1.CMC == ostatkigrouptmc.cMc)) = tsok {
+          _Kol   := ostatkigrouptmc.kol;
+          _Summa := ostatkigrouptmc.Sum;
+        }
+      _Kol_Prih   := tPrihodMC.kol;
+      _Summa_Prih := tPrihodMC.sum;
+
+      if _Kol_Prih +_Kol =0 then continue; // нет остатков и прихода
+
+       _Price := (_Summa_Prih + _Summa)/(_Kol_Prih +_Kol);
+      mylog('katmc.barkod = ' + katmc.barkod+ ' _KolOst = ' + string(_Kol) + ' _SummaOst = '+ string(_Summa)+ ' _Kol_Prih = ' + string(_Kol_Prih) + ' _Summa_Prih = ' + _Summa_Prih + ' PriceToSet = ' + string(_Price));
+      // расходные ордера
+
+      _loop tRashodMC where ((tPrihodMC.cMc == tRashodMC.cMc)) {
+        mylog('loop tRashodMC tRashodMC.cSpOrder = ' + string(tRashodMC.cSpOrder,0,0) + ' tRashodMC.RSRPRICE = ' + string(tRashodMC.RSRPRICE));
+          if Round(_Price,2) = Round(tRashodMC.RSRPRICE,2)then continue;
+
+          if isProverka = 1 then {
+                MyLog('Расходный|' + KatMc.Barkod +'|' +KatMc.Name+'|'+String(SpOrder_rash.RSRPRICE)+ '->'+ String(_Price));
+           }
+           else {
+              if getfirst SpOrder_rash where ((tRashodMC.cSpOrder == SpOrder_rash.nrec)) = tsOK {
+               mylog('exists SpOrder_rash');
+              _izmenenoRash++;
+                MyLog('Расходный|' + KatMc.Barkod +'|' +KatMc.Name+'|'+String(SpOrder_rash.RSRPRICE)+ '->'+ String(_Price));
+                update Current SpOrder_rash Set
+                    SpOrder_rash.RSRPRICE := _Price
+                   ,SpOrder_rash.SRPRICE  := Round(_Price*SpOrder_rash.kol,2)/SpOrder_rash.kol
+                 ;
+               } else {
+                  mylog('NOT! exists SpOrder_rash')
+               }
+           }
+       } // end _loop SpOrder_Rash Where ((  0 == SpOrder.SP
+
+       // внутреннее перемещение и транзитные
+     _loop tVnutrMC where ((tRashodMC.cMc == tVnutrMC.cMc)) {
+       if Round(_Price,2) = Round(SpOrder_Vnutr.RSRPRICE,2)then continue;
+          if isProverka = 1 then {
+             MyLog('Внутренний|' + KatMc.Barkod +'|' +KatMc.Name+'|'+String(SpOrder_rash.RSRPRICE)+ '->'+ String(_Price));
+         } else {
+            if getfirst SpOrder_Vnutr where ((tRashodMC.cSpOrder == SpOrder_Vnutr.nrec)) = tsOK {
+           _izmenenoVnutr++;
+             MyLog('Внутренний|' + KatMc.Barkod +'|' +KatMc.Name+'|'+String(SpOrder_rash.RSRPRICE)+ '->'+ String(_Price));
+              update Current SpOrder_Vnutr Set
+                  SpOrder_Vnutr.RSRPRICE := _Price
+                 ,SpOrder_Vnutr.SRPRICE  := Round(_Price*SpOrder_Vnutr.kol,2)/SpOrder_Vnutr.kol
+               ;
+         }
+       }// end _loop SpOrder_Vnutr Where ((  0 == SpOrder.SP
+     } // end _loop KatMc
+  }
+
+   MyLog('Обработано позиций ордеров: ');
+   MyLog('   - расходных: '+_izmenenoRash) ;
+   MyLog('   - приходных по внутреннему перемещению: '+_izmenenoVnutr  );
+   MyLog('Конец ' + Cur_Time);
+  StopVisual('The End',vfTimer);
+   ProcessText(_log,vfEscable or vfNewTitle or vfMacroSize,'Лог-файл ошибок');
+}
+
+end;
+end.
+
+//------------------------------------------------------------------------------
+// Отчеты пользователя
+//------------------------------------------------------------------------------
+
+#Component "F_UserReport"
+ObjInterface IUserReport;
+  // Запуск отчета на вvполнение при выборе его из списка отчетов
+  procedure Run;
+  // Наименование отчета в списке
+  function GetReportName : String;
+  // Наименования групп, в которvе входит отчет
+  // +Группа n+1 делается подчиненной группе n
+  function GetGroupName (Level : Word) : String;
+  // Приоритет отчета - сортировка внутри группv вvполняется сначала
+  // по приоритету, а затем по наименовани_
+  function GetPriority : Integer;
+  // ModuleID модулей, в которvх будет виден отчет
+  // '*' - отчет будет виден в любом модуле
+  function VisibleInModule (Ind : Byte) : String;
+end;
+
+VipInterface UserReport_Pereschet_MC Implements IUserReport;
+
+Interface UserReport_Pereschet_MC
+
+create view;
+function VisibleInModule(Ind : Byte) : String;
+begin
+  VisibleInModule := '';
+  case Ind of
+    1 : VisibleInModule := '*';
+  end;
+end;
+function GetPriority : Integer;
+begin
+  GetPriority := 0;
+end;
+function GetGroupName (Level : Word) : String;
+begin
+  GetGroupName := '';
+  case Level of
+    1 : GetGroupName := 'Склад';
+  end;
+end;
+
+function GetReportName: String;
+begin
+  GetReportName := 'Пересчет Цен МЦ'
+end;
+!-------------------------------------------------------------------------------
+procedure Run;
+begin
+  runinterface(L_SALDOMTR::PRICES4PERIOD_RECALC );
+end;
+!-------------------------------------------------------------------------------
+end.

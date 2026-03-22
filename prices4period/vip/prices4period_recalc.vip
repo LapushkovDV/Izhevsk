@@ -10,20 +10,18 @@ table struct tTempMC (
    nRec     : comp
  , cRec     : comp
  , cMc      : comp
- , kol_ost  : double
- , sum_ost  : double
+ , kol_ost    : double
+ , sum_ost    : double
+ , kol_prihod : double
+ , sum_prihod : double
  , cSpOrder : comp
 )
 with index (
- ind0 = Nrec
+   ind0 = Nrec (unique, surrogate)
+ , ind1 = cRec
+ , ind2 = cMc
 );
-table struct ostatkigrouptmc (
-   cMc : comp
- , kol : double
- , sum : Double
-) with index (
- index0 = cMc
-);
+
 table struct tMoveMC (
    cMc      : comp
  , cSpOrder : comp
@@ -31,23 +29,11 @@ table struct tMoveMC (
 with index (
  index0 = cMc
 );
-table struct tRashodMC (
-   cMc      : comp
- , cSpOrder : comp
-)
-with index (
- index0 = cMc
-);
-table struct tVnutrMC (
-   cMc      : comp
- , cSpOrder : comp
-)
-with index (
- index0 = cMc
-);
+
 //************************ Вьюха  *************************
 create view
  var
+     cur_mc : comp = 0h;
      iSaldoFun : SaldoFuncs;
        DatBeg
      , DatEnd : date;
@@ -61,21 +47,57 @@ create view
      , _izmenenoMontaj : longint;
      isProverka : byte;
      _tekMonth : date;
+as select
+  if ( SPO_br.VidOrder = 0, 'П', 'Р')
+    ( Fieldname = VidOper )
+, if ( SklOrder_br.TipOrd = 1,
+      if ( NOT IsValid(tnKatSopr_br), 'К',
+                if (KatSopr_br.vidSopr = 611, 'В',
+                        if ( ((KatSopr_br.vidSopr >= 101) and (KatSopr_br.vidSopr <= 106) or (KatSopr_br.vidSopr =  108) or
+                              (KatSopr_br.vidSopr >= 201) and (KatSopr_br.vidSopr <= 206) or
+                              (KatSopr_br.vidSopr >= 210) and (KatSopr_br.vidSopr <= 229) or
+                              (KatSopr_br.vidSopr >= 521) and (KatSopr_br.vidSopr <= 522) or
+                              (KatSopr_br.vidSopr  = 626) or  (KatSopr_br.vidSopr  = 636)), 'К', '*'))),
+    if (SPO_br.TipOrd = 2, 'П',
+      if (SPO_br.TipOrd = 3, 'В',
+        if (SPO_br.TipOrd>= 4 and SPO_br.TipOrd<= 7, 'Д', '*'))))
+    ( Fieldname = TipOper )
+, if ( SklOrder_br.vidOrder = 0, ColorSklModulKSU2, ColorSklModulKSU3 )
+    ( Fieldname = ColorVidOrder )
+, if((wGetTune('Oper.FormatNamePodrMOL') = 0), KatMOL.Name, KatMOL.Kod + ' - ' + KatMOL.Name)
+    ( FieldName = KatMOL1_Name )
+//------------------------------------------------------------------------------
+, if((wGetTune('Oper.FormatNamePodrMOL') = 0), KatPodr.Name, KatPodr.Kod + ' - ' + KatPodr.Name)
+    ( FieldName = katpodr1_name )
+
  from
-   Pick
-  ,KatMc
-  ,SpOrder SpOrder_Rash
-  ,SpOrder SpOrder_Vnutr
+    Pick
+  , KatMc MC_br
   , SaldoMc
   , tmpSaldo1
-  , tPrihodMC
-  , tRashodMC
-  , tVnutrMC
-  , ostatkigrouptmc
- Where  ((           root == tPrihodMC.cmc
-        and tPrihodMC.cMc == katmc.nrec
-        and tPrihodMC.cmc == ostatkigrouptmc.cMc
-      ))
+  , SpOrder SpOrder_loop
+  , SpOrder SPO_BR
+  , SklOrder SklOrder_br
+  , KatPodr
+  , KatMOL
+  , KatParty
+  , KatSopr KatSopr_br
+  , tTempMC
+  , tTempMC tTempMC_br
+  , tMoveMC
+  , tMoveMC tMoveMC_loop
+ Where ((
+        tMoveMC_loop.cSpOrder == SpOrder_loop.nrec
+                  and  cur_mc == tTempMC_br.crec
+           and tTempMC_br.cmc == MC_br.nrec
+      and tTempMC_br.cSpOrder == SPO_br.nrec
+      and    SPO_br.cSklOrder == SklOrder_br.NRec
+      and   SklOrder_br.cSopr == KatSopr_br.NRec
+      and       SPO_br.ccPodr == KatPodr.NRec
+      and        SPO_br.ccMol == KatMOL.NRec
+      and       SPO_br.cParty == KatParty.NRec
+
+ ))
  ;
 Procedure MyLog(_str: string); {
   LogStrToFile(_log,DateToStr(cur_date,'YYYYMMDD')+'_'+timetostr(cur_time,'HHMMSS')  + ':'+_str);
@@ -86,6 +108,7 @@ Procedure MysqlAddStr(var query_handle : tptr; add_query_str: string); {
 } //Function MysqlAddStr(var query_handle: longInt; add_query_str: string): longInt;
 
 function FillMCFiltrTable : boolean; {
+  if getfirst pick where ((cgPick_MC == Pick.wList)) <> tsok then exit;
  setvisualHeader('Заполнение таблицы-фильтра по ТМЦ');
   result := false;
   var strID : tptr;  strID   := 0;
@@ -139,6 +162,50 @@ SCREEN PROJ5;
 >>
 END;
 
+window winBrowseMC '';
+tree trBrowseMC 'Дебиторская задолженность';
+  table tTempMC_br;
+fields
+  MC_br.name            'Наименование МЦ' ('Наименование МЦ'): [35], protect;
+  MC_br.barkod          'Баркод МЦ' ('Баркод МЦ'): [10], protect;
+  tTempMC_br.kol_ost    'Остаток','кол-во' ('остаток по МЦ количество'): [10], protect;
+  tTempMC_br.sum_ost    'Остаток','сумма' ('остаток по МЦ сумма'): [10], protect;
+  tTempMC_br.kol_prihod 'Приход','кол-во' ('приход по МЦ количество'): [10], protect;
+  tTempMC_br.sum_prihod 'Приход','кол-во' ('приход по МЦ сумма'): [10], protect;
+  VidOper        'П'('Приход/расход')
+                : [1], Protect, NoAutoSize, Centered,
+                 { Font = {Color = ColorVidOrder; Bold = TRUE}};
+//------------------------------------------------------------------------------
+  TipOper        'Т'('Тип операции: К-внешняя, П-производство, В-внутренняя, Д-переоценка, *-прочие', , )
+                : [1], Protect, NoAutoSize, Centered;
+
+  SklOrder_br.DesGr 'Группа' : [5], Protect, NoAutoSize;
+  SPO_BR.Descr  'Дескр' : [5], Protect, NoAutoSize;
+  SklOrder_br.NOrder 'Номер': [6], Protect, NoAutoSize, { Font = {BackColor = if (SklOrder_br.NOrder = '', ColorNeed, 0)}};
+  SklOrder_br.dOrd  'Дата' : [10], Protect, NoAutoSize, Centered, { Font = {BackColor = if (Longint(SklOrder_br.dOrd) = Longint(0), ColorNeed, 0)}};
+  katpodr1_name   'Подразделение' : [15], Protect, { Font = {BackColor = if (not IsValid(#KatPodr), ColorNeed, 0)}};
+  KatMOL1_Name    'МОЛ' : [15], Protect;
+  KatParty.KOD   'Партия', 'код' : [5], Protect;
+  KatParty.Name  'Партия', 'наименование' : [15], Protect;
+  SPO_BR.Kol    'Количество' (, , sci134EnEsc) : [12], [prSignsInKol, '\3p[|-]36`666`666`666`666.888'], NoAutoSize, EditButton, { Font = {Color = ColorVidOrder}};
+  SPO_BR.rSrPrice 'Цена' : [17], [brForSpOrder_Price, '\2p[|-]36`666`666`666`666.88'], NoAutoSize;
+end;
+end;
+
+TableEvent table tTempMC_br;
+cmTreeTop:  {
+     cur_mc := 0;
+}
+cmTreeDown: {
+     cur_mc := tTempMC_br.NRec;
+}
+cmTreeUp:   {
+     cur_mc := tTempMC_br.cRec;
+}
+cmTreeNodeType:{
+  if (TreeIsTerminal(trBrowseMC)) TreeSetNodeType(trBrowseMC,   2);
+}
+end;
 //------------------------------------------------------------------------------
 // Инициализация главного окна
 //------------------------------------------------------------------------------
@@ -147,6 +214,7 @@ cmInit:
 {
  //RunInterFace(L_SKLAD::COUNTSAL);
  _tekMonth := dGetTuneEx  ('TEKMONTH', 1, UserId )
+ delete pick where ((cgPick_MC == Pick.wList));
 // wSetTuneEx('PICK.SORTMC',1,UserID,_nastr)
 }
 cmNewMonth:
@@ -178,16 +246,14 @@ cmPick:
 }
 cmOK:
 {
+
+/*
  if getfirst pick where ((cgPick_MC == Pick.wList)) <> tsok {
    message('Не выбраны ТМЦ', error);
    stop; abort; exit;
  }
+*/
 
-
- if getfirst pick where ((cgPick_MC == Pick.wList)) <> tsok {
-   message('Не выбраны ТМЦ', error);
-   stop; abort; exit;
- }
  if DatBeg = to_date(0,0,0) {
    message('Дата начала расчета не может быть пустой', error);
    stop; abort; exit;
@@ -216,69 +282,65 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
   }
 
  setvisualHeader('Запрос по приходным ордерам');
- delete all tPrihodMC;
- delete all tRashodMC;
- delete all tVnutrMC;
+
+ delete all tMoveMC;
+ delete all tTempMC;
+
   var hstr : tptr = 0;
-  setvisualHeader('Запрос по расходным ордерам');
+  setvisualHeader('Запрос по ордерам');
   hstr := 0;
-  mylog(' ------------ Запрос по расходным ордерам          ');
-  MysqlAddStr(hstr, '   select
-  MysqlAddStr(hstr, '     katmc.nrec  as cMc
-  MysqlAddStr(hstr, '   , SpOrder_Rash.nrec as cSpOrder
-  MysqlAddStr(hstr, '   , SpOrder_Rash.RSRPRICE as rSrPrice
-  MysqlAddStr(hstr, '   from katmc
-  MysqlAddStr(hstr, '              join saldtune on saldtune.nrec = #comp(000100000000000Ah) // ЦУ ЛИ
-  MysqlAddStr(hstr, '   join sporder SpOrder_Rash on SpOrder_Rash.SP = 0
-  MysqlAddStr(hstr, '                            and SpOrder_Rash.VIDORDER = 1
-  MysqlAddStr(hstr, '                            and SpOrder_Rash.CMC = katmc.nRec
-  MysqlAddStr(hstr, '                            and SpOrder_Rash.DORD between #date(01,06,2025) and #date(30,06,2025)
-  MysqlAddStr(hstr, '   join specmtr cu on cu.csaldtune = saldtune.nrec
-  MysqlAddStr(hstr, '                   and cu.COTABLE = 1112
-  MysqlAddStr(hstr, '                   and cu.cspec = SpOrder_Rash.nrec
-  MysqlAddStr(hstr, '                              and cu.COBJ = #comp(000100000000061Ch) // вид собственности = Собственные
-  MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
-  MysqlAddStr(hstr, ' union all
-  MysqlAddStr(hstr, '  select
-  MysqlAddStr(hstr, '              katmc.nrec
-  MysqlAddStr(hstr, '            , SpOrder_Prih.nrec as cSpOrder
-  MysqlAddStr(hstr, '            , SpOrder_Prih.RSRPRICE as rSrPrice
-  MysqlAddStr(hstr, '            from katmc
-  MysqlAddStr(hstr, '            join saldtune on saldtune.nrec = #comp(000100000000000Ah) // ЦУ ЛИ
-  MysqlAddStr(hstr, '            join sporder SpOrder_Prih on SpOrder_Prih.SP = 0                        // склад
-  MysqlAddStr(hstr, '                                     and SpOrder_Prih.VIDORDER = 0                  // приходный
-  MysqlAddStr(hstr, '                                     and SpOrder_Prih.CMC = katmc.nRec
-  MysqlAddStr(hstr, '                                     and SpOrder_Prih.DORD between #date(01,06,2025) and #date(30,06,2025)
-  MysqlAddStr(hstr, '                                     and SpOrder_Prih.TIPORD in (1,2)
-  MysqlAddStr(hstr, '            join specmtr cu on cu.csaldtune = saldtune.nrec
-  MysqlAddStr(hstr, '                            and cu.COTABLE = 1112
-  MysqlAddStr(hstr, '                            and cu.cspec = SpOrder_Prih.nrec
-  MysqlAddStr(hstr, '                            and cu.COBJ = #comp(000100000000061Ch)
-  MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
-  MysqlAddStr(hstr, ' union all
-  MysqlAddStr(hstr, ' select
-  MysqlAddStr(hstr, '   katmc.nrec  as cMc
-  MysqlAddStr(hstr, ' , SpOrder_Vnutr.nrec as cSpOrder
-  MysqlAddStr(hstr, ' , SpOrder_Vnutr.RSRPRICE as rSrPrice
-  MysqlAddStr(hstr, '
-  MysqlAddStr(hstr, '
-  MysqlAddStr(hstr, ' from katmc
-  MysqlAddStr(hstr, '             join saldtune on saldtune.nrec = #comp(000100000000000Ah) // ЦУ ЛИ
-  MysqlAddStr(hstr, ' join sporder SpOrder_Vnutr on SpOrder_Vnutr.SP = 0
-  MysqlAddStr(hstr, '                           and SpOrder_Vnutr.VIDORDER = 0
-  MysqlAddStr(hstr, '                          and SpOrder_Vnutr.CMC = katmc.nRec
-  MysqlAddStr(hstr, '                          and SpOrder_Vnutr.DORD between #date(01,06,2025) and #date(30,06,2025)
-  MysqlAddStr(hstr, '                          and SpOrder_Vnutr.TIPORD = 3
-  MysqlAddStr(hstr, '  join SKLORDER SKLORDER_Vnutr on SpOrder_Vnutr.cSklOrder = SKLORDER_Vnutr.nrec
-  MysqlAddStr(hstr, '
-  MysqlAddStr(hstr, ' join specmtr cu on cu.csaldtune = saldtune.nrec
-  MysqlAddStr(hstr, '                 and cu.COTABLE = 1112
-  MysqlAddStr(hstr, '                 and cu.cspec = SpOrder_Vnutr.nrec
-  MysqlAddStr(hstr, '                             and cu.COBJ = #comp(000100000000061Ch) // вид собственности = Собственные
-  MysqlAddStr(hstr, ' where SKLORDER_Vnutr.cSopr = #comp(0h)
-  MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
+  mylog(' ------------ Запрос по ордерам          ');
+  MysqlAddStr(hstr, '   select                                                                              ');
+  MysqlAddStr(hstr, '     katmc.nrec  as cMc                                                                ');
+  MysqlAddStr(hstr, '   , SpOrder_Rash.nrec as cSpOrder                                                     ');
+  MysqlAddStr(hstr, '   from katmc                                                                          ');
+  MysqlAddStr(hstr, '              join saldtune on saldtune.nrec = #comp('+string(000100000000000Ah,0,0) + ')'); // ЦУ ЛИ
+  MysqlAddStr(hstr, '   join sporder SpOrder_Rash on SpOrder_Rash.SP = 0                                    ');
+  MysqlAddStr(hstr, '                            and SpOrder_Rash.VIDORDER = 1                              ');
+  MysqlAddStr(hstr, '                            and SpOrder_Rash.CMC = katmc.nRec                          ');
+  MysqlAddStr(hstr, '                            and SpOrder_Rash.DORD between #date(' + datetostr(datBeg,'DD,MM,YYYY')+ ') and #date(' + datetostr(DatEnd,'DD,MM,YYYY')+ ')');
+  MysqlAddStr(hstr, '   join specmtr cu on cu.csaldtune = saldtune.nrec                                     ');
+  MysqlAddStr(hstr, '                   and cu.COTABLE = 1112                                               ');
+  MysqlAddStr(hstr, '                   and cu.cspec = SpOrder_Rash.nrec                                    ');
+  MysqlAddStr(hstr, '                              and cu.COBJ = #comp('+string(000100000000061Ch,0,0)+')'); // вид собственности = Собственные
+  if getfirst pick where ((cgPick_MC == Pick.wList)) = tsok then MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
+  MysqlAddStr(hstr, ' union all                                                                             ');
+  MysqlAddStr(hstr, '  select                                                                               ');
+  MysqlAddStr(hstr, '      katmc.nrec                                                               ');
+  MysqlAddStr(hstr, '    , SpOrder_Prih.nrec as cSpOrder                                            ');
+  MysqlAddStr(hstr, '            from katmc                                                                 ');
+  MysqlAddStr(hstr, '            join saldtune on saldtune.nrec = #comp('+string(000100000000000Ah,0,0) + ')'); // ЦУ ЛИ
+  MysqlAddStr(hstr, '            join sporder SpOrder_Prih on SpOrder_Prih.SP = 0                           ');// склад
+  MysqlAddStr(hstr, '                                     and SpOrder_Prih.VIDORDER = 0                     '); // приходный
+  MysqlAddStr(hstr, '                                     and SpOrder_Prih.CMC = katmc.nRec                 ');
+  MysqlAddStr(hstr, '                                     and SpOrder_Prih.DORD between #date(' + datetostr(datBeg,'DD,MM,YYYY')+ ') and #date(' + datetostr(DatEnd,'DD,MM,YYYY')+ ')');
+  MysqlAddStr(hstr, '                                     and SpOrder_Prih.TIPORD in (1,2)                  ');
+  MysqlAddStr(hstr, '            join specmtr cu on cu.csaldtune = saldtune.nrec                            ');
+  MysqlAddStr(hstr, '                            and cu.COTABLE = 1112                                      ');
+  MysqlAddStr(hstr, '                            and cu.cspec = SpOrder_Prih.nrec                           ');
+  MysqlAddStr(hstr, '                            and cu.COBJ = #comp('+string(000100000000061Ch,0,0)+')');  // вид собственности = Собственные
+  if getfirst pick where ((cgPick_MC == Pick.wList)) = tsok then MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
+  MysqlAddStr(hstr, ' union all                                                                            ');
+  MysqlAddStr(hstr, ' select                                                                               ');
+  MysqlAddStr(hstr, '   katmc.nrec  as cMc                                                                 ');
+  MysqlAddStr(hstr, ' , SpOrder_Vnutr.nrec as cSpOrder                                                     ');
+  MysqlAddStr(hstr, ' from katmc                                                                           ');
+  MysqlAddStr(hstr, '             join saldtune on saldtune.nrec = #comp('+string(000100000000000Ah,0,0) + ')'); // ЦУ ЛИ
+  MysqlAddStr(hstr, ' join sporder SpOrder_Vnutr on SpOrder_Vnutr.SP = 0                                   ');
+  MysqlAddStr(hstr, '                           and SpOrder_Vnutr.VIDORDER = 0                             ');
+  MysqlAddStr(hstr, '                          and SpOrder_Vnutr.CMC = katmc.nRec                          ');
+  MysqlAddStr(hstr, '                          and SpOrder_Vnutr.DORD between #date(' + datetostr(datBeg,'DD,MM,YYYY')+ ') and #date(' + datetostr(DatEnd,'DD,MM,YYYY')+ ')');
+  MysqlAddStr(hstr, '                          and SpOrder_Vnutr.TIPORD = 3                                ');
+  MysqlAddStr(hstr, '  join SKLORDER SKLORDER_Vnutr on SpOrder_Vnutr.cSklOrder = SKLORDER_Vnutr.nrec       ');
+  MysqlAddStr(hstr, '                                                                                      ');
+  MysqlAddStr(hstr, ' join specmtr cu on cu.csaldtune = saldtune.nrec                                      ');
+  MysqlAddStr(hstr, '                 and cu.COTABLE = 1112                                                ');
+  MysqlAddStr(hstr, '                 and cu.cspec = SpOrder_Vnutr.nrec                                    ');
+  MysqlAddStr(hstr, '                             and cu.COBJ = #comp('+string(000100000000061Ch,0,0)+')'); // вид собственности = Собственные
+  MysqlAddStr(hstr, ' where SKLORDER_Vnutr.cSopr = #comp(0h)                                               ');
+  if getfirst pick where ((cgPick_MC == Pick.wList)) = tsok then MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
 //  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)
-  MysqlAddStr(hstr, '  and katmc.nrec in (select tblFiltrTMC_RECACL.cmc from tblFiltrTMC_RECACL)     ');
+
   var objQuery3 : iQuery;
     objQuery3 := queryManager.createQuery(hstr);
   if objQuery3.execute.errorCode != tsOk
@@ -286,9 +348,9 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
       MyLog('Ошибка выполнения запроса '+ objQuery3.errorCode);
       }
   else {
-    sqlCopyInto(objQuery3, tntVnutrMC, false);
+    sqlCopyInto(objQuery3, tntMoveMC, false);
   }
-  mylog('  выбрано записей '+ string(recordsintable(tntVnutrMC)));
+  mylog('  выбрано записей '+ string(recordsintable(tntMoveMC)));
 
   setvisualHeader('Расчет сальдо на начало периода');
   delete all tmpSaldo1;
@@ -310,26 +372,43 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
                                  , True  // группировать по партиям
                                  , False  // bIncZeroKol
                                  );
-        delete all ostatkigrouptmc;
            StartNewVisual(vtIndicatorVisual ,vfTimer,'Просмотр и группировка остатков по ТМЦ',RecordsInTable(tnTmpSaldo1));
             _loop TmpSaldo1 {
               nextvisual;
-              if getfirst tPrihodMC where (( TmpSaldo1.CMC == tPrihodMC.cMc)) <> tsok then insert tPrihodMC set tPrihodMC.cMc := TmpSaldo1.CMC; // дозаполняем, чтобы потом пройтись на всякий по всем
-              if getfirst ostatkigrouptmc where (( TmpSaldo1.CMC == ostatkigrouptmc.cMc)) <> tsok then insert ostatkigrouptmc set ostatkigrouptmc.cMc := TmpSaldo1.CMC;
-              update current ostatkigrouptmc set
-                 ostatkigrouptmc.kol := ostatkigrouptmc.kol + TmpSaldo1.kol
-               , ostatkigrouptmc.sum := ostatkigrouptmc.sum + TmpSaldo1.kol*TmpSaldo1.PRICE
-              ;
+              if getfirst tTempMC where (( TmpSaldo1.CMC == tTempMC.cMc)) <> tsok then insert tTempMC set tTempMC.cMc := TmpSaldo1.CMC;
+                update current tTempMC set
+                  tTempMC.kol_ost := tTempMC.kol_ost + TmpSaldo1.kol
+                , tTempMC.sum_ost := tTempMC.sum_ost + TmpSaldo1.kol*TmpSaldo1.PRICE
+               ;
             }
-         StopVisual('The End',vfTimer);
+  StopVisual('The End',vfTimer);
+
+  StartNewVisual(vtIndicatorVisual ,vfTimer,'Просмотр выбранных позиций ордеров',RecordsInTable(tntMoveMC_loop));
+  _loop tMoveMC_loop {
+    nextvisual;
+    if getfirst SpOrder_loop <> tsOK continue;
+    if getfirst tTempMC where ((tMoveMC_loop.CMC == tTempMC.cMc)) <> tsok then insert tTempMC set tTempMC.cMc := tMoveMC_loop.CMC;
+    if     SpOrder_loop.SP = 0          // склад
+       and SpOrder_loop.VIDORDER = 0    // приходный
+       and ( SpOrder_loop.TIPORD = 1    // внешние операции
+          or SpOrder_loop.TIPORD = 2) then {
+       update current tTempMC set
+           tTempMC.kol_prihod := tTempMC.kol_prihod + SpOrder_loop.kol
+         , tTempMC.sum_prihod := tTempMC.sum_prihod + SpOrder_loop.kol*SpOrder_loop.RSRPRICE
+       ;
+     }
+     var _Nrec : comp = tTempMC.nrec;
+    insert tTempMC set
+       tTempMC.cRec     :=_Nrec
+     , tTempMC.cSporder := SpOrder_loop.nrec
+    ;
+  }
+  stopvisual;
+  StopVisual;
+ runwindowmodal(winBrowseMC);
 
 
-
-
-   _i := 0;
- var _Kol , _Summa ,_Kol_pRIH , _Summa_pRIH: Double;
- var _Price : double;
-
+   /*
   _loop tPrihodMC {
     mylog('tPrihodMC.cMc = ' + string(tPrihodMC.cMc,0,0));
      _i++;
@@ -371,7 +450,7 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
                   mylog('NOT! exists SpOrder_rash')
                }
            }
-       } // end _loop SpOrder_Rash Where ((  0 == SpOrder.SP
+       } // end _loop SpOrder_Rash Where ((  0 == SPO_BR.SP
 
        // внутреннее перемещение и транзитные
      _loop tVnutrMC where ((tRashodMC.cMc == tVnutrMC.cMc)) {
@@ -387,7 +466,7 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
                  ,SpOrder_Vnutr.SRPRICE  := Round(_Price*SpOrder_Vnutr.kol,2)/SpOrder_Vnutr.kol
                ;
          }
-       }// end _loop SpOrder_Vnutr Where ((  0 == SpOrder.SP
+       }// end _loop SpOrder_Vnutr Where ((  0 == SPO_BR.SP
      } // end _loop KatMc
   }
 
@@ -395,6 +474,7 @@ _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
    MyLog('   - расходных: '+_izmenenoRash) ;
    MyLog('   - приходных по внутреннему перемещению: '+_izmenenoVnutr  );
    MyLog('Конец ' + Cur_Time);
+*/
   StopVisual('The End',vfTimer);
    ProcessText(_log,vfEscable or vfNewTitle or vfMacroSize,'Лог-файл ошибок');
 }
