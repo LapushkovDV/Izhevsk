@@ -2,7 +2,7 @@
 #include SaldoFuncs.vih
 #include modifOrd.vih
 #include ModifOrd.var
-
+#include MTRFuncs.vih
 #component "L_SaldoMTR"
 
 interface prices4period_recalc 'Расчет средних цен МЦ', EscClose;
@@ -35,6 +35,7 @@ with index (
 //************************ Вьюха  *************************
 create view
  var
+iMTRFun         : MTRFuncs;
      cur_mc : comp = 0h;
      iSaldoFun : SaldoFuncs;
        DatBeg
@@ -91,6 +92,7 @@ as select
   , SpecMtr
   , SpOrder
   , SklOrder
+  , KatMc
   , tTempMC
   , tTempMC tTempMC_br
   , tTempMC tTempMC_func
@@ -121,7 +123,7 @@ Procedure MysqlAddStr(var query_handle : tptr; add_query_str: string); {
 
 function FillMCFiltrTable : boolean; {
   result := true;
-  if getfirst pick where ((cgPick_MC == Pick.wList)) <> tsok then exit;
+
  setvisualHeader('Заполнение таблицы-фильтра по ТМЦ');
   result := false;
   var strID : tptr;  strID   := 0;
@@ -171,9 +173,14 @@ procedure createDoocenka; {
                  and DatEnd == sklorder.DORD
              and 'DOOCENKA' == sklorder.NORDER (noindex) )) {
        _loop SpOrder where ((sklorder.NREC == SpOrder.cSklOrder)) {
-         oModifOrds.AnySpOrder_Delete(TypeSpOrder(SpOrder.buffer));
+          if getfirst pick where ((cgPick_MC == Pick.wList)) <> tsok // если нет фильтра
+              or
+             getfirst pick where ((cgPick_MC == Pick.wList and SpOrder.cmc == Pick.cRec)) = tsok { // если фильтр есть, то проверяем, что МЦ в нем
+              iMTRFun.DelSpecMTR(coSpOrder, SpOrder.nrec);
+              oModifOrds.AnySpOrder_Delete(TypeSpOrder(SpOrder.buffer));
+          }
        }
-      Delete current sklorder;
+       if getfirst SpOrder where ((sklorder.NREC == SpOrder.cSklOrder)) <> tsok then Delete current sklorder;
       _i++;
       if _i mod 23 = 0 then { //  чтобы не тормозила перерисовка визуализации
          setVisualHeader('Удаление предыдуших дооценочных ордеров' +
@@ -194,19 +201,26 @@ procedure createDoocenka; {
                                  , 0h //склад
                                  , 0h //МОЛ
                                  , 0h //группам партий и партиям
-                                 , False // выгружать остатки по МТР
+                                 , true // выгружать остатки по МТР
                                  , 000100000000000Ah  //фильтр по ЦУ: ЦУ ЛИ,
                                  , 000100000000061Ch  //фильтр по ЦУ: вид собственности = Собственные
-                                 , false  // группировать по складам
-                                 , false  // группировать по МОЛ
-                                 , false  // группировать по партиям
+                                 , true  // группировать по складам
+                                 , true  // группировать по МОЛ
+                                 , true  // группировать по партиям
                                  , True  // bIncZeroKol  - вдруг списали количество, а цена осталась
                                  );
            StartNewVisual(vtIndicatorVisual ,vfTimer,'Просмотр остатков по ТМЦ, формирование дооценочных ордеров',RecordsInTable(tnTmpSaldo1));
+           MyLog('Формирование дооценки');
            _loop TmpSaldo1 {
+             if getfirst katmc where ((TmpSaldo1.CMC == katmc.nrec)) <> tsok then continue;
+             if getfirst katpodr where ((tmpsaldo1.CPODR == katpodr.nrec)) <> tsOK then continue;
+
               nextvisual;
+
+              MyLog('katpodr.kod = ' + katpodr.kod + ' barkod = ' + katmc.barkod + ' TmpSaldo1.kol = ' + string(TmpSaldo1.kol)+' TmpSaldo1.PRICE = ' + string(TmpSaldo1.PRICE) + ' PricePlanRecalc = ' + string(PricePlanRecalc(TmpSaldo1.CMC)));
               if TmpSaldo1.PRICE <> PricePlanRecalc(TmpSaldo1.CMC) {
                 var _SumDoocenka : double = if(TmpSaldo1.kol = 0,1,TmpSaldo1.kol)*(PricePlanRecalc(TmpSaldo1.CMC) - TmpSaldo1.PRICE); //вдруг списали количество, а цена осталась
+                mylog('   _SumDoocenka = ' + string(_SumDoocenka));
                 if _SumDoocenka = 0 then continue;
                 insert sklorder set
                    sklorder.DESCR   :=  sgettune('USER.DESCR')
@@ -218,37 +232,39 @@ procedure createDoocenka; {
                  , sklorder.YEARORD := year(DatEnd  )
                  , sklorder.TIPORD  := 4
                 ;
-                insert sporder set
-                   sporder.DESCR     := sklorder.DESCR
-                 , sporder.DESGR     := sklorder.DESGR
-                 , sporder.CSKLORDER := sklorder.nrec
-                 , sporder.DORD      := sklorder.DORD
-                 , sporder.NPP       := 1
-                 , sporder.TIPORD    := 4
-                 , sporder.CMC       := tmpsaldo1.CMC
-                 , sporder.CPARTY    := tmpsaldo1.CPARTY
-                 , sporder.SRPRICE   := _SumDoocenka
-                 , sporder.RSRPRICE  := _SumDoocenka
-                 , sporder.CCPODR    := sklorder.CPODR
-                 , sporder.CCMOL     := sklorder.CMOL
-                 , sporder.EMPTY     := 4
-                ;
-                Insert Specmtr set
-                   Specmtr.COTABLE   := coSpOrder
-                 , Specmtr.CSPEC     := SpOrder.nrec
-                 , Specmtr.CSALDTUNE := tmpsaldo1.CSALDTUNE
-                 , Specmtr.COBJ      := tmpsaldo1.COBJ
-                 , Specmtr.CKAU[1]   := tmpsaldo1.CKAU[1]
-                 , Specmtr.CKAU[2]   := tmpsaldo1.CKAU[2]
-                 , Specmtr.CKAU[3]   := tmpsaldo1.CKAU[3]
-                 , Specmtr.CKAU[4]   := tmpsaldo1.CKAU[4]
-                 , Specmtr.CKAU[5]   := tmpsaldo1.CKAU[5]
-                 , Specmtr.CKAU[6]   := tmpsaldo1.CKAU[6]
-                 , Specmtr.CKAU[7]   := tmpsaldo1.CKAU[7]
-                 , Specmtr.CKAU[8]   := tmpsaldo1.CKAU[8]
-                 , Specmtr.CKAU[9]   := tmpsaldo1.CKAU[9]
-                ;
-               oModifOrds.AnySpOrder_UpDate(TypeSpOrder(SpOrder.buffer))
+                clearbuffer(tnsporder);
+                 sporder.DESCR     := sklorder.DESCR;
+                 sporder.DESGR     := sklorder.DESGR;
+                 sporder.CSKLORDER := sklorder.nrec ;
+                 sporder.DORD      := sklorder.DORD ;
+                 sporder.NPP       := 1             ;
+                 sporder.TIPORD    := 4             ;
+                 sporder.CMC       := tmpsaldo1.CMC ;
+                 sporder.CPARTY    := tmpsaldo1.CPARTY;
+                 sporder.SRPRICE   := _SumDoocenka    ;
+                 sporder.RSRPRICE  := _SumDoocenka    ;
+                 sporder.CCPODR    := sklorder.CPODR  ;
+                 sporder.CCMOL     := sklorder.CMOL   ;
+                 sporder.EMPTY     := 4               ;
+                oModifOrds.AnySpOrder_insert(TypeSpOrder(SpOrder.buffer));
+
+                clearbuffer(tnSpecmtr);
+                 Specmtr.COTABLE   := coSpOrder        ;
+                 Specmtr.CSPEC     := SpOrder.nrec     ;
+                 Specmtr.CSALDTUNE := 000100000000000Ah;  //ЦУ ЛИ,
+                 Specmtr.COBJ      := 000100000000061Ch;  //вид собственности = Собственные
+                 Specmtr.CKAU[1]   := tmpsaldo1.CKAU[1];
+                 Specmtr.CKAU[2]   := tmpsaldo1.CKAU[2];
+                 Specmtr.CKAU[3]   := tmpsaldo1.CKAU[3];
+                 Specmtr.CKAU[4]   := tmpsaldo1.CKAU[4];
+                 Specmtr.CKAU[5]   := tmpsaldo1.CKAU[5];
+                 Specmtr.CKAU[6]   := tmpsaldo1.CKAU[6];
+                 Specmtr.CKAU[7]   := tmpsaldo1.CKAU[7];
+                 Specmtr.CKAU[8]   := tmpsaldo1.CKAU[8];
+                 Specmtr.CKAU[9]   := tmpsaldo1.CKAU[9];
+
+               iMTRFun.InsUpdRec(SpecMTR.buffer);
+               oModifOrds.AnySpOrder_update(TypeSpOrder(SpOrder.buffer));
               }
             }
   StopVisual('The End',vfTimer);
@@ -265,12 +281,12 @@ procedure setnewPrices; {
              and ( SpOrder_SetPrice.TIPORD = 1    // внешние операции
                 or SpOrder_SetPrice.TIPORD = 2) ) {
 
-            if SpOrder_SetPrice.RSRPRICE <> PricePlanRecalc(SpOrder_SetPrice.cMc) then
-               update Current SpOrder_SetPrice Set
-                  SpOrder_SetPrice.RSRPRICE := PricePlanRecalc(SpOrder_SetPrice.cMc)
-                 ,SpOrder_SetPrice.SRPRICE  := Round(PricePlanRecalc(SpOrder_SetPrice.cMc),2)
-               ;
-           oModifOrds.AnySpOrder_UpDate(TypeSpOrder(SpOrder.buffer))
+            if SpOrder_SetPrice.RSRPRICE <> PricePlanRecalc(SpOrder_SetPrice.cMc) then {
+               //update Current SpOrder_SetPrice Set
+                SpOrder_SetPrice.RSRPRICE := PricePlanRecalc(SpOrder_SetPrice.cMc);
+                SpOrder_SetPrice.SRPRICE  := Round(PricePlanRecalc(SpOrder_SetPrice.cMc),2);
+               oModifOrds.AnySpOrder_UpDate(TypeSpOrder(SpOrder_SetPrice.buffer))
+           }
          }
        }
     }
