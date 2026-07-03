@@ -3,10 +3,21 @@
 #include modifOrd.vih
 #include ModifOrd.var
 #include MTRFuncs.vih
+#include SHManager.vih
+
 #component "L_SaldoMTR"
 
 interface prices4period_recalc 'Расчет средних цен МЦ', EscClose;
 show at (,,60,13);
+
+Table Struct tModifsDocs (
+   wTable : word
+ , cRec   : comp
+)
+with index (
+ ind = wTable + cRec
+)
+;
 
 table struct tTempMC (
    nRec     : comp
@@ -35,7 +46,8 @@ with index (
 //************************ Вьюха  *************************
 create view
  var
-iMTRFun         : MTRFuncs;
+    iMTRFun         : MTRFuncs;
+    iSHoz           : SHmanager;
      cur_mc : comp = 0h;
      iSaldoFun : SaldoFuncs;
        DatBeg
@@ -79,6 +91,7 @@ as select
   , KatMc MC_br
   , KatMc KatMc_check_group
   , SaldoMc
+  , sOPRhOZ
   , tmpSaldo1
   , SpOrder SpOrder_SetPrice
   , SpOrder SpOrder_loop
@@ -98,6 +111,7 @@ as select
   , tTempMC tTempMC_func
   , tMoveMC
   , tMoveMC tMoveMC_loop
+  , tModifsDocs
  Where ((
         tMoveMC_loop.cSpOrder == SpOrder_loop.nrec
                   and  cur_mc == tTempMC_br.crec
@@ -180,7 +194,12 @@ procedure createDoocenka; {
               oModifOrds.AnySpOrder_Delete(TypeSpOrder(SpOrder.buffer));
           }
        }
-       if getfirst SpOrder where ((sklorder.NREC == SpOrder.cSklOrder)) <> tsok then Delete current sklorder;
+       if getfirst SpOrder where ((sklorder.NREC == SpOrder.cSklOrder)) <> tsok then {
+        If(GetFirst FastFirstRow SoprHoz Where((sklorder.Nrec == SoprHoz.cSoprDoc And 150 == SoprHoz.TipDoc)) = TsOk) {
+          iSHoz.DelByHan(SoprHoz.BufferP);
+         }
+         Delete current sklorder;
+        }
       _i++;
       if _i mod 23 = 0 then { //  чтобы не тормозила перерисовка визуализации
          setVisualHeader('Удаление предыдуших дооценочных ордеров' +
@@ -232,6 +251,11 @@ procedure createDoocenka; {
                  , sklorder.YEARORD := year(DatEnd  )
                  , sklorder.TIPORD  := 4
                 ;
+                insert tModifsDocs set
+                    tModifsDocs.wTable := coSklOrder
+                  , tModifsDocs.cRec := SklOrder.nrec
+                 ;
+                // добавить данный документ в список для последубщей обработки ТХО
                 clearbuffer(tnsporder);
                  sporder.DESCR     := sklorder.DESCR;
                  sporder.DESGR     := sklorder.DESGR;
@@ -265,6 +289,20 @@ procedure createDoocenka; {
 
                iMTRFun.InsUpdRec(SpecMTR.buffer);
                oModifOrds.AnySpOrder_update(TypeSpOrder(SpOrder.buffer));
+
+                 ClearBuffer(tnSoprHoz);
+                  SoprHoz.FilialNo := lGetTune('Konsolid.FilialNo');
+                  SoprHoz.Direct   := 1;
+                  SoprHoz.Descr    := SklOrder.Descr;
+                  SoprHoz.DesGr    := SklOrder.DesGr;
+                  SoprHoz.DatOb    := SklOrder.dOrd;
+                  SoprHoz.NoDoc    := SklOrder.NOrder;
+                  SoprHoz.TipDoc   := word(150);
+                  SoprHoz.TiDkGal  := word(150);
+                  SoprHoz.cSoprDoc := SklOrder.NRec;
+                  SoprHoz.Summa    := SpOrder.SrPrice;
+                  SoprHoz.SummaSp  := SpOrder.SrPrice;
+                  iSHoz.InsByHan(SoprHoz.BufferP);
               }
             }
   StopVisual('The End',vfTimer);
@@ -273,9 +311,11 @@ procedure createDoocenka; {
 }
 
 procedure setnewPrices; {
- StartNewVisual(vtRotateVisual, vfTimer, 'Установка цен',1);
+ StartNewVisual(vtIndicatorVisual, vfTimer, 'Установка цен',recordsintable(tntTempMC));
+ delete all tModifsDocs;
     _loop tTempMC where tTempMC.cSpOrder <> 0h {
-       if getfirst SpOrder_SetPrice where ((tTempMC.cSpOrder == SpOrder_SetPrice.nrec)) = tsOK {
+      nextvisual;
+       if getfirst fastfirstrow SpOrder_SetPrice where ((tTempMC.cSpOrder == SpOrder_SetPrice.nrec)) = tsOK {
          if not (SpOrder_SetPrice.SP = 0          // склад
              and SpOrder_SetPrice.VIDORDER = 0    // приходный
              and ( SpOrder_SetPrice.TIPORD = 1    // внешние операции
@@ -286,12 +326,23 @@ procedure setnewPrices; {
                 SpOrder_SetPrice.RSRPRICE := PricePlanRecalc(SpOrder_SetPrice.cMc);
                 SpOrder_SetPrice.SRPRICE  := Round(PricePlanRecalc(SpOrder_SetPrice.cMc),2);
                oModifOrds.AnySpOrder_UpDate(TypeSpOrder(SpOrder_SetPrice.buffer))
+
+             if getfirst SklOrder where ((SpOrder_SetPrice.cSklOrder == SklOrder.nrec)) = tsOK {
+                  insert tModifsDocs set
+                    tModifsDocs.wTable := coKatSopr
+                  , tModifsDocs.cRec   := sklorder.CSOPR
+                 ;
+              }
            }
          }
        }
     }
  StopVisual('The End',vfTimer);
  createDoocenka;
+ myLog('Список измененных документов');
+ _loop tModifsDocs {
+   myLog(string(tModifsDocs.wTable) + ' ' + string(tModifsDocs.cRec,0,0));
+ }
 }
 SCREEN PROJ5;
   Fields
