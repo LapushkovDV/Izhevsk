@@ -76,6 +76,7 @@ as select
  from
     Pick
   , KatMc MC_br
+  , KatMc KatMc_check_group
   , SaldoMc
   , tmpSaldo1
   , SpOrder SpOrder_SetPrice
@@ -86,6 +87,10 @@ as select
   , KatMOL
   , KatParty
   , KatSopr KatSopr_br
+  , KATLINK
+  , SpecMtr
+  , SpOrder
+  , SklOrder
   , tTempMC
   , tTempMC tTempMC_br
   , tTempMC tTempMC_func
@@ -136,11 +141,19 @@ function FillMCFiltrTable : boolean; {
   }
   if result {
   _loop pick where ((cgPick_MC == Pick.wList)) {
-        var _sqlstr : string =   'INSERT INTO tblFiltrTMC_RECACL (cMc) VALUES (' + ' #comp(' + string(Pick.cRec) + '))';
-        sqlExecDirect(_sqlstr);
+        if getfirst KatMc_check_group where ((Pick.cRec == KatMc_check_group.nrec)) = tsOK {
+          if getfirst KATLINK where (( 'CHOOSE_GROUP_MC_EXCLUDE' == KATLINK.OWNNAME
+                                  and KatMc_check_group.cGroupMC == KATLINK.CREC (noindex))) = tsOK {
+               delete current Pick;
+           } else {
+              var _sqlstr : string =   'INSERT INTO tblFiltrTMC_RECACL (cMc) VALUES (' + ' #comp(' + string(Pick.cRec) + '))';
+              sqlExecDirect(_sqlstr);
+            }
+        }
         //mylog('sql :' + _sqlstr);
    }
   }
+  if getfirst pick where ((cgPick_MC == Pick.wList)) <> tsok then result := false; // нет МЦ для пересчета, считать нечего
 }
 function PricePlanRecalc(_cMc : comp) : double; cacheable;{
   result := 0;
@@ -148,8 +161,102 @@ function PricePlanRecalc(_cMc : comp) : double; cacheable;{
      result := (tTempMC_func.sum_ost + tTempMC_func.sum_prihod) / (tTempMC_func.kol_ost + tTempMC_func.kol_prihod);
   }
 }
-procedure setnewPrices; {
 
+procedure createDoocenka; {
+  StartNewVisual(vtRotateVisual ,vfTimer,'Удаление предыдуших дооценочных ордеров',0);
+  var _i : longint = 0;
+  _loop sklorder where (( 0 == sklorder.SP
+                      and 0 == sklorder.VIDORDER
+                      and 4 == sklorder.TIPORD
+                 and DatEnd == sklorder.DORD
+             and 'DOOCENKA' == sklorder.NORDER (noindex) )) {
+       _loop SpOrder where ((sklorder.NREC == SpOrder.cSklOrder)) {
+         oModifOrds.AnySpOrder_Delete(TypeSpOrder(SpOrder.buffer));
+       }
+      Delete current sklorder;
+      _i++;
+      if _i mod 23 = 0 then { //  чтобы не тормозила перерисовка визуализации
+         setVisualHeader('Удаление предыдуших дооценочных ордеров' +
+                       ''#13'' + string(_i));
+      }
+    }
+ StopVisual('The End',vfTimer);
+
+ StartNewVisual(vtRotateVisual ,vfTimer,'Расчет сальдо на конец периода',0);
+  delete all tmpSaldo1;
+          iSaldoFun.Store_Run_New( // хрен зате куда пропала фнкция это .. Store_run_new_ex
+                                   DatEnd
+                                 , true //складские остатки
+                                 , false //производственные
+                                 , False
+                                 , False
+                                 , -2 //МЦ - будут браться из PICK по крайней мере в Store_run_new_ex брались
+                                 , 0h //склад
+                                 , 0h //МОЛ
+                                 , 0h //группам партий и партиям
+                                 , False // выгружать остатки по МТР
+                                 , 000100000000000Ah  //фильтр по ЦУ: ЦУ ЛИ,
+                                 , 000100000000061Ch  //фильтр по ЦУ: вид собственности = Собственные
+                                 , false  // группировать по складам
+                                 , false  // группировать по МОЛ
+                                 , false  // группировать по партиям
+                                 , True  // bIncZeroKol  - вдруг списали количество, а цена осталась
+                                 );
+           StartNewVisual(vtIndicatorVisual ,vfTimer,'Просмотр остатков по ТМЦ, формирование дооценочных ордеров',RecordsInTable(tnTmpSaldo1));
+           _loop TmpSaldo1 {
+              nextvisual;
+              if TmpSaldo1.PRICE <> PricePlanRecalc(TmpSaldo1.CMC) {
+                var _SumDoocenka : double = if(TmpSaldo1.kol = 0,1,TmpSaldo1.kol)*(PricePlanRecalc(TmpSaldo1.CMC) - TmpSaldo1.PRICE); //вдруг списали количество, а цена осталась
+                if _SumDoocenka = 0 then continue;
+                insert sklorder set
+                   sklorder.DESCR   :=  sgettune('USER.DESCR')
+                 , sklorder.DESGR   :=  sgettune('USER.DESGR')
+                 , sklorder.NORDER  := 'DOOCENKA'
+                 , sklorder.CPODR   := tmpsaldo1.CPODR
+                 , sklorder.CMOL    := tmpsaldo1.CMOL
+                 , sklorder.DORD    := DatEnd
+                 , sklorder.YEARORD := year(DatEnd  )
+                 , sklorder.TIPORD  := 4
+                ;
+                insert sporder set
+                   sporder.DESCR     := sklorder.DESCR
+                 , sporder.DESGR     := sklorder.DESGR
+                 , sporder.CSKLORDER := sklorder.nrec
+                 , sporder.DORD      := sklorder.DORD
+                 , sporder.NPP       := 1
+                 , sporder.TIPORD    := 4
+                 , sporder.CMC       := tmpsaldo1.CMC
+                 , sporder.CPARTY    := tmpsaldo1.CPARTY
+                 , sporder.SRPRICE   := _SumDoocenka
+                 , sporder.RSRPRICE  := _SumDoocenka
+                 , sporder.CCPODR    := sklorder.CPODR
+                 , sporder.CCMOL     := sklorder.CMOL
+                 , sporder.EMPTY     := 4
+                ;
+                Insert Specmtr set
+                   Specmtr.COTABLE   := coSpOrder
+                 , Specmtr.CSPEC     := SpOrder.nrec
+                 , Specmtr.CSALDTUNE := tmpsaldo1.CSALDTUNE
+                 , Specmtr.COBJ      := tmpsaldo1.COBJ
+                 , Specmtr.CKAU[1]   := tmpsaldo1.CKAU[1]
+                 , Specmtr.CKAU[2]   := tmpsaldo1.CKAU[2]
+                 , Specmtr.CKAU[3]   := tmpsaldo1.CKAU[3]
+                 , Specmtr.CKAU[4]   := tmpsaldo1.CKAU[4]
+                 , Specmtr.CKAU[5]   := tmpsaldo1.CKAU[5]
+                 , Specmtr.CKAU[6]   := tmpsaldo1.CKAU[6]
+                 , Specmtr.CKAU[7]   := tmpsaldo1.CKAU[7]
+                 , Specmtr.CKAU[8]   := tmpsaldo1.CKAU[8]
+                 , Specmtr.CKAU[9]   := tmpsaldo1.CKAU[9]
+                ;
+               oModifOrds.AnySpOrder_UpDate(TypeSpOrder(SpOrder.buffer))
+              }
+            }
+  StopVisual('The End',vfTimer);
+  StopVisual('The End',vfTimer);
+
+}
+
+procedure setnewPrices; {
  StartNewVisual(vtRotateVisual, vfTimer, 'Установка цен',1);
     _loop tTempMC where tTempMC.cSpOrder <> 0h {
        if getfirst SpOrder_SetPrice where ((tTempMC.cSpOrder == SpOrder_SetPrice.nrec)) = tsOK {
@@ -168,6 +275,7 @@ procedure setnewPrices; {
        }
     }
  StopVisual('The End',vfTimer);
+ createDoocenka;
 }
 SCREEN PROJ5;
   Fields
@@ -237,6 +345,7 @@ windowevent winBrowseMC;
   cmValue1 : {
     setnewPrices;
     message('Цены установлены');
+    closewindow(winBrowseMC);
   }
 
 end;
@@ -345,7 +454,8 @@ cmOK:
 _izmenenoPrih := _izmenenoRash:= _izmenenoVnutr :=_izmenenoMontaj := 0;
 
  if not FillMCFiltrTable then {
-   message('Не удалось заполнить временную таблицу-фильтр по ТМЦ', error)
+   message('Нет ТМЦ для пересчета (см. настройку групп исключения) или не удалось заполнить временную таблицу-фильтр по ТМЦ', error);
+   exit;
   }
 
  setvisualHeader('Запрос по приходным ордерам');
